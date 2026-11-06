@@ -1,0 +1,27 @@
+{
+ "register_1GiB_s": 0.148,
+ "register_GBps": 7.3,
+ "h2d_copy_1GiB_GBps": 390.3,
+ "kernel_read_host_1GiB_GBps": 230.2,
+ "kernel_read_hbm_1GiB_GBps": 360.8,
+ "h2d_36_experts_ms": 1.847,
+ "h2d_expert_GBps": 366.5,
+ "h2d_1_expert_us": 52.5,
+ "fp4_gemm_w1_real": {
+  "M1": {
+   "hbm_us": 91.3,
+   "uva_us": 102.8,
+   "equal": true,
+   "uva_eff_GBps": 61.0
+  },
+  "M6": {
+   "hbm_us": 91.1,
+   "uva_us": 102.9,
+   "equal": true,
+   "uva_eff_GBps": 60.9
+  }
+ },
+ "engram_gather_24rows_uva_us": 15.3,
+ "engram_gather_24rows_hbm_us": 14.2,
+ "engram_gather_24rows_uva_randidx_us": 15.7
+}
