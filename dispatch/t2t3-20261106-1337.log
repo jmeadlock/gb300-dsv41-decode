@@ -1,0 +1,18 @@
+The loader, placement CLI, host tier and expert pools are written and pass 18 tests on the Mac. The 7 GPU tests skip here, so registration, the UVA views and the forward pass are untested until the box runs them.
+
+1. Files: in `runtime/`, `ckpt.py`, `placement.py`, `host_tier.py`, `expert_pool.py`, `loader.py`, `refmodel.py` (imports the reference unchanged), `README.md`. In `tests/`, `mini_ckpt.py`, `conftest.py`, `test_loader_mini.py`, `gpu/test_host_tier_gpu.py`. No `patches.py`: `model.py` needed no change.
+2. Mac `.venv/bin/python -m pytest -q tests/`: `18 passed, 7 skipped in 2.35s`. On CPU, the reference `Transformer` is built from the mini checkpoint, and every parameter matches the output of running `convert.py` itself (byte-for-byte or `torch.equal`). `--verify` hashes match for every tensor. Loads with missing, unexpected or wrong-shape keys are refused.
+3. Rename map: copied from `convert.py:104-126`, with one extra I found: `mlp`→`ffn` is skipped for `vision.*`. The real checkpoint already uses the converted names.
+4. Dtype conversions: besides the `wo_a` dequant, the loader widens bf16→fp32 for `head.weight` (model.py:1008) and for the ratio-2 compressor `wkv`/`wgate` (model.py:444-448). The reference does the same widening when it loads, so matching it requires this. The handoff said `wo_a` only; the widening is exact and `--verify` checks it.
+5. Construction: plain `torch.device("meta")` would put the KV/RoPE buffers on meta too and poison the cached RoPE table. Instead only `torch.empty` and `torch.ones` (which create every parameter in `model.py`) go to meta. The build is refused unless every parameter is meta and every buffer except `engram_hash.cache` is real; that one is re-allocated.
+6. Synthetic placement report (mini: 2 layers, 4 hot / 4 cold per layer): HBM 125 tensors, 9,694,128 B placed (head 1→2 MiB from widening); HOST 52 tensors, 1,363,584 B (Engram 528,000 + cold experts 835,584); SKIP 20 (vision 12, mtp 8).
+7. Real 1017 shapes (built from `config.json`, checked against the inventory): HBM experts 206.61 GiB, host experts 62.33, Engram 188.83, pinned 251.17. At 325 per layer: 227.62 / 41.32 / 230.16. All match plan §4.
+8. Hot map: there is no rowmap-static-v1 file in the repo, so the default falls back to ids 0–294 per layer. Pass `--map` with the real map for the actual boot.
+9. Global state: `build_and_load` leaves the default dtype set to bf16, as `generate.py:118` does. Before any forward the driver must also call `torch.set_default_device("cuda")` (`generate.py:134`).
+
+To run on the box, from the repo checkout:
+- **Placement dry-run** (CPU only): `docker run --rm -v "$HOME/hermes/gb300-dsv41-megakernel":/work -w /work -v /models/DeepSeek-V4.1-Flash-1017-1bae0e1088993b9b82de08f59de5be5a34e42170:/ref:ro --entrypoint python3 vllm/vllm-openai:v0.31.0 -m runtime.placement --model-dir /ref --hot-per-layer 295`. Paste the output into the README.
+- **GPU tests**: the exact `docker run` line (CDI `GPU-1c1855c8…`, `DSV41_MODEL_DIR=/ref`) is in the docstring of `tests/gpu/test_host_tier_gpu.py`. It runs `python3 tests/gpu/test_host_tier_gpu.py`, which works without pytest. The JIT-cache mount paths there are my guess at the tools' defaults; match them to how the T1 runs mounted the cache.
+- **Real boot and verify** (T2's done-when): same mounts plus `--device nvidia.com/gpu=GPU-1c1855c8-dd10-0247-583e-3c3880ddbf55 --ipc=host`, then `-m runtime.loader --model-dir /ref --hot-per-layer 295 --verify --json /work/scratch/t2-boot.json`. Verify re-reads and hashes about 475 GiB.
+
+T2T3: ready-for-box — the Mac tests pass and the expert/Engram numbers match plan §4; registration, UVA views and the tiered-vs-all-HBM forward are untested until the box runs the GPU tests.

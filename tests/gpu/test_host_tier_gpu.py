@@ -72,7 +72,7 @@ def test_register_chunks_and_cuda_view():
     assert len(hb.chunks) == 5 and hb.is_registered()
     u8 = hb.cuda_view(torch.uint8, (n,))
     assert u8.device.type == "cuda" and u8.data_ptr() == hb.ptr
-    assert torch.equal(u8.cpu(), hb.cpu)
+    assert torch.equal(u8.clone().cpu(), hb.cpu)  # read the alias through the GPU; .cpu() on the alias itself is an invalid D2H
     # writes through the host side are visible to the GPU (same memory, no copy)
     hb.cpu[:16] = 7
     torch.cuda.synchronize()

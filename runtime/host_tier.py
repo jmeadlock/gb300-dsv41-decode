@@ -106,6 +106,9 @@ class HostBuffer:
         return self.cpu[offset:offset + n].view(dtype).view(tuple(shape))
 
     def cuda_view(self, dtype: torch.dtype, shape: Sequence[int], offset: int = 0, device=None) -> torch.Tensor:
+        # NOTE: the alias is host memory the GPU can address. Read it on the GPU (kernels, device->device copy_).
+        # `alias.cpu()` / `.to("cpu")` issue cudaMemcpy DeviceToHost from a host pointer and fail with invalid argument;
+        # the host-side data is already `self.cpu` / `host_view(...)`.
         """CUDA tensor over the same bytes (UVA alias). Requires the range to be registered."""
         n = _nbytes(dtype, shape)
         self._check_range(offset, n)
@@ -176,6 +179,15 @@ class HostBuffer:
         self.cpu = None
         self._cbuf = None
         self._mm.close()
+
+    def __del__(self):
+        # never let the mapping go away while CUDA still holds the registration: a later mmap can reuse the
+        # address and every cudaHostRegister after that returns 712 (HostMemoryAlreadyRegistered).
+        try:
+            if getattr(self, "chunks", None):
+                self.release()
+        except Exception:
+            pass
 
     def __repr__(self) -> str:
         return (f"HostBuffer({self.name!r}, {self.nbytes / GiB:.3f} GiB, ptr={self.ptr:#x}, "
