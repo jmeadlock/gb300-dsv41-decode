@@ -1,0 +1,82 @@
+{
+ "gpu": "NVIDIA GB300",
+ "cap": [
+  10,
+  3
+ ],
+ "torch": "2.13.0+cu130",
+ "results": {
+  "act_quant": {
+   "ok": true,
+   "s": "torch.float32",
+   "y": "torch.float8_e4m3fn",
+   "rel_err": 0.0257
+  },
+  "act_quant_ue8m0": {
+   "ok": true,
+   "s": "torch.float32",
+   "y": "torch.float8_e4m3fn",
+   "s_shape": [
+    64,
+    40
+   ]
+  },
+  "fp4_act_quant": {
+   "ok": true,
+   "s": "torch.float8_e8m0fnu",
+   "y": "torch.float4_e2m1fn_x2",
+   "shape": [
+    64,
+    2560
+   ],
+   "s_shape": [
+    64,
+    160
+   ]
+  },
+  "fp8_gemm": {
+   "ok": true,
+   "s": 0.2,
+   "rel_err": 0.0369,
+   "y": "torch.bfloat16"
+  },
+  "fp4_gemm": {
+   "ok": true,
+   "s": 4.34,
+   "shape": [
+    64,
+    2304
+   ],
+   "finite": true,
+   "y": "torch.bfloat16"
+  },
+  "hc_split_sinkhorn": {
+   "ok": true,
+   "s": 0.11,
+   "pre": [
+    1,
+    64,
+    4
+   ],
+   "comb": [
+    1,
+    64,
+    4,
+    4
+   ],
+   "row_sum_dev": 0.0,
+   "col_sum_dev": 0.0
+  },
+  "sparse_attn": {
+   "ok": true,
+   "s": 0.08,
+   "shape": [
+    1,
+    1,
+    64,
+    512
+   ],
+   "rel_err": 0.0021
+  }
+ }
+}
