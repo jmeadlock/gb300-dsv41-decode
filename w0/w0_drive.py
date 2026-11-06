@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""w0_drive.py — W0 request driver for the GB300 DSV4.1 Megakernel project (Milo, 2026-11-06). Stdlib only.
+"""w0_drive.py — W0 request driver for the GB300 DSV4.1 Decode project (Milo, 2026-11-06). Stdlib only.
 
   parity <out.jsonl>            greedy T=0 chat completions with top-20 logprobs on the fixture prompts (M0 parity reference)
   step   <out.json> [--profile] warm, then one 512-token greedy generation; step time from /metrics spec counters + stream

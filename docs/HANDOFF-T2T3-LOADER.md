@@ -1,6 +1,6 @@
 # HANDOFF — T2+T3: streaming loader with tiered placement, and the host tier (Engram + cold experts)
 
-Coding worker for the GB300 DSV4.1 Megakernel project. Read `PROJECT.md` (decisions 3, 4, 9, 13, 14), then `docs/M0-PORT-PLAN.md` §2, §3, §4, §5(b)(c), §8 risks 4 and 7, then `docs/ENVIRONMENT.md`, then `docs/checkpoint-1017-inventory.json`, `reference/deepseek-inference/convert.py` + `model.py` (classes `Linear`, `ParallelEngramEmbedding`, `Expert`, `MoE`, `Transformer`, `load_model` in `generate.py`).
+Coding worker for the GB300 DSV4.1 Decode project. Read `PROJECT.md` (decisions 3, 4, 9, 13, 14), then `docs/M0-PORT-PLAN.md` §2, §3, §4, §5(b)(c), §8 risks 4 and 7, then `docs/ENVIRONMENT.md`, then `docs/checkpoint-1017-inventory.json`, `reference/deepseek-inference/convert.py` + `model.py` (classes `Linear`, `ParallelEngramEmbedding`, `Expert`, `MoE`, `Transformer`, `load_model` in `generate.py`).
 
 Goal: `runtime/` Python package that builds DeepSeek's reference `Transformer` (unchanged `model.py` imported from `reference/deepseek-inference/`) at MP=1 on one GPU, with **weights streamed from the HF shards straight into their tier**:
 - HBM: everything except the two tiers below (and except vision + MTP, which are not loaded at M0);

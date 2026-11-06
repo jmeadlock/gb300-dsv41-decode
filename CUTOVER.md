@@ -20,7 +20,7 @@ Live state checked 2026-11-06 10:37 CST: Pg61 up on `:30006` (`ds41` + `ds41-sid
 1. Repoint consumers above; smoke each: one Hermes one-shot with a tool call on `custom[dsv41-spark]`; Echo one chat; Forge gateway in-container curl; Alyx one chat.
 2. Stop the 10-min Pg61 lane-check cron on the M4 (`dsv41_pg61_lane_check.sh`) — disable, don't delete.
 3. On the box: `cd ~/dsv41/garner && WORK=~/dsv41/garner/pg61-work DS41_HOME=~/dsv41/garner/home launcher/launch-pg61.sh down` (stops+removes `ds41`/`ds41-sidecar`, stops p3 watchdog, clears peer shm).
-4. Write `~/dsv41/m3/logs/MAINTENANCE` ("megakernel project; Station is dev box; no restore until James says") and a dated `LANE-OWNER.txt` line.
+4. Write `~/dsv41/m3/logs/MAINTENANCE` ("decode-runtime project; Station is dev box; no restore until James says") and a dated `LANE-OWNER.txt` line.
 5. Verify: `nvidia-smi` both GPUs near 0 MiB; `ss -ltn | grep 30006` closed; `pgrep -af "[s]idecar_watchdog"` empty; Spark `/v1/models` 200.
 6. Tell James which consumers went dark/degraded, with the 12 h ETA convention for W0.
 

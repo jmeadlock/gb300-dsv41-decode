@@ -75,7 +75,7 @@ with convert.py's own MP=1 output:
 
 On the box, inside the image, from the repo checkout (no GPU needed):
 
-    docker run --rm -v "$HOME/hermes/gb300-dsv41-megakernel":/work -w /work \
+    docker run --rm -v "$HOME/hermes/gb300-dsv41-decode":/work -w /work \
       -v /models/DeepSeek-V4.1-Flash-1017-1bae0e1088993b9b82de08f59de5be5a34e42170:/ref:ro \
       --entrypoint python3 vllm/vllm-openai:v0.31.0 -m runtime.placement --model-dir /ref --hot-per-layer 295
 
@@ -93,7 +93,7 @@ If that file is missing, it falls back to the vendored `reference/deepseek-infer
 **Real boot + verify (box, T2's done-when).**
 
     docker run --rm --device nvidia.com/gpu=GPU-1c1855c8-dd10-0247-583e-3c3880ddbf55 --ipc=host --ulimit memlock=-1:-1 \
-      -v "$HOME/hermes/gb300-dsv41-megakernel":/work -w /work \
+      -v "$HOME/hermes/gb300-dsv41-decode":/work -w /work \
       -v /models/DeepSeek-V4.1-Flash-1017-1bae0e1088993b9b82de08f59de5be5a34e42170:/ref:ro \
       --entrypoint python3 vllm/vllm-openai:v0.31.0 \
       -m runtime.loader --model-dir /ref --hot-per-layer 295 --verify --json /work/scratch/t2-boot.json

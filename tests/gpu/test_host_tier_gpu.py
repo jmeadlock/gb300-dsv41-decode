@@ -4,7 +4,7 @@ views feeding the reference fp4_gemm, and the loader end to end on the mini chec
 Run on the box (orchestrator), from the repo checkout, inside the library image with the GB300 by CDI:
 
   docker run --rm --device nvidia.com/gpu=GPU-1c1855c8-dd10-0247-583e-3c3880ddbf55 --ipc=host --ulimit memlock=-1:-1 \
-    -v "$HOME/hermes/gb300-dsv41-megakernel":/work -w /work \
+    -v "$HOME/hermes/gb300-dsv41-decode":/work -w /work \
     -v /models/DeepSeek-V4.1-Flash-1017-1bae0e1088993b9b82de08f59de5be5a34e42170:/ref:ro -e DSV41_MODEL_DIR=/ref \
     -v "$HOME/dsv41/w0/jit-cache/tilelang":/root/.tilelang -v "$HOME/dsv41/w0/jit-cache/triton":/root/.triton \
     -v "$HOME/dsv41/w0/jit-cache/nv":/root/.nv \

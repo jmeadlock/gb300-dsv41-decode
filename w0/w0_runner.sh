@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# w0_runner.sh — W0 measurement window for the GB300 DSV4.1 Megakernel project (Milo, 2026-11-06).
+# w0_runner.sh — W0 measurement window for the GB300 DSV4.1 Decode project (Milo, 2026-11-06).
 #   Phase 1 (Pg61 as-is, consumers already moved off :30006): parity capture ×2 (A, A2 → Pg61's own spread),
 #            clean C1 step cell ×3 from /metrics spec counters.
 #   Phase 2: Pg61 down (production launcher) → build + boot the nsys-wrapped clone (launch-w0.sh, patch 06) →
@@ -26,7 +26,7 @@ w0_down(){ ( cd "$W" && WORK=$W/work DS41_HOME=$GR/home bash launch-w0.sh down )
 finish(){ # every exit path: make sure nothing is left serving, say so, END
   kill_wd; w0_down
   docker ps --format '{{.Names}}' | grep -qxE 'ds41|ds41-sidecar' && log "WARN: ds41 containers still up at END"
-  own "W0 END: lane DARK by charter (megakernel dev box). Receipts $R. No restore until James says."
+  own "W0 END: lane DARK by charter (decode-runtime dev box). Receipts $R. No restore until James says."
   log "===== W0 END (lane = DARK, by charter) ====="
 }
 echo $$ > "$W/w0_runner.pid"

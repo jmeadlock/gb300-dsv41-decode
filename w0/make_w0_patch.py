@@ -23,7 +23,7 @@ s = orig
 a = """  # Every variable below is read by vLLM or by the mounted hook/fastpath; the fastpath's tuning values are code
   # constants in its components, not container env.
 """
-b = """  # W0 (megakernel project, 2026-11-06): optional nsys wrap of the server, a no-op unless DS41_NSYS_WRAP=1.
+b = """  # W0 (decode-runtime project, 2026-11-06): optional nsys wrap of the server, a no-op unless DS41_NSYS_WRAP=1.
   local nsysmnt=() nsyspfx=() nsysprof=()
   if [ "${DS41_NSYS_WRAP:-0}" = 1 ]; then
     mkdir -p "$DS41_CACHE_DIR/prof/${DS41_NSYS_TAG:-W0}"

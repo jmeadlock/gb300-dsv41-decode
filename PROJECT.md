@@ -1,4 +1,4 @@
-# GB300 DSV4.1 Megakernel — Project Charter
+# GB300 DSV4.1 Decode — Project Charter
 
 Status: **CHARTER, awaiting James's sign-off** (2026-11-06). Nothing on the lane has been touched.
 Owner: James Meadlock. Handler: Milo. Settled by grill session 2026-11-06 (three rounds, tree empty).
@@ -7,7 +7,7 @@ Owner: James Meadlock. Handler: Milo. Settled by grill session 2026-11-06 (three
 
 Make DeepSeek-V4.1-Flash-1017 (`1bae0e10`) run as fast as it can on one GB300 Station, measured as **single-user decode step time**.
 
-"Megakernel" is the banner, not a commitment. The project definition is *whatever makes the step shortest*; the first architecture bet is a fused multi-kernel chain with mailboxes + PDL (the sgl-nvidia-mega / Kimi-K3 "specialized decode" shape); one persistent kernel per decoder layer is the stretch, taken only if the measured boundary cost after the chain still justifies it. One kernel per forward is not a goal.
+Renamed from "GB300 DSV4.1 Megakernel" on 2026-11-06 (James): the technique was never the thesis. The project definition is *whatever makes the step shortest*; the first architecture bet is a fused multi-kernel chain with mailboxes + PDL (the sgl-nvidia-mega / Kimi-K3 "specialized decode" shape); one persistent kernel per decoder layer is the stretch, taken only if the measured boundary cost after the chain still justifies it. One kernel per forward is not a goal.
 
 ## The number
 
@@ -40,7 +40,7 @@ Make DeepSeek-V4.1-Flash-1017 (`1bae0e10`) run as fast as it can on one GB300 St
 | 15 | People | Milo + subagents; Garner McCloud invited after M0 (repo public from first commit). Kernel-design workers on Anthropic; desk/grunt on Spark DSV4.1 (`custom[dsv41-spark]`) |
 | 16 | Budget | soft lines **$200/mo each**: Anthropic, Nous, Grok; plus local inference. Overage tolerated; reported weekly, warn-at not cap |
 | 17 | Kill rule | **M0 by 2026-12-18 (week 6)** or Pg61 is restored and the project parks as desk research. Park decision is James's. Milo flags a projected miss by week 4 (2026-12-04) |
-| 18 | Repo | `github.com/jmeadlock/gb300-dsv41-megakernel`, Apache-2.0, local `~/hermes/gb300-dsv41-megakernel/`. Milo byline = session model |
+| 18 | Repo | `github.com/jmeadlock/gb300-dsv41-decode`, Apache-2.0, local `~/hermes/gb300-dsv41-decode/`. Milo byline = session model |
 | 19 | Cadence | Friday status: milestone table, spend per provider vs soft lines, box-time log, blockers. Launch messages end with a 12 h ETA; slips flagged. Blog only at measured milestones, teaching voice, corrections published |
 | 20 | Verdict home | Obsidian `Ideas/Inference - Decode Fusion.md` under the verdict board; each milestone ends in a dated verdict there |
 
