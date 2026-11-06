@@ -11,6 +11,7 @@ Standalone: no vllm import anywhere (charter decision 3). The reference `model.p
 | `expert_pool.py` | hot experts in per-layer HBM slot pools `[H,N,K/2]` + `[H,N,K/32]`; cold experts in one registered host pool, same layout; `loc[L][E] = (slot, tier)` int32 on device; binds the reference `Expert`s to zero-copy views (M0a zero-copy arm); host-side cold-hit counters |
 | `loader.py` | `build_and_load(model_dir, map, device)` and a CLI: meta construction, tiered streaming load, refusal on any key/shape/dtype mismatch, `--verify` sha256 of every placed tensor |
 | `refmodel.py` | imports the reference modules; `cpu_stubs=True` (Mac tests only) stands in for tilelang/PIL; Python < 3.10 compiles them with `from __future__ import annotations` (the file is untouched) |
+| `generate.py` | T5 driver: `Generator(model, tokenizer_dir)` -- `encode`/`decode` (checkpoint `encoding.py` chat mode + `tokenizer.json`), `prefill`/`step` (generate.py's call pattern), `greedy` -> one parity JSONL record (fp32 log-softmax top-20), NVTX `decode_step`, `arm_profile` (cudaProfilerApi window), `set_determinism` |
 
 ## Value paths (bit-identity rule)
 
@@ -139,3 +140,61 @@ reproduces 227.62 / 41.32 / 230.16.
 **Real checkpoint dry-run (headers of /models).** The orchestrator pastes it here:
 
     (pending: python -m runtime.placement --model-dir /ref --hot-per-layer 295)
+
+## First light (T5 + T6)
+
+`runtime/generate.py` drives the reference forward exactly as `generate.py` does: `model(tokens[:, 0:L], 0)` to
+prefill, then one token at its own position. There is no cache reset between prompts; a fresh prompt overwrites
+from position 0 and nothing stale is read (the module docstring has the line cites). Greedy is the model's own
+`argmax` (`model.temperature = 0`). The record is the W0 parity JSONL record minus `wall_s`, so two replays are
+byte-identical files. EOS is kept in `logprobs`/`n_tokens` and dropped from `text`, as in the W0 capture.
+
+**Mac tests** (CPU): `.venv/bin/python -m pytest -q tests/`. `tests/test_generate_cpu.py` reproduces the 8 fixture
+prompt-token counts and first ids with the vendored `encoding.py`. It needs a DSv4.1 `tokenizer.json` on the Mac:
+`$DSV41_TOKENIZER_DIR`, or the local `~/code/deepseek-recipe/static/tokenizers/v41` copy (a modified V4-Flash-Vision-
+Exp file; the box test with the checkpoint's own file is first light itself). It also re-creates every Pg61 token
+string by single-id decode and runs first_light's whole post-boot path on a fake model.
+
+**GPU test (box), mini checkpoint:** prefill + 10 greedy steps, self-replay equal (with a longer prompt in between),
+profile/NVTX hooks, and the CUDA-event step cell:
+
+    docker run --rm --device nvidia.com/gpu=GPU-1c1855c8-dd10-0247-583e-3c3880ddbf55 --ipc=host --ulimit memlock=-1:-1 \
+      -v "$HOME/hermes/gb300-dsv41-megakernel":/work -w /work -e CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+      -v "$HOME/dsv41/w0/jit-cache/tilelang":/root/.tilelang -v "$HOME/dsv41/w0/jit-cache/triton":/root/.triton \
+      -v "$HOME/dsv41/w0/jit-cache/nv":/root/.nv \
+      --entrypoint python3 vllm/vllm-openai:v0.31.0 tests/gpu/test_generate_mini_gpu.py
+
+**First light (box), real checkpoint.** Mounts: the T2 boot's two (repo at `/work`, checkpoint at `/ref`), plus
+`$W/w0` (the fixture), the JIT caches, `IPC_LOCK`, and the cuBLAS workspace setting:
+
+    W=$HOME/hermes/gb300-dsv41-megakernel
+    docker run --rm --device nvidia.com/gpu=GPU-1c1855c8-dd10-0247-583e-3c3880ddbf55 \
+      --ipc=host --ulimit memlock=-1:-1 --cap-add IPC_LOCK \
+      -v "$W":/work -w /work -v "$W/w0":/work/w0 \
+      -v /models/DeepSeek-V4.1-Flash-1017-1bae0e1088993b9b82de08f59de5be5a34e42170:/ref:ro \
+      -v "$HOME/dsv41/w0/jit-cache/tilelang":/root/.tilelang -v "$HOME/dsv41/w0/jit-cache/triton":/root/.triton \
+      -v "$HOME/dsv41/w0/jit-cache/nv":/root/.nv \
+      -e CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+      --entrypoint python3 vllm/vllm-openai:v0.31.0 \
+      bench/first_light.py --model-dir /ref --hot-per-layer 295 \
+        --fixture w0/results/phase1/parity-A.jsonl --out scratch/first-light-cand.jsonl \
+        --max-new 256 --reps 2 --step-cell 512
+
+What it writes:
+- `scratch/first-light-cand.jsonl` (rep 1) and `scratch/first-light-cand-replay.jsonl` (rep 2);
+- `<jsonl>.parity.json` for each rep (`bench/parity.py --json`);
+- `docs/first-light-<YYYYMMDD>.json` with boot, determinism, per-prompt meta (fp32-logit sha256, token ids, prefill,
+  cold hits), parity, self-replay, the step cell (per-step ms, cold calls per step and per layer), and errors.
+
+It prints the parity tables, any self-replay divergence, and a 12-line summary. The exit code is 0, or 2 if any
+stage logged an error. The run continues past a failing prompt.
+
+Options:
+- `--map hot.json` replaces `--hot-per-layer 295`.
+- `--only prose,json` runs a subset.
+- `--no-fill-uninit` turns off torch's NaN fill of `torch.empty` under deterministic mode. That fill is on by default
+  and shows in the step time.
+- For an nsys capture of the step cell, add `--skip-parity --profile --profile-warm 32 --profile-steps 64
+  [--nvtx-layers]` and wrap the command in `nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop`.
+  Where nsys lives (host `/usr/local/bin/nsys` in W0) and how it is mounted into the container is not settled here;
+  the hooks are tested only without nsys attached.
