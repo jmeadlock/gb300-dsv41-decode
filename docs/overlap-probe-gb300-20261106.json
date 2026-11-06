@@ -1,0 +1,12 @@
+{
+ "gemm_alone_us": 90.6,
+ "h2d_alone_ms": 2.751,
+ "hbmcopy_alone_ms": 0.341,
+ "gemm_with_h2d_us": 90.6,
+ "h2d_with_gemm_ms": 2.75,
+ "hbmcopy_with_h2d_ms": 0.357,
+ "h2d_with_hbmcopy_ms": 2.751,
+ "h2d_alone_GBps": 390.3,
+ "h2d_with_gemm_GBps": 390.5,
+ "hbmcopy_alone_GBps_rw": 6297.6
+}
