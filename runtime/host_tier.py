@@ -107,6 +107,9 @@ class HostBuffer:
 
     def cuda_view(self, dtype: torch.dtype, shape: Sequence[int], offset: int = 0, device=None) -> torch.Tensor:
         # NOTE: the alias is host memory the GPU can address. Read it on the GPU (kernels, device->device copy_).
+        # Measured on GB300 (2026-11-06): kernels may address the whole alias across registration chunks (the VA
+        # is contiguous), but a single cudaMemcpy/clone/copy_ must lie inside ONE registered chunk — a copy that
+        # crosses a chunk boundary fails with cudaErrorInvalidValue. Use `copy_chunks()` for memcpy-style reads.
         # `alias.cpu()` / `.to("cpu")` issue cudaMemcpy DeviceToHost from a host pointer and fail with invalid argument;
         # the host-side data is already `self.cpu` / `host_view(...)`.
         """CUDA tensor over the same bytes (UVA alias). Requires the range to be registered."""
@@ -121,6 +124,22 @@ class HostBuffer:
         if t.device.type != "cuda" or t.data_ptr() != ptr:
             raise RuntimeError(f"UVA alias failed for {self.name!r}: device={t.device} ptr={t.data_ptr():#x} != {ptr:#x}")
         return t.view(dtype).view(tuple(shape))
+
+    def copy_chunks(self, dst: torch.Tensor, offset: int = 0, nbytes: Optional[int] = None) -> torch.Tensor:
+        """memcpy the registered range [offset, offset+nbytes) into device tensor `dst` (uint8, flat), one copy per
+        registration chunk so no copy crosses a chunk boundary."""
+        nbytes = self.nbytes - offset if nbytes is None else nbytes
+        self._check_range(offset, nbytes)
+        src = self.cuda_view(torch.uint8, (nbytes,), offset=offset)
+        pos = 0
+        for p, n in self.chunks:
+            lo, hi = max(p, self.ptr + offset), min(p + n, self.ptr + offset + nbytes)
+            if hi > lo:
+                k = hi - lo
+                dst[pos:pos + k].copy_(src[lo - (self.ptr + offset):hi - (self.ptr + offset)])
+                pos += k
+        assert pos == nbytes, (pos, nbytes)
+        return dst
 
     def _check_range(self, offset: int, nbytes: int) -> None:
         if offset < 0 or nbytes < 0 or offset + nbytes > self.nbytes:

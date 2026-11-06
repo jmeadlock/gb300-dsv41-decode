@@ -72,7 +72,9 @@ def test_register_chunks_and_cuda_view():
     assert len(hb.chunks) == 5 and hb.is_registered()
     u8 = hb.cuda_view(torch.uint8, (n,))
     assert u8.device.type == "cuda" and u8.data_ptr() == hb.ptr
-    assert torch.equal(u8.clone().cpu(), hb.cpu)  # read the alias through the GPU; .cpu() on the alias itself is an invalid D2H
+    # a memcpy may not cross a registration chunk (measured: cudaErrorInvalidValue); kernels may. Read chunk-wise.
+    assert torch.equal(hb.copy_chunks(torch.empty(n, dtype=torch.uint8, device="cuda")).cpu(), hb.cpu)
+    assert int(u8.sum()) == int(hb.cpu.sum())  # kernel over the whole alias across all 5 chunks
     # writes through the host side are visible to the GPU (same memory, no copy)
     hb.cpu[:16] = 7
     torch.cuda.synchronize()
