@@ -1,0 +1,81 @@
+{
+ "model_dir": "/ref",
+ "config": "/ref/inference/config.json",
+ "device": "cuda",
+ "map": "first-295-per-layer",
+ "bytes_GiB": {
+  "read_HBM": 215.782,
+  "read_HOST": 251.167,
+  "pool_HBM": 206.612,
+  "pool_HOST": 62.334,
+  "engram_HOST": 188.833,
+  "hbm_params": 11.681
+ },
+ "timings_s": {
+  "scan": 0.62,
+  "construct": 8.13,
+  "alloc": 0.16,
+  "host_read": 19.79,
+  "hbm_load": 21.51,
+  "register": 0.66,
+  "assign": 1.88,
+  "verify": 163.64,
+  "total": 219.34
+ },
+ "mem_log": [
+  {
+   "stage": "before-host-alloc",
+   "mem_available_GiB": 449.5,
+   "need_GiB": 251.17,
+   "reserve_GiB": 16.0
+  },
+  {
+   "stage": "before-pin",
+   "mem_available_GiB": 197.8,
+   "need_GiB": 0.0,
+   "reserve_GiB": 16.0
+  },
+  {
+   "stage": "after-pin",
+   "mem_available_GiB": 197.8,
+   "need_GiB": 0.0,
+   "reserve_GiB": 16.0
+  },
+  {
+   "stage": "registered",
+   "pinned_GiB": 251.167,
+   "register_s": {
+    "layers.1.engram.embed.scale": 0.007,
+    "layers.1.engram.embed.weight": 0.206,
+    "layers.14.engram.embed.scale": 0.006,
+    "layers.14.engram.embed.weight": 0.239,
+    "cold_experts": 0.205
+   }
+  }
+ ],
+ "dequantized_wo_a": 40,
+ "widened_bf16_to_fp32": [
+  "head.weight",
+  "layers.14.attn.compressor.wgate.weight",
+  "layers.14.attn.compressor.wkv.weight",
+  "layers.2.attn.compressor.wgate.weight",
+  "layers.2.attn.compressor.wkv.weight",
+  "layers.8.attn.compressor.wgate.weight",
+  "layers.8.attn.compressor.wkv.weight"
+ ],
+ "host_buffers": {
+  "layers.1.engram.embed.scale": "HostBuffer('layers.1.engram.embed.scale', 2.861 GiB, ptr=0xf9cd93890000, registered=1 chunks, hugepages=True)",
+  "layers.1.engram.embed.weight": "HostBuffer('layers.1.engram.embed.weight', 91.554 GiB, ptr=0xf9b6b0100000, registered=2 chunks, hugepages=True)",
+  "layers.14.engram.embed.scale": "HostBuffer('layers.14.engram.embed.scale', 2.861 GiB, ptr=0xf9b5f8f20000, registered=1 chunks, hugepages=True)",
+  "layers.14.engram.embed.weight": "HostBuffer('layers.14.engram.embed.weight', 91.557 GiB, ptr=0xf99f15500000, registered=2 chunks, hugepages=True)",
+  "cold_experts": "HostBuffer('cold_experts', 62.334 GiB, ptr=0xf9ce4aa50000, registered=1 chunks, hugepages=True)"
+ },
+ "verify": {
+  "n": 93338,
+  "ok": 93338,
+  "mismatch": [],
+  "bytes": 501381239248
+ },
+ "cuda_allocated_GiB": 218.61,
+ "cuda_reserved_GiB": 219.885
+}
