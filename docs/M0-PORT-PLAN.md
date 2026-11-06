@@ -208,8 +208,8 @@ T1's remainder covers these, with real expert bytes for `fp4_gemm`. Fallback for
 
 | # | Task | Days | Depends | Done when |
 |---|---|---|---|---|
-| T0 | Desk: read vLLM v0.31.0 DSV4.1 compressed-KV/indexer write path (read-only); vendor checkpoint `encoding/`; render 8 W0 prompts | 0.5 | — | D1 memo; counts = 42/47/54/38/34/49/46/31 |
-| T1 | Env: **mostly done** (ENVIRONMENT.md: image, versions, 7 kernels on sm_103). Remainder: `python model.py`; model-config kernel cases (block-32 E8M0 `fp8_gemm`, inplace QDQs, E4M3/16 FP4, real-weight `fp4_gemm`, M=1); fp8/e8m0 `F.embedding`; context MiB | 0.5 | — | all pass, or the failing case is named with its fallback |
+| T0 | Desk: read vLLM v0.31.0 DSV4.1 compressed-KV/indexer write path (read-only); vendor checkpoint `encoding/`; render 8 W0 prompts | 0.5 | — | D1 memo; counts = 42/47/54/38/34/49/46/31 — **2026-11-06: encoding vendored, counts match 8/8 (ENVIRONMENT.md); D1 memo in progress** |
+| T1 | Env | 0.5 | — | **DONE 2026-11-06** (ENVIRONMENT.md): image/versions, 7 kernels on sm_103, block-32 E8M0 fp8_gemm + real-expert fp4_gemm at M=1/6 (rel_err 0.0017), inplace QDQs, fp8/e8m0 `F.embedding` all pass. Open: `python model.py` import smoke, context MiB |
 | T2 | Streaming loader (renames, wo_a dequant, fp4 view, placement, refuse-on-mismatch) | 3 | T1 | placed-byte sha256 = shard bytes for 100% of tensors; host peak ≤ pinned + 8 GiB |
 | T3 | Host tier: register + alias, Engram and cold pool | 1.5 | T1 | alias vs HBM `torch.equal` on 10⁶ ids; gather µs logged |
 | T4 | Expert split M0a (staging and zero-copy arms), rowmap load | 2 | T2, T3 | layer-level `torch.equal` vs all-HBM experts; cold-hit counter live |

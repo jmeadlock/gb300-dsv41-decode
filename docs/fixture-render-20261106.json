@@ -1,0 +1,290 @@
+[
+ {
+  "tag": "prose",
+  "pg61_prompt_tokens": 42,
+  "rendered": {
+   "chat": {
+    "n": 42,
+    "head": "<｜begin▁of▁sentence｜><｜User｜>Explain in three paragraphs why a mixture-of-expert",
+    "tail": "eed when some of them live in host RAM.<｜Assistant｜></think>",
+    "ids_head": [
+     0,
+     128803,
+     65106,
+     295,
+     2038,
+     42830
+    ]
+   },
+   "thinking": {
+    "n": 68,
+    "head": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the",
+    "tail": "peed when some of them live in host RAM.<｜Assistant｜><think>",
+    "ids_head": [
+     0,
+     128799,
+     77666,
+     288,
+     9504,
+     482
+    ]
+   }
+  },
+  "match": {
+   "chat": true,
+   "thinking": false
+  }
+ },
+ {
+  "tag": "code",
+  "pg61_prompt_tokens": 47,
+  "rendered": {
+   "chat": {
+    "n": 47,
+    "head": "<｜begin▁of▁sentence｜><｜User｜>Write a Python function `topk_rows(scores, k)` that",
+    "tail": "lude a short docstring and two asserts.<｜Assistant｜></think>",
+    "ids_head": [
+     0,
+     128803,
+     21750,
+     260,
+     15255,
+     2019
+    ]
+   },
+   "thinking": {
+    "n": 73,
+    "head": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the",
+    "tail": "clude a short docstring and two asserts.<｜Assistant｜><think>",
+    "ids_head": [
+     0,
+     128799,
+     77666,
+     288,
+     9504,
+     482
+    ]
+   }
+  },
+  "match": {
+   "chat": true,
+   "thinking": false
+  }
+ },
+ {
+  "tag": "math",
+  "pg61_prompt_tokens": 54,
+  "rendered": {
+   "chat": {
+    "n": 54,
+    "head": "<｜begin▁of▁sentence｜><｜User｜>A GPU has 7.2 TB/s of memory bandwidth. A decode st",
+    "tail": "p in microseconds? Show the arithmetic.<｜Assistant｜></think>",
+    "ids_head": [
+     0,
+     128803,
+     35,
+     54186,
+     769,
+     223
+    ]
+   },
+   "thinking": {
+    "n": 80,
+    "head": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the",
+    "tail": "ep in microseconds? Show the arithmetic.<｜Assistant｜><think>",
+    "ids_head": [
+     0,
+     128799,
+     77666,
+     288,
+     9504,
+     482
+    ]
+   }
+  },
+  "match": {
+   "chat": true,
+   "thinking": false
+  }
+ },
+ {
+  "tag": "json",
+  "pg61_prompt_tokens": 38,
+  "rendered": {
+   "chat": {
+    "n": 38,
+    "head": "<｜begin▁of▁sentence｜><｜User｜>Return ONLY a JSON object with keys name, port, rep",
+    "tail": "on port 30006 with 1 replica. No prose.<｜Assistant｜></think>",
+    "ids_head": [
+     0,
+     128803,
+     25529,
+     68861,
+     260,
+     26639
+    ]
+   },
+   "thinking": {
+    "n": 64,
+    "head": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the",
+    "tail": " on port 30006 with 1 replica. No prose.<｜Assistant｜><think>",
+    "ids_head": [
+     0,
+     128799,
+     77666,
+     288,
+     9504,
+     482
+    ]
+   }
+  },
+  "match": {
+   "chat": true,
+   "thinking": false
+  }
+ },
+ {
+  "tag": "shell",
+  "pg61_prompt_tokens": 34,
+  "rendered": {
+   "chat": {
+    "n": 34,
+    "head": "<｜begin▁of▁sentence｜><｜User｜>Give the exact bash one-liner that lists the five l",
+    "tail": "and explain each flag in one line each.<｜Assistant｜></think>",
+    "ids_head": [
+     0,
+     128803,
+     45585,
+     270,
+     6319,
+     64448
+    ]
+   },
+   "thinking": {
+    "n": 60,
+    "head": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the",
+    "tail": " and explain each flag in one line each.<｜Assistant｜><think>",
+    "ids_head": [
+     0,
+     128799,
+     77666,
+     288,
+     9504,
+     482
+    ]
+   }
+  },
+  "match": {
+   "chat": true,
+   "thinking": false
+  }
+ },
+ {
+  "tag": "tool",
+  "pg61_prompt_tokens": 49,
+  "rendered": {
+   "chat": {
+    "n": 49,
+    "head": "<｜begin▁of▁sentence｜><｜User｜>You have a tool `read_file(path)`. The user asks: w",
+    "tail": "ith keys name and arguments, then stop.<｜Assistant｜></think>",
+    "ids_head": [
+     0,
+     128803,
+     3476,
+     611,
+     260,
+     4105
+    ]
+   },
+   "thinking": {
+    "n": 75,
+    "head": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the",
+    "tail": "with keys name and arguments, then stop.<｜Assistant｜><think>",
+    "ids_head": [
+     0,
+     128799,
+     77666,
+     288,
+     9504,
+     482
+    ]
+   }
+  },
+  "match": {
+   "chat": true,
+   "thinking": false
+  }
+ },
+ {
+  "tag": "long",
+  "pg61_prompt_tokens": 46,
+  "rendered": {
+   "chat": {
+    "n": 46,
+    "head": "<｜begin▁of▁sentence｜><｜User｜>Summarize the trade-offs between tensor parallelism",
+    "tail": "s, then one sentence of recommendation.<｜Assistant｜></think>",
+    "ids_head": [
+     0,
+     128803,
+     101859,
+     1387,
+     270,
+     7629
+    ]
+   },
+   "thinking": {
+    "n": 72,
+    "head": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the",
+    "tail": "ns, then one sentence of recommendation.<｜Assistant｜><think>",
+    "ids_head": [
+     0,
+     128799,
+     77666,
+     288,
+     9504,
+     482
+    ]
+   }
+  },
+  "match": {
+   "chat": true,
+   "thinking": false
+  }
+ },
+ {
+  "tag": "story",
+  "pg61_prompt_tokens": 31,
+  "rendered": {
+   "chat": {
+    "n": 31,
+    "head": "<｜begin▁of▁sentence｜><｜User｜>Write a 150-word story about a kernel engineer who ",
+    "tail": "ng on a PCIe round trip the whole time.<｜Assistant｜></think>",
+    "ids_head": [
+     0,
+     128803,
+     21750,
+     260,
+     223,
+     4980
+    ]
+   },
+   "thinking": {
+    "n": 57,
+    "head": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the",
+    "tail": "ing on a PCIe round trip the whole time.<｜Assistant｜><think>",
+    "ids_head": [
+     0,
+     128799,
+     77666,
+     288,
+     9504,
+     482
+    ]
+   }
+  },
+  "match": {
+   "chat": true,
+   "thinking": false
+  }
+ }
+]
