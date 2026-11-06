@@ -87,3 +87,9 @@ docs/           lever ledger mirror, milestone verdicts, status
 PROJECT.md      this charter
 CUTOVER.md      Station → Sparks cutover checklist (reversible)
 ```
+
+## Amendments proposed (2026-11-06, awaiting James) — see `docs/LEDGER.md`
+
+- **A1 (decision 4 wording).** "No KV quantization" was written against Pg61's `--kv-cache-dtype fp8_ds_mla`. D1 (`docs/D1-KV-NUMERICS.md`) shows the *model definition* (DeepSeek's reference) attends FP4-QDQ'd compressed-KV and index-K values, and that Pg61 skips that QDQ and stores MXFP8 of the raw latent instead. Proposal: the runtime's default KV numerics = the reference's (E2M1/E4M3-16 QDQ of the latent, FP8/32 window, FP4/32 index-K), with a `--kv-numerics pg61` switch kept only for the parity instrument; decision 4 then reads "no quantization below the model definition's own".
+- **A2 (decision 13).** Static map for M0 (parity) stays. For M2 (recipe A thesis test) the static map is replaced by adaptive residency (our v26ar seed map + swap policy, ported into the runtime): at the static map's cold share the C2C self-fetch costs ~3.9 ms/step on bandwidth alone (`docs/C2C-PROBE-20261106.md`), so the thesis cannot be tested with it. The M2 bar is restated as `cold bytes/step ÷ 390 GB/s` exposed time, with copies pipelined under hot-expert work (shown fully concurrent).
+
