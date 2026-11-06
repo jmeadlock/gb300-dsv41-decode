@@ -232,8 +232,14 @@ def install_layer_nvtx(model) -> List:
     handles = []
 
     def wrap(mod, name):
-        handles.append(mod.register_forward_pre_hook(lambda m, i, n=name: nv.range_push(n)))
-        handles.append(mod.register_forward_hook(lambda m, i, o: nv.range_pop()))
+        # hooks MUST return None: a forward_pre_hook's non-None return replaces the module's inputs, and
+        # nvtx.range_push returns the range depth (an int) — that silently fed `(depth,)` to Engram.forward.
+        def pre(m, i, n=name):
+            nv.range_push(n)
+        def post(m, i, o):
+            nv.range_pop()
+        handles.append(mod.register_forward_pre_hook(pre))
+        handles.append(mod.register_forward_hook(post))
 
     for i, layer in enumerate(model.layers):
         wrap(layer, f"L{i}")
