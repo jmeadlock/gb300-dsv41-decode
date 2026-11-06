@@ -1,0 +1,1025 @@
+{
+ "model_dir": "/models/DeepSeek-V4.1-Flash-1017-1bae0e1088993b9b82de08f59de5be5a34e42170",
+ "shards": 48,
+ "tensors": 96085,
+ "total_GiB": 475.24,
+ "config_keys": {
+  "bos_token_id": 0,
+  "dtype": "bfloat16",
+  "eos_token_id": 1,
+  "image_token_id": 129264,
+  "model_type": "deepseek_v41",
+  "pad_token_id": 2,
+  "quantization_config": {
+   "quant_method": "fp8",
+   "activation_scheme": "dynamic",
+   "weight_block_size": [
+    32,
+    32
+   ],
+   "scale_fmt": "ue8m0",
+   "expert_dtype": "fp4"
+  },
+  "transformers_version": "5.6.0"
+ },
+ "roles": {
+  "attention": {
+   "n": 870,
+   "GiB": 5.439,
+   "dtypes": {
+    "BF16": 268,
+    "F32": 172,
+    "F8_E8M0": 215,
+    "F8_E4M3": 215
+   },
+   "examples": [
+    [
+     "vision.blocks.0.attn.wo.bias",
+     "BF16",
+     [
+      1024
+     ],
+     2048
+    ],
+    [
+     "vision.blocks.0.attn.wo.weight",
+     "BF16",
+     [
+      1024,
+      1024
+     ],
+     2097152
+    ],
+    [
+     "vision.blocks.0.attn.wqkv.bias",
+     "BF16",
+     [
+      3072
+     ],
+     6144
+    ],
+    [
+     "vision.blocks.0.attn.wqkv.weight",
+     "BF16",
+     [
+      3072,
+      1024
+     ],
+     6291456
+    ],
+    [
+     "vision.blocks.1.attn.wo.bias",
+     "BF16",
+     [
+      1024
+     ],
+     2048
+    ],
+    [
+     "vision.blocks.1.attn.wo.weight",
+     "BF16",
+     [
+      1024,
+      1024
+     ],
+     2097152
+    ]
+   ]
+  },
+  "dense_mlp": {
+   "n": 64,
+   "GiB": 0.516,
+   "dtypes": {
+    "BF16": 64
+   },
+   "examples": [
+    [
+     "vision.blocks.0.mlp.w1.weight",
+     "BF16",
+     [
+      5632,
+      1024
+     ],
+     11534336
+    ],
+    [
+     "vision.blocks.0.mlp.w2.weight",
+     "BF16",
+     [
+      1024,
+      2816
+     ],
+     5767168
+    ],
+    [
+     "vision.blocks.1.mlp.w1.weight",
+     "BF16",
+     [
+      5632,
+      1024
+     ],
+     11534336
+    ],
+    [
+     "vision.blocks.1.mlp.w2.weight",
+     "BF16",
+     [
+      1024,
+      2816
+     ],
+     5767168
+    ],
+    [
+     "vision.blocks.10.mlp.w1.weight",
+     "BF16",
+     [
+      5632,
+      1024
+     ],
+     11534336
+    ],
+    [
+     "vision.blocks.10.mlp.w2.weight",
+     "BF16",
+     [
+      1024,
+      2816
+     ],
+     5767168
+    ]
+   ]
+  },
+  "embed_head": {
+   "n": 4,
+   "GiB": 1.296,
+   "dtypes": {
+    "BF16": 4
+   },
+   "examples": [
+    [
+     "vision.patch_embed.proj.bias",
+     "BF16",
+     [
+      1024
+     ],
+     2048
+    ],
+    [
+     "vision.patch_embed.proj.weight",
+     "BF16",
+     [
+      1024,
+      588
+     ],
+     1204224
+    ],
+    [
+     "embed.weight",
+     "BF16",
+     [
+      129280,
+      5120
+     ],
+     1323827200
+    ],
+    [
+     "mtp.2.markov_head.embed.weight",
+     "BF16",
+     [
+      129280,
+      256
+     ],
+     66191360
+    ]
+   ]
+  },
+  "engram": {
+   "n": 12,
+   "GiB": 189.127,
+   "dtypes": {
+    "F8_E4M3": 4,
+    "F8_E8M0": 4,
+    "BF16": 4
+   },
+   "examples": [
+    [
+     "layers.1.engram.embed.weight",
+     "F8_E4M3",
+     [
+      384006168,
+      256
+     ],
+     98305579008
+    ],
+    [
+     "layers.1.engram.embed.scale",
+     "F8_E8M0",
+     [
+      384006168,
+      8
+     ],
+     3072049344
+    ],
+    [
+     "layers.1.engram.q_weight",
+     "BF16",
+     [
+      4,
+      5120
+     ],
+     40960
+    ],
+    [
+     "layers.1.engram.k_weight",
+     "BF16",
+     [
+      4,
+      5120
+     ],
+     40960
+    ],
+    [
+     "layers.1.engram.wkv.weight",
+     "F8_E4M3",
+     [
+      25600,
+      6144
+     ],
+     157286400
+    ],
+    [
+     "layers.1.engram.wkv.scale",
+     "F8_E8M0",
+     [
+      800,
+      192
+     ],
+     153600
+    ]
+   ]
+  },
+  "indexer": {
+   "n": 32,
+   "GiB": 0.042,
+   "dtypes": {
+    "BF16": 16,
+    "F8_E8M0": 8,
+    "F8_E4M3": 8
+   },
+   "examples": [
+    [
+     "layers.2.attn.indexer.k_norm.weight",
+     "BF16",
+     [
+      128
+     ],
+     256
+    ],
+    [
+     "layers.2.attn.indexer.weights_proj.weight",
+     "BF16",
+     [
+      32,
+      5120
+     ],
+     327680
+    ],
+    [
+     "layers.2.attn.indexer.wk.weight",
+     "BF16",
+     [
+      128,
+      512
+     ],
+     131072
+    ],
+    [
+     "layers.2.attn.indexer.wq_b.scale",
+     "F8_E8M0",
+     [
+      128,
+      40
+     ],
+     5120
+    ],
+    [
+     "layers.2.attn.indexer.wq_b.weight",
+     "F8_E4M3",
+     [
+      4096,
+      1280
+     ],
+     5242880
+    ],
+    [
+     "layers.8.attn.indexer.k_norm.weight",
+     "BF16",
+     [
+      128
+     ],
+     256
+    ]
+   ]
+  },
+  "mtp_draft": {
+   "n": 13,
+   "GiB": 0.14,
+   "dtypes": {
+    "F32": 9,
+    "F8_E8M0": 1,
+    "F8_E4M3": 1,
+    "BF16": 2
+   },
+   "examples": [
+    [
+     "mtp.0.hc_ffn_base",
+     "F32",
+     [
+      24
+     ],
+     96
+    ],
+    [
+     "mtp.0.hc_ffn_fn",
+     "F32",
+     [
+      24,
+      20480
+     ],
+     1966080
+    ],
+    [
+     "mtp.0.hc_ffn_scale",
+     "F32",
+     [
+      3
+     ],
+     12
+    ],
+    [
+     "mtp.0.main_proj.scale",
+     "F8_E8M0",
+     [
+      160,
+      480
+     ],
+     76800
+    ],
+    [
+     "mtp.0.main_proj.weight",
+     "F8_E4M3",
+     [
+      5120,
+      15360
+     ],
+     78643200
+    ],
+    [
+     "mtp.1.hc_ffn_base",
+     "F32",
+     [
+      24
+     ],
+     96
+    ]
+   ]
+  },
+  "norm_mhc": {
+   "n": 111,
+   "GiB": 0.001,
+   "dtypes": {
+    "BF16": 111
+   },
+   "examples": [
+    [
+     "vision.blocks.0.norm1.weight",
+     "BF16",
+     [
+      1024
+     ],
+     2048
+    ],
+    [
+     "vision.blocks.0.norm2.weight",
+     "BF16",
+     [
+      1024
+     ],
+     2048
+    ],
+    [
+     "vision.blocks.1.norm1.weight",
+     "BF16",
+     [
+      1024
+     ],
+     2048
+    ],
+    [
+     "vision.blocks.1.norm2.weight",
+     "BF16",
+     [
+      1024
+     ],
+     2048
+    ],
+    [
+     "vision.blocks.10.norm1.weight",
+     "BF16",
+     [
+      1024
+     ],
+     2048
+    ],
+    [
+     "vision.blocks.10.norm2.weight",
+     "BF16",
+     [
+      1024
+     ],
+     2048
+    ]
+   ]
+  },
+  "other": {
+   "n": 128,
+   "GiB": 1.443,
+   "dtypes": {
+    "BF16": 8,
+    "F32": 120
+   },
+   "examples": [
+    [
+     "aligner.w1.bias",
+     "BF16",
+     [
+      5120
+     ],
+     10240
+    ],
+    [
+     "aligner.w1.weight",
+     "BF16",
+     [
+      5120,
+      9216
+     ],
+     94371840
+    ],
+    [
+     "aligner.w2.bias",
+     "BF16",
+     [
+      5120
+     ],
+     10240
+    ],
+    [
+     "aligner.w2.weight",
+     "BF16",
+     [
+      5120,
+      5120
+     ],
+     52428800
+    ],
+    [
+     "image_end",
+     "BF16",
+     [
+      5120
+     ],
+     10240
+    ],
+    [
+     "image_newline",
+     "BF16",
+     [
+      5120
+     ],
+     10240
+    ]
+   ]
+  },
+  "routed_experts": {
+   "n": 94464,
+   "GiB": 275.669,
+   "dtypes": {
+    "F8_E8M0": 47232,
+    "I8": 47232
+   },
+   "examples": [
+    [
+     "layers.0.ffn.experts.0.w1.scale",
+     "F8_E8M0",
+     [
+      2304,
+      160
+     ],
+     368640
+    ],
+    [
+     "layers.0.ffn.experts.0.w2.scale",
+     "F8_E8M0",
+     [
+      5120,
+      72
+     ],
+     368640
+    ],
+    [
+     "layers.0.ffn.experts.0.w3.scale",
+     "F8_E8M0",
+     [
+      2304,
+      160
+     ],
+     368640
+    ],
+    [
+     "layers.0.ffn.experts.1.w1.scale",
+     "F8_E8M0",
+     [
+      2304,
+      160
+     ],
+     368640
+    ],
+    [
+     "layers.0.ffn.experts.1.w2.scale",
+     "F8_E8M0",
+     [
+      5120,
+      72
+     ],
+     368640
+    ],
+    [
+     "layers.0.ffn.experts.1.w3.scale",
+     "F8_E8M0",
+     [
+      2304,
+      160
+     ],
+     368640
+    ]
+   ]
+  },
+  "router": {
+   "n": 129,
+   "GiB": 0.15,
+   "dtypes": {
+    "F32": 86,
+    "BF16": 43
+   },
+   "examples": [
+    [
+     "layers.0.ffn.gate.bias",
+     "F32",
+     [
+      384
+     ],
+     1536
+    ],
+    [
+     "layers.0.ffn.gate.bias_vl",
+     "F32",
+     [
+      384
+     ],
+     1536
+    ],
+    [
+     "layers.0.ffn.gate.weight",
+     "BF16",
+     [
+      384,
+      5120
+     ],
+     3932160
+    ],
+    [
+     "layers.1.ffn.gate.bias",
+     "F32",
+     [
+      384
+     ],
+     1536
+    ],
+    [
+     "layers.1.ffn.gate.bias_vl",
+     "F32",
+     [
+      384
+     ],
+     1536
+    ],
+    [
+     "layers.1.ffn.gate.weight",
+     "BF16",
+     [
+      384,
+      5120
+     ],
+     3932160
+    ]
+   ]
+  },
+  "shared_experts": {
+   "n": 258,
+   "GiB": 1.419,
+   "dtypes": {
+    "F8_E8M0": 129,
+    "F8_E4M3": 129
+   },
+   "examples": [
+    [
+     "layers.0.ffn.shared_experts.w1.scale",
+     "F8_E8M0",
+     [
+      72,
+      160
+     ],
+     11520
+    ],
+    [
+     "layers.0.ffn.shared_experts.w2.scale",
+     "F8_E8M0",
+     [
+      160,
+      72
+     ],
+     11520
+    ],
+    [
+     "layers.0.ffn.shared_experts.w3.scale",
+     "F8_E8M0",
+     [
+      72,
+      160
+     ],
+     11520
+    ],
+    [
+     "layers.0.ffn.shared_experts.w1.weight",
+     "F8_E4M3",
+     [
+      2304,
+      5120
+     ],
+     11796480
+    ],
+    [
+     "layers.0.ffn.shared_experts.w2.weight",
+     "F8_E4M3",
+     [
+      5120,
+      2304
+     ],
+     11796480
+    ],
+    [
+     "layers.0.ffn.shared_experts.w3.weight",
+     "F8_E4M3",
+     [
+      2304,
+      5120
+     ],
+     11796480
+    ]
+   ]
+  }
+ },
+ "per_layer_GiB": {
+  "0": {
+   "attention": 0.12,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "1": {
+   "attention": 0.12,
+   "engram": 94.562,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "2": {
+   "attention": 0.13,
+   "indexer": 0.005,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "3": {
+   "attention": 0.12,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "4": {
+   "attention": 0.12,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "5": {
+   "attention": 0.12,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "6": {
+   "attention": 0.12,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "7": {
+   "attention": 0.12,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "8": {
+   "attention": 0.13,
+   "indexer": 0.005,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "9": {
+   "attention": 0.12,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "10": {
+   "attention": 0.12,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "11": {
+   "attention": 0.12,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "12": {
+   "attention": 0.12,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "13": {
+   "attention": 0.12,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "14": {
+   "attention": 0.13,
+   "engram": 94.565,
+   "indexer": 0.005,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "15": {
+   "attention": 0.12,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "16": {
+   "attention": 0.12,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "17": {
+   "attention": 0.12,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "18": {
+   "attention": 0.12,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "19": {
+   "attention": 0.12,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "20": {
+   "attention": 0.125,
+   "indexer": 0.005,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "21": {
+   "attention": 0.12,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "22": {
+   "attention": 0.12,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "23": {
+   "attention": 0.12,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "24": {
+   "attention": 0.12,
+   "indexer": 0.005,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "25": {
+   "attention": 0.12,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "26": {
+   "attention": 0.12,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "27": {
+   "attention": 0.12,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "28": {
+   "attention": 0.12,
+   "indexer": 0.005,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "29": {
+   "attention": 0.12,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "30": {
+   "attention": 0.12,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "31": {
+   "attention": 0.12,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "32": {
+   "attention": 0.12,
+   "indexer": 0.005,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "33": {
+   "attention": 0.12,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "34": {
+   "attention": 0.12,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "35": {
+   "attention": 0.12,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "36": {
+   "attention": 0.12,
+   "indexer": 0.005,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "37": {
+   "attention": 0.12,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "38": {
+   "attention": 0.12,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  },
+  "39": {
+   "attention": 0.12,
+   "norm_mhc": 0.0,
+   "other": 0.002,
+   "routed_experts": 6.724,
+   "router": 0.004,
+   "shared_experts": 0.033
+  }
+ }
+}

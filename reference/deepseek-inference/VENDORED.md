@@ -1,0 +1,1 @@
+Vendored verbatim from the DeepSeek-V4.1-Flash-1017 checkpoint (HF revision 1bae0e10), directory `inference/`, MIT License (see LICENSE). DeepSeek's readable reference implementation: vision, sparse attention + two-level indexer, Engram, MoE, Hyper-Connections, DSpark. Not modified. Our runtime starts from this, not from vLLM.
