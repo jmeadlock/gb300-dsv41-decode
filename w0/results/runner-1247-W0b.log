@@ -1,0 +1,11 @@
+2026-11-06 12:47:24 CST ===== W0 START pid 3068396 R=/home/milo/dsv41/w0/results-20261106-1247 =====
+2026-11-06 12:47:24 CST SKIP_P1=1: phase 1 receipts taken in an earlier run; Pg61 already down
+2026-11-06 12:47:25 CST preflight OK; root 367 GiB free; Pg61 bound
+2026-11-06 12:47:46 CST nsys mode: cuda-graph-trace=graph tag=W0b
+2026-11-06 12:53:25 CST P2 up rc=0 (339 s) 2026-11-06 12:53:25 CST [pg61] soak clock started: {"soak_start_utc": "2026-11-06T18:53:25Z", "soak_start_local": "2026-11-06 12:53:25 CST", "epoch": 1793991205}
+2026-11-06 12:53:25 CST P2 watchdog stopped for the capture (nsys ends the server on /stop_profile by design)
+2026-11-06 12:55:35 CST P2 DEADLOCK: no token progress for 120s (gen_tokens=32.0); diagnostics then kill
+2026-11-06 12:55:35 CST P2 profiled step rc=143 
+2026-11-06 12:58:56 CST WARN: ds41 still running 3 min after stop_profile; stopping it
+2026-11-06 12:59:26 CST P2 nsys report: MISSING  bytes
+2026-11-06 13:00:03 CST ===== W0 END (lane = DARK, by charter) =====

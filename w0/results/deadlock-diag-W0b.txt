@@ -1,0 +1,10 @@
+0, 0 %, 95682 MiB
+1, 0 %, 242910 MiB
+PID                 %CPU                ELAPSED             COMMAND
+3069944             0.0                 06:30               /nsys/target-linux-sbsa-armv8/nsys profile --trace=cuda,nvtx
+3070032             0.0                 06:29               /nsys/target-linux-sbsa-armv8/nsys --start-agent --session-n
+3070040             0.0                 06:29               /nsys/target-linux-sbsa-armv8/nsys-launcher /tmp/70d2-fa0c-d
+3070041             7.7                 06:29               /usr/bin/python3 /usr/local/bin/vllm serve --model /model --
+3070042             0.0                 06:29               nsys-tee 3 4 5 6
+3070510             0.9                 05:59               /usr/bin/python3 -c from multiprocessing.resource_tracker im
+3070511             271                 05:59               VLLM::EngineCore

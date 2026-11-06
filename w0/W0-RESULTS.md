@@ -12,8 +12,14 @@ Receipts: `results/` (copied from the box `~/dsv41/w0/results-20261106-{1059,110
 - Reading: once CUPTI kernel tracing opened, the engine stopped making progress. Pg61's peer tier v3 (persistent cooperative kernel on the RTX + GB300 spin on host-mapped shm, `PEER3_SPINS=1e12`) and CUPTI tracing do not coexist. The v27-lane capture (Card I1b) that produced the 11.216 ms anatomy ran peer v2, not v3.
 - First attempt (10:59) aborted on my own preflight grep (`nsys profile` vs JSON `"nsys","profile"`) — cost one 6-min boot; fixed.
 
+## Phase 2b — second attempt, `--cuda-graph-trace=graph` (12:47–13:00 CST) — FAILED the same way, and the finding sharpened
+- Same clone, only the trace mode changed; progress watchdog added (kill after 120 s without token progress). Boot 339 s, bound.
+- Stalled on the **second warm request, before `/start_profile` was ever posted** (`generation_tokens_total` frozen at 32; first attempt froze at 64 after two warms + the profiled request). EngineCore at 271 % CPU, both GPUs 0 % util, sidecar log healthy (`serving`, 2,880 peer3 calls, 0 lost records), `/stop_profile` never completed. `deadlock-diag-W0b.txt`.
+- So the stall is not the CUPTI capture range and not graph-node tracing: **an nsys-wrapped Pg61 engine stalls after 1–2 requests regardless of capture mode**, in a host spin consistent with the peer-tier-v3 wait loop (`PEER3_SPINS=1e12`) never seeing the sidecar's done flag. Unknown whether nsys's CUDA-API interception alters the host-mapped shm path or just the timing; the Card I1b capture that produced the v27 anatomy ran peer v2, not v3.
+- **Decision (Milo, 13:00 CST): stop spending boots on a Pg61 per-role anatomy.** It is not on M0's critical path (M0 is graded on `/metrics` step time + parity), and the runtime will own its own sidecar protocol, so the next per-role trace is the runtime's. Reopen only with a Grace-only arm (no peer3) or a non-CUPTI instrument (`nsys --gpu-metrics-devices` sampling).
+
 ## Open
-- Pg61 per-role anatomy still missing. Candidates, cheapest first: (a) `--cuda-graph-trace=graph` (no per-node CUPTI records; may not deadlock; gives graph-level timing only); (b) `nsys --gpu-metrics-devices` sampling (no CUPTI injection; counters only, `gpu_metrics_decode_windows.py`); (c) capture the Grace-only arm (peer3 off) — not Pg61, but the shape recipe A inherits; (d) profile with the sidecar in `coldskip`/self-answer mode. Needs a window; Station is dark by charter so cost is only box time.
+- Pg61 per-role anatomy still missing (parked, see 2b). Candidates if reopened, cheapest first: (a) `--cuda-graph-trace=graph` (no per-node CUPTI records; may not deadlock; gives graph-level timing only); (b) `nsys --gpu-metrics-devices` sampling (no CUPTI injection; counters only, `gpu_metrics_decode_windows.py`); (c) capture the Grace-only arm (peer3 off) — not Pg61, but the shape recipe A inherits; (d) profile with the sidecar in `coldskip`/self-answer mode. Needs a window; Station is dark by charter so cost is only box time.
 - Per-boundary PDL gap histogram: same dependency.
 
 ## Box state at END
