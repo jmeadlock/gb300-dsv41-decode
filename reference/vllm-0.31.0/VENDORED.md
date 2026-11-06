@@ -1,0 +1,1 @@
+Copied from the vllm/vllm-openai:v0.31.0 image, `vllm/models/deepseek_v41/` (+ `vllm/tokenizers/` as `tokenizers_pkg/`), Apache-2.0 (vLLM project). Study reference only — never imported by the runtime (charter decision 3). Pyc stripped.

@@ -1,0 +1,31 @@
+I wrote `docs/M0-PORT-PLAN.md` and `docs/m0-forward-graph.json`. Nothing else was edited, and I made no commits. There was no ssh, docker or network, and no GPU work on my side.
+
+One thing to know first: at 13:05, while I was still working, a commit (`a5b3950`) took my first draft of the plan. That commit also brought in `docs/ENVIRONMENT.md` and a kernel smoke-test receipt. I then trimmed the plan and folded that receipt in, so `docs/M0-PORT-PLAN.md` now shows as modified against `a5b3950` and is uncommitted. The JSON file is unchanged from that commit.
+
+- **Can the reference be the M0 base? Yes.** At world size 1 it runs with no `dist` changes, because every collective is behind `world_size > 1`. It breaks on one GPU only through memory placement, long prefill and speed — none of them the math. Built as written, it runs out of GPU memory during construction at layer 14's Engram table, after about 199.6 GiB is already allocated.
+- **HBM fit:** 325 hot experts per layer at most (227.6 GiB). That is after 11.77 GiB of non-expert weights and KV, 8 GiB headroom, 1 GiB context and 1.26 GiB of staging. Grace would then hold 41.3 GiB of cold experts plus 188.8 GiB of Engram tables.
+- **The existing 295/89 map fits with 21.2 GiB to spare.** The MTP draft layers M1 needs take 7.5 GiB of that. Grace pins 251 GiB at this map.
+- **Three biggest changes:**
+  - **Our own loader:** at one rank, `convert.py` holds about 476 GiB in host RAM on a 494 GiB machine with no swap, so we stream the checkpoint shards straight into place instead.
+  - **Host tier:** Engram tables and cold experts live in Grace memory the GPU can read directly; both kernels that read them stay unchanged.
+  - **Chunked prefill:** single-shot prefill tops out around 7K tokens, so 32K needs a multi-row path at a nonzero start position. M1's 6-row verify step reuses it.
+- **Top risk is the speed gate.** The reference decodes eagerly with a host sync every layer, so "≤ Pg61 + 10%" depends on graph capture plus borrowed kernels landing inside the same six weeks.
+- **The new receipt cleared my worst kernel worry.** All 7 reference kernels compile and run on sm_103, including attention with 64 heads in one CTA, which was my main concern. Torch is 2.13.
+- **Still not covered by that receipt:** the model's actual kernel settings (block-32 GEMMs with power-of-two scales, the in-place quantize steps, the compressed-KV FP4 path, real expert weights). Those are now a half-day item in the work breakdown.
+- **Mistakes in the handoff, corrected in the plan:**
+  - The 275.67 GiB expert total includes 3 MTP layers × 128 experts, not one layer of 384.
+  - Vision plus aligner is about 0.90 GiB, not 0.5.
+  - The inventory JSON holds role totals and sample tensors, not every tensor.
+  - The reference has no 6-row verify step; the checkpoint's DSpark block size is 5.
+- **Parity instrument:**
+  - **What Pg61's own capture shows:** its logits are bf16-quantized (18 exact ties in 1,476 positions), and its A-vs-A2 divergence at `code` token 121 happened at a tie.
+  - **Pass bar:** identical results when M0 replays itself; zero flips at positions where Pg61 was confident; and every free-run divergence landing on a near-tie.
+  - **Coverage gap:** the W0 prompts are at most 310 tokens, too short to exercise indexer selection, so long context needs its own test.
+- **Over length:** the prose is about 3,200 words against the ~2,500 target; the extra is in sections 1 and 5.
+
+Decisions for you — none of them blocks tasks T0–T6:
+- **D1 – which compressed-KV numerics M0 uses.** DeepSeek's own forward quantizes compressed KV and the indexer's K/Q to FP4, which is the shape of the `nvfp4_ds_mla` / mxfp4 options you ruled out as cache choices. Here they are the model's own math, while Pg61 runs `fp8_ds_mla`. It matters even on the short W0 prompts, because every compressed entry is attended. Desk task T0 reads vLLM's code to settle whether vLLM applies the same step.
+- **D2 – what "1-row-equivalent" means.** I propose M0's 1-row step must come in at or under 1.1 × 7.36 = 8.10 ms.
+- **D3 – the hot-expert map.** Keep 295/89 through M1, or grow toward about 314 per layer once MTP is in.
+
+M0-PLAN: ready — the reference runs at MP=1 unchanged in its math; the work is placement, an extend path, and graph/kernel swaps, with three decisions for James (D1 numerics, D2 speed bar, D3 map) that do not block T0–T6.
