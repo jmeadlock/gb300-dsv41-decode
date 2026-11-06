@@ -28,3 +28,14 @@ Optional confirmation (one 6-min boot, not done): capture Pg61 with `--kv-cache-
 
 ## What first light says about speed (M1+)
 404.9 ms/step is the unfused reference at 1 row: ~1,300 TileLang/torch launches per step from Python, each expert GEMM 91 µs latency-bound (`fp4_gemm` at M=1 does 18 CTAs). The plan's borrowed-kernel swaps (DeepGEMM MegaMoE for the routed experts, FlashMLA sparse attention, a CUDA-graphed layer loop) are the whole gap between 405 ms and Pg61's 7.36; the per-layer breakdown this runtime can now be profiled for (NVTX ranges + `cudaProfilerApi` window are in) is the next window's deliverable.
+
+## A3 confirmation — done (17:51–18:02 CST, `../w0/results/parity-pg61-nvfp4.jsonl`)
+
+Pg61's own code, one knob changed (`--kv-cache-dtype nvfp4_ds_mla` instead of `fp8_ds_mla`), same fixture, same instrument, graded against Pg61-A/A2:
+
+| | identical/8 | first divergence (prose/code/math/shell/long/story) | mean \|Δlogprob\| vs Pg61-A |
+|---|---|---|---|
+| **Pg61 nvfp4** (vLLM vs vLLM) | **2/8** | 5 / 152 / 27 / 27 / 23 / 9 | 0.0003–0.078 |
+| our runtime (reference numerics) | 2/8 | 14 / 152 / 27 / 129 / 22 / 1 | 0.001–0.051 |
+
+vLLM against itself with one KV format changed scores exactly what our runtime scores — and three of its divergence positions (code 152, math 27, long 22/23) are the *same positions* ours diverges at, i.e. those are the fixture's genuine near-ties. The plan's parity bar is confirmed unmeetable by anything but the incumbent's exact configuration; our runtime is, by this instrument, as close to Pg61 as Pg61 is to itself one setting over. **A3 stands as proposed.**
