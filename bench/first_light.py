@@ -242,6 +242,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--step-tag", default="prose")
     ap.add_argument("--stats-from", type=int, default=32)
     ap.add_argument("--only", default=None, help="comma-separated fixture tags (default: all)")
+    ap.add_argument("--kv-numerics", choices=["reference", "pg61"], default="reference",
+                    help="pg61 = MXFP8 QDQ on the compressed-KV latent instead of the reference FP4 (runtime/patches.py)")
     ap.add_argument("--skip-parity", action="store_true", help="step cell only (e.g. under nsys)")
     ap.add_argument("--profile", action="store_true", help="cudaProfilerStart/Stop around step-cell steps")
     ap.add_argument("--profile-warm", type=int, default=32)
@@ -268,6 +270,9 @@ def main(argv=None) -> int:
     from runtime.loader import build_and_load
 
     t0 = time.time()
+    if a.kv_numerics == "pg61":
+        from runtime.refmodel import import_reference
+        import_reference(); from runtime import patches; patches.kv_numerics_pg61(True); print("[patch] kv_numerics=pg61 active", flush=True)
     model = build_and_load(a.model_dir, a.map, "cuda", hot_per_layer=a.hot_per_layer, config_path=a.config,
                            reserve_host_gib=a.reserve_host_gib)
     report["boot"] = model.runtime_load.summary()
