@@ -1,0 +1,21 @@
+2026-11-06 10:59:12 CST ===== W0 START pid 3056822 R=/home/milo/dsv41/w0/results-20261106-1059 =====
+2026-11-06 10:59:13 CST preflight OK; root 367 GiB free; Pg61 bound
+2026-11-06 10:59:17 CST P1 parity A rc=0 parity: 8 prompts -> /home/milo/dsv41/w0/results-20261106-1059/phase1/parity-A.jsonl
+2026-11-06 10:59:21 CST P1 parity A2 rc=0 parity: 8 prompts -> /home/milo/dsv41/w0/results-20261106-1059/phase1/parity-A2.jsonl
+2026-11-06 10:59:26 CST P1 step rc=0 3 reps
+  P1 rep0 step_ms=7.746 tok/step=2.753 steps=186.0 ttft=0.03
+  P1 rep1 step_ms=7.747 tok/step=2.626 steps=195.0 ttft=0.031
+  P1 rep2 step_ms=7.724 tok/step=2.926 steps=175.0 ttft=0.03
+  P1 parity A vs A2 prose  len 256/256 first_divergence=None
+  P1 parity A vs A2 code   len 256/224 first_divergence=121
+  P1 parity A vs A2 math   len 256/256 first_divergence=None
+  P1 parity A vs A2 json   len 18/18 first_divergence=None
+  P1 parity A vs A2 shell  len 256/256 first_divergence=None
+  P1 parity A vs A2 tool   len 21/21 first_divergence=None
+  P1 parity A vs A2 long   len 256/256 first_divergence=None
+  P1 parity A vs A2 story  len 157/157 first_divergence=None
+2026-11-06 11:00:02 CST P2 pg61 down rc=0 (36 s)
+2026-11-06 11:00:29 CST P2 build rc=0 (6 s) 2026-11-06 11:00:29 CST [pg61] built: 114 files hashed; libw6mk b54168223847560b
+2026-11-06 11:06:07 CST P2 up rc=0 (338 s) 2026-11-06 11:06:07 CST [pg61] soak clock started: {"soak_start_utc": "2026-11-06T17:06:07Z", "soak_start_local": "2026-11-06 11:06:07 CST", "epoch": 1793984767}
+2026-11-06 11:06:07 CST ABORT: ds41 args carry no nsys wrap
+2026-11-06 11:06:49 CST ===== W0 END (lane = DARK, by charter) =====

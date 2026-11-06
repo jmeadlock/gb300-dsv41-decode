@@ -1,0 +1,9 @@
+2026-11-06 11:07:56 CST ===== W0 START pid 3062326 R=/home/milo/dsv41/w0/results-20261106-1107 =====
+2026-11-06 11:07:56 CST SKIP_P1=1: phase 1 receipts taken in an earlier run; Pg61 already down
+2026-11-06 11:07:57 CST preflight OK; root 367 GiB free; Pg61 bound
+2026-11-06 11:13:57 CST P2 up rc=0 (339 s) 2026-11-06 11:13:57 CST [pg61] soak clock started: {"soak_start_utc": "2026-11-06T17:13:57Z", "soak_start_local": "2026-11-06 11:13:57 CST", "epoch": 1793985237}
+2026-11-06 11:13:57 CST P2 watchdog stopped for the capture (nsys ends the server on /stop_profile by design)
+2026-11-06 11:20:25 CST P2 profiled step rc=143 
+2026-11-06 11:25:27 CST WARN: ds41 still running 5 min after stop_profile; stopping it
+2026-11-06 11:25:57 CST P2 nsys report: MISSING  bytes
+2026-11-06 11:26:33 CST ===== W0 END (lane = DARK, by charter) =====

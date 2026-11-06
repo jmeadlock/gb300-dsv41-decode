@@ -1,0 +1,9 @@
+parity prose: 256 tokens, 0.997 s, finish=length
+parity code: 256 tokens, 0.573 s, finish=length
+parity math: 256 tokens, 0.533 s, finish=length
+parity json: 18 tokens, 0.063 s, finish=stop
+parity shell: 256 tokens, 0.584 s, finish=length
+parity tool: 21 tokens, 0.062 s, finish=stop
+parity long: 256 tokens, 0.792 s, finish=length
+parity story: 157 tokens, 0.689 s, finish=stop
+parity: 8 prompts -> /home/milo/dsv41/w0/results-20261106-1059/phase1/parity-A.jsonl
