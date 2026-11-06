@@ -1,0 +1,5 @@
+scratch/
+**/raw/
+*.nsys-rep
+*.sqlite
+__pycache__/
