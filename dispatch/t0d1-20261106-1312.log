@@ -1,0 +1,25 @@
+The memo is written. The main finding: Pg61 attends different compressed-KV values than DeepSeek's reference.
+
+**What vLLM does under `fp8_ds_mla`.** It does not apply the reference's FP4 step to the compressed KV latent. It applies RoPE to the bf16 latent and quantizes it straight to MXFP8 (one scale per 32 values) in the same 528 B record the sliding window uses (`v/common/ops/fused_compress_quant_cache.py:354-405`, `v/attention.py:506-508`). The reference instead attends FP4 values with one E4M3 scale per 16. That difference hits every compressed layer (2–39), including on the W0 fixture.
+
+**The other three tensors:**
+- **Window KV:** same transform in both. I can't confirm bit-exactness because vLLM's window encoder is a C++ op that isn't in the vendored source.
+- **Index K/Q:** cannot tell. The default for `indexer_kv_dtype` lives in a module that isn't vendored, and Pg61's launch args don't set it. It doesn't matter for the W0 fixture: below 512 compressed positions neither engine scores; both select every position (`v/attention.py:1426-1448`, `ref/model.py:579`).
+
+**Correction to the plan and charter.** M0-PORT-PLAN §5(d) says the decision-6 records encode the reference's values exactly (288 B compressed, 68 B index K). That is true of `nvfp4_ds_mla` with the MXFP4 indexer, not of `fp8_ds_mla`. MXFP8 can't hold the reference's FP4 values losslessly: 15 of the 56 possible value×scale products need more bits than e4m3 has (a local arithmetic check). vLLM's own source calls the 288 B NVFP4 record "the format the reference implementation itself stores" (`v/nvidia/model.py:228-235`). Pg61 opts out of it with an explicit `--kv-cache-dtype fp8_ds_mla`.
+
+**Recommendation.** Matching the reference and matching Pg61 can't both be true for compressed KV.
+- Make the reference numerics M0's default, with one switch on the compressed-KV write: reference FP4 or Pg61 MXFP8.
+- At T6, run the teacher-forced parity check against Pg61 with each setting.
+- The parity check is built to tolerate a difference like this unless it causes a confident flip. Whether it does is an empirical question the source can't answer.
+- If the reference passes, change decision 6 to the 288 B record for M2 packing. If only the Pg61 setting passes, you choose.
+
+Two lines in Pg61's boot log would settle the live KV and indexer formats; the memo gives their source locations (finding 5). Pg61 runs Garner's patched engine rather than stock v0.31.0, and those patches weren't readable from here.
+
+I made no other edits, ran no ssh, docker or network calls, and didn't commit. `.gitignore` now shows as modified (`+.venv/`, changed at 13:18). I didn't make that change; something else running at the same time did.
+
+The memo is 1,049 words plus one table.
+
+D1-MEMO: different — under `fp8_ds_mla`, vLLM stores MXFP8 of the un-FP4'd latent, so Pg61 attends different compressed-KV values than the reference; window KV is the same; index K/Q is unknown from vendored source and moot on the W0 fixture.
+
+File: /Users/jamesmeadlock/hermes/gb300-dsv41-megakernel/docs/D1-KV-NUMERICS.md

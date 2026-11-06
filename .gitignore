@@ -3,3 +3,4 @@ scratch/
 *.nsys-rep
 *.sqlite
 __pycache__/
+.venv/
