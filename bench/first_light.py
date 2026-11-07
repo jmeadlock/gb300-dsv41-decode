@@ -552,6 +552,8 @@ def measure_rows(gen: Generator, a, report: Dict, *, out: str, json_path: str, f
     if sc1 is not None:
         try:
             ids = gen.encode([{"role": "user", "content": step_row["prompt"]}])
+            if a.profile:  # nsys window over the 6-row cell (same arming as the 1-row cell)
+                report["profile_window_rows"] = gen.arm_profile(a.profile_warm, a.profile_steps)
             scr = step_cell_rows(gen, ids, sc1["token_ids"], a.step_cell, a.stats_from)
             r6 = scr["ms_per_step"].get("mean")
             r1m = sc1["ms_per_step_same_positions"].get("mean")
