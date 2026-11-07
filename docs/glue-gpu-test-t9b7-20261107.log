@@ -1,0 +1,65 @@
+  act_quant / QDQ / dg_act kernels == reference on all finite bf16 + real shapes
+PASS test_act_quant_kernels_vs_reference_all_bf16 (4.6s)
+  routed + shared SwiGLU+act_quant kernels == reference glue at [6|1, 2304]
+PASS test_swiglu_kernels_vs_reference_real_shapes (0.2s)
+  combine == fp32 slot-order sum at [6, 5120]; hc_post mismatches per sum order {0: 0, 1: 5235, 2: 5292} -> [0]
+PASS test_combine_and_hc_post_kernels (1.3s)
+  RoPE forms equal to apply_rotary_emb on this device: o path (inverse) [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2), (2, 0), (2, 1), (2, 2)], wq_b GEMV epilogue (forward) [(0, 1), (0, 2), (1, 1), (1, 2), (2, 1), (2, 2)]
+PASS test_rope_kernels_modes_on_device (3.9s)
+  one-launch gather == 6 x gather_rows (+ convert_scales) on mini4's tables, ref and dg-masked
+PASS test_gather_tables_vs_six_gathers (8.0s)
+Traceback (most recent call last):
+  File "/work/tests/gpu/test_fused_glue_gpu.py", line 445, in <module>
+    t()
+  File "/work/tests/gpu/test_fused_glue_gpu.py", line 354, in test_fused_vs_ref_mini_refref
+    _fused_vs_ref("mini", "ref", "ref")
+  File "/work/tests/gpu/test_fused_glue_gpu.py", line 316, in _fused_vs_ref
+    assert want_on <= set(d["on"]) and set(d["on"]) - want_on <= set(R2_CLUSTER_NAMES), \
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: {'dg_act': 'n/a: moe_impl ref (StaticMoE runs reference Experts)', 'swiglu_routed': 'n/a: moe_impl ref (StaticMoE runs reference Experts)', 'moe_combine': 'n/a: moe_impl ref (StaticMoE runs reference Experts)', 'q_rope_epilogue': 'n/a: fp8_impl ref (the epilogue lives in the T9b-1 GEMV)', 'concat_free': "n/a: not implemented in round 1: the window ring is per layer while the compressed cache and the published topk_idxs are shared by every layer of a kv/index group, so one buffer per layer needs either per-layer copies of the compressed rows (no launch saved) or re-allocating the model's caches into per-group pools with per-layer index offsets; deferred, 76 launches", 'gemv_pair': 'n/a: fp8_impl ref (the pair / the fold live in the T9b-1 GEMV)', 'reduce_fold': 'n/a: fp8_impl ref (the pair / the fold live in the T9b-1 GEMV)', 'dg_sf_pack': 'n/a: moe_impl is not dg-inplace (the contiguous GEMM is the one that converts the activation SF)', 'dedup': 'n/a: rows=1: the one-row MoE routes k distinct experts (no dedup)'}
+  mini ref/ref: clusters {'gather': 'on', 'dg_act': 'n/a: moe_impl ref (StaticMoE runs reference Experts)', 'swiglu_routed': 'n/a: moe_impl ref (StaticMoE runs reference Experts)', 'swiglu_shared': 'on', 'moe_combine': 'n/a: moe_impl ref (StaticMoE runs reference Experts)', 'hc_post': 'on', 'o_rope_qdq': 'on', 'q_rope_epilogue': 'n/a: fp8_impl ref (the epilogue lives in the T9b-1 GEMV)', 'concat_free': "n/a: not implemented in round 1: the window ring is per layer while the compressed cache and the published topk_idxs are shared by every layer of a kv/index group, so one buffer per layer needs either per-layer copies of the compressed rows (no launch saved) or re-allocating the model's caches into per-group pools with per-layer index offsets; deferred, 76 launches", 'hc_norm': 'on', 'mix_stat': 'on', 'kv_path': 'on', 'q_path': 'on', 'router': 'on', 'engram': 'on', 'indexer_post': 'on', 'hc_split': 'on', 'gemv_pair': 'n/a: fp8_impl ref (the pair / the fold live in the T9b-1 GEMV)', 'reduce_fold': 'n/a: fp8_impl ref (the pair / the fold live in the T9b-1 GEMV)', 'dg_sf_pack': 'n/a: moe_impl is not dg-inplace (the contiguous GEMM is the one that converts the activation SF)', 'dedup': 'n/a: rows=1: the one-row MoE routes k distinct experts (no dedup)'}; modes {'rope_fwd': [1, 2], 'rope_inv': [1, 2], 'hc_sum': 0, 'hc_pre_sum': 0}
+FAIL test_fused_vs_ref_mini_refref (0.5s)
+Traceback (most recent call last):
+  File "/work/tests/gpu/test_fused_glue_gpu.py", line 445, in <module>
+    t()
+  File "/work/tests/gpu/test_fused_glue_gpu.py", line 358, in test_fused_vs_ref_mini4_refref
+    _fused_vs_ref("mini4", "ref", "ref")
+  File "/work/tests/gpu/test_fused_glue_gpu.py", line 316, in _fused_vs_ref
+    assert want_on <= set(d["on"]) and set(d["on"]) - want_on <= set(R2_CLUSTER_NAMES), \
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: {'dg_act': 'n/a: moe_impl ref (StaticMoE runs reference Experts)', 'swiglu_routed': 'n/a: moe_impl ref (StaticMoE runs reference Experts)', 'moe_combine': 'n/a: moe_impl ref (StaticMoE runs reference Experts)', 'q_rope_epilogue': 'n/a: fp8_impl ref (the epilogue lives in the T9b-1 GEMV)', 'concat_free': "n/a: not implemented in round 1: the window ring is per layer while the compressed cache and the published topk_idxs are shared by every layer of a kv/index group, so one buffer per layer needs either per-layer copies of the compressed rows (no launch saved) or re-allocating the model's caches into per-group pools with per-layer index offsets; deferred, 76 launches", 'gemv_pair': 'n/a: fp8_impl ref (the pair / the fold live in the T9b-1 GEMV)', 'reduce_fold': 'n/a: fp8_impl ref (the pair / the fold live in the T9b-1 GEMV)', 'dg_sf_pack': 'n/a: moe_impl is not dg-inplace (the contiguous GEMM is the one that converts the activation SF)', 'dedup': 'n/a: rows=1: the one-row MoE routes k distinct experts (no dedup)'}
+  mini4 ref/ref: clusters {'gather': 'on', 'dg_act': 'n/a: moe_impl ref (StaticMoE runs reference Experts)', 'swiglu_routed': 'n/a: moe_impl ref (StaticMoE runs reference Experts)', 'swiglu_shared': 'on', 'moe_combine': 'n/a: moe_impl ref (StaticMoE runs reference Experts)', 'hc_post': 'on', 'o_rope_qdq': 'on', 'q_rope_epilogue': 'n/a: fp8_impl ref (the epilogue lives in the T9b-1 GEMV)', 'concat_free': "n/a: not implemented in round 1: the window ring is per layer while the compressed cache and the published topk_idxs are shared by every layer of a kv/index group, so one buffer per layer needs either per-layer copies of the compressed rows (no launch saved) or re-allocating the model's caches into per-group pools with per-layer index offsets; deferred, 76 launches", 'hc_norm': 'on', 'mix_stat': 'on', 'kv_path': 'on', 'q_path': 'on', 'router': 'on', 'engram': 'on', 'indexer_post': 'on', 'hc_split': 'on', 'gemv_pair': 'n/a: fp8_impl ref (the pair / the fold live in the T9b-1 GEMV)', 'reduce_fold': 'n/a: fp8_impl ref (the pair / the fold live in the T9b-1 GEMV)', 'dg_sf_pack': 'n/a: moe_impl is not dg-inplace (the contiguous GEMM is the one that converts the activation SF)', 'dedup': 'n/a: rows=1: the one-row MoE routes k distinct experts (no dedup)'}; modes {'rope_fwd': [1, 2], 'rope_inv': [1, 2], 'hc_sum': 0, 'hc_pre_sum': 0}
+FAIL test_fused_vs_ref_mini4_refref (0.3s)
+Traceback (most recent call last):
+  File "/work/tests/gpu/test_fused_glue_gpu.py", line 445, in <module>
+    t()
+  File "/work/tests/gpu/test_fused_glue_gpu.py", line 362, in test_fused_vs_ref_mini_dg_gemv
+    _fused_vs_ref("mini", "dg-masked", "gemv")
+  File "/work/tests/gpu/test_fused_glue_gpu.py", line 316, in _fused_vs_ref
+    assert want_on <= set(d["on"]) and set(d["on"]) - want_on <= set(R2_CLUSTER_NAMES), \
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: {'concat_free': "n/a: not implemented in round 1: the window ring is per layer while the compressed cache and the published topk_idxs are shared by every layer of a kv/index group, so one buffer per layer needs either per-layer copies of the compressed rows (no launch saved) or re-allocating the model's caches into per-group pools with per-layer index offsets; deferred, 76 launches", 'dg_sf_pack': 'n/a: moe_impl is not dg-inplace (the contiguous GEMM is the one that converts the activation SF)', 'dedup': 'n/a: rows=1: the one-row MoE routes k distinct experts (no dedup)'}
+  mini dg-masked/gemv: clusters {'gather': 'on', 'dg_act': 'on', 'swiglu_routed': 'on', 'swiglu_shared': 'on', 'moe_combine': 'on', 'hc_post': 'on', 'o_rope_qdq': 'on', 'q_rope_epilogue': 'on', 'concat_free': "n/a: not implemented in round 1: the window ring is per layer while the compressed cache and the published topk_idxs are shared by every layer of a kv/index group, so one buffer per layer needs either per-layer copies of the compressed rows (no launch saved) or re-allocating the model's caches into per-group pools with per-layer index offsets; deferred, 76 launches", 'hc_norm': 'on', 'mix_stat': 'on', 'kv_path': 'on', 'q_path': 'on', 'router': 'on', 'engram': 'on', 'indexer_post': 'on', 'hc_split': 'on', 'gemv_pair': 'on', 'reduce_fold': 'on', 'dg_sf_pack': 'n/a: moe_impl is not dg-inplace (the contiguous GEMM is the one that converts the activation SF)', 'dedup': 'n/a: rows=1: the one-row MoE routes k distinct experts (no dedup)'}; modes {'rope_fwd': [1, 2], 'rope_inv': [1, 2], 'hc_sum': 0, 'hc_pre_sum': 0}
+FAIL test_fused_vs_ref_mini_dg_gemv (0.8s)
+Traceback (most recent call last):
+  File "/work/tests/gpu/test_fused_glue_gpu.py", line 445, in <module>
+    t()
+  File "/work/tests/gpu/test_fused_glue_gpu.py", line 366, in test_fused_vs_ref_mini4_dg_gemv
+    _fused_vs_ref("mini4", "dg-masked", "gemv")
+  File "/work/tests/gpu/test_fused_glue_gpu.py", line 316, in _fused_vs_ref
+    assert want_on <= set(d["on"]) and set(d["on"]) - want_on <= set(R2_CLUSTER_NAMES), \
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: {'concat_free': "n/a: not implemented in round 1: the window ring is per layer while the compressed cache and the published topk_idxs are shared by every layer of a kv/index group, so one buffer per layer needs either per-layer copies of the compressed rows (no launch saved) or re-allocating the model's caches into per-group pools with per-layer index offsets; deferred, 76 launches", 'dg_sf_pack': 'n/a: moe_impl is not dg-inplace (the contiguous GEMM is the one that converts the activation SF)', 'dedup': 'n/a: rows=1: the one-row MoE routes k distinct experts (no dedup)'}
+  mini4 dg-masked/gemv: clusters {'gather': 'on', 'dg_act': 'on', 'swiglu_routed': 'on', 'swiglu_shared': 'on', 'moe_combine': 'on', 'hc_post': 'on', 'o_rope_qdq': 'on', 'q_rope_epilogue': 'on', 'concat_free': "n/a: not implemented in round 1: the window ring is per layer while the compressed cache and the published topk_idxs are shared by every layer of a kv/index group, so one buffer per layer needs either per-layer copies of the compressed rows (no launch saved) or re-allocating the model's caches into per-group pools with per-layer index offsets; deferred, 76 launches", 'hc_norm': 'on', 'mix_stat': 'on', 'kv_path': 'on', 'q_path': 'on', 'router': 'on', 'engram': 'on', 'indexer_post': 'on', 'hc_split': 'on', 'gemv_pair': 'on', 'reduce_fold': 'on', 'dg_sf_pack': 'n/a: moe_impl is not dg-inplace (the contiguous GEMM is the one that converts the activation SF)', 'dedup': 'n/a: rows=1: the one-row MoE routes k distinct experts (no dedup)'}; modes {'rope_fwd': [1, 2], 'rope_inv': [1, 2], 'hc_sum': 0, 'hc_pre_sum': 0}
+FAIL test_fused_vs_ref_mini4_dg_gemv (0.4s)
+  T9b-7 norm_D     w   5120 x1: 1-row order vec_T512_V4_dec|mul (exact True); 6-row-shape order vec_T128_V4_dec|mul; batched torch rows != per-row: 1/6; 1-row order == per-row oracle: True
+  T9b-7 mix        w  20480 x1: 1-row order vec_T512_V4_dec|mul (exact True); 6-row-shape order vec_T128_V8_dec|mul; batched torch rows != per-row: 3/6; 1-row order == per-row oracle: True
+  T9b-7 q          w   1280 x1: 1-row order vec_T256_V4_dec|mul (exact True); 6-row-shape order vec_T128_V4_dec|mul; batched torch rows != per-row: 2/6; 1-row order == per-row oracle: True
+  T9b-7 kv         w    512 x1: 1-row order vec_T128_V4_dec|mul (exact True); 6-row-shape order vec_T128_V4_dec|mul; batched torch rows != per-row: 0/6; 1-row order == per-row oracle: True
+  T9b-7 router     w      6 x1: 1-row order vec_T4_V1_dec|mul (exact True); 6-row-shape order vec_T4_V1_dec|mul; batched torch rows != per-row: 0/6; 1-row order == per-row oracle: True
+  T9b-7 engram     w   5120 x4: 1-row order vec_T128_V4_dec|mul (exact True); 6-row-shape order vec_T32_V4_dec|mul; batched torch rows != per-row: 5/6; 1-row order == per-row oracle: True
+  T9b-7 engram_sum w   5120 x4: 1-row order vec_T128_V4_dec|mul (exact True); 6-row-shape order vec_T32_V4_dec|mul; batched torch rows != per-row: 6/6; 1-row order == per-row oracle: True
+PASS test_t9b7_real_width_orders (2.0s)
+  mini4 dg-masked/gemv graph step cell p50: glue ref 1.924 ms, fused 0.953 ms
+PASS test_fused_step_cell_informative (1.9s)
+7/11 not failed; 4 failed
