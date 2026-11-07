@@ -1,0 +1,145 @@
+[pool] layer 0: 295 hot + 14 cold in spare slots; 8 sets of 6x6
+OK   r1_c128 {"rows": 48}
+OK   r1_c128_pk {"rows": 48}
+OK   r1_c16 {"rows": 48}
+OK   r1_c16_pad {"rows": 48}
+OK   r1_c16_pad_pk {"rows": 48}
+OK   r1_c16_pad_g16 {"rows": 48}
+OK   r6_c16 {"rows": 48}
+OK   r6_c16_pk {"rows": 48}
+OK   r6_c128 {"rows": 48}
+OK   r1_masked {"rows": 48}
+OK   r6_masked {"rows": 48}
+  r1_c128|r1_c128_pk             rows bit-equal  48/48  max ulp 0
+  r1_c128|r1_c16                 rows bit-equal  48/48  max ulp 0
+  r1_c128|r1_c16_pad             rows bit-equal  48/48  max ulp 0
+  r1_c128|r1_c16_pad_pk          rows bit-equal  48/48  max ulp 0
+  r1_c128|r1_c16_pad_g16         rows bit-equal  48/48  max ulp 0
+  r1_c128|r6_c16                 rows bit-equal  48/48  max ulp 0
+  r1_c128|r6_c16_pk              rows bit-equal  48/48  max ulp 0
+  r1_c128|r6_c128                rows bit-equal  48/48  max ulp 0
+  r1_c128|r1_masked              rows bit-equal  48/48  max ulp 0
+  r1_c128|r6_masked              rows bit-equal  48/48  max ulp 0
+  r1_c128_pk|r1_c16              rows bit-equal  48/48  max ulp 0
+  r1_c128_pk|r1_c16_pad          rows bit-equal  48/48  max ulp 0
+  r1_c128_pk|r1_c16_pad_pk       rows bit-equal  48/48  max ulp 0
+  r1_c128_pk|r1_c16_pad_g16      rows bit-equal  48/48  max ulp 0
+  r1_c128_pk|r6_c16              rows bit-equal  48/48  max ulp 0
+  r1_c128_pk|r6_c16_pk           rows bit-equal  48/48  max ulp 0
+  r1_c128_pk|r6_c128             rows bit-equal  48/48  max ulp 0
+  r1_c128_pk|r1_masked           rows bit-equal  48/48  max ulp 0
+  r1_c128_pk|r6_masked           rows bit-equal  48/48  max ulp 0
+  r1_c16|r1_c16_pad              rows bit-equal  48/48  max ulp 0
+  r1_c16|r1_c16_pad_pk           rows bit-equal  48/48  max ulp 0
+  r1_c16|r1_c16_pad_g16          rows bit-equal  48/48  max ulp 0
+  r1_c16|r6_c16                  rows bit-equal  48/48  max ulp 0
+  r1_c16|r6_c16_pk               rows bit-equal  48/48  max ulp 0
+  r1_c16|r6_c128                 rows bit-equal  48/48  max ulp 0
+  r1_c16|r1_masked               rows bit-equal  48/48  max ulp 0
+  r1_c16|r6_masked               rows bit-equal  48/48  max ulp 0
+  r1_c16_pad|r1_c16_pad_pk       rows bit-equal  48/48  max ulp 0
+  r1_c16_pad|r1_c16_pad_g16      rows bit-equal  48/48  max ulp 0
+  r1_c16_pad|r6_c16              rows bit-equal  48/48  max ulp 0
+  r1_c16_pad|r6_c16_pk           rows bit-equal  48/48  max ulp 0
+  r1_c16_pad|r6_c128             rows bit-equal  48/48  max ulp 0
+  r1_c16_pad|r1_masked           rows bit-equal  48/48  max ulp 0
+  r1_c16_pad|r6_masked           rows bit-equal  48/48  max ulp 0
+  r1_c16_pad_pk|r1_c16_pad_g16   rows bit-equal  48/48  max ulp 0
+  r1_c16_pad_pk|r6_c16           rows bit-equal  48/48  max ulp 0
+  r1_c16_pad_pk|r6_c16_pk        rows bit-equal  48/48  max ulp 0
+  r1_c16_pad_pk|r6_c128          rows bit-equal  48/48  max ulp 0
+  r1_c16_pad_pk|r1_masked        rows bit-equal  48/48  max ulp 0
+  r1_c16_pad_pk|r6_masked        rows bit-equal  48/48  max ulp 0
+  r1_c16_pad_g16|r6_c16          rows bit-equal  48/48  max ulp 0
+  r1_c16_pad_g16|r6_c16_pk       rows bit-equal  48/48  max ulp 0
+  r1_c16_pad_g16|r6_c128         rows bit-equal  48/48  max ulp 0
+  r1_c16_pad_g16|r1_masked       rows bit-equal  48/48  max ulp 0
+  r1_c16_pad_g16|r6_masked       rows bit-equal  48/48  max ulp 0
+  r6_c16|r6_c16_pk               rows bit-equal  48/48  max ulp 0
+  r6_c16|r6_c128                 rows bit-equal  48/48  max ulp 0
+  r6_c16|r1_masked               rows bit-equal  48/48  max ulp 0
+  r6_c16|r6_masked               rows bit-equal  48/48  max ulp 0
+  r6_c16_pk|r6_c128              rows bit-equal  48/48  max ulp 0
+  r6_c16_pk|r1_masked            rows bit-equal  48/48  max ulp 0
+  r6_c16_pk|r6_masked            rows bit-equal  48/48  max ulp 0
+  r6_c128|r1_masked              rows bit-equal  48/48  max ulp 0
+  r6_c128|r6_masked              rows bit-equal  48/48  max ulp 0
+  r1_masked|r6_masked            rows bit-equal  48/48  max ulp 0
+OK   us_per_layer {"r1_c128": 53.14, "r1_c128_pk": 44.79, "r1_c16": 45.07, "r1_c16_pad": 99.98, "r1_c16_pad_pk": 90.23, "r6_c16": 110.27, "r6_c16_pk": 101.91, "delta_us_per_layer_on_vs_today": 45.44, "delta_us_per_layer_align_vs_today": -8.07, "projected_1row_ms_on": 12.338, "projected_1row_ms_align": 10.197, "note":
+wrote /work/scratch/dg-rowmatch-spike-20261107-gputest.json
+VERDICT {"rows": 48, "rowmatch_on_equal_r6": true, "rowmatch_on_packed_equal_r6": true, "rowmatch_align_equal_r6": true, "today_equal_r6": true, "today_fp32_equal_r6": true, "r6_packed_equal_fp32": true, "r6_c128_equal_c16": true, "num_groups_invariant": true, "masked_1_equal_6": true, "masked_equal_contiguous": true, "all_equal": true, "not_equal_pairs": [], "projected_1row_ms_on": 12.338, "delta_us_per_layer_on": 45.44, "gate_1row_ms": 10.72, "failed": []}
+  r1_c128_pk|r1_c16              rows bit-equal  48/48  max ulp 0
+  r1_c128_pk|r1_c16_pad          rows bit-equal  48/48  max ulp 0
+  r1_c128_pk|r1_c16_pad_g16      rows bit-equal  48/48  max ulp 0
+  r1_c128_pk|r1_c16_pad_pk       rows bit-equal  48/48  max ulp 0
+  r1_c128_pk|r1_masked           rows bit-equal  48/48  max ulp 0
+  r1_c128_pk|r6_c128             rows bit-equal  48/48  max ulp 0
+  r1_c128_pk|r6_c16              rows bit-equal  48/48  max ulp 0
+  r1_c128_pk|r6_c16_pk           rows bit-equal  48/48  max ulp 0
+  r1_c128_pk|r6_masked           rows bit-equal  48/48  max ulp 0
+  r1_c128|r1_c128_pk             rows bit-equal  48/48  max ulp 0
+  r1_c128|r1_c16                 rows bit-equal  48/48  max ulp 0
+  r1_c128|r1_c16_pad             rows bit-equal  48/48  max ulp 0
+  r1_c128|r1_c16_pad_g16         rows bit-equal  48/48  max ulp 0
+  r1_c128|r1_c16_pad_pk          rows bit-equal  48/48  max ulp 0
+  r1_c128|r1_masked              rows bit-equal  48/48  max ulp 0
+  r1_c128|r6_c128                rows bit-equal  48/48  max ulp 0
+  r1_c128|r6_c16                 rows bit-equal  48/48  max ulp 0
+  r1_c128|r6_c16_pk              rows bit-equal  48/48  max ulp 0
+  r1_c128|r6_masked              rows bit-equal  48/48  max ulp 0
+  r1_c16_pad_g16|r1_masked       rows bit-equal  48/48  max ulp 0
+  r1_c16_pad_g16|r6_c128         rows bit-equal  48/48  max ulp 0
+  r1_c16_pad_g16|r6_c16          rows bit-equal  48/48  max ulp 0
+  r1_c16_pad_g16|r6_c16_pk       rows bit-equal  48/48  max ulp 0
+  r1_c16_pad_g16|r6_masked       rows bit-equal  48/48  max ulp 0
+  r1_c16_pad_pk|r1_c16_pad_g16   rows bit-equal  48/48  max ulp 0
+  r1_c16_pad_pk|r1_masked        rows bit-equal  48/48  max ulp 0
+  r1_c16_pad_pk|r6_c128          rows bit-equal  48/48  max ulp 0
+  r1_c16_pad_pk|r6_c16           rows bit-equal  48/48  max ulp 0
+  r1_c16_pad_pk|r6_c16_pk        rows bit-equal  48/48  max ulp 0
+  r1_c16_pad_pk|r6_masked        rows bit-equal  48/48  max ulp 0
+  r1_c16_pad|r1_c16_pad_g16      rows bit-equal  48/48  max ulp 0
+  r1_c16_pad|r1_c16_pad_pk       rows bit-equal  48/48  max ulp 0
+  r1_c16_pad|r1_masked           rows bit-equal  48/48  max ulp 0
+  r1_c16_pad|r6_c128             rows bit-equal  48/48  max ulp 0
+  r1_c16_pad|r6_c16              rows bit-equal  48/48  max ulp 0
+  r1_c16_pad|r6_c16_pk           rows bit-equal  48/48  max ulp 0
+  r1_c16_pad|r6_masked           rows bit-equal  48/48  max ulp 0
+  r1_c16|r1_c16_pad              rows bit-equal  48/48  max ulp 0
+  r1_c16|r1_c16_pad_g16          rows bit-equal  48/48  max ulp 0
+  r1_c16|r1_c16_pad_pk           rows bit-equal  48/48  max ulp 0
+  r1_c16|r1_masked               rows bit-equal  48/48  max ulp 0
+  r1_c16|r6_c128                 rows bit-equal  48/48  max ulp 0
+  r1_c16|r6_c16                  rows bit-equal  48/48  max ulp 0
+  r1_c16|r6_c16_pk               rows bit-equal  48/48  max ulp 0
+  r1_c16|r6_masked               rows bit-equal  48/48  max ulp 0
+  r1_masked|r6_masked            rows bit-equal  48/48  max ulp 0
+  r6_c128|r1_masked              rows bit-equal  48/48  max ulp 0
+  r6_c128|r6_masked              rows bit-equal  48/48  max ulp 0
+  r6_c16_pk|r1_masked            rows bit-equal  48/48  max ulp 0
+  r6_c16_pk|r6_c128              rows bit-equal  48/48  max ulp 0
+  r6_c16_pk|r6_masked            rows bit-equal  48/48  max ulp 0
+  r6_c16|r1_masked               rows bit-equal  48/48  max ulp 0
+  r6_c16|r6_c128                 rows bit-equal  48/48  max ulp 0
+  r6_c16|r6_c16_pk               rows bit-equal  48/48  max ulp 0
+  r6_c16|r6_masked               rows bit-equal  48/48  max ulp 0
+  us/layer (3 GEMMs, one token): today 44.79 | on 90.23 | align 45.07 | 6-row 110.27; projected 1-row step (on) 12.338 ms (gate 10.72)
+  VERDICT {"rows": 48, "rowmatch_on_equal_r6": true, "rowmatch_on_packed_equal_r6": true, "rowmatch_align_equal_r6": true, "today_equal_r6": true, "today_fp32_equal_r6": true, "r6_packed_equal_fp32": true, "r6_c128_equal_c16": true, "num_groups_invariant": true, "masked_1_equal_6": true, "masked_equal_contiguous": true, "all_equal": true, "not_equal_pairs": [], "projected_1row_ms_on": 12.338, "delta_us_per_layer_on": 45.44, "gate_1row_ms": 10.72, "failed": []}
+  num_groups invariant (G vs G + 16): True
+PASS test_real_bytes_rowmatch_spike (5.8s)
+  preflight: sparse_attn JIT targets (none introspectable); window idx on cuda:0; direct call on cuda OK
+  mini4 1-row build: rowmatch on -> on=True align 16 gemm_blocks 24; check {"w1": 6, "w2": 6}/6, today's call equal True
+PASS test_build_check_mini4_real_deepgemm (6.7s)
+  preflight: sparse_attn JIT targets ['{"kind":"cuda","tag":"","keys":["cuda","gpu"],"max_num_threads":1024,"thread_warp_size":32,"arch":"sm_103a"}']; window idx on cuda:0; direct call on cuda OK
+  MoE isolated, rowmatch on  (1-row align 16 x 24, check True), L=17: 6-row vs 1-row rows bit-equal 24/24
+  MoE isolated, rowmatch on  (1-row align 16 x 24, check True), L=18: 6-row vs 1-row rows bit-equal 24/24
+  MoE isolated, rowmatch off (1-row align 128 x 4, check None), L=17: 6-row vs 1-row rows bit-equal 24/24
+  MoE isolated, rowmatch off (1-row align 128 x 4, check None), L=18: 6-row vs 1-row rows bit-equal 24/24
+PASS test_mini4_static6_equals_static1_moe_isolated (14.9s)
+  preflight: sparse_attn JIT targets ['{"kind":"cuda","tag":"","keys":["cuda","gpu"],"max_num_threads":1024,"thread_warp_size":32,"arch":"sm_103a"}']; window idx on cuda:0; direct call on cuda OK
+  headline impls, rowmatch on , L=17: 6-row vs 1-row rows bit-equal 24/24; glue orders differing 1-row vs 6-row: {'engram': ('vec_T64_V4_dec|mul', 'vec_T32_V4_dec|mul'), 'engram_sum': ('vec_T64_V4_dec|mul', 'vec_T32_V4_dec|mul'), 'mix': ('vec_T256_V4_dec|mul', 'vec_T128_V4_dec|mul')}
+  headline impls, rowmatch on , L=18: 6-row vs 1-row rows bit-equal 24/24; glue orders differing 1-row vs 6-row: {'engram': ('vec_T64_V4_dec|mul', 'vec_T32_V4_dec|mul'), 'engram_sum': ('vec_T64_V4_dec|mul', 'vec_T32_V4_dec|mul'), 'mix': ('vec_T256_V4_dec|mul', 'vec_T128_V4_dec|mul')}
+  headline impls, rowmatch off, L=17: 6-row vs 1-row rows bit-equal 24/24; glue orders differing 1-row vs 6-row: {'engram': ('vec_T64_V4_dec|mul', 'vec_T32_V4_dec|mul'), 'engram_sum': ('vec_T64_V4_dec|mul', 'vec_T32_V4_dec|mul'), 'mix': ('vec_T256_V4_dec|mul', 'vec_T128_V4_dec|mul')}
+  headline impls, rowmatch off, L=18: 6-row vs 1-row rows bit-equal 24/24; glue orders differing 1-row vs 6-row: {'engram': ('vec_T64_V4_dec|mul', 'vec_T32_V4_dec|mul'), 'engram_sum': ('vec_T64_V4_dec|mul', 'vec_T32_V4_dec|mul'), 'mix': ('vec_T256_V4_dec|mul', 'vec_T128_V4_dec|mul')}
+PASS test_mini4_headline_impls_reported (15.2s)
+4/4 not failed; 0 failed

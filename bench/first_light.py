@@ -1055,7 +1055,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--rows-sf-store", default=None, choices=["step", "resident", "pool"],
                     help="M1-T10-MOE: where the R-row dg-inplace step's hot packed weight SF live (default pool: one "
                          "pre-packed copy owned by the expert pool, cold-only staging; sets $DSV41_ROWS_SF_STORE)")
-    ap.add_argument("--moe-rowmatch", default="on", choices=["on", "align", "off"],
+    ap.add_argument("--moe-rowmatch", default="off", choices=["on", "align", "off"],
                     help="T9a-3: the 1-row dg-inplace routed GEMM in the R-row step's call shape (on: its ALIGN and "
                          "its R*k A blocks, the same kernel config; align: its ALIGN, k blocks; off: T9a-2's ALIGN 128 "
                          "x k), checked per row at build vs the R-row call on layer 0's real bytes, else off; sets "

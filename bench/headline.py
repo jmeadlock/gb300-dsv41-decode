@@ -258,7 +258,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--draft-impls", choices=["same", "ref"], default="same",
                     help="M1-T11-PORT: same = the draft on the verify's impls (draft_step.draft_impls_for); ref = T11")
     ap.add_argument("--spare-slots", type=int, default=None, help="6-row dg-inplace spare slots/layer (default 8)")
-    ap.add_argument("--moe-rowmatch", choices=["on", "align", "off"], default="on",
+    ap.add_argument("--moe-rowmatch", choices=["on", "align", "off"], default="off",
                     help="T9a-3: the 1-row (truth) dg-inplace routed GEMM in the 6-row step's call shape, checked per "
                          "row at build (runtime/dg_inplace.build_one_row; sets $DSV41_MOE_ROWMATCH before any build)")
     ap.add_argument("--no-gemv-pin", action="store_true", help="do not set DSV41_GEMV_PIN_M1=1")
