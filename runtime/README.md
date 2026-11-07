@@ -841,3 +841,21 @@ fused --attn-impl flashmla --map docs/maps/hot-v26ar-seed-295.json`); check `fus
 self-check's reason), `fused_glue.calibration.r4`, `dg_moe.act_sf_packed`, the G/D/L rows, and output bytes vs the
 13.88 run. A/B any part with `-e DSV41_GLUE_DISABLE=<part>`. nsys: `t9b4_hc_norm` replaces `t9b2r2_hc_norm`;
 `t9b4_mxfp8_gemv2` 80/step; `t9b_splitk_reduce` 250 -> 90; `transpose_and_pack_fp32_into_ue8m0` 120 -> 0.
+
+## M1-T11: the DSpark draft step (`mtp_loader.py`, `draft_step.py`)
+
+`build_and_load(..., load_mtp=True)` (CLI `--load-mtp`) then `mtp_loader.attach_mtp`: the checkpoint config's three
+reference `DSparkBlock`s (model.py:1103-1159, 1210-1216) built on meta like the backbone, every `mtp.*` tensor in HBM
+(dense; each stage's routed experts as one stacked `[E, N, K/2]` + `[E, N, K/32]` block per projection, the reference
+Experts bound as views), the loader's three value paths (wo_a dequant, bf16 -> fp32 widening of the Markov head and
+the confidence proj, I8 -> fp4 views), `stage.temperature = 0` (model.py:1113/1156; design memo 0.5), shared
+embed/head; refusal lists as the loader; bytes in `model.runtime_mtp.summary()`. The backbone keeps the overlay.
+
+`draft_step.DraftStep(model, main_hidden=..., tok=...)`: the static, graph-capturable draft (design 2.3): device A'
+and ctx_count; context write of <= 6 rows into the stage rings, predicated; 5-row stage forward over
+`[ring(128) | block(5)]` with the reference's index list (-1 padding moved to the end: same kernel bits); the draft MoE
+on `moe_rows.dedup_routes` with an `index_select` gather from the stacks; the reference `forward_head` (Markov chain,
+confidence). Oracle helpers: `prefill_hidden`, `seed_draft_rings`, `reference_draft` (forward_spec decode calls, one
+context row each). Mac: `tests/test_draft_cpu.py` (incl. the GPU gate dry-run on the kernel emulations); box:
+`tests/gpu/test_draft_gpu.py` (V2 gate, graph, optional real checkpoint via `DSV41_MODEL_DIR`) and
+`bench/draft_bench.py` (draft ms in a graph; acceptance vs the 1-row greedy records, W0 fixture).

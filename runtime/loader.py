@@ -319,9 +319,13 @@ def build_and_load(model_dir: str, map=None, device: Union[str, torch.device] = 
                    overlay: Optional[dict] = None, verify: bool = False, io_threads: int = 8,
                    stage_bytes: int = 256 * MiB, n_stage: int = 4, host_chunk_bytes: int = 256 * MiB,
                    reserve_host_gib: float = 16.0, register_host: Optional[bool] = None,
-                   cpu_stubs: bool = False, install_counters: bool = True, log: Callable = print) -> nn.Module:
+                   cpu_stubs: bool = False, install_counters: bool = True, load_mtp: bool = False,
+                   log: Callable = print) -> nn.Module:
     """Construct the reference Transformer and load `model_dir` into it, tier by tier. Returns the model with
     `model.runtime_load` (a LoadResult: plan, pools, host buffers, timings, verify results) attached.
+
+    `load_mtp` (M1-T11): afterwards build the DSpark draft stages and load every `mtp.*` tensor into HBM
+    (runtime/mtp_loader.py `attach_mtp`: `model.mtp`, `model.runtime_mtp`); the backbone keeps the overlay.
 
     `map`: path to `{"<layer>": [hot ids]}` JSON, a dict, a HotMap, or None for `hot_per_layer` (default 295).
     `register_host`: cudaHostRegister the host tier (default: device is CUDA). On a CPU device the host tier is
@@ -483,6 +487,12 @@ def build_and_load(model_dir: str, map=None, device: Union[str, torch.device] = 
             f"({v['bytes'] / GiB:.2f} GiB hashed); mismatches: {v['mismatch'][:10]}")
         if v["mismatch"]:
             raise LoadRefused(f"verify failed for {len(v['mismatch'])} tensors: {v['mismatch'][:20]}")
+    if load_mtp:  # M1-T11
+        from runtime.mtp_loader import attach_mtp
+
+        attach_mtp(model, index, config_path, device, overlay=overlay, verify=verify, io_threads=io_threads,
+                   stage_bytes=stage_bytes, n_stage=n_stage, cpu_stubs=cpu_stubs, log=log)
+        timings["mtp"] = model.runtime_mtp.timings.get("total", 0.0)
     timings["total"] = time.time() - t_all
     return model
 
@@ -539,10 +549,14 @@ def main(argv=None) -> int:
     ap.add_argument("--io-threads", type=int, default=8)
     ap.add_argument("--reserve-host-gib", type=float, default=16.0)
     ap.add_argument("--json", default=None, help="write the load summary here")
+    ap.add_argument("--load-mtp", action="store_true", help="M1-T11: also load the mtp.* draft stages into HBM")
     a = ap.parse_args(argv)
     model = build_and_load(a.model_dir, a.map, a.device, hot_per_layer=a.hot_per_layer, config_path=a.config,
-                           verify=a.verify, io_threads=a.io_threads, reserve_host_gib=a.reserve_host_gib)
+                           verify=a.verify, io_threads=a.io_threads, reserve_host_gib=a.reserve_host_gib,
+                           load_mtp=a.load_mtp)
     s = model.runtime_load.summary()
+    if a.load_mtp:
+        s["mtp"] = model.runtime_mtp.summary()
     if torch.cuda.is_available() and a.device.startswith("cuda"):
         s["cuda_allocated_GiB"] = round(torch.cuda.memory_allocated() / GiB, 3)
         s["cuda_reserved_GiB"] = round(torch.cuda.memory_reserved() / GiB, 3)
