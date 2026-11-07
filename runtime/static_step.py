@@ -408,6 +408,13 @@ def _dedup_describe():
     return dedup_describe()
 
 
+def _fp32_impl() -> str:
+    """T9b-5: $DSV41_FP32_IMPL (cublas | fixed): the mixes' and the head's fp32 F.linear (runtime/fused_glue_r2.py)."""
+    from runtime.fused_glue_r2 import fp32_impl
+
+    return fp32_impl()
+
+
 class StaticStep:
     """Fixed-shape 1-row decode step over the reference model (module docstring for the row-by-row mapping).
 
@@ -1020,10 +1027,13 @@ class StaticStep:
         g = self.glue
         if g is not None and g.on("hc_norm") and x.is_contiguous() and pre_mix.is_contiguous():
             return g.mix_pre_norm(layer, x, pre_mix, side)
+        from runtime.fused_glue_r2 import fp32_fixed, hc_mixes_fixed
+
+        mixes = (lambda *a: hc_mixes_fixed(self.R, layer, *a)) if fp32_fixed() else layer.hc_mixes  # T9b-5
         if side == "attn":
-            pre, post, comb = layer.hc_mixes(x, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base)
+            pre, post, comb = mixes(x, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base)
             return pre, post, comb, layer.attn_norm(layer.hc_pre(x, pre_mix)), None
-        pre, post, comb = layer.hc_mixes(x, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base)
+        pre, post, comb = mixes(x, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base)
         return pre, post, comb, layer.ffn_norm(layer.hc_pre(x, pre_mix)), None
 
     def _ffn(self, layer, x):
@@ -1047,6 +1057,10 @@ class StaticStep:
         g, m = self.glue, self.model
         if g is not None and g.on("hc_norm") and h.is_contiguous() and pre_mix.is_contiguous():
             return g.head(layer, h, pre_mix)
+        from runtime.fused_glue_r2 import fp32_fixed, head_fixed
+
+        if fp32_fixed():                                                      # T9b-5: the fixed-order head
+            return head_fixed(m, m.norm(layer.hc_pre(h, pre_mix)), full_logits=self.rows > 1)
         if self.rows > 1:                                                     # M1-T10: logits for every row
             return m.head(m.norm(layer.hc_pre(h, pre_mix)), full_logits=True)  # model.py:1010-1014, [1, R, V]
         return m.head(m.norm(layer.hc_pre(h, pre_mix)))
@@ -1286,7 +1300,7 @@ class StaticStep:
                 "attn_impl": self.attn_impl, "attn_on": bool(self._attn_on or self._fm_on),
                 "hidden_layers": list(self.hidden_layers), "n_slots": self.n_slots, "spare_slots": self.spare_slots,
                 "rows_moe_gemm": getattr(getattr(self, "dg", None), "rows_gemm", None),
-                "dedup_impl": _dedup_describe() if self.rows > 1 else None}
+                "dedup_impl": _dedup_describe() if self.rows > 1 else None, "fp32_impl": _fp32_impl()}
 
     def marker_count(self) -> int:
         return int(self.marker_ctr.item())

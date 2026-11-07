@@ -3,6 +3,9 @@ use, so the Mac (no Triton, no GPU) can execute the real `@triton.jit` function 
 added: tl.max/abs/fma, the `mul.rn/add.rn/sub.rn.f32` inline-asm forms, reshape/split/join/broadcast_to, uint8 and
 fp8e4nv casts (RNE, as `fp_downcast_rounding="rtne"`), `%`, `>>`, `^`, unary minus, fp32 scalar args, the
 `enable_fp_fusion` launch option, and write-back of any stored-to fp8/uint8/int buffer.)
+T9b-5 (runtime/static_kernels.py t9b5_head_fp32 / t9b5_mix_fp32, tests/test_fp32_fixed_cpu.py): those bodies use only
+ops whose shim form is exact and order-explicit -- tl.fma (one rounding), fp32 `+` of tl.split halves (the pair
+tree), tl.reshape / broadcast_to / static_range -- and no tl.sum / tl.dot, so the shim executes the GPU's order.
 
 What it is for: the kernels' INDEX MATH and CONTROL FLOW -- pointer arithmetic, row/column clamping, masks, the
 split-K K-block ranges, the KU unroll and its tail, the workspace layout, the reduce order, the constexpr branches.

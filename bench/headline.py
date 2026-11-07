@@ -190,6 +190,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--fp8-impl", choices=["ref", "gemv"], default="ref")
     ap.add_argument("--glue-impl", choices=["ref", "fused"], default="ref")
     ap.add_argument("--attn-impl", choices=["ref", "bounded", "flashmla"], default="ref")
+    ap.add_argument("--fp32-impl", choices=["cublas", "fixed"], default="cublas",
+                    help="T9b-5: the mixes' / head's fp32 F.linear: cublas, or our fixed-order kernels (row-invariant; "
+                         "sets $DSV41_FP32_IMPL before any build, so the 1-row truth and the loop both use it)")
     ap.add_argument("--draft-impls", choices=["same", "ref"], default="same",
                     help="M1-T11-PORT: same = the draft on the verify's impls (draft_step.draft_impls_for); ref = T11")
     ap.add_argument("--spare-slots", type=int, default=None, help="6-row dg-inplace spare slots/layer (default 8)")
@@ -339,6 +342,7 @@ def main(argv=None) -> int:
     a = build_parser().parse_args(argv)
     if not a.no_gemv_pin:
         os.environ["DSV41_GEMV_PIN_M1"] = "1"     # before any GEMV get_config (builds, warm-ups, captures)
+    os.environ["DSV41_FP32_IMPL"] = a.fp32_impl   # T9b-5 (= runtime.fused_glue_r2.FP32_IMPL_ENV), before any build
     import torch
 
     from runtime.dspark_loop import DSparkLoop
@@ -348,7 +352,7 @@ def main(argv=None) -> int:
     date = time.strftime("%Y%m%d")
     json_path = a.json or os.path.join(REPO, "docs", f"headline-{date}.json")
     graphs = [int(x) for x in a.graphs.split(",") if x.strip()]
-    impls = {"moe": a.moe_impl, "fp8": a.fp8_impl, "glue": a.glue_impl, "attn": a.attn_impl}
+    impls = {"moe": a.moe_impl, "fp8": a.fp8_impl, "glue": a.glue_impl, "attn": a.attn_impl, "fp32": a.fp32_impl}
     rep: Dict = {"date": time.strftime("%Y-%m-%d %H:%M:%S %Z"), "argv": sys.argv[1:] if argv is None else argv,
                  "metric": METRIC, "mode": a.mode, "impls": impls, "max_new": a.max_new,
                  "gemv_pin_m1": os.environ.get("DSV41_GEMV_PIN_M1") == "1", "errors": [], "json": json_path,

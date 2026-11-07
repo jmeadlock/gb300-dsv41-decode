@@ -43,6 +43,8 @@ T9b-4 (docs/HANDOFF-T9B4-RESIDUAL.md; runtime/README.md section T9b-4): `t9b4_hc
 not partitioned, so no order is re-derived), norm_row reading GEMV split partials (reduce_fold, `_t9b4_ld`), the
 wq_a || wkv pair (gemv_pair) feeding the q and kv paths, and packed DeepGEMM activation-SF stores (dg_sf_pack,
 `_t9b4_store_code`); `calibrate_r4` checks each against the path it replaces, bitwise, on the device.
+T9b-5 (docs/HANDOFF-T9B5-FP32-FIXED.md; section "T9b-5: fixed fp32" below): $DSV41_FP32_IMPL=fixed puts the mHC mixes'
+and the head's fp32 F.linear on runtime/static_kernels.py's fixed-order kernels (row-invariant); default cublas.
 CPU (the Mac tests, the census): the wrappers run torch mirrors; with no device to calibrate on, the statistics run
 torch's own op (order "native"), so the CPU step is bit-identical by construction; the explicit-order mirrors and the
 Triton bodies (under tests/triton_shim.py) are tested against each other and against the family's definition.
@@ -385,6 +387,186 @@ def engram_gate_torch(h: torch.Tensor, key: torch.Tensor, wp: torch.Tensor, eps:
 def indexer_post_torch(idx: torch.Tensor, clen: torch.Tensor, offset: int) -> torch.Tensor:
     s = idx.sort(dim=-1).values
     return torch.where(s < clen, s + offset, -1).int()
+
+
+# ------------------------------------------------------------------------------------------------ T9b-5: fixed fp32
+# docs/HANDOFF-T9B5-FP32-FIXED.md. The step's two fp32 F.linear sites -- the mHC mixes (model.py:956, [R, hc*D] x
+# [mix_hc, hc*D]^T, 2 per layer) and the head (model.py:1014, [R, D] x [V, D]^T) -- go to cuBLAS, which picks its
+# algorithm / split-K by M: they are the only kernels of the 6-row step that are not row-invariant (W4 4a). With
+# $DSV41_FP32_IMPL=fixed (`--fp32-impl fixed` on bench/first_light.py and bench/headline.py) both run our own kernel
+# (runtime/static_kernels.py t9b5_head_fp32 / t9b5_mix_fp32) in ONE documented order, the same at every R:
+#   KB = fixed_kb(site, K) lanes; lane j sums k = j, j + KB, ... sequentially from +0.0 with one fp32 FMA per term;
+#   then the adjacent-pair tree s[i] = s[2i] + s[2i+1] over the lanes; the mixes then * rsqrt[r] (one fp32 multiply,
+#   the reference's own `* rsqrt`). `fixed_dot_torch` is that definition in torch (exact FMA emulation in fp64).
+# Numerics: a defined, reproducible fp32 sum; it differs from cuBLAS's order (1-ulp class vs the cuBLAS reference),
+# and is row-invariant and replay-identical by construction. The oracle side adopts the same kernel under the switch
+# (the glue's self-check, static_step's reference-op path, the census): policy W4 4d option A.
+# The head's operands: x is bf16 (hc_norm's output) and the head weight holds bf16 checkpoint values widened to fp32
+# by runtime/loader.py (do_special: boot record widened_bf16_to_fp32 lists head.weight), so every product is exact in
+# fp32 and only the sum order is a choice. The kernel reads whatever dtype the weight has in HBM (fp32 today).
+FP32_IMPL_ENV = "DSV41_FP32_IMPL"
+FP32_IMPLS = ("cublas", "fixed")
+FP32_IMPL_DEFAULT = "cublas"      # until the box gate passes (HANDOFF-T9B5 step 3)
+FIXED_KB = {"head": 64, "mix": 512}   # lanes per output (the order; K tiles of the real model: 80 / 40)
+FIXED_SITES = tuple(FIXED_KB)
+
+
+def fp32_impl() -> str:
+    v = os.environ.get(FP32_IMPL_ENV, FP32_IMPL_DEFAULT) or FP32_IMPL_DEFAULT
+    if v not in FP32_IMPLS:
+        raise ValueError(f"{FP32_IMPL_ENV}={v!r} not in {FP32_IMPLS}")
+    return v
+
+
+def fp32_fixed() -> bool:
+    return fp32_impl() == "fixed"
+
+
+def fixed_kb(site: str, K: int) -> int:
+    """KB lanes of `site` at reduction width K: FIXED_KB[site], or the largest power of two dividing K if smaller
+    (mini checkpoints). A function of (site, K) only: never of R."""
+    K = int(K)
+    return max(1, min(FIXED_KB[site], K & -K))
+
+
+def fma_f32_torch(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    """RN_fp32(a * b + c) with ONE rounding (fp32 fma), exactly: a * b is exact in fp64 (24 + 24 bits); TwoSum gives
+    the fp64 sum's error e; the fp64 sum rounds to fp32 like the exact value except at an fp32 midpoint, where e
+    decides (tests/triton_shim.fma is the same construction in numpy). Elementwise, broadcasting."""
+    a, b, c = torch.broadcast_tensors(a.float(), b.float(), c.float())
+    p = a.double() * b.double()
+    cd = c.double()
+    s = p + cd
+    bb = s - p
+    e = (p - (s - bb)) + (cd - bb)
+    r = s.float()
+    rd = r.double()
+    up = s > rd
+    inf = torch.tensor(float("inf"), dtype=torch.float32, device=r.device)
+    n = torch.nextafter(r, torch.where(up, inf, -inf))
+    mid = ((rd + n.double()) * 0.5 == s) & (rd != s)
+    take = mid & (e != 0) & ((e > 0) == up)
+    return torch.where(take, n, r)
+
+
+def fixed_dot_torch(x: torch.Tensor, w: torch.Tensor, kb: int, scale: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """The T9b-5 order (section comment) in torch: x [R, K], w [N, K] (fp32 or bf16 values) -> [R, N] fp32 on x's
+    device. Every op is an exact elementwise fp32 / fp64 op, so CPU and CUDA give the same bits."""
+    R, K = x.shape
+    N = w.size(0)
+    assert w.size(1) == K and K % kb == 0 and kb & (kb - 1) == 0, (tuple(x.shape), tuple(w.shape), kb)
+    acc = torch.zeros(R, N, kb, dtype=torch.float32, device=x.device)
+    for t in range(K // kb):
+        xs = x[:, t * kb:(t + 1) * kb].float()
+        ws = w[:, t * kb:(t + 1) * kb].float()
+        acc = fma_f32_torch(xs[:, None, :], ws[None, :, :], acc)
+    s = acc
+    while s.size(-1) > 1:
+        s = s[..., 0::2] + s[..., 1::2]
+    out = s[..., 0]
+    if scale is not None:
+        out = out * scale.reshape(R, 1).float()
+    return out
+
+
+def launch_fixed_dot(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor, *, site: str,
+                     scale: Optional[torch.Tensor] = None) -> None:
+    """out [R, N] fp32 <- x [R, K] . w^T (* scale [R]) in the T9b-5 order: the Triton kernel on CUDA (one launch,
+    t9b5_<site>_fp32), the torch definition on CPU."""
+    kb = fixed_kb(site, x.size(-1))
+    if x.is_cuda:
+        from runtime.static_kernels import fixed_dot
+
+        fixed_dot(x, w, out, kb=kb, site=site, scale=scale)
+    else:
+        out.copy_(fixed_dot_torch(x, w, kb, scale))
+
+
+def hc_mixes_fixed(R, layer, x: torch.Tensor, hc_fn, hc_scale, hc_base):
+    """Block.hc_mixes (model.py:950-957) with its F.linear in the T9b-5 order (everything else the reference's own
+    ops): the oracle / reference-op form of the fixed mixes. R = the reference module (hc_split_sinkhorn)."""
+    xf = x.flatten(2).float()
+    rsqrt = torch.rsqrt(xf.square().mean(-1, keepdim=True) + layer.norm_eps)
+    T_ = xf.numel() // xf.size(-1)
+    mixes = torch.empty(*xf.shape[:-1], hc_fn.size(0), dtype=torch.float32, device=xf.device)
+    launch_fixed_dot(xf.reshape(T_, xf.size(-1)), hc_fn, mixes.view(T_, -1), site="mix",
+                     scale=rsqrt.reshape(T_).contiguous())
+    return R.hc_split_sinkhorn(mixes, hc_scale, hc_base, layer.hc_mult, layer.hc_sinkhorn_iters, layer.hc_eps)
+
+
+def head_fixed(model, x: torch.Tensor, full_logits: bool = False) -> torch.Tensor:
+    """ParallelHead.forward (model.py:1010-1014, world_size 1) with F.linear(x.float(), weight) in the T9b-5 order:
+    x [b, s, D] -> [b, V] (last position) or [b, s, V] (full_logits)."""
+    W = model.head.weight
+    if not full_logits:
+        x = x[:, -1]
+    D = x.size(-1)
+    lead = tuple(x.shape[:-1])
+    xr = x.reshape(-1, D)
+    out = torch.empty(xr.size(0), W.size(0), dtype=torch.float32, device=x.device)
+    launch_fixed_dot(xr, W, out, site="head")
+    return out.view(*lead, W.size(0))
+
+
+def describe_fp32() -> dict:
+    return {"impl": fp32_impl(), "env": FP32_IMPL_ENV, "kb": dict(FIXED_KB),
+            "order": "KB lanes, sequential fp32 FMA over K tiles from +0.0, adjacent-pair tree over the lanes "
+                     "(+ one fp32 multiply by rsqrt for the mixes)"}
+
+
+def fp32_fixed_census(model, rows: int = 6, seed: int = 0) -> List[dict]:
+    """runtime/row_census.py-format records for the two T9b-5 sites (layer 0's mixes weight, the real head): the
+    fixed kernel at `rows` rows vs each row alone, next to cuBLAS F.linear on the SAME inputs (the evidence that
+    cuBLAS is what breaks the census). Eager; syncs."""
+    from runtime.row_census import compare
+
+    dev = model.embed.weight.device
+    g = torch.Generator(device="cpu").manual_seed(20261108 + seed)
+    L0 = model.layers[0]
+    hc = L0.hc_mult
+    D = model.embed.weight.size(1)
+    out: List[dict] = []
+
+    def rec(family, op, shape, fn):
+        r = {"family": family, "op": op, "shape": shape, "equal": None, "note": ""}
+        try:
+            with torch.inference_mode():
+                cmp_, note = fn()
+            r.update(cmp_)
+            r["note"] = note
+        except Exception as e:  # recorded, never fatal (the census convention)
+            r["note"] = f"n/a: {type(e).__name__}: {str(e).splitlines()[0][:160] if str(e) else ''}"
+        out.append(r)
+        return r
+
+    def fixed(x, w, site, scale=None):
+        o = torch.empty(x.size(0), w.size(0), dtype=torch.float32, device=x.device)
+        launch_fixed_dot(x, w, o, site=site, scale=scale)
+        return o
+
+    xm = (torch.randn(rows, hc * D, generator=g, device="cpu").to(torch.bfloat16).float()).to(dev)
+    sm = (torch.rand(rows, generator=g, device="cpu") + 0.5).float().to(dev)
+    xh = (torch.randn(rows, D, generator=g, device="cpu")).to(torch.bfloat16).to(dev)
+    W = model.head.weight
+    for fam, site, x, w, sc, nm in (("T9b-5 fixed fp32", "mix", xm, L0.hc_attn_fn, sm, "mHC mixes (hc_attn_fn)"),
+                                    ("T9b-5 fixed fp32", "head", xh, W, None, "head")):
+        shape = f"[{rows},{x.size(1)}]x{tuple(w.shape)} KB {fixed_kb(site, x.size(1))}"
+
+        def f_fixed(x=x, w=w, sc=sc, site=site):
+            full = fixed(x, w, site, sc)
+            parts = [fixed(x[i:i + 1], w, site, sc[i:i + 1] if sc is not None else None) for i in range(rows)]
+            again = fixed(x, w, site, sc)
+            return compare(full, parts), f"replay equal {bool(torch.equal(full, again))}"
+
+        def f_cublas(x=x, w=w, sc=sc):
+            mul = (lambda t, s_: t * s_.view(-1, 1)) if sc is not None else (lambda t, s_: t)
+            full = mul(F.linear(x.float(), w), sc)
+            parts = [mul(F.linear(x[i:i + 1].float(), w), sc[i:i + 1] if sc is not None else None)
+                     for i in range(rows)]
+            return compare(full, parts), "same inputs as the fixed row"
+        rec(fam, nm, shape, f_fixed)
+        rec("cuBLAS fp32 F.linear (same inputs)", nm, shape, f_cublas)
+    return out
 
 
 # ------------------------------------------------------------------------------------------------ Triton kernels
@@ -1462,7 +1644,10 @@ class R2Glue:
                 x, pre = self._cat_rows(lambda: self._hc_inputs(g, HC, D, i))
                 fn, sc, bs = self._mix_params(layer, side)
                 norm = layer.attn_norm if side == "attn" else layer.ffn_norm
-                pr, po, cb = layer.hc_mixes(x, fn, sc, bs)
+                if fp32_fixed():   # T9b-5: the oracle adopts the fixed-order mixes (policy W4 4d A)
+                    pr, po, cb = hc_mixes_fixed(R, layer, x, fn, sc, bs)
+                else:
+                    pr, po, cb = layer.hc_mixes(x, fn, sc, bs)
                 y_r = norm(layer.hc_pre(x, pre))
                 q_r, s_r = R.act_quant(y_r, R.fp8_block_size, R.scale_fmt, R.scale_dtype)
                 p2, po2, cb2, y, xq = self.mix_pre_norm(layer, x, pre, side)
@@ -1490,7 +1675,9 @@ class R2Glue:
                     out["mismatch"] = max(out.get("mismatch", 0.0), r["mismatch"])
         # the head: hc_pre + model.norm + head (model.py:1273-1274)
         x, pre = self._cat_rows(lambda: self._hc_inputs(g, HC, D, 1))
-        if Rr > 1:   # the R-row step's head: logits of every row (static_step._head, model.py:1010-1014)
+        if fp32_fixed():   # T9b-5: the oracle's head in the fixed order
+            ref = head_fixed(model, model.norm(layer.hc_pre(x, pre)), full_logits=Rr > 1)
+        elif Rr > 1:   # the R-row step's head: logits of every row (static_step._head, model.py:1010-1014)
             ref = model.head(model.norm(layer.hc_pre(x, pre)), full_logits=True)
         else:
             ref = model.head(model.norm(layer.hc_pre(x, pre)))
@@ -1650,10 +1837,18 @@ class R2Glue:
             return layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base
         return layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base
 
-    def mix_tail(self, layer, xf, mrs, side: str):
-        """hc_mixes after its statistic (model.py:956-957): F.linear(x, hc_fn) * rsqrt, then the sinkhorn kernel."""
+    def mix_tail(self, layer, xf, mrs, side: str, x=None):
+        """hc_mixes after its statistic (model.py:956-957): F.linear(x, hc_fn) * rsqrt, then the sinkhorn kernel.
+        T9b-5 ($DSV41_FP32_IMPL=fixed): the mm and the * rsqrt in ONE launch (t9b5_mix_fp32, fixed order); it reads
+        the bf16 stream x [1, T, HC, D] when given (the same values as xf = x.float(): half the bytes)."""
         fn, sc, bs = self._mix_params(layer, side)
-        mixes = F.linear(xf, fn) * mrs
+        if fp32_fixed():
+            T_ = xf.numel() // xf.size(-1)
+            mixes = torch.empty(1, T_, fn.size(0), dtype=torch.float32, device=xf.device)
+            src = x.reshape(T_, xf.size(-1)) if x is not None else xf.reshape(T_, xf.size(-1))
+            launch_fixed_dot(src, fn, mixes.view(T_, -1), site="mix", scale=mrs.reshape(T_).contiguous())
+        else:
+            mixes = F.linear(xf, fn) * mrs
         return self.R.hc_split_sinkhorn(mixes, sc, bs, layer.hc_mult, layer.hc_sinkhorn_iters, layer.hc_eps)
 
     def mix_pre_norm(self, layer, x, pre_mix, side: str):
@@ -1691,7 +1886,7 @@ class R2Glue:
                        s=s.view(-1) if one else s.view(T_, D // BLOCK), dq=dq, ds=ds, split=self.on("hc_split"))
         if mrs is None:   # mix_stat off: the reference statistic, on the same fp32 values (one launch fewer: .float())
             mrs = torch.rsqrt(xf.square().mean(-1, keepdim=True) + layer.norm_eps)
-        pre, post, comb = self.mix_tail(layer, xf, mrs, side)
+        pre, post, comb = self.mix_tail(layer, xf, mrs, side, x=x if x.dtype == torch.bfloat16 else None)
         if side == "ffn":
             self._ffn_ctx = {"ptr": y.data_ptr(), "xf": yf, "q": q, "s": s, "dg": dg}
             return pre, post, comb, y, None
@@ -1722,14 +1917,19 @@ class R2Glue:
         T_ = h.numel() // (HC * D)
         y = torch.empty(1, T_, D, dtype=h.dtype, device=h.device)
         yf = torch.empty(T_, D, dtype=torch.float32, device=h.device)
+        fixed = fp32_fixed()   # T9b-5: the head in the fixed order (t9b5_head_fp32) on hc_norm's bf16 y (= yf's values)
         if T_ > 1:
             launch_hc_norm(h.reshape(T_, HC, D), pre_mix.reshape(T_, HC).contiguous(), model.norm.weight,
                            y.view(T_, D), eps=model.norm.eps, norm_ord=self.orders["norm_D"],
                            hc_mode=self.hc_pre_mode, yf=yf, split=self.on("hc_split"))
+            if fixed:
+                return head_fixed(model, y, full_logits=True)
             return F.linear(yf.view(1, T_, D), model.head.weight)   # = F.linear(x.float(), weight) at [1, T, D]
         launch_hc_norm(h.reshape(HC, D), pre_mix.reshape(HC).contiguous(), model.norm.weight, y.view(-1),
                        eps=model.norm.eps, norm_ord=self.orders["norm_D"], hc_mode=self.hc_pre_mode, yf=yf.view(-1),
                        split=self.on("hc_split"))
+        if fixed:
+            return head_fixed(model, y)
         return F.linear(yf, model.head.weight)          # = F.linear(x[:, -1].float(), weight) (model.py:1013-1014)
 
     def _q_norm_quant(self, attn, qa):
@@ -2161,7 +2361,8 @@ class R2Glue:
         return {"approx": self.approx, "numerics": _jsonable(self.numerics),
                 "orders": {k: v.get("name") for k, v in self.orders.items()}, "hc_pre_mode": self.hc_pre_mode,
                 "bytes": dict(getattr(self, "r2_bytes", {})), "indexer_score": INDEXER_SCORE_WHY,
-                "outcome": {c: self.numerics.get(c, {}).get("outcome") for c in R2_CLUSTERS if self.on(c)}}
+                "outcome": {c: self.numerics.get(c, {}).get("outcome") for c in R2_CLUSTERS if self.on(c)},
+                "fp32": describe_fp32()}
 
 
 def _jsonable(v):

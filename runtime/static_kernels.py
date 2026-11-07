@@ -11,6 +11,10 @@ so the Mac tests never need triton).
   t9b2_gather_tables  T9b-2 (`--glue-impl fused`, clusters #11 + #9): a layer's six gathers in one launch, dg-masked's
                    e8m0 -> fp32 scale conversion and the ids_step copy folded in (data movement + an exact decode).
                    T9b-3a: 16-byte vectors per lane.
+  t9b5_head_fp32 / t9b5_mix_fp32   T9b-5 (`--fp32-impl fixed`, docs/HANDOFF-T9B5-FP32-FIXED.md): out[r, n] =
+                   sum_k x[r, k] * w[n, k] in fp32 in ONE fixed order per output (fixed_dot below): the head
+                   (F.linear(x.float(), head.weight), model.py:1014) and the mHC mixes (F.linear(x, hc_fn) * rsqrt,
+                   model.py:956). Row-invariant by construction; the CPU mirror is fused_glue_r2.fixed_dot_torch.
 
 T9b-3a Task B (docs/HANDOFF-T9B3A-ATTN-BOUND.md): the T8 / T9b-2 kernels (kept below, bodies unchanged, as
 `t8_gather_rows_u8` / `t9b2_gather_tables_u8`: the GPU equality test's reference, gather_bench's baseline and
@@ -35,6 +39,7 @@ import torch
 import triton
 import triton.language as tl
 
+HAVE_TRITON = True         # (tests/triton_shim.load_module_under_shim asserts it)
 GATHER_BLOCK = 8192        # bytes per program of the _u8 kernels (bench/moe_static_spike.py:126)
 VEC_BLOCK_BYTES = int(os.environ.get("DSV41_GATHER_BLOCK_BYTES", "8192"))  # bytes per program, vec kernels
 VEC_WARPS = int(os.environ.get("DSV41_GATHER_WARPS", "4"))
@@ -455,3 +460,171 @@ def stage_rows(ptab6: torch.Tensor, uniq: torch.Tensor, gtab: torch.Tensor, dtab
     m1_stage_rows[(nw, npg, 3)](ptab6, uniq, gtab, sidx, wl, dtab, ptab6.size(1), int(H), int(n13), int(c13),
                                 int(n2), int(c2), ww, bw, nbw, STAGE_BN, bc, npg, even,
                                 num_warps=int(num_warps or VEC_WARPS))
+
+
+# ------------------------------------------------------------------------------------------------ T9b-5 (fp32 fixed)
+# docs/HANDOFF-T9B5-FP32-FIXED.md. out[r, n] = sum_k x[r, k] * w[n, k] in fp32, in ONE order per output that does not
+# depend on R, on the launch configuration or on the device's choice of algorithm (cuBLAS picks split-K / gemv vs
+# sgemm by M, so the 6-row step's head and mixes differ from the 1-row step's, docs/HEADLINE-20261107.md). The order
+# (fused_glue_r2.fixed_dot_torch is its CPU definition; tests/test_fp32_fixed_cpu.py runs this body under the shim):
+#   KB lanes (a power of two dividing K); lane j accumulates k = j, j + KB, j + 2 KB, ... sequentially from +0.0 with
+#   one IEEE fp32 FMA per term (acc = fma(x, w, acc)); then an adjacent-pair tree over the lanes,
+#   s[i] = s[2i] + s[2i+1], log2(KB) levels; then (HAS_SC) one fp32 multiply by sc[r] (the mixes' * rsqrt).
+# Launched with enable_fp_fusion=False (no other contraction exists, but nothing is left to the compiler). Nothing
+# else is a free parameter of the arithmetic: BN (outputs per program), RB (rows per program: the rows share every
+# weight tile, so the weight is read once per step at any R <= 8), U (K tiles unrolled per loop trip: more loads in
+# flight, same adds in the same order), num_warps and num_stages change speed only (the GPU test asserts every
+# config is bit-identical). Rows r >= R and outputs n >= N are masked: they never feed a stored output.
+T9B5_KB_MAX = 4096
+T9B5_RB_MAX = 8
+# per site and rows-per-program RB: (BN, U, num_warps, num_stages). Speed-only knobs (bench/t9b5_bench.py sweeps them);
+# override: DSV41_T9B5_CFG="head:8=16,2,8,1;mix:1=1,8,4,1".
+T9B5_CFG = {"head": {1: (32, 4, 4, 1), 2: (32, 2, 4, 1), 4: (16, 4, 4, 1), 8: (16, 4, 8, 1)},
+            "mix": {1: (1, 20, 16, 1)}}   # mixes: 40 K tiles in 2 trips (latency: few programs at 1 row)
+T9B5_CFG_ENV = "DSV41_T9B5_CFG"
+
+
+@triton.jit
+def _t9b5_pairs(s, M: tl.constexpr, H: tl.constexpr):
+    """[M, 2H] -> [M, H]: s[:, 2i] + s[:, 2i + 1] (one IEEE fp32 add each)."""
+    pa, pb = tl.split(tl.reshape(s, [M, H, 2]))
+    return pa + pb
+
+
+@triton.jit
+def _t9b5_tree(acc, RB: tl.constexpr, BN: tl.constexpr, KB: tl.constexpr):
+    """acc [RB, BN, KB] -> [RB, BN]: the adjacent-pair tree over the KB lanes (KB a power of two <= 4096)."""
+    s = tl.reshape(acc, [RB * BN, KB])
+    if KB >= 4096:
+        s = _t9b5_pairs(s, RB * BN, 2048)
+    if KB >= 2048:
+        s = _t9b5_pairs(s, RB * BN, 1024)
+    if KB >= 1024:
+        s = _t9b5_pairs(s, RB * BN, 512)
+    if KB >= 512:
+        s = _t9b5_pairs(s, RB * BN, 256)
+    if KB >= 256:
+        s = _t9b5_pairs(s, RB * BN, 128)
+    if KB >= 128:
+        s = _t9b5_pairs(s, RB * BN, 64)
+    if KB >= 64:
+        s = _t9b5_pairs(s, RB * BN, 32)
+    if KB >= 32:
+        s = _t9b5_pairs(s, RB * BN, 16)
+    if KB >= 16:
+        s = _t9b5_pairs(s, RB * BN, 8)
+    if KB >= 8:
+        s = _t9b5_pairs(s, RB * BN, 4)
+    if KB >= 4:
+        s = _t9b5_pairs(s, RB * BN, 2)
+    if KB >= 2:
+        s = _t9b5_pairs(s, RB * BN, 1)
+    return tl.reshape(s, [RB, BN])
+
+
+@triton.jit
+def _t9b5_dot(x, w, out, sc, R, N, sxr, swn, sor, NK: tl.constexpr, KB: tl.constexpr, BN: tl.constexpr,
+              RB: tl.constexpr, U: tl.constexpr, HAS_SC: tl.constexpr):
+    """Program (pn, pr): outputs n in [pn*BN, (pn+1)*BN) of rows r in [pr*RB, (pr+1)*RB). x [R, K] (fp32 or bf16
+    values, row stride sxr), w [N, K] (fp32 or bf16, row stride swn), out [R, N] fp32 (row stride sor), K = NK*KB."""
+    pn = tl.program_id(0)
+    pr = tl.program_id(1)
+    n = pn * BN + tl.arange(0, BN)
+    r = pr * RB + tl.arange(0, RB)
+    j = tl.arange(0, KB)
+    mn = n < N
+    mr = r < R
+    wp = w + n.to(tl.int64)[:, None] * swn + j[None, :]
+    xp = x + r.to(tl.int64)[:, None] * sxr + j[None, :]
+    wm = mn[:, None] & (j[None, :] >= 0)
+    xm = mr[:, None] & (j[None, :] >= 0)
+    acc = tl.zeros([RB, BN, KB], dtype=tl.float32)
+    for t in range(NK // U):
+        for u in tl.static_range(U):
+            k0 = (t * U + u) * KB
+            wv = tl.load(wp + k0, mask=wm, other=0.0).to(tl.float32)
+            xv = tl.load(xp + k0, mask=xm, other=0.0).to(tl.float32)
+            acc = tl.fma(tl.broadcast_to(xv[:, None, :], [RB, BN, KB]), tl.broadcast_to(wv[None, :, :], [RB, BN, KB]),
+                         acc)
+    for t2 in range((NK // U) * U, NK):          # the tiles past the last whole unroll (same order: tile t2 next)
+        k2 = t2 * KB
+        wv2 = tl.load(wp + k2, mask=wm, other=0.0).to(tl.float32)
+        xv2 = tl.load(xp + k2, mask=xm, other=0.0).to(tl.float32)
+        acc = tl.fma(tl.broadcast_to(xv2[:, None, :], [RB, BN, KB]), tl.broadcast_to(wv2[None, :, :], [RB, BN, KB]),
+                     acc)
+    s = _t9b5_tree(acc, RB, BN, KB)
+    if HAS_SC:
+        s = s * tl.load(sc + r, mask=mr, other=1.0)[:, None]
+    tl.store(out + r.to(tl.int64)[:, None] * sor + n[None, :], s, mask=mr[:, None] & mn[None, :])
+
+
+@triton.jit
+def t9b5_head_fp32(x, w, out, sc, R, N, sxr, swn, sor, NK: tl.constexpr, KB: tl.constexpr, BN: tl.constexpr,
+                   RB: tl.constexpr, U: tl.constexpr, HAS_SC: tl.constexpr):
+    """The head (model.py:1014): logits [R, V] = x [R, D] . W [V, D]^T (named launch for nsys)."""
+    _t9b5_dot(x, w, out, sc, R, N, sxr, swn, sor, NK, KB, BN, RB, U, HAS_SC)
+
+
+@triton.jit
+def t9b5_mix_fp32(x, w, out, sc, R, N, sxr, swn, sor, NK: tl.constexpr, KB: tl.constexpr, BN: tl.constexpr,
+                  RB: tl.constexpr, U: tl.constexpr, HAS_SC: tl.constexpr):
+    """The mHC mixes (model.py:956): [R, mix_hc] = (x [R, hc*D] . hc_fn^T) * rsqrt[R] (named launch for nsys)."""
+    _t9b5_dot(x, w, out, sc, R, N, sxr, swn, sor, NK, KB, BN, RB, U, HAS_SC)
+
+
+T9B5_KERNELS = {"head": t9b5_head_fp32, "mix": t9b5_mix_fp32}
+
+
+def _t9b5_env_cfg() -> dict:
+    out = {}
+    for item in (os.environ.get(T9B5_CFG_ENV) or "").split(";"):
+        item = item.strip()
+        if not item:
+            continue
+        key, val = item.split("=")
+        site, rb = key.split(":")
+        out[(site.strip(), int(rb))] = tuple(int(v) for v in val.split(","))
+    return out
+
+
+def t9b5_rows_per_program(site: str, R: int) -> int:
+    """RB: the mixes run one row per program (their 2 MB weight is L2-resident across the R programs that share
+    it); the head puts every row (<= 8) in one program so its 2.65 GB weight is read once per step."""
+    if site == "mix":
+        return 1
+    return min(T9B5_RB_MAX, triton.next_power_of_2(max(1, int(R))))
+
+
+def t9b5_config(site: str, R: int) -> tuple:
+    """(RB, BN, U, num_warps, num_stages) for a call of `site` at R rows."""
+    rb = t9b5_rows_per_program(site, R)
+    env = _t9b5_env_cfg()
+    bn, u, nw, ns = env.get((site, rb)) or T9B5_CFG[site].get(rb) or T9B5_CFG[site][max(T9B5_CFG[site])]
+    return rb, bn, u, nw, ns
+
+
+def fixed_dot(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor, *, kb: int, site: str,
+              scale: Optional[torch.Tensor] = None, cfg: Optional[tuple] = None) -> None:
+    """T9b-5: out [R, N] fp32 <- x [R, K] . w [N, K]^T (* scale [R]) in the fixed order of KB = kb lanes (the
+    contract above; fused_glue_r2.fixed_dot_torch on CPU). site "head" / "mix" picks the named kernel and the
+    default launch config; cfg = (RB, BN, U, num_warps, num_stages) overrides it (speed only)."""
+    if x.dim() != 2 or w.dim() != 2 or out.dim() != 2:
+        raise ValueError(f"fixed_dot: x {tuple(x.shape)}, w {tuple(w.shape)}, out {tuple(out.shape)} must be 2-D")
+    R, K = x.shape
+    N = w.size(0)
+    if w.size(1) != K or tuple(out.shape) != (R, N) or out.dtype != torch.float32:
+        raise ValueError(f"fixed_dot: x [{R}, {K}], w {tuple(w.shape)}, out {tuple(out.shape)} {out.dtype}")
+    if x.stride(1) != 1 or w.stride(1) != 1 or out.stride(1) != 1:
+        raise ValueError("fixed_dot: x / w / out rows must be contiguous")
+    if kb < 1 or kb & (kb - 1) or kb > T9B5_KB_MAX or K % kb:
+        raise ValueError(f"fixed_dot: kb {kb} must be a power of two <= {T9B5_KB_MAX} dividing K = {K}")
+    if scale is not None and (scale.numel() != R or scale.dtype != torch.float32 or not scale.is_contiguous()):
+        raise ValueError(f"fixed_dot: scale must be fp32 contiguous [R = {R}]")
+    if R == 0:
+        return
+    rb, bn, u, nw, ns = cfg if cfg is not None else t9b5_config(site, R)
+    nk = K // kb
+    u = max(1, min(int(u), nk))
+    T9B5_KERNELS[site][(triton.cdiv(N, bn), triton.cdiv(R, rb))](
+        x, w, out, scale if scale is not None else out, R, N, x.stride(0), w.stride(0), out.stride(0),
+        nk, kb, bn, rb, u, scale is not None, num_warps=nw, num_stages=ns, enable_fp_fusion=False)

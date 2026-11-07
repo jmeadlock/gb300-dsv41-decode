@@ -27,6 +27,9 @@ M1-T10-FIX (docs/HANDOFF-M1-T10-FIX.md):
 M1-T10-FIX2 (docs/HANDOFF-M1-T10-FIX2.md): the D row at spare_slots = 8 (compact cold index, the real Triton
   staging kernel), no overflow; forced overflow (spare_slots = 1): the device counter == the host expectation from
   each eager step's routing, and the graph replay trips it identically.
+T9b-5 (docs/HANDOFF-T9B5-FP32-FIXED.md): the V0 census also lists the fixed-order fp32 kernels (family "T9b-5 fixed
+  fp32": mixes + head, row-invariant by construction) next to cuBLAS on the same inputs, and the step-level table has
+  "ref, fp32 fixed" and "fast, GEMV M=1 cfg pinned, fp32 fixed" ($DSV41_FP32_IMPL=fixed for both steps).
 
 Run on the box (orchestrator), same line as tests/gpu/test_static_mini_gpu.py, repo at $W:
 
@@ -594,19 +597,31 @@ def test_v0_census_and_step_level_table():
 
     with _model("mini4") as (model, pool):
         recs = census(model, rows=ROWS)
+        # T9b-5: the two cuBLAS fp32 sites under --fp32-impl fixed (the fixed-order kernels, next to cuBLAS on the
+        # same inputs); with the switch both sites' families read row-invariant
+        from runtime.fused_glue_r2 import fp32_fixed_census
+
+        recs += fp32_fixed_census(model, rows=ROWS)
         for line in census_table(recs):
             print("  " + line)
         ids, toks = _toks(18, ROWS * 4, 44)
         n_pos = ROWS * 4
         print(f"  STEP-LEVEL V0: 6-row step row j vs the 1-row step at P0+j, same impls, {n_pos} positions")
         print(f"  {'impls':44s} {'bit-equal':>9s} {'max|dlogit|':>12s} {'argmax':>7s}")
-        cases = [("ref", {}, None, False), ("ref, row_invariant_mode", {}, None, True),
-                 ("fast, GEMV tuned M=6 cfg", dict(FAST), "0", False),
-                 ("fast, GEMV M=1 cfg pinned", dict(FAST), "1", False)]
-        for label, kw, pin, rim in cases:
+        cases = [("ref", {}, None, False, None), ("ref, row_invariant_mode", {}, None, True, None),
+                 ("ref, fp32 fixed (T9b-5)", {}, None, False, "fixed"),
+                 ("fast, GEMV tuned M=6 cfg", dict(FAST), "0", False, None),
+                 ("fast, GEMV M=1 cfg pinned", dict(FAST), "1", False, None),
+                 ("fast, GEMV M=1 cfg pinned, fp32 fixed", dict(FAST), "1", False, "fixed")]
+        from runtime.fused_glue_r2 import FP32_IMPL_ENV
+
+        for label, kw, pin, rim, fp32 in cases:
             prev = os.environ.get(PIN_ENV)
+            prev32 = os.environ.get(FP32_IMPL_ENV)
             if pin is not None:
                 os.environ[PIN_ENV] = pin
+            if fp32 is not None:
+                os.environ[FP32_IMPL_ENV] = fp32
             try:
                 cm = row_invariant_mode() if rim else contextlib.nullcontext()
                 with cm:
@@ -628,6 +643,11 @@ def test_v0_census_and_step_level_table():
                         os.environ.pop(PIN_ENV, None)
                     else:
                         os.environ[PIN_ENV] = prev
+                if fp32 is not None:
+                    if prev32 is None:
+                        os.environ.pop(FP32_IMPL_ENV, None)
+                    else:
+                        os.environ[FP32_IMPL_ENV] = prev32
 
 
 # ------------------------------------------------------------------------------------------------ first light cells

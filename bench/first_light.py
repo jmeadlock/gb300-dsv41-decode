@@ -598,6 +598,9 @@ def measure_rows(gen: Generator, a, report: Dict, *, out: str, json_path: str, f
             from runtime.row_census import census, census_table
 
             recs = census(gen.model, rows=R_)
+            from runtime.fused_glue_r2 import fp32_fixed_census
+
+            recs += fp32_fixed_census(gen.model, rows=R_)   # T9b-5: the fixed kernels next to cuBLAS (same inputs)
             rm["v0_census"] = recs
             for line in census_table(recs):
                 print(line, flush=True)
@@ -1007,6 +1010,11 @@ def build_parser() -> argparse.ArgumentParser:
                          "bounded = the same kernel with its block loop bounded by a device per-row valid-block "
                          "count, bit-identical (T9b-3a, runtime/kernels/sparse_attn_bounded.py) / flashmla = "
                          "FlashMLA sparse_prefill_fwd on every layer, A3-class (T9b-3c, runtime/attn_flashmla.py)")
+    ap.add_argument("--fp32-impl", choices=["cublas", "fixed"], default="cublas",
+                    help="the mHC mixes' and the head's fp32 F.linear: cublas = torch/cuBLAS (algorithm and split-K "
+                         "chosen by M: not row-invariant) / fixed = our fixed-order fp32 FMA kernels, row-invariant "
+                         "by construction, 1-ulp class vs cuBLAS (T9b-5, runtime/fused_glue_r2.py; sets "
+                         "$DSV41_FP32_IMPL; the glue self-check and the reference-op path adopt the same order)")
     ap.add_argument("--max-pos", type=int, default=4095,
                     help="static/graph: largest decode position (fixes the compressed-KV cat and index-score widths)")
     ap.add_argument("--marker", action="store_true", help="launch t8_step_marker once per decode step (nsys)")
@@ -1082,6 +1090,10 @@ def main(argv=None) -> int:
     report: Dict = {"date": time.strftime("%Y-%m-%d %H:%M:%S %Z"), "argv": sys.argv[1:] if argv is None else argv,
                     "errors": []}
     report["rows_moe_env"] = rows_moe_env(a)
+    from runtime.fused_glue_r2 import FP32_IMPL_ENV, describe_fp32
+
+    os.environ[FP32_IMPL_ENV] = a.fp32_impl      # T9b-5: before any StaticStep / glue build
+    report["fp32"] = describe_fp32()
     from runtime.loader import build_and_load
 
     t0 = time.time()
@@ -1107,7 +1119,8 @@ def main(argv=None) -> int:
                            "tokenizer_dir": gen.tokenizer_dir, "mode": gen.mode, "max_pos": gen.max_pos,
                            "marker": gen.marker, "moe_impl": gen.moe_impl, "fp8_impl": gen.fp8_impl,
                            "spare_slots": gen.spare_slots,
-                           "glue_impl": gen.glue_impl, "glue_approx": gen.glue_approx, "attn_impl": gen.attn_impl}
+                           "glue_impl": gen.glue_impl, "glue_approx": gen.glue_approx, "attn_impl": gen.attn_impl,
+                           "fp32_impl": a.fp32_impl}
     if a.nvtx_layers:
         install_layer_nvtx(model)
     if a.rows != 1 and a.moe_impl == "dg-inplace" and gen.pool is not None:
