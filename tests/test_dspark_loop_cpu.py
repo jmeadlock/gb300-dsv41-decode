@@ -646,3 +646,225 @@ def test_headline_cells_dry_run_on_cpu(emu, monkeypatch):
     assert lines[0].startswith("HEADLINE dry | ms per 6-row step, DSpark k=5")
     assert "streams exact vs 1-row: 2/2" in lines[-1] and any(l.strip().startswith("a ") for l in lines), lines
     print("\n".join(lines))
+
+
+# ------------------------------------------------------------------------------------------------ LOOSE-1107
+class _ShimGraph:
+    """A CUDAGraph stand-in: `replay()` runs the captured body eagerly and counts itself."""
+
+    def __init__(self, fn):
+        self.fn, self.replays = fn, 0
+
+    def replay(self):
+        self.replays += 1
+        self.fn()
+
+
+def _install_graph_shim(loop, n_graphs):
+    """Give a CPU loop the graph structure of DSparkLoop.capture(): n_graphs 2 = A (verify|accept|commit, inside
+    st._active()) + B (draft|next input); 1 = AB (A then the draft outside the verify scope) + B for the first draft.
+    The bodies are the loop's own (`_verify_accept`, `_draft`), so only the launch structure differs."""
+    st = loop.st
+
+    def A():
+        with torch.inference_mode(), st._active():
+            loop._verify_accept()
+
+    def B():
+        with torch.inference_mode():
+            loop._draft()
+
+    if n_graphs == 2:
+        loop.graphs = {"A": _ShimGraph(A), "B": _ShimGraph(B)}
+    else:
+        loop.graphs = {"AB": _ShimGraph(lambda: (A(), B())), "B": _ShimGraph(B)}
+    loop.n_graphs = n_graphs
+
+
+class _HookStub:
+    """Stands in for the ResidencyManager: records the order of its per-step calls."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def after_step(self, live=None):
+        self.calls += 1
+
+
+def test_one_graph_and_two_graphs_modes_make_the_same_accept_plan(emu, monkeypatch):
+    """LOOSE-1107 (3): the one_graph and two_graphs launch structures (graph shim: AB + B vs A + B) run the same
+    bodies, so on the same prompt they emit the same tokens, the same accept plan, and bit-equal fp32 logits per
+    emitted position as the eager loop -- and the residency hook (A2-2) fires once per issued step after the
+    replay(s), in both modes. Stream and logits are also the 1-row greedy's (row-invariant mode)."""
+    G = _gpu_module(monkeypatch, emu)
+    model, _ = emu("mini3")
+    n, L = 24, 17
+    with G.row_invariant_mode(True):
+        gen = G._gen(model, "static")
+        ids = G._toks(L, 300 + L, 2000)
+        truth, sha = G._truth(gen, ids, n)
+        loop = G._loop(gen, n)
+        hook = _HookStub()
+        monkeypatch.setattr(gen, "residency_mgr", hook, raising=False)
+        runs = {}
+        for mode in (0, 2, 1):
+            if mode:
+                _install_graph_shim(loop, mode)
+            hook.calls = 0
+            for parity in (True, False):
+                r = loop.generate(ids, n, stop_on_eos=False, parity=parity)
+                assert hook.calls == r["steps_issued"], (mode, parity, hook.calls, r["steps_issued"])
+                hook.calls = 0
+                runs[(mode, parity)] = r
+            if mode == 2:
+                assert loop.graphs["A"].replays == loop.graphs["B"].replays - 2 == sum(
+                    runs[(2, p)]["steps_issued"] for p in (True, False)), {k: g.replays for k, g in loop.graphs.items()}
+            if mode == 1:
+                assert loop.graphs["AB"].replays == sum(runs[(1, p)]["steps_issued"] for p in (True, False))
+                assert loop.graphs["B"].replays == 2                   # only the first draft after each prefill
+        gen.residency_mgr = None                                       # close() would ask the stub to restore the map
+        loop.close()
+    base = runs[(0, True)]
+    assert base["token_ids"] == truth and base["step_sha256"] == sha
+    assert len(base["accepts"]) == base["steps"] > 1 and set(base["accepts"]) <= set(range(6))
+    for key, r in runs.items():
+        assert r["token_ids"] == base["token_ids"], key
+        assert r["accepts"] == base["accepts"], key
+        assert r["steps"] == base["steps"] and r["steps_issued"] == base["steps_issued"], key
+        if key[1]:
+            assert r["step_sha256"] == base["step_sha256"] and r["logits_sha256"] == base["logits_sha256"], key
+
+
+def _cell(mean, p50, p90, n, verify=None, draft=None, mgr=None, cold=None):
+    w = {"stats_from_step": 4, "steps": n, "ms_per_step": {"n": n, "mean": mean, "p50": p50, "p90": p90},
+         "ms_verify_graph": {"n": n, "mean": verify} if verify else None,
+         "ms_draft_graph": {"n": n, "mean": draft} if draft else None,
+         "ms_manager_per_step": {"n": n, "mean": mgr} if mgr is not None else None,
+         "ms_per_step_incl_manager": (mean + mgr) if mgr is not None else None, "cold_share": cold}
+    return w
+
+
+def test_mode_gap_report_cases():
+    B = _headline()
+    assert B.mode_gap({"headline": {"two_graphs": _cell(20.0, 20.0, 20.1, 10)}}) is None       # one cell only
+    # no residency, cells equal: nothing to explain
+    h = {"two_graphs": _cell(20.30, 20.3, 20.5, 100, 17.4, 2.9), "one_graph": _cell(20.29, 20.3, 20.5, 50)}
+    mg = B.mode_gap({"headline": h, "residency_config": None})
+    assert mg["within_tolerance"] and mg["cause"].startswith("none") and not mg["residency_on"]
+    assert "mode gap" in B.mode_gap_line(mg) and "+0.010" in B.mode_gap_line(mg)
+    # no residency, cells differ: flagged as unexplained, never blamed on residency
+    h["one_graph"] = _cell(19.0, 19.0, 19.2, 50)
+    mg = B.mode_gap({"headline": h, "residency_config": None})
+    assert not mg["within_tolerance"] and mg["cause"].startswith("UNEXPLAINED") and mg["headline_mode"] == "unresolved"
+    # residency on: two_graphs ms = 20 + 0.4 ms per cold-share point (4 prompts), one_graph at ~zero cold share
+    cold = {"a": 0.01, "b": 0.05, "c": 0.09, "d": 0.13}
+    prompts = {t: {"steps": 50, "cold_share_by_rep": [c, c], "window": {"all_ms_per_step": {"mean": 20 + 40 * c}},
+                   "window_one_graph": {"all_ms_per_step": {"mean": 20.1}}} for t, c in cold.items()}
+    m2 = sum(20 + 40 * c for c in cold.values()) / 4
+    h = {"two_graphs": _cell(m2, m2, m2 + 1, 200, 17.0, 2.9, 0.05), "one_graph": _cell(20.1, 20.1, 20.2, 100, mgr=0.04)}
+    rep = {"headline": h, "prompts": prompts, "residency_config": {"drain_n": 64},
+           "residency": {"on": True, "sf_store": {"requested": "pool", "got": "step"}, "host_steps": 448,
+                         "drain_log": [{"host_steps": 64 * i, "cold_share": 0.05 if i < 6 else 0.0025}
+                                       for i in range(1, 8)]}}
+    rep["headline"]["one_graph"]["all_steps"] = 100
+    mg = B.mode_gap(rep)
+    fit = mg["fit_two_graphs_ms_vs_cold_share"]
+    assert abs(fit["slope"] - 40.0) < 1e-9 and abs(fit["intercept"] - 20.0) < 1e-9 and fit["r"] > 0.999999
+    assert mg["residency_on"] and not mg["within_tolerance"] and mg["gap_ms"] > 0.5
+    mm = mg["one_graph_ms_modeled"]                  # the drains over the last 100 steps (host steps 384, 448): both at 0.25 %
+    assert abs(mm["cold_share_drain_tail"] - 0.0025) < 1e-12 and abs(mm["ms"] - 20.1) < 1e-9, mm
+    assert "residency state" in mg["cause"] or "policy states" in mg["cause"]
+    assert "sf_store pool->step" in mg["cause"] and mg["headline_mode"].startswith("not decidable")
+    # both cells instrumented: the fit predicts the gap from the cold shares (modeled)
+    rep["headline"]["two_graphs"]["cold_share"], rep["headline"]["one_graph"]["cold_share"] = 0.07, 0.0025
+    mg = B.mode_gap(rep)
+    assert abs(mg["gap_predicted_from_cold_share_ms"] - 40.0 * (0.07 - 0.0025)) < 1e-9
+    assert "7.00% (two_graphs) vs 0.25% (one_graph)" in mg["cause"]
+    # the cold-share helper: call-weighted, None without counters
+    assert B.cold_pooled([{"routed_calls": 100, "cold_calls": 10}, {"routed_calls": 300, "cold_calls": 10}]) == 0.05
+    assert B.cold_pooled([{}]) is None
+
+
+def test_mode_gap_on_the_residency_receipt():
+    """docs/headline-20261107-residency.json (box): 21.82 vs 20.41 ms. The gap is the residency state, not the graph
+    mode: the two_graphs cell's per-prompt step ms track its cold share (r > 0.95) and the fit at the cold share of the
+    last drains predicts the one_graph cell to 0.1 ms. (Modeled numbers; the receipt is read, nothing is measured.)"""
+    import json
+
+    path = os.path.join(REPO, "docs", "headline-20261107-residency.json")
+    if not os.path.exists(path):
+        pytest.skip("receipt not in this checkout")
+    with open(path) as f:
+        rep = json.load(f)
+    mg = _headline().mode_gap(rep)
+    assert abs(mg["gap_ms"] - 1.4137) < 1e-3 and mg["residency_on"] and not mg["within_tolerance"]
+    assert mg["draft_graph_ms_two_graphs"] < 2.91 and mg["verify_graph_ms_two_graphs"] > 18.9      # all of it is verify
+    assert mg["fit_two_graphs_ms_vs_cold_share"]["r"] > 0.95
+    mm = mg["one_graph_ms_modeled"]
+    assert abs(mm["ms"] - mm["actual_ms"]) < 0.1, mm
+    assert mg["sf_store"] == {"requested": "pool", "got": "step"}
+
+
+def _probe_module():
+    spec = importlib.util.spec_from_file_location("row_divergence_probe_loose", os.path.join(
+        REPO, "bench", "row_divergence_probe.py"))
+    P = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(P)
+    return P
+
+
+def test_probe_mini_model_restores_the_engram_token_map(monkeypatch, tmp_path):
+    """LOOSE-1107 (2): tests/gpu/test_row_divergence_gpu.py builds mini models and then the REAL checkpoint in one
+    process. mini_model patched engram.build_compressed_token_map to a 2048-entry identity map and never undid it, so
+    the real build's Engram token_map had 2048 rows and `token_map[input_ids]` (real ids up to ~129k) was a
+    device-side index assert -> CUDA_ERROR_ASSERT at the next cuModuleLoadData (docs/rowdiv-gpu-test-r2-20261107.log).
+    The patch must be scoped to the context, also when the body raises."""
+    import types
+
+    import engram
+    import mini_ckpt
+    import runtime.loader
+    import runtime.refmodel
+
+    P = _probe_module()
+    real_import = runtime.refmodel.import_reference
+    monkeypatch.setattr(runtime.refmodel, "import_reference", lambda *a, **k: real_import(cpu_stubs=True))
+    monkeypatch.setattr(mini_ckpt, "make_mini_checkpoint", lambda d, cfg=None: {"model_dir": d, "map": None})
+    seen = []
+
+    def fake_build(model_dir, hot, device, **kw):
+        tm, n_classes = engram.build_compressed_token_map(kw.get("tokenizer"))
+        seen.append((len(tm), n_classes))
+        res = types.SimpleNamespace(pool=object(), release=lambda: seen.append("released"))
+        return types.SimpleNamespace(temperature=1.0, runtime_load=res)
+
+    monkeypatch.setattr(runtime.loader, "build_and_load", fake_build)
+    marker = lambda tok: ([0] * 129280, 99092)                                  # noqa: E731 (stands in for the real map)
+    monkeypatch.setattr(engram, "build_compressed_token_map", marker)
+    with P.mini_model("mini4", "cpu") as (model, pool):
+        assert engram.build_compressed_token_map is not marker                  # patched inside
+        assert model.temperature == 0.0
+    assert seen[0] == (MINI_CONFIG["vocab_size"], MINI_CONFIG["engram_compressed_vocab_size"]) and seen[-1] == "released"
+    assert engram.build_compressed_token_map is marker                          # restored: the real build sees its own map
+    with pytest.raises(RuntimeError, match="boom"):
+        with P.mini_model("mini", "cpu"):
+            raise RuntimeError("boom")
+    assert engram.build_compressed_token_map is marker                          # restored on an exception too
+
+
+def test_probe_check_token_ids_names_a_mini_sized_map():
+    """The host-side guard that replaces the late device assert: an id past the embedding or the Engram token_map is a
+    ValueError naming the table, before any kernel runs."""
+    import types
+
+    P = _probe_module()
+    model = types.SimpleNamespace(
+        embed=types.SimpleNamespace(weight=torch.zeros(129280, 1, device="cpu")),
+        engram_hash=types.SimpleNamespace(token_map=torch.zeros(2048, dtype=torch.long, device="cpu")))
+    P.check_token_ids(model, [0, 5, 2047])
+    with pytest.raises(ValueError, match="engram token_map has 2048 rows"):
+        P.check_token_ids(model, [3, 128803, 7])
+    with pytest.raises(ValueError, match="embed has 129280 rows"):
+        P.check_token_ids(types.SimpleNamespace(embed=model.embed, engram_hash=None), [129280])
+    P.check_token_ids(types.SimpleNamespace(embed=model.embed, engram_hash=None), [129279])
+    P.check_token_ids(model, [])
