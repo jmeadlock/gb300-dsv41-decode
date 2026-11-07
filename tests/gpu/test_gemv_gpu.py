@@ -18,6 +18,11 @@
     mismatch both streams are printed and the test fails); the routed-call count per step is 7 per layer + indexer
     wq_b + Engram wkv; capture with tuning on (configs chosen in the warm-up, none under capture);
   * informative: mini graph step-cell p50, ref vs gemv (and dg-masked + gemv when deep_gemm imports).
+  * T9b-6 gemv3 (runtime/gemv_mxfp8.py section "T9b-6"): every form (WIDE / block loads, KT 1..16) == gemv's MMA=1
+    form at the same split plan, bit for bit, M 1/3/6/8, real + odd shapes; row-invariant with the step's (N, K)
+    config and fp64-oracle distance <= gemv's (within 0.5 %); 200 eager repeats + 50 graph replays == eager (the
+    last-arrival in-kernel fold under the GPU's arrival orders), counters back at 0, one launch per call; capture
+    refusals; gemv_pair as one launch, RoPE epilogue == gemv's; quick tune + versioned cache; mini4 on gemv3.
 
 Run on the box (orchestrator), from the repo checkout, inside the library image with the GB300 by CDI; same line as
 tests/gpu/test_dg_moe_gpu.py (the Triton cache mount keeps the GEMV compiles across runs):
@@ -84,16 +89,18 @@ def _act(M, K, seed):
     differ block to block), quantized by the reference act_quant (model.py:197)."""
     K_ = _kernel()
     g = torch.Generator(device="cpu").manual_seed(seed)
-    x = (torch.randn(M, K // 32, 32, generator=g) * torch.exp2(torch.randint(-6, 7, (M, K // 32, 1), generator=g)
-                                                                .float())).view(M, K).to(torch.bfloat16).cuda()
+    x = (torch.randn(M, K // 32, 32, generator=g, device="cpu")
+         * torch.exp2(torch.randint(-6, 7, (M, K // 32, 1), generator=g, device="cpu").float())
+         ).view(M, K).to(torch.bfloat16).cuda()
     return K_.act_quant(x, 32, "ue8m0", E8)
 
 
 def _weights(N, K, seed):
     """fp8 from N(0, 0.5) (mini_ckpt's recipe) and e8m0 block scales 118..130."""
     g = torch.Generator(device="cpu").manual_seed(seed)
-    w = (torch.randn(N, K, generator=g) * 0.5).to(FP8).cuda()
-    s = torch.randint(118, 131, ((N + 31) // 32, K // 32), generator=g, dtype=torch.int32).to(torch.uint8).cuda()
+    w = (torch.randn(N, K, generator=g, device="cpu") * 0.5).to(FP8).cuda()
+    s = torch.randint(118, 131, ((N + 31) // 32, K // 32), generator=g, dtype=torch.int32, device="cpu"
+                      ).to(torch.uint8).cuda()
     return w, s.view(E8)
 
 
@@ -129,7 +136,7 @@ def test_pair_scale_device_all_pairs():
     _need_gemv()
     from runtime.gemv_mxfp8 import pair_scale, pair_scale_device
 
-    c = torch.arange(256, dtype=torch.int32)
+    c = torch.arange(256, dtype=torch.int32, device="cpu")
     a, b = c.repeat_interleave(256), c.repeat(256)
     want = pair_scale(a, b)
     nan = torch.isnan(want)
@@ -533,12 +540,326 @@ def test_gemv_step_cell_informative():
         del gen
 
 
+# ================================================================================================ T9b-6: gemv3
+# runtime/gemv_mxfp8.py section "T9b-6" (docs/HANDOFF-T9B6-GEMV-BYTES.md). Gates: bit-identical to gemv's MMA=1 form
+# at the same split plan (so BLOCK_N / KT / WIDE / warps / stages never change bits); row-invariant (row m alone ==
+# row m inside M = 2..8) with the one (N, K) config; replay-identical under graph capture (stress: the last-arrival
+# fold under many arrival orders), counters back at 0; fp64-oracle distance <= gemv's (ORACLE_TOL: see below).
+ORACLE_TOL = 5e-3   # relative slack on the MEAN |err| vs fp64: two valid fixed fp32 orders flip a bf16 rounding on
+#                    <= 0.5 % of outputs (the 1-ulp class), which moves the mean by about that fraction either way
+
+
+def _v3_matrix(N, K):
+    """gemv3 configs covering the forms (wide / block loads, KT 1..16, BLOCK_N 16..128, stages 2..4) at two split
+    plans: the auto split (2 x SMs) and split 1 (the reference's single chain)."""
+    from runtime import gemv_mxfp8 as G
+
+    sms = G.num_sms()
+    KB = K // 32
+    out = []
+    for bn, kt, wide, nw, ns in [(64, 8, 0, 4, 3), (64, 8, 1, 4, 3), (32, 4, 1, 4, 2), (128, 2, 1, 8, 4),
+                                 (16, 16, 0, 4, 2), (32, 1, 1, 4, 3), (64, 4, 0, 8, 4)]:
+        kt = min(kt, 1 << (KB.bit_length() - 1))
+        if wide and kt > G.WIDE3_MAX_KT:
+            continue
+        for sk in (G.auto_split_k3(N, K, bn, kt, sms), 1):
+            out.append(G.Gemv3Config(bn, kt, nw, ns, sk, wide))
+    return out
+
+
+def test_gemv3_bit_identical_to_gemv_same_plan():
+    """Every gemv3 form == gemv (t9b_mxfp8_gemv + t9b_splitk_reduce, MMA=1) with the same split plan, bit for bit, on
+    the real shapes and odd ones, M in {1, 3, 6, 8}; and == the reference fp8_gemm within the 1-ulp class. A WIDE
+    config this Triton cannot compile is reported (the tuner skips it the same way); a block-load one fails."""
+    _need_gemv()
+    from runtime import gemv_mxfp8 as G
+
+    K_ = _kernel()
+    torch.set_default_dtype(torch.bfloat16)
+    bad, failed_wide, n, n_wide = [], {}, 0, 0
+    for i, (N, K) in enumerate(REAL_SHAPES + [(1000, 512), (40, 96), (7, 64), (2304 + 16, 384)]):
+        w, s = _weights(N, K, 900 + i)
+        for M in (1, 3, 6, 8):
+            xq, xs = _act(M, K, 950 + 10 * i + M)
+            ref = K_.fp8_gemm(xq, xs, w, s, E8, block_size=32)
+            for c3 in _v3_matrix(N, K):
+                if c3.wide and json_key(c3) in failed_wide:
+                    continue
+                v1 = G.GemvConfig(32, 2, 4, 3, c3.split_k, 1)
+                o1 = G.mxfp8_gemv(xq, xs, w, s, torch.empty(M, N, dtype=torch.bfloat16, device="cuda"),
+                                  config=v1).clone()
+                try:
+                    o3 = G.mxfp8_gemv3(xq, xs, w, s, torch.full((M, N), float("nan"), dtype=torch.bfloat16,
+                                                                device="cuda"), config=c3).clone()
+                    torch.cuda.synchronize()
+                except Exception as e:
+                    if not c3.wide:
+                        raise
+                    failed_wide[json_key(c3)] = repr(e)[:200]
+                    continue
+                n += 1
+                n_wide += int(c3.wide)
+                r = compare(o3, ref)
+                if not torch.equal(o3, o1) or not r["finite"] or r["mismatch"] > MISMATCH_GATE:
+                    bad.append((N, K, M, c3.as_dict(), float((o3 != o1).float().mean()), r["mismatch"]))
+        print(f"  gemv3 N={N} K={K}: {len(_v3_matrix(N, K))} configs x M 1/3/6/8 == gemv MMA=1 same plan")
+    for k, e in failed_wide.items():
+        print(f"  WIDE config did not compile/launch here (tuner skips it): {k}: {e}")
+    print(f"  {n} gemv3 calls bit-identical to gemv at the same plan ({n_wide} WIDE); {len(failed_wide)} WIDE "
+          f"configs unavailable")
+    assert not bad, f"gemv3 differs from gemv (same plan) or leaves the 1-ulp class: {bad[:6]}"
+    if n_wide == 0:   # informative: the block-load form still issues KT*32 B per row per iteration; the tuner and
+        #               bench/gemv_bench.py's speed gates decide whether that is enough
+        print("  WARNING: no WIDE (one [BLOCK_N, KT*32] load) config compiles on this Triton; gemv3 runs the "
+              "block-load form only")
+
+
+def test_gemv3_row_invariant_and_oracle():
+    """With the (N, K) config gemv3 uses in the step (get_config3), each row of an M = 6 (and 8, 3) call == that row
+    alone, bit for bit; the mean |err| vs the float64 product <= gemv's (its own config) within ORACLE_TOL."""
+    _need_gemv()
+    from runtime import gemv_mxfp8 as G
+
+    torch.set_default_dtype(torch.bfloat16)
+    worst = []
+    for i, (N, K) in enumerate(REAL_SHAPES):
+        w, s = _weights(N, K, 1100 + i)
+        c3 = G.get_config3(N, K)
+        xq, xs = _act(8, K, 1200 + i)
+        full = G.mxfp8_gemv3(xq, xs, w, s, torch.empty(8, N, dtype=torch.bfloat16, device="cuda"), config=c3).clone()
+        for M in (6, 3):
+            part = G.mxfp8_gemv3(xq[:M].contiguous(), xs[:M].contiguous(), w, s,
+                                 torch.empty(M, N, dtype=torch.bfloat16, device="cuda"), config=c3)
+            assert torch.equal(part, full[:M]), (N, K, M)
+        for m in range(8):
+            one = G.mxfp8_gemv3(xq[m:m + 1].contiguous(), xs[m:m + 1].contiguous(), w, s,
+                                torch.empty(1, N, dtype=torch.bfloat16, device="cuda"), config=c3)
+            assert torch.equal(one, full[m:m + 1]), (N, K, m)
+        if N * K <= (64 << 20):
+            ex = _exact(xq[:6], xs[:6], w, s)
+            e3 = float((full[:6].double() - ex).abs().mean())
+            o1 = G.mxfp8_gemv(xq[:6].contiguous(), xs[:6].contiguous(), w, s,
+                              torch.empty(6, N, dtype=torch.bfloat16, device="cuda"), config=G.get_config(N, K, 6))
+            e1 = float((o1.double() - ex).abs().mean())
+            worst.append((e3 / e1, N, K))
+            print(f"  gemv3 N={N} K={K} config {c3.as_dict()}: rows 1/3/6/8 bit-identical; mean |err| vs f64 at M=6 "
+                  f"gemv3 {e3:.6g} gemv {e1:.6g} (ratio {e3 / e1:.5f})")
+    bad = [x for x in worst if x[0] > 1 + ORACLE_TOL]
+    assert not bad, f"gemv3 fp64-oracle distance above gemv's (tol {ORACLE_TOL}): {bad}"
+
+
+def test_gemv3_graph_replay_stress_and_counters():
+    """Split shapes (in-kernel fold) and an unsplit one in one graph: 50 replays (NaN-filled outputs before each) ==
+    eager every time -- the last-arrival fold under whatever arrival orders the GPU produces --, 200 eager repeats
+    equal too, every counter back at 0, no host sync in an eager call, ONE kernel per call (no reduce launch), and
+    capture refuses an untuned shape (tune on) and counters first needed under capture."""
+    _need_gemv()
+    from runtime import gemv_mxfp8 as G
+
+    torch.set_default_dtype(torch.bfloat16)
+    shapes = [(1280, 5120, 1), (512, 5120, 6), (2304, 5120, 8), (32768, 1280, 3), (5120, 8192, 6)]
+    bufs = []
+    for i, (N, K, M) in enumerate(shapes):
+        w, s = _weights(N, K, 1300 + i)
+        xq, xs = _act(M, K, 1400 + i)
+        bufs.append((xq, xs, w, s, torch.empty(M, N, dtype=torch.bfloat16, device="cuda")))
+    cfgs = [G.get_config3(b[2].size(0), b[2].size(1)) for b in bufs]
+    plans = [G.launch_plan3(c, b[0].size(0), b[2].size(0), b[2].size(1)) for c, b in zip(cfgs, bufs)]
+    assert any(p["SPLIT"] for p in plans), plans
+    for b, c in zip(bufs, cfgs):
+        G.mxfp8_gemv3(*b, config=c)
+    eager = [b[4].clone() for b in bufs]
+    for _ in range(200):
+        for b, c, e in zip(bufs, cfgs, eager):
+            G.mxfp8_gemv3(*b, config=c)
+        torch.cuda.synchronize()
+        assert all(torch.equal(b[4], e) for b, e in zip(bufs, eager)), "eager repeat differs"
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        for b, c in zip(bufs, cfgs):
+            G.mxfp8_gemv3(*b, config=c)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    g = torch.cuda.CUDAGraph()
+    st = torch.cuda.Stream()
+    st.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(st):
+        for b, c in zip(bufs, cfgs):
+            G.mxfp8_gemv3(*b, config=c)
+    torch.cuda.current_stream().wait_stream(st)
+    torch.cuda.synchronize()
+    with torch.cuda.graph(g):
+        for b, c in zip(bufs, cfgs):
+            G.mxfp8_gemv3(*b, config=c)
+    for rep in range(50):
+        for b in bufs:
+            b[4].fill_(float("nan"))
+        g.replay()
+        torch.cuda.synchronize()
+        for b, e in zip(bufs, eager):
+            assert torch.equal(b[4], e), f"graph replay {rep} differs from eager"
+    assert all(int(t.abs().sum()) == 0 for t in G._COUNTERS.values()), "arrival counters not reset"
+    # one launch per call: profile the eager calls
+    from torch.profiler import ProfilerActivity, profile
+
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        for b, c in zip(bufs, cfgs):
+            G.mxfp8_gemv3(*b, config=c)
+        torch.cuda.synchronize()
+    names = [e.name for e in prof.events() if e.device_type.name == "CUDA"]
+    n3 = sum("t9b6_gemv3" in nm for nm in names)
+    assert n3 == len(bufs) and not any("splitk_reduce" in nm for nm in names), names
+    # refused under capture: an untuned shape (tune on), and counters never allocated eagerly
+    w, s = _weights(96, 256, 1500)
+    xq, xs = _act(1, 256, 1501)
+    out = torch.empty(1, 96, dtype=torch.bfloat16, device="cuda")
+    prev = os.environ.get("DSV41_GEMV_TUNE")
+    os.environ["DSV41_GEMV_TUNE"] = "1"
+    raised = False
+    try:
+        try:
+            with torch.cuda.graph(torch.cuda.CUDAGraph()):
+                G.mxfp8_gemv3(xq, xs, w, s, out)
+        except RuntimeError as e:
+            raised = "capture" in str(e)
+    finally:
+        if prev is None:
+            os.environ.pop("DSV41_GEMV_TUNE", None)
+        else:
+            os.environ["DSV41_GEMV_TUNE"] = prev
+    assert raised, "an untuned shape under capture must raise, not tune"
+    w, s = _weights(672, 5120, 1502)
+    xq, xs = _act(1, 5120, 1503)
+    out = torch.empty(1, 672, dtype=torch.bfloat16, device="cuda")
+    c = G.Gemv3Config(32, 8, 4, 3, 10, 0)
+    raised = False
+    try:
+        with torch.cuda.graph(torch.cuda.CUDAGraph()):
+            G.mxfp8_gemv3(xq, xs, w, s, out, config=c)
+    except RuntimeError as e:
+        raised = "capture" in str(e)
+    assert raised, "workspace / counters first needed under capture must raise, not allocate"
+    print(f"  gemv3: 200 eager repeats + 50 graph replays == eager; counters 0; one launch per call; plans "
+          f"{[(p['grid'], p['EVEN']) for p in plans]}")
+
+
+def test_gemv3_pair_and_rope():
+    """Under set_impl("gemv3"): gemv_pair = ONE t9b6_gemv3_pair launch whose halves equal their single calls (bf16,
+    reduced inside); linear_fp8_rope == gemv's RoPE output at the same plan (both store paths: split and not)."""
+    _need_gemv()
+    from runtime import gemv_mxfp8 as G
+    from runtime.fused_glue import rope_rows_torch
+
+    torch.set_default_dtype(torch.bfloat16)
+    G.set_impl("gemv3")
+    try:
+        for i, (NA, NB, K, M) in enumerate([(1280, 512, 5120, 1), (2304, 2304, 5120, 6), (32768, 4096, 1280, 3)]):
+            wa, sa = _weights(NA, K, 1600 + i)
+            wb, sb = _weights(NB, K, 1650 + i)
+            xq, xs = _act(M, K, 1700 + i)
+            sa_ = G.mxfp8_gemv3(xq, xs, wa, sa, torch.empty(M, NA, dtype=torch.bfloat16, device="cuda")).clone()
+            sb_ = G.mxfp8_gemv3(xq, xs, wb, sb, torch.empty(M, NB, dtype=torch.bfloat16, device="cuda")).clone()
+            n0 = G.PAIR_STATS["pair3"]
+            pa, pb = G.gemv_pair(xq, xs, wa, sa, wb, sb)
+            assert G.PAIR_STATS["pair3"] - n0 == 1 and torch.equal(pa, sa_) and torch.equal(pb, sb_), (NA, NB, M)
+        g = torch.Generator(device="cpu").manual_seed(5)
+        mirror_diff = {}
+        for N, K, M, hd, rd, c3 in [(4096, 1280, 1, 128, 64, G.Gemv3Config(64, 8, 4, 3, 5, 1)),
+                                    (32768, 1280, 6, 512, 64, G.Gemv3Config(64, 8, 4, 3, 1, 0))]:
+            w, s = _weights(N, K, 1800 + N % 97)
+            xq, xs = _act(M, K, 1850 + M)
+            ang = torch.rand(rd // 2, generator=g, dtype=torch.float32, device="cpu") * 6.0
+            fr = torch.stack([ang.cos(), ang.sin()], -1).contiguous().cuda()
+            for modes in ((0, 0), (1, 2)):
+                rope = (fr, hd, rd, modes)
+                o3 = G.mxfp8_gemv3(xq, xs, w, s, torch.empty(M, N, dtype=torch.bfloat16, device="cuda"), config=c3,
+                                   rope=rope).clone()
+                o1 = G.mxfp8_gemv(xq, xs, w, s, torch.empty(M, N, dtype=torch.bfloat16, device="cuda"),
+                                  config=G.GemvConfig(64, 2, 4, 3, c3.split_k, 1), rope=rope)
+                plain = G.mxfp8_gemv3(xq, xs, w, s, torch.empty(M, N, dtype=torch.bfloat16, device="cuda"),
+                                      config=c3)
+                assert torch.equal(o3, o1), (N, M, modes)                      # the gate: gemv's epilogue, same bits
+                mir = rope_rows_torch(plain.cpu(), fr.cpu(), hd, rd, modes, inverse=False)
+                mirror_diff[(N, M, modes)] = int((o3.cpu() != mir).sum())    # informative: the CPU mirror
+        print(f"  gemv3 pair: one launch, halves == singles; RoPE epilogue == gemv's at the same plan; outputs "
+              f"differing from the CPU RoPE mirror (informative) {mirror_diff}")
+    finally:
+        G.set_impl(None)
+
+
+def test_gemv3_tune_quick_and_cache():
+    """Tuning on (quick space) for one shape: a config is chosen, written to gemv3's own versioned cache file, read
+    back identically after a reset; the tuned config is row-invariant and bit-identical to gemv at its plan."""
+    _need_gemv()
+    from runtime import gemv_mxfp8 as G
+
+    torch.set_default_dtype(torch.bfloat16)
+    with tempfile.TemporaryDirectory() as tmp:
+        prev = {k: os.environ.get(k) for k in ("DSV41_GEMV_TUNE", "DSV41_GEMV_CACHE", "DSV41_GEMV3_CACHE",
+                                               "DSV41_GEMV_TUNE_SPACE")}
+        os.environ.update({"DSV41_GEMV_TUNE": "1", "DSV41_GEMV_TUNE_SPACE": "quick",
+                           "DSV41_GEMV_CACHE": os.path.join(tmp, "tune.json")})
+        os.environ.pop("DSV41_GEMV3_CACHE", None)
+        G.reset_configs()
+        try:
+            N, K = 1280, 5120
+            c = G.get_config3(N, K)
+            path = G.cache3_path()
+            assert path.endswith("tune.gemv3.json") and os.path.exists(path)
+            import json as _json
+
+            data = _json.load(open(path))
+            assert data["impl"] == "gemv3" and data["version"] == G.GEMV3_VERSION and f"v3:{N}x{K}" in data["configs"]
+            log = G._TUNE_LOG3[(N, K)]
+            G.reset_configs()
+            assert G.load_cache3() == 1 and G.get_config3(N, K) == c
+            w, s = _weights(N, K, 1900)
+            xq, xs = _act(6, K, 1901)
+            o6 = G.mxfp8_gemv3(xq, xs, w, s, torch.empty(6, N, dtype=torch.bfloat16, device="cuda"), config=c).clone()
+            o1 = torch.cat([G.mxfp8_gemv3(xq[m:m + 1].contiguous(), xs[m:m + 1].contiguous(), w, s,
+                                          torch.empty(1, N, dtype=torch.bfloat16, device="cuda"), config=c)
+                            for m in range(6)])
+            v1 = G.mxfp8_gemv(xq, xs, w, s, torch.empty(6, N, dtype=torch.bfloat16, device="cuda"),
+                              config=G.GemvConfig(32, 2, 4, 3, c.split_k, 1))
+            assert torch.equal(o6, o1) and torch.equal(o6, v1)
+            print(f"  gemv3 tuned {N}x{K}: {c.as_dict()} best {log['best_us']} us of {log['n_timed']} timed "
+                  f"({log['n_failed']} failed); plan {log['plan']}")
+        finally:
+            for k, v in prev.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            G.reset_configs()
+
+
+def test_gemv3_mini_graph_and_stream():
+    """The mini checkpoint with `fp8_impl="gemv"` on the gemv3 path: static-eager self-replay equal (no host sync),
+    graph == static-eager, replay #2, fills-on recapture and relaunch equal, top-1 stream == ref's."""
+    _need_gemv()
+    from runtime import gemv_mxfp8 as G
+
+    G.set_impl("gemv3")
+    try:
+        _gemv_static("mini4")
+        _gemv_graph("mini4")
+        _gemv_vs_ref("mini4")
+        assert G.describe()["impl"] == "gemv3" and G.describe()["gemv3"]["configs"]
+        print(f"  mini4 on gemv3: configs {G.describe()['gemv3']['configs']}")
+    finally:
+        G.set_impl(None)
+
+
 TESTS = [test_pair_scale_device_all_pairs, test_gemv_vs_reference_real_shapes, test_gemv_vs_reference_mini_and_odd_shapes,
          test_gemv_split_k_and_mma_vs_reference, test_every_candidate_config_bit_identical,
          test_graph_capture_replay_and_no_sync,
          test_gemv_static_selfreplay_mini, test_gemv_static_selfreplay_mini4, test_gemv_graph_equals_static_mini,
          test_gemv_graph_equals_static_mini4, test_gemv_vs_ref_tokens_mini, test_gemv_vs_ref_tokens_mini4,
-         test_gemv_capture_with_tuning_and_cache, test_gemv_step_cell_informative]
+         test_gemv_capture_with_tuning_and_cache, test_gemv_step_cell_informative,
+         # T9b-6 gemv3
+         test_gemv3_bit_identical_to_gemv_same_plan, test_gemv3_row_invariant_and_oracle,
+         test_gemv3_graph_replay_stress_and_counters, test_gemv3_pair_and_rope, test_gemv3_tune_quick_and_cache,
+         test_gemv3_mini_graph_and_stream]
 
 if __name__ == "__main__":
     import traceback

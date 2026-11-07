@@ -707,3 +707,518 @@ def test_first_light_fp8_impl_flag_and_report(tmp_path, capsys):
     assert report["parity_levels"]["variant"] == "dg-masked+gemv" and report["parity_levels"]["verdict"] == "PASS"
     lines = capsys.readouterr().out.strip().splitlines()
     assert lines[-12].startswith("FIRST LIGHT d | mode graph moe dg-masked fp8 gemv levels PASS")
+
+
+# ================================================================================================ T9b-6: gemv3
+# runtime/gemv_mxfp8.py section "T9b-6" (docs/HANDOFF-T9B6-GEMV-BYTES.md). Through tests/triton_shim.py the real
+# `@triton.jit` bodies run program by program on data whose 32-product block sums are exact in fp32
+# (test_gemv_kernel_shim_cpu._exact_fp8), so kernel == the torch mirror of the same split holds bit for bit and only
+# the index math, slicing, K order, split fold and counter protocol are under test (not Triton compilation, layouts,
+# memory ordering or speed: tests/gpu/test_gemv_gpu.py + bench/gemv_bench.py on the box).
+import itertools as _itertools  # noqa: E402
+import random as _random  # noqa: E402
+
+import numpy as _np  # noqa: E402
+
+import triton_shim  # noqa: E402
+
+G3 = G.Gemv3Config
+
+
+@pytest.fixture(scope="module")
+def K3():
+    mod = triton_shim.load_module_under_shim(os.path.join(REPO, "runtime", "gemv_mxfp8.py"), "gemv_t9b6_shim")
+    mod.KERNELS_ON_CPU = True
+    return mod
+
+
+@pytest.fixture
+def _impl_reset():
+    G.set_impl(None)
+    yield
+    G.set_impl(None)
+
+
+def _ops3(M, N, K_, seed):
+    from test_gemv_kernel_shim_cpu import _operands as _exact_operands
+
+    return _exact_operands(M, N, K_, seed)
+
+
+def _run3(K3, xq, xs, w, s, cfg, out=None, rope=None):
+    """One gemv3 launch through the shim with fresh NaN workspace and zero counters -> (out, ws, cnt, plan)."""
+    M, Kd = xq.shape
+    N = w.size(0)
+    p = K3.launch_plan3(cfg, M, N, Kd)
+    ws = torch.full((p["NSPLIT"], M, N), float("nan"), dtype=torch.float32)
+    cnt = torch.zeros(p["tiles"], dtype=torch.int32)
+    out = torch.full((M, N), float("nan"), dtype=torch.bfloat16) if out is None else out
+    K3._launch3(xq, xs, w, s, out, cfg, ws if p["SPLIT"] else out, cnt, rope=rope)
+    return out, ws, cnt, p
+
+
+CASES3 = [  # (M, N, K, Gemv3Config(block_n, kt, warps, stages, split_k, wide))
+    (1, 64, 256, G3(32, 4, 4, 2, 1, 0)),       # split 1: direct bf16 store, EVEN, block loads
+    (1, 64, 256, G3(32, 8, 4, 2, 1, 1)),       # split 1, one wide [32, 256] load = the whole K
+    (1, 100, 1280, G3(32, 8, 4, 3, 7, 1)),     # KB 40 / split 7 -> PER 6 < KT 8: wide tail + short last split
+    (3, 96, 640, G3(64, 2, 4, 2, 4, 1)),       # N % BLOCK_N != 0; PER 5 with KT 2 (tail); wide KT 2
+    (6, 40, 384, G3(16, 4, 4, 2, 5, 1)),       # N % 32 != 0, BLOCK_N 16; KB 12 / 5 -> (3, 4)
+    (8, 128, 1024, G3(32, 4, 8, 2, 4, 1)),     # EVEN split: KB 32 / 4 -> PER 8 = 2 wide tiles of KT 4
+    (8, 128, 1024, G3(32, 4, 8, 2, 4, 0)),     # the same plan through block loads
+    (2, 72, 2048, G3(32, 16, 4, 4, 4, 0)),     # KT 16 (block loads only), EVEN: KB 64 / 4 -> PER 16
+    (6, 48, 512, G3(16, 1, 4, 2, 16, 1)),      # KT 1 wide, PER 1: every program one block
+    (5, 33, 288, G3(32, 2, 4, 2, 9, 0)),       # KB 9, split 9 -> PER 1 with KT 2 (tail every program)
+    (4, 256, 1536, G3(128, 8, 4, 2, 6, 1)),    # BLOCK_N > N/2, wide KT 8, EVEN 48 / 6 -> PER 8
+]
+
+
+@pytest.mark.parametrize("M,N,Kd,cfg", CASES3, ids=[f"M{c[0]}-N{c[1]}-K{c[2]}-bn{c[3].block_n}-kt{c[3].kt}-"
+                                                    f"s{c[3].split_k}-w{c[3].wide}" for c in CASES3])
+def test_gemv3_kernel_equals_split_mirror(K3, M, N, Kd, cfg):
+    """The one gemv3 launch == gemv_torch with the same split (bit for bit), every ws slot is its split's K-order
+    chain alone, the counters are back at 0, exactly one launch (no reduce kernel), grid / constexprs as planned."""
+    xq, xs, w, s = _ops3(M, N, Kd, seed=M * 131 + N + Kd + cfg.split_k)
+    n_red = len(K3.t9b_splitk_reduce.launches)
+    K3.t9b6_gemv3.launches.clear()
+    out, ws, cnt, p = _run3(K3, xq, xs, w, s, cfg)
+    assert len(K3.t9b6_gemv3.launches) == 1 and len(K3.t9b_splitk_reduce.launches) == n_red
+    la = K3.t9b6_gemv3.launches[0]
+    assert la["grid"] == p["grid"] == (-(-N // cfg.block_n), p["NSPLIT"])
+    ce = la["constexprs"]
+    assert (ce["BLOCK_M"], ce["BLOCK_N"], ce["KT"], ce["WIDE"], ce["EVEN"], ce["SPLIT"], ce["CG"]) == \
+        (16, cfg.block_n, cfg.kt, bool(cfg.wide), p["EVEN"], p["SPLIT"], False)
+    assert not torch.isnan(out.float()).any()
+    assert torch.equal(out, G.gemv_torch(xq, xs, w, s, split_k=cfg.split_k))
+    assert not cnt.any(), cnt                      # every tile's counter reset by its last program
+    if p["SPLIT"]:
+        assert not torch.isnan(ws).any()
+        for ks in range(p["NSPLIT"]):
+            lo, hi = ks * p["PER"], min((ks + 1) * p["PER"], Kd // 32)
+            chain = G.gemv_torch_f32(xq[:, lo * 32:hi * 32].contiguous(), xs[:, lo:hi].contiguous(),
+                                     w[:, lo * 32:hi * 32].contiguous(), s[:, lo:hi].contiguous(), 1)
+            assert torch.equal(ws[ks].view(torch.int32), chain.view(torch.int32)), ks
+    # gemv (t9b_mxfp8_gemv + t9b_splitk_reduce, MMA form) with the same partition: the same bits
+    v1 = G.GemvConfig(32, 4, 4, 2, cfg.split_k, 1)
+    assert G.numerics_key(v1, N, Kd) == tuple(G.numerics_key3(cfg, N, Kd)) + (1,)
+    p1 = K3.launch_plan(v1, M, N, Kd)
+    o1 = torch.full((M, N), float("nan"), dtype=torch.bfloat16)
+    K3._launch(xq, xs, w, s, o1, v1, torch.zeros(p1["NSPLIT"], M, N) if p1["SPLIT"] else o1)
+    assert torch.equal(o1, out)
+
+
+def test_gemv3_wide_slicing_is_k_order():
+    """The WIDE slice expression (reshape [BN*KT, 32] -> trans -> reshape [32, BN, KT], then even/odd halving of the
+    last axis) yields block u == weight bytes [n, 32u : 32u + 32] for every KT the kernel uses, in the order the
+    kernel consumes them (u0..u7): checked with numpy on index-valued tiles (independent of the shim's dot)."""
+    def halves(t, h):
+        r = t.reshape(t.shape[0], t.shape[1], h, 2)
+        return r[..., 0], r[..., 1]
+
+    BN = 16
+    for KT in (1, 2, 4, 8):
+        wt2 = _np.arange(BN * KT * 32).reshape(BN, KT * 32)
+        t = wt2.reshape(BN * KT, 32).T.reshape(32, BN, KT)
+        if KT == 1:
+            us = [t]
+        elif KT == 2:
+            us = list(halves(t, 1))
+        elif KT == 4:
+            e, o = halves(t, 2)
+            u0, u2 = halves(e, 1)
+            u1, u3 = halves(o, 1)
+            us = [u0, u1, u2, u3]
+        else:
+            e, o = halves(t, 4)
+            ee, eo = halves(e, 2)
+            oe, oo = halves(o, 2)
+            u0, u4 = halves(ee, 1)
+            u2, u6 = halves(eo, 1)
+            u1, u5 = halves(oe, 1)
+            u3, u7 = halves(oo, 1)
+            us = [u0, u1, u2, u3, u4, u5, u6, u7]
+        for u, sl in enumerate(us):
+            assert _np.array_equal(sl.reshape(32, BN), wt2[:, 32 * u:32 * u + 32].T), (KT, u)
+
+
+class _ShuffledItertools:
+    """Stand-in for triton_shim's `itertools`: the launch's programs run in a seeded random order (the shim normally
+    runs them in grid order, so split ks = NSPLIT-1 would always arrive last)."""
+
+    def __init__(self, seed):
+        self.rng = _random.Random(seed)
+        self.orders = []
+
+    def product(self, *its):
+        pids = list(_itertools.product(*its))
+        self.rng.shuffle(pids)
+        self.orders.append(pids)
+        return pids
+
+
+def test_gemv3_any_arrival_order_same_bits(K3, monkeypatch):
+    """Whichever program of a tile arrives last, it folds the partials in split order: 12 random program orders give
+    the identical output (== the mirror), and the counters end at 0 every time."""
+    M, N, Kd, cfg = 3, 96, 1280, G3(32, 4, 4, 2, 7, 1)
+    xq, xs, w, s = _ops3(M, N, Kd, seed=77)
+    want = G.gemv_torch(xq, xs, w, s, split_k=7)
+    lasts = set()
+    for seed in range(12):
+        sh = _ShuffledItertools(seed)
+        monkeypatch.setattr(triton_shim, "itertools", sh)
+        out, _, cnt, p = _run3(K3, xq, xs, w, s, cfg)
+        monkeypatch.setattr(triton_shim, "itertools", _itertools)
+        assert torch.equal(out, want) and not cnt.any(), seed
+        order = sh.orders[-1]
+        lasts.add(tuple(max((i, ks) for i, (pn, ks, _) in enumerate(order) if pn == t)[1] for t in range(3)))
+    assert len(lasts) > 1     # the last arrival really varied
+
+
+def test_gemv3_fold_is_split_order_not_arrival_order(K3, monkeypatch):
+    """Crafted operands make the fold order visible in the bf16 output: KB 3, split 3 (PER 1), block partials
+    2^24, 1, -2^24 for output 0 -> ((0 + 2^24) + 1) - 2^24 = 0 in split order, 1 in reverse. Every program order
+    (all 6) gives 0."""
+    M, N, Kd = 1, 16, 96
+    wb = torch.full((N, Kd), 0x38, dtype=torch.uint8)               # e4m3 1.0
+    wb[:, 64:] = 0xB8                                              # e4m3 -1.0: block 2 products -1
+    w = wb.view(FP8)
+    xq = torch.full((M, Kd), 0x38, dtype=torch.uint8).view(FP8)
+    xs = _e8(torch.tensor([[127, 127, 127]], dtype=torch.int32))
+    s = _e8(torch.tensor([[146, 122, 146]], dtype=torch.int32))   # 32 * 2^19 = 2^24, 32 * 2^-5 = 1, -2^24
+    cfg = G3(16, 1, 4, 2, 3, 0)
+    for perm in _itertools.permutations(range(3)):
+        class _Fixed:
+            @staticmethod
+            def product(*its, _perm=perm):
+                return [(0, ks, 0) for ks in _perm]
+
+        monkeypatch.setattr(triton_shim, "itertools", _Fixed)
+        out, ws, cnt, _ = _run3(K3, xq, xs, w, s, cfg)
+        monkeypatch.setattr(triton_shim, "itertools", _itertools)
+        assert [float(v) for v in ws[:, 0, 0]] == [2.0 ** 24, 1.0, -(2.0 ** 24)]
+        assert float(out[0, 0]) == 0.0 and not cnt.any(), perm   # reverse order would give 1.0
+
+
+def test_gemv3_only_atomic_is_the_int32_counter(K3, monkeypatch):
+    """No fp32 atomics: every atomic the kernel issues is on the int32 arrival counters (one per program)."""
+    seen = []
+    real = K3.tl.atomic_add
+
+    def spy(ptr, val, mask=None):
+        seen.append(ptr.buf.dtype)
+        return real(ptr, val, mask)
+
+    monkeypatch.setattr(K3.tl, "atomic_add", spy)
+    M, N, Kd, cfg = 2, 64, 640, G3(32, 4, 4, 2, 5, 1)
+    xq, xs, w, s = _ops3(M, N, Kd, seed=5)
+    _, _, _, p = _run3(K3, xq, xs, w, s, cfg)
+    assert len(seen) == p["grid"][0] * p["grid"][1] and set(seen) == {_np.dtype(_np.int32)}
+
+
+def test_gemv3_rows_past_m_and_columns_past_n_untouched(K3):
+    M, N, Kd = 3, 40, 512
+    xq, xs, w, s = _ops3(M, N, Kd, seed=3)
+    for cfg in (G3(64, 4, 4, 2, 3, 1), G3(64, 4, 4, 2, 1, 0)):
+        big = torch.full((M + 2, 2 * N), -7.0, dtype=torch.bfloat16)
+        out = big[:M, :N]
+        _run3(K3, xq, xs, w, s, cfg, out=out)
+        assert torch.equal(big[:M, :N], G.gemv_torch(xq, xs, w, s, split_k=cfg.split_k)), cfg
+        assert bool((big[:M, N:] == -7).all()) and bool((big[M:] == -7).all()), cfg
+
+
+@pytest.mark.parametrize("cfg", [G3(32, 4, 4, 2, 1, 1), G3(32, 4, 4, 2, 4, 1), G3(64, 2, 4, 2, 5, 0)])
+def test_gemv3_rows_bit_identical_across_m(K3, cfg):
+    """Row-invariance through the kernel body: row m of an M-row call == the same row alone (M = 1) == the same row
+    inside every other M <= 8, with the one (N, K) config."""
+    N, Kd = 96, 640
+    xq, xs, w, s = _ops3(8, N, Kd, seed=21)
+    full, _, _, _ = _run3(K3, xq, xs, w, s, cfg)
+    for M in (1, 2, 5, 6, 7):
+        part, _, _, _ = _run3(K3, xq[:M].contiguous(), xs[:M].contiguous(), w, s, cfg)
+        assert torch.equal(part, full[:M]), M
+    for m in range(8):
+        one, _, _, _ = _run3(K3, xq[m:m + 1].contiguous(), xs[m:m + 1].contiguous(), w, s, cfg)
+        assert torch.equal(one, full[m:m + 1]), m
+
+
+@pytest.mark.parametrize("M,N,Kd,cfg,hd,rd,rows", [
+    (1, 128, 256, G3(32, 4, 4, 2, 1, 1), 64, 16, False),     # split 1: epilogue in the program's own store
+    (1, 192, 640, G3(64, 2, 4, 2, 4, 0), 96, 32, False),     # split 4: epilogue in the last arrival's store
+    (3, 256, 384, G3(32, 4, 8, 3, 3, 1), 128, 64, True),     # 3 rows, each its own position
+])
+@pytest.mark.parametrize("modes", [(0, 0), (1, 1), (2, 2)])
+def test_gemv3_rope_epilogue(K3, M, N, Kd, cfg, hd, rd, rows, modes):
+    """gemv3 with ROPE == gemv3 without it, then the RoPE mirror; == gemv's (t9b_mxfp8_gemv / reduce) RoPE output of
+    the same split; == the CPU path (gemv_torch + rope_rows_torch)."""
+    from runtime.fused_glue import rope_rows_torch
+    from test_fused_glue_r2_cpu import _freqs
+
+    xq, xs, w, s = _ops3(M, N, Kd, seed=70 + N)
+    plain, _, _, _ = _run3(K3, xq, xs, w, s, cfg)
+    if rows:
+        fr = torch.stack([torch.view_as_real(_freqs(rd, 100 + 7 * m)).reshape(-1, 2).float() for m in range(M)])
+        fr = fr.contiguous()
+        want = torch.stack([rope_rows_torch(plain[m], fr[m], hd, rd, modes, inverse=False) for m in range(M)])
+    else:
+        fr = torch.view_as_real(_freqs(rd, 999)).reshape(-1, 2).float().contiguous()
+        want = rope_rows_torch(plain, fr, hd, rd, modes, inverse=False)
+    rope = (fr, hd, rd, modes)
+    rot, _, cnt, _ = _run3(K3, xq, xs, w, s, cfg, rope=rope)
+    assert torch.equal(rot, want) and not cnt.any()
+    v1 = G.GemvConfig(32, 4, 4, 2, cfg.split_k, 1)
+    p1 = K3.launch_plan(v1, M, N, Kd)
+    o1 = torch.full((M, N), float("nan"), dtype=torch.bfloat16)
+    K3._launch(xq, xs, w, s, o1, v1, torch.zeros(p1["NSPLIT"], M, N) if p1["SPLIT"] else o1, rope=rope)
+    assert torch.equal(o1, rot)
+    cpu = G.mxfp8_gemv3(xq, xs, w, s, torch.empty(M, N, dtype=torch.bfloat16), config=cfg, rope=rope)
+    assert torch.equal(cpu, rot)
+
+
+PAIRS3 = [  # (M, NA, NB, K, cfg_a, cfg_b)
+    (1, 96, 64, 320, G3(32, 2, 4, 2, 3, 1), G3(64, 4, 4, 2, 1, 0)),     # ragged a split 3, b unsplit
+    (3, 64, 64, 512, G3(32, 4, 4, 2, 2, 0), G3(32, 2, 4, 2, 4, 1)),     # NA == NB (shared w1 / w3), both split
+    (6, 128, 32, 1024, G3(16, 8, 4, 2, 4, 1), G3(64, 2, 4, 2, 8, 0)),   # b ragged vs a's BLOCK_N, many splits
+]
+
+
+@pytest.mark.parametrize("case", range(len(PAIRS3)))
+def test_gemv3_pair_one_launch_equals_singles(K3, case):
+    M, NA, NB, Kd, ca, cb = PAIRS3[case]
+    xq, xs, wa, sa = _ops3(M, NA, Kd, 10 + case)
+    _, _, wb, sb = _ops3(M, NB, Kd, 20 + case)
+    singles = [K3.gemv_partials(xq, xs, w_, s_, config=c).clone() for w_, s_, c in ((wa, sa, ca), (wb, sb, cb))]
+    n0, n3 = len(K3.t9b6_gemv3_pair.launches), K3.PAIR_STATS["pair3"]
+    pa, pb = K3.gemv_pair(xq, xs, wa, sa, wb, sb, configs=(ca, cb))
+    assert len(K3.t9b6_gemv3_pair.launches) - n0 == 1 and K3.PAIR_STATS["pair3"] - n3 == 1
+    pp = K3.pair_plan3(ca, cb, M, NA, NB, Kd)
+    assert K3.t9b6_gemv3_pair.launches[-1]["grid"] == pp["grid"]
+    for got, single, cfg, w_, s_ in ((pa, singles[0], ca, wa, sa), (pb, singles[1], cb, wb, sb)):
+        assert got.dtype == torch.bfloat16 and not hasattr(got, "nsplit")     # reduced inside: never a SplitK
+        assert torch.equal(got, single) and torch.equal(got, G.gemv_torch(xq, xs, w_, s_, split_k=cfg.split_k))
+    pc = [t for k, t in K3._COUNTERS.items() if k[2].startswith("v3pair/")]
+    assert pc and all(not t.any() for t in pc)
+
+
+def test_gemv3_dispatch_impl_selection(K3, monkeypatch, _impl_reset):
+    """$DSV41_GEMV_IMPL / set_impl route mxfp8_gemv, gemv_partials and gemv_pair to gemv3 (one t9b6 launch, bf16
+    results, no reduce launch); an explicit GemvConfig / Gemv3Config wins; a bad name raises; the CPU path (no shim)
+    computes the same numbers under either impl."""
+    M, N, Kd = 2, 64, 512
+    xq, xs, w, s = _ops3(M, N, Kd, seed=9)
+    monkeypatch.delenv("DSV41_GEMV_IMPL", raising=False)
+    assert G.gemv_impl() == "gemv" and G.describe()["impl"] == "gemv"
+    monkeypatch.setenv("DSV41_GEMV_IMPL", "gemv3")
+    assert G.gemv_impl() == "gemv3" and G.describe()["impl"] == "gemv3"
+    G.set_impl("gemv")
+    assert G.gemv_impl() == "gemv"                    # set_impl wins over the environment
+    G.set_impl(None)
+    monkeypatch.setenv("DSV41_GEMV_IMPL", "gemv4")
+    with pytest.raises(ValueError):
+        G.gemv_impl()
+    with pytest.raises(ValueError):
+        G.set_impl("gemv4")
+    monkeypatch.setenv("DSV41_GEMV_IMPL", "gemv3")
+    # the CPU torch path: identical numbers under both impls (the Mac emulated StaticStep tests rely on it)
+    a = G.mxfp8_gemv(xq, xs, w, s, torch.empty(M, N, dtype=torch.bfloat16))
+    monkeypatch.setenv("DSV41_GEMV_IMPL", "gemv")
+    assert torch.equal(a, G.mxfp8_gemv(xq, xs, w, s, torch.empty(M, N, dtype=torch.bfloat16)))
+    # the shim (kernels on CPU): gemv3 launches, not gemv's
+    monkeypatch.setenv("DSV41_GEMV_IMPL", "gemv3")
+    monkeypatch.setattr(K3, "CPU_SPLIT_K", 4)         # config None on CPU -> DEFAULT_CONFIG3 with this split
+    c3, c1, cr = (len(K3.t9b6_gemv3.launches), len(K3.t9b_mxfp8_gemv.launches),
+                  len(K3.t9b_splitk_reduce.launches))
+    y = K3.mxfp8_gemv(xq, xs, w, s, torch.empty(M, N, dtype=torch.bfloat16))
+    r = K3.gemv_partials(xq, xs, w, s)
+    assert not hasattr(r, "nsplit") and r.dtype == torch.bfloat16 and K3.materialize(r) is r
+    assert (len(K3.t9b6_gemv3.launches) - c3, len(K3.t9b_mxfp8_gemv.launches) - c1,
+            len(K3.t9b_splitk_reduce.launches) - cr) == (2, 0, 0)
+    want = G.gemv_torch(xq, xs, w, s, split_k=4)
+    assert torch.equal(y, want) and torch.equal(r, want)
+    assert K3.t9b6_gemv3.launches[-1]["grid"][1] == 4
+    # an explicit config decides regardless of the impl (a GemvConfig: gemv's CPU path, no gemv3 launch)
+    z = K3.mxfp8_gemv(xq, xs, w, s, torch.empty(M, N, dtype=torch.bfloat16), config=G.GemvConfig(32, 4, 4, 2, 4, 1))
+    assert torch.equal(z, want) and len(K3.t9b6_gemv3.launches) - c3 == 2
+    monkeypatch.setenv("DSV41_GEMV_IMPL", "gemv")
+    K3.mxfp8_gemv(xq, xs, w, s, torch.empty(M, N, dtype=torch.bfloat16), config=G3(32, 4, 4, 2, 4, 1))
+    assert len(K3.t9b6_gemv3.launches) - c3 == 3
+    assert not hasattr(K3.gemv_partials(xq, xs, w, s, config=G3(32, 4, 4, 2, 4, 1)), "nsplit")
+    assert hasattr(K3.gemv_partials(xq, xs, w, s, tag="t9b6-v1"), "nsplit")   # gemv: partials left for the consumer
+
+
+def test_gemv3_configs_per_shape_cache_versioned(tmp_path, monkeypatch):
+    """One config per (N, K) for every M (no M in the key); the cache file is gemv3's own (derived from
+    $DSV41_GEMV_CACHE, never that file), keys carry the version, a file of another version is ignored, gemv's
+    loader ignores gemv3 keys should both share a file; tuning off -> DEFAULT_CONFIG3 with its split resolved."""
+    G.reset_configs()
+    base = str(tmp_path / "gemv-tune.json")
+    monkeypatch.setenv("DSV41_GEMV_CACHE", base)
+    monkeypatch.delenv("DSV41_GEMV3_CACHE", raising=False)
+    monkeypatch.setenv("DSV41_GEMV_TUNE", "0")
+    try:
+        assert G.cache3_path() == str(tmp_path / "gemv-tune.gemv3.json") != G.cache_path()
+        d = G.get_config3(1280, 5120)
+        assert d == G.resolve_config3(G.DEFAULT_CONFIG3, 1280, 5120, G.num_sms()) and d.split_k >= 1
+        c = G3(32, 8, 4, 3, 10, 1)
+        G.set_config3(2304, 5120, c)
+        assert G.get_config3(2304, 5120) == c
+        assert G.save_cache3() == G.cache3_path()
+        data = json.load(open(G.cache3_path()))
+        assert data["impl"] == "gemv3" and data["version"] == G.GEMV3_VERSION == 3
+        assert data["configs"]["v3:2304x5120"] == c.as_dict()
+        assert not os.path.exists(base)                                   # gemv's file untouched
+        G.reset_configs()
+        assert G.load_cache3() == 2 and G.get_config3(2304, 5120) == c     # back from the file
+        d3 = G.describe()["gemv3"]
+        assert d3["configs"]["v3:2304x5120"]["numerics_key"] == [16, 10]
+        assert d3["configs"]["v3:2304x5120"]["bytes_per_thread"] == 32 * 8 * 32 // (32 * 4)
+        # another version's file: ignored as a whole
+        data["version"] = 2
+        json.dump(data, open(G.cache3_path(), "w"))
+        G.reset_configs()
+        assert G.load_cache3() == 0 and G.describe()["gemv3"]["cache_ignored"]
+        # gemv3 keys in gemv's own file (someone pointed both at one path): gemv's loader skips them
+        json.dump({"configs": {"v3:2304x5120": c.as_dict(),
+                               "512x5120/m1": G.GemvConfig(32, 2, 4, 4, 19, 1).as_dict()}}, open(base, "w"))
+        G.reset_configs()
+        assert G.load_cache() == 1 and "v3:2304x5120" in G.describe()["cache_ignored"]
+        monkeypatch.setenv("DSV41_GEMV3_CACHE", str(tmp_path / "own.json"))
+        assert G.cache3_path() == str(tmp_path / "own.json")
+    finally:
+        G.reset_configs()
+
+
+def test_gemv3_splits_candidates_and_plan():
+    sms = 152
+    assert G.even_splits(160, 8) == [1, 2, 4, 5, 10, 20] and G.even_splits(40, 8) == [1, 5]
+    assert G.even_splits(9, 8) == [] and G.even_splits(72, 8) == [1, 3, 9]
+    for KB in (40, 72, 160, 192, 256):
+        for kt in (4, 8, 16):
+            for ns in G.even_splits(KB, kt):
+                per, n2 = G.split_plan(KB, ns)
+                assert n2 == ns and per * ns == KB and per % kt == 0
+    # the auto split: the smallest EVEN split giving >= 2 x SMs programs (else the largest EVEN one)
+    assert G.auto_split_k3(1280, 5120, 64, 8, sms) == 20            # 20 tiles: 20 x 20 = 400 >= 304
+    assert G.auto_split_k3(5120, 8192, 64, 8, sms) == 4             # 80 tiles x 4 = 320
+    assert G.auto_split_k3(32768, 1280, 64, 8, sms) == 1 and G.auto_split_k3(25600, 6144, 64, 8, sms) == 1
+    assert G.auto_split_k3(512, 5120, 64, 8, sms) == 20             # 8 tiles: capped at the largest EVEN split
+    assert G.auto_split_k3(7, 288, 16, 8, sms) == 1                 # KB 9: no EVEN split; >= 8 blocks per program
+    for N, K in [(1280, 5120), (2304, 5120), (5120, 8192), (25600, 6144), (32768, 1280), (512, 5120), (4096, 1280),
+                 (5120, 2304)]:
+        cands = G.candidate_configs3(N, K, sms)
+        assert cands and len(set(cands)) == len(cands)
+        for c in cands:
+            G.check_config3(c)
+            p = G.launch_plan3(c, 1, N, K)
+            assert c.split_k >= 1 and p["tile_bytes"] * c.num_stages <= G.TUNE3_SMEM_CAP
+            assert p["bytes_per_thread"] >= G.TUNE3_MIN_BYTES_PER_THREAD and not (c.wide and c.kt > 8)
+        assert {c.wide for c in cands} == {0, 1} and {4, 8, 16} <= {c.kt for c in cands}
+        assert any(G.launch_plan3(c, 1, N, K)["EVEN"] for c in cands)
+    with pytest.raises(ValueError):
+        G.check_config3(G3(24, 8, 4, 2, 1, 0))
+    with pytest.raises(ValueError):
+        G.check_config3(G3(32, 16, 4, 2, 1, 1))                    # wide needs kt <= 8
+    with pytest.raises(ValueError):
+        G.launch_plan3(G3(32, 8, 4, 2, 0, 0), 1, 64, 256)           # unresolved split
+    p = G.launch_plan3(G.resolve_config3(G.DEFAULT_CONFIG3, 1280, 5120, sms), 6, 1280, 5120)
+    assert (p["grid"], p["PER"], p["EVEN"], p["BLOCK_M"], p["launches"]) == ((20, 20), 8, True, 16, 1)
+    # PER 8 == KT 8: one loop iteration per program, so exactly one 16 KB tile in flight per program (stages cannot
+    # prefetch a second); 400 programs -> 6.4 MB requested GPU-wide at once (the whole 6.6 MB weight)
+    assert p["tile_bytes"] == 64 * 8 * 32 and p["bytes_per_thread"] == 128 and p["iters"] == 1
+    assert p["inflight_bytes"] == 16384 and p["programs"] == 400 and p["grid_inflight_bytes"] == 400 * 16384
+    p2 = G.launch_plan3(G.resolve_config3(G.DEFAULT_CONFIG3, 5120, 8192, sms), 1, 5120, 8192)
+    assert (p2["PER"], p2["iters"], p2["inflight_bytes"]) == (64, 8, 2 * 16384)      # 3 stages: 2 tiles ahead
+    assert G.TUNE3_MIN_BYTES_PER_THREAD >= 128                                         # the handoff's wide-load floor
+    # the plan never depends on M: one config, one binary, one split for M = 1..8
+    c = G.resolve_config3(G.DEFAULT_CONFIG3, 2304, 5120, sms)
+    assert len({tuple(sorted((k, str(v)) for k, v in G.launch_plan3(c, m, 2304, 5120).items()))
+                for m in range(1, 9)}) == 1
+    monkey_quick = os.environ.get("DSV41_GEMV_TUNE_SPACE")
+    os.environ["DSV41_GEMV_TUNE_SPACE"] = "quick"
+    try:
+        q = G.candidate_configs3(1280, 5120, sms)
+        assert 1 <= len(q) <= 8 and {c.wide for c in q} == {0, 1}
+        assert G.candidate_configs3(16, 64, sms)                     # tiny shapes still get a candidate
+    finally:
+        if monkey_quick is None:
+            os.environ.pop("DSV41_GEMV_TUNE_SPACE", None)
+        else:
+            os.environ["DSV41_GEMV_TUNE_SPACE"] = monkey_quick
+
+
+def test_gemv3_counters_static_and_zero():
+    a = G.counters("cpu", 7, "t9b6-test")
+    assert a.dtype == torch.int32 and a.shape == (7,) and not a.any()
+    assert G.counters("cpu", 7, "t9b6-test") is a and G.counters("cpu", 7, "other") is not a
+
+
+def test_gemv3_kernel_source_contract(K3):
+    """The jit entry points are the shim's / Triton's jit objects, M is excluded from specialization on real Triton
+    (the wrapper), and the block body is gemv's MMA=1 arithmetic (same expressions as _t9b4_gemv_tile)."""
+    import inspect
+
+    blk = inspect.getsource(K3._t9b6_block.fn)
+    v1 = inspect.getsource(K3._t9b4_gemv_tile.fn)
+    for expr in ("sbf = _t9b_pow2(tl.load(s_rows + kbc).to(tl.int32))", "saf = _t9b_pow2(tl.load(xs_rows + kbc)"
+                 ".to(tl.int32))", "q = part * (saf[:, None] * sbf[None, :])", "tl.where(kb < kb_hi, acc + q, acc)"):
+        assert expr in blk and expr in v1, expr
+    assert "tl.dot(xt, wtT)" in blk and "tl.dot(xt, tl.trans(wt))" in v1
+    assert 'do_not_specialize=["M"]' in inspect.getsource(K3._jit_m_free)
+    tile = inspect.getsource(K3._t9b6_tile.fn)
+    assert tile.count("tl.atomic_add(") == 1 and "atomic_add(cnt + cnt_idx, 1)" in tile
+
+
+def test_bench_gates3():
+    """bench/gemv_bench.py's T9b-6 gates: >= 3 TB/s or <= 4 µs at every measured M; rows / replay / same-plan
+    bit-identity; oracle <= gemv's within ORACLE3_TOL; per-step M=1 total <= 2.0 ms; all_pass only if none is False
+    and the speed / step gates were measured; per-step totals for both impls and the saving."""
+    mod = _bench_module()
+
+    def r3(us, gbps, rows=True, rep=True, ratio=1.0, same=True, mism=1e-4):
+        return {"us": us, "GBps": gbps, "row_invariant": rows, "replay_identical": rep, "err_ratio_vs_gemv": ratio,
+                "bitident_same_plan": same, "mismatch": mism}
+
+    def rec(N, K, calls, m1, m6, us1=None, us6=None):
+        r = {"shape": [N, K], "calls_per_step": calls, "per_m3": {1: m1, 6: m6}, "per_m": {}}
+        if us1 is not None:
+            r["per_m"] = {1: {"us_gemv": us1}, 6: {"us_gemv": us6}}
+        r["gates3"] = mod.shape_gates3(N, K, r["per_m3"])
+        return r
+
+    big = rec(5120, 8192, 40, r3(12.0, 3500.0, rows=None), r3(12.5, 3360.0), 19.4, 20.06)
+    small = rec(1280, 5120, 40, r3(3.9, 1700.0, rows=None, ratio=None), r3(3.95, 1690.0, ratio=1.004), 9.13, 9.04)
+    g = big["gates3"]
+    assert g["fast_ge_3TBps_or_le_4us"] and g["row_invariant"] and g["oracle_le_gemv"] and g["replay_identical"]
+    assert small["gates3"]["fast_ge_3TBps_or_le_4us"] is True and small["gates3"]["oracle_le_gemv"] is True
+    st = mod.step_totals3([big, small], [1, 6])
+    assert st["ms_gemv3_m1"] == round((40 * 12.0 + 40 * 3.9) / 1e3, 3) and st["ms_gemv_m1"] == round(
+        (40 * 19.4 + 40 * 9.13) / 1e3, 3)
+    assert st["saved_ms_m6"] == round(st["ms_gemv_m6"] - st["ms_gemv3_m6"], 3) and st["target_ms_gemv3_m1"] == 2.0
+    ok = mod.overall_gates3([big, small], st)
+    assert ok["all_pass"] and not ok["failing"] and ok["step_le_2ms_m1"] is True
+    for bad, name in [(rec(1280, 5120, 40, r3(4.2, 1600.0), r3(3.9, 1700.0)), "fast_ge_3TBps_or_le_4us"),
+                      (rec(1280, 5120, 40, r3(3.9, 1700.0), r3(3.9, 1700.0, rows=False)), "row_invariant"),
+                      (rec(1280, 5120, 40, r3(3.9, 1700.0), r3(3.9, 1700.0, ratio=1.006)), "oracle_le_gemv"),
+                      (rec(1280, 5120, 40, r3(3.9, 1700.0, rep=False), r3(3.9, 1700.0)), "replay_identical"),
+                      (rec(1280, 5120, 40, r3(3.9, 1700.0), r3(3.9, 1700.0, same=False)), "bitident_gemv_same_plan"),
+                      (rec(1280, 5120, 40, r3(3.9, 1700.0, mism=6e-3), r3(3.9, 1700.0)), "mismatch_le_0p5pct")]:
+        out = mod.overall_gates3([big, bad], mod.step_totals3([big, bad], [1, 6]))
+        assert not out["all_pass"] and out["failing"] == {name: [[1280, 5120]]}, (name, out)
+    slow = mod.step_totals3([rec(5120, 8192, 290, r3(7.0, 6000.0), r3(7.0, 6000.0))], [1, 6])
+    assert slow["ms_gemv3_m1"] == 2.03 and mod.overall_gates3([], slow)["step_le_2ms_m1"] is False
+    assert mod.overall_gates3([], {})["all_pass"] is False                 # nothing measured: not a pass
+    assert "ms_gemv_m1" not in mod.step_totals3([rec(1280, 5120, 40, r3(3.9, 1700.0), r3(3.9, 1700.0))], [1])
+
+
+def test_first_light_report_names_gemv3(tmp_path, monkeypatch, _impl_reset):
+    """The box selects gemv3 as `DSV41_GEMV_IMPL=gemv3` + `--fp8-impl gemv` (bench/first_light.py's --fp8-impl choices
+    and every `fp8_impl == "gemv"` route stay as they are): the first-light report's fp8_gemv section then names the
+    kernel path that ran ("gemv3") and carries gemv3's versioned config table."""
+    fl = _first_light()
+    monkeypatch.setenv("DSV41_GEMV_IMPL", "gemv3")
+    a = fl.build_parser().parse_args(["--model-dir", "x", "--mode", "graph", "--moe-impl", "dg-masked", "--fp8-impl",
+                                      "gemv", "--fixture", FIXTURE, "--only", "prose", "--reps", "1", "--max-new",
+                                      "4", "--out", str(tmp_path / "c.jsonl"), "--json", str(tmp_path / "r.json")])
+    gen = _gen(mode="graph", moe_impl=a.moe_impl, fp8_impl=a.fp8_impl)
+    report = {"date": "d", "env": {"device": None}, "errors": [], "generator": {"mode": "graph"}}
+    fl.measure(gen, a, report, n_layers=2, out=a.out, json_path=a.json, fixture2=None)
+    assert report["generator"]["fp8_impl"] == "gemv"
+    assert report["fp8_gemv"]["impl"] == "gemv3" and report["fp8_gemv"]["gemv3"]["version"] == G.GEMV3_VERSION
