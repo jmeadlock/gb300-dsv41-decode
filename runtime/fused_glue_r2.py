@@ -49,6 +49,13 @@ m2_router_plan: softplus, sqrt, +bias, torch.topk's CUDA result incl. its tie or
 at build against this cluster's own path; default `fused` = the router cluster below, unchanged.
 T9b-5 (docs/HANDOFF-T9B5-FP32-FIXED.md; section "T9b-5: fixed fp32" below): $DSV41_FP32_IMPL=fixed puts the mHC mixes'
 and the head's fp32 F.linear on runtime/static_kernels.py's fixed-order kernels (row-invariant); default cublas.
+T9b-7 (docs/HANDOFF-T9B7-GLUE-ORDER.md; section "T9b-7: one order per shape" below): every cluster's reduction order
+is a function of the reduction's SHAPE only, never of the step's row count R ($DSV41_GLUE_ORDER, default `shape`).
+The orders are picked once at the 1-row reference shapes (what the 1-row build picks, so that build is unchanged) and
+the R-row kernels reduce each row alone in that order; at R > 1 the self-checks compare against the reference glue
+evaluated one row at a time (`per_row_reductions`: torch's sum / mean of each [1, 1, ...] row slice, the 1-row step's
+call). Invariant: 1-row output byte-identical to the pre-T9b-7 1-row step; R-row output equal per row to the 1-row
+output. `rows` = the pre-T9b-7 behaviour (orders calibrated at the R-row reference shapes), kept for A/B.
 CPU (the Mac tests, the census): the wrappers run torch mirrors; with no device to calibrate on, the statistics run
 torch's own op (order "native"), so the CPU step is bit-identical by construction; the explicit-order mirrors and the
 Triton bodies (under tests/triton_shim.py) are tested against each other and against the family's definition.
@@ -131,6 +138,86 @@ _ORDER_CACHE: Dict[tuple, dict] = {}   # pick_order results per (device, kind, w
 def _kern(t: torch.Tensor) -> bool:
     return t.is_cuda or (KERNELS_ON_CPU and HAVE_TRITON)
 
+
+# ------------------------------------------------------------------------------------------------ T9b-7: one order per shape
+# docs/HANDOFF-T9B7-GLUE-ORDER.md. torch's CUDA reduce picks its thread layout from the number of OUTPUTS as well as
+# the reduced width (Reduce.cuh set_block_dimension; predicted_order's `rows`), so "torch's order" for a per-token
+# statistic differs between the 1-row step ([1, 1, w]: one output) and the R-row step ([1, R, w]: R outputs) -- the box
+# found it for norm_D, mix, q, engram and engram_sum (docs/headline-20261107e.json rowmatch.glue_orders_differ), and
+# mix's R-row order is not even in the family (mix_stat off at 6 rows). The fused kernels reduce each row in ONE
+# program, so a kernel's per-row result depends only on its order constexprs: give the R-row build the 1-row build's
+# orders and its rows equal the 1-row step's, bit for bit (the T12-FIX2 pattern, docs/loop-gpu-test-r3-20261107.log).
+#   shape (default): pick_order at the 1-row reference shape (rows 1; Engram: hc_mult rows, the 1-row call's
+#                    [1, 1, hc, D]) for every R; at R > 1 the self-checks' oracle is the reference glue with each
+#                    torch sum / mean of a [1, R, ...] tensor evaluated on each [1, 1, ...] row slice
+#                    (per_row_reductions) -- i.e. "the 1-row reference, row by row".
+#   rows:            the pre-T9b-7 protocol (orders of the R-row reference shapes, oracle = the reference at R rows).
+GLUE_ORDER_ENV = "DSV41_GLUE_ORDER"
+GLUE_ORDERS = ("shape", "rows")
+GLUE_ORDER_DEFAULT = "shape"
+
+
+def glue_order() -> str:
+    v = os.environ.get(GLUE_ORDER_ENV, GLUE_ORDER_DEFAULT) or GLUE_ORDER_DEFAULT
+    if v not in GLUE_ORDERS:
+        raise ValueError(f"{GLUE_ORDER_ENV}={v!r} not in {GLUE_ORDERS}")
+    return v
+
+
+def cal_rows(policy: str, rows: int) -> int:
+    """The row count a cluster's order is calibrated at: 1 (shape) or the step's R (rows). Multiply by the rows one
+    reference call reduces together per token (Engram: hc_mult)."""
+    return 1 if policy == "shape" else max(1, int(rows))
+
+
+_RED_OWNERS = ((torch.Tensor, "sum"), (torch.Tensor, "mean"), (torch, "sum"), (torch, "mean"))
+
+
+def _reduced_dims(x: torch.Tensor, args, kw):
+    dim = args[0] if args else kw.get("dim")
+    ds = tuple(dim) if isinstance(dim, (tuple, list)) else (() if dim is None else (dim,))
+    if not ds or not all(isinstance(d, int) and not isinstance(d, bool) for d in ds):
+        return None
+    return tuple(int(d) % x.dim() for d in ds)
+
+
+def _per_row_reduce(orig, two_d: bool):
+    """sum / mean wrapper. x float [1, s > 1, ...] reduced over dims >= 2 only -> orig on each fresh [1, 1, ...] slice
+    (the 1-row call's shape, a fresh aligned allocation), concatenated on dim 1. two_d: also x float [n > 1, K]
+    reduced over dim 1 -> orig on each [1, K] row (Gate.forward's [R, k] weight sum). Anything else: orig."""
+    def f(x, *args, **kw):
+        if isinstance(x, torch.Tensor) and x.is_floating_point() and "out" not in kw:
+            ds = _reduced_dims(x, args, kw) if x.dim() >= 2 else None
+            if ds is not None:
+                if x.dim() >= 3 and x.size(0) == 1 and x.size(1) > 1 and min(ds) >= 2:
+                    return torch.cat([orig(x[:, i:i + 1].clone(), *args, **kw) for i in range(x.size(1))], 1)
+                if two_d and x.dim() == 2 and x.size(0) > 1 and ds == (1,):
+                    return torch.cat([orig(x[i:i + 1].clone(), *args, **kw) for i in range(x.size(0))], 0)
+        return orig(x, *args, **kw)
+
+    return f
+
+
+@contextlib.contextmanager
+def per_row_reductions(enabled: bool = True, two_d: bool = False):
+    """T9b-7's R-row oracle: torch.sum / torch.mean / Tensor.sum / Tensor.mean evaluated per token row while open
+    (_per_row_reduce; process-global, restored on exit; nests). F.linear, einsum and every kernel are untouched: the
+    fp32 GEMM sites follow $DSV41_FP32_IMPL at the R-row call shape, as the fused path runs them."""
+    if not enabled:
+        yield
+        return
+    saved = []
+    for owner, name in _RED_OWNERS:
+        saved.append((owner, name, name in vars(owner), getattr(owner, name)))
+        setattr(owner, name, _per_row_reduce(getattr(owner, name), two_d))
+    try:
+        yield
+    finally:
+        for owner, name, own, fn in reversed(saved):
+            if own:
+                setattr(owner, name, fn)
+            else:
+                delattr(owner, name)   # inherited (torch.Tensor.sum lives on torch._C.TensorBase)
 
 # ------------------------------------------------------------------------------------------------ reduction orders
 def last_pow2(n: int) -> int:
@@ -224,19 +311,26 @@ def mean_finish(ssum: torch.Tensor, w: int, fin: str) -> torch.Tensor:
     return ssum * fac_of(w)
 
 
+def _native(x: torch.Tensor, fn) -> torch.Tensor:
+    """torch's own reduction `fn` on the reference call's shape x (the CPU mirror); T9b-7 `shape` policy: on each
+    token row of an R-row shape alone (per_row_reductions -- the 1-row call), so the mirror's order is the shape's."""
+    with per_row_reductions(glue_order() == "shape", two_d=True):
+        return fn(x)
+
+
 def sqmean_torch(v: torch.Tensor, w: int, ordd: dict, shape=None) -> torch.Tensor:
     """mean(v^2) over the last dim of fp32 v [N, w] in the picked order; NATIVE = torch's op on `shape` (the
     reference call's shape, so its launch configuration is the reference's)."""
     if ordd["order"] == NATIVE:
         x = v.reshape(shape) if shape is not None else v
-        return x.square().mean(-1).reshape(-1)
+        return _native(x, lambda t: t.square().mean(-1)).reshape(-1)
     return mean_finish(order_sum_torch(v * v, ordd["order"]), w, ordd["fin"])
 
 
 def sum_torch(v: torch.Tensor, ordd: dict, shape=None) -> torch.Tensor:
     if ordd["order"] == NATIVE:
         x = v.reshape(shape) if shape is not None else v
-        return x.sum(-1).reshape(-1)
+        return _native(x, lambda t: t.sum(-1)).reshape(-1)
     return order_sum_torch(v, ordd["order"])
 
 
@@ -1374,6 +1468,10 @@ class R2Glue:
         self._ffn_ctx: Optional[dict] = None
         self.gate_w: Dict[int, torch.Tensor] = {}
         self.engram_wp: Dict[int, torch.Tensor] = {}
+        # T9b-7: the order policy of THIS build (fixed at build: an env change later does not mix policies) and the
+        # row count every order is calibrated at (1 under `shape`, whatever R this step runs)
+        self.order_policy = glue_order()
+        self.cal_rows = cal_rows(self.order_policy, getattr(self, "rows", 1))
         o = self.o
         if self.on("router"):
             for sm in o.moes:
@@ -1407,7 +1505,7 @@ class R2Glue:
             return {"order": o_, "fin": "mul", "exact": True, "name": order_name(o_, "mul")}
 
         D = l0.attn_norm.dim
-        Rr = self.rows   # M1-T10-PORT: the reference reduces R rows together (its launch configuration's rows)
+        Rr = self.cal_rows   # T9b-7: 1 (shape policy, every R) or (rows policy) the R-row reference's rows
         self.orders.update(norm_D=d(D, Rr), mix=d(self.hc * D, Rr), kv=d(l0.attn.head_dim, Rr),
                            q=d(l0.attn.q_lora_rank, Rr), router=d(l0.ffn.gate.topk, Rr))
         eng = next((l.engram for l in model.layers if l.engram is not None), None)
@@ -1478,6 +1576,11 @@ class R2Glue:
     def _r2_norm(self, key: str) -> dict:
         return self.orders[key]
 
+    def _oracle(self, two_d: bool = False):
+        """T9b-7: the context the self-checks evaluate the REFERENCE ops in -- at R > 1 under the shape policy, torch's
+        per-token sums / means one row at a time (per_row_reductions: the 1-row reference, row by row); else as is."""
+        return per_row_reductions(self.order_policy == "shape" and self.rows > 1, two_d=two_d)
+
     def _set_outcome(self, clusters, rec: dict, what: str) -> None:
         """Record the numerics outcome of the order `rec` for `clusters`: (i) exact keeps them on; (ii) approx turns
         them `approx` (glue_approx) or off."""
@@ -1505,8 +1608,12 @@ class R2Glue:
         l0 = layers[0]
         D = l0.attn_norm.dim
         dev = self.dev
-        Rr = self.rows   # M1-T10-PORT: orders of the R-row reference reductions (each row reduced alike)
+        # T9b-7: the rows each order is picked at -- shape policy: the 1-row reference's (1; Engram hc_mult), the
+        # same picks (and the same cache entries) as the 1-row build, whatever R this step runs; rows policy: the
+        # R-row reference's (the pre-T9b-7 protocol)
+        Rr = self.cal_rows
         r2 = cal.setdefault("r2", {})
+        r2["order_policy"] = {"policy": self.order_policy, "cal_rows": Rr, "step_rows": self.rows}
         if self.on("hc_norm"):
             rec = self.orders["norm_D"] = pick_order(dev, D, Rr, "sqmean")
             self._set_outcome(("hc_norm", "mix_stat"), rec, f"RMSNorm[{D}]")
@@ -1661,12 +1768,13 @@ class R2Glue:
                 x, pre = self._cat_rows(lambda: self._hc_inputs(g, HC, D, i))
                 fn, sc, bs = self._mix_params(layer, side)
                 norm = layer.attn_norm if side == "attn" else layer.ffn_norm
-                if fp32_fixed():   # T9b-5: the oracle adopts the fixed-order mixes (policy W4 4d A)
-                    pr, po, cb = hc_mixes_fixed(R, layer, x, fn, sc, bs)
-                else:
-                    pr, po, cb = layer.hc_mixes(x, fn, sc, bs)
-                y_r = norm(layer.hc_pre(x, pre))
-                q_r, s_r = R.act_quant(y_r, R.fp8_block_size, R.scale_fmt, R.scale_dtype)
+                with self._oracle():   # T9b-7: at R > 1 (shape policy) the 1-row reference, row by row
+                    if fp32_fixed():   # T9b-5: the oracle adopts the fixed-order mixes (policy W4 4d A)
+                        pr, po, cb = hc_mixes_fixed(R, layer, x, fn, sc, bs)
+                    else:
+                        pr, po, cb = layer.hc_mixes(x, fn, sc, bs)
+                    y_r = norm(layer.hc_pre(x, pre))
+                    q_r, s_r = R.act_quant(y_r, R.fp8_block_size, R.scale_fmt, R.scale_dtype)
                 p2, po2, cb2, y, xq = self.mix_pre_norm(layer, x, pre, side)
                 ctx, self._ffn_ctx = self._ffn_ctx, None
                 pairs = [("pre", p2, pr, apm), ("post", po2, po, apm), ("comb", cb2, cb, apm), ("y", y, y_r)]
@@ -1692,12 +1800,13 @@ class R2Glue:
                     out["mismatch"] = max(out.get("mismatch", 0.0), r["mismatch"])
         # the head: hc_pre + model.norm + head (model.py:1273-1274)
         x, pre = self._cat_rows(lambda: self._hc_inputs(g, HC, D, 1))
-        if fp32_fixed():   # T9b-5: the oracle's head in the fixed order
-            ref = head_fixed(model, model.norm(layer.hc_pre(x, pre)), full_logits=Rr > 1)
-        elif Rr > 1:   # the R-row step's head: logits of every row (static_step._head, model.py:1010-1014)
-            ref = model.head(model.norm(layer.hc_pre(x, pre)), full_logits=True)
-        else:
-            ref = model.head(model.norm(layer.hc_pre(x, pre)))
+        with self._oracle():
+            if fp32_fixed():   # T9b-5: the oracle's head in the fixed order
+                ref = head_fixed(model, model.norm(layer.hc_pre(x, pre)), full_logits=Rr > 1)
+            elif Rr > 1:   # the R-row step's head: logits of every row (static_step._head, model.py:1010-1014)
+                ref = model.head(model.norm(layer.hc_pre(x, pre)), full_logits=True)
+            else:
+                ref = model.head(model.norm(layer.hc_pre(x, pre)))
         got = self.head(layer, x, pre)
         r = self._cmp([("head logits", got, ref)], apn)
         if r.get("why"):
@@ -1713,8 +1822,9 @@ class R2Glue:
         ap = self.status.get("q_path") == "approx"
         for _ in range(4):
             qa = self._cat_rows(lambda: self._stream(g, 1, QL, -4, 6).view(1, 1, QL)).to(self.dev)
-            qr_r = attn.q_norm(qa)
-            q_r, s_r = R.act_quant(qr_r, R.fp8_block_size, R.scale_fmt, R.scale_dtype)
+            with self._oracle():
+                qr_r = attn.q_norm(qa)
+                q_r, s_r = R.act_quant(qr_r, R.fp8_block_size, R.scale_fmt, R.scale_dtype)
             qr, (q, s) = self._q_norm_quant(attn, qa)
             r = self._cmp([("qr", qr, qr_r), ("q", q, q_r), ("s", s, s_r)], ap)
             if r:
@@ -1732,9 +1842,10 @@ class R2Glue:
             kvr = self._cat_rows(lambda: self._stream(g, 1, HD, -4, 6).view(1, 1, HD)).to(self.dev)
             pos = int(torch.randint(1, max(2, S - Rr + 1), (1,), generator=g, device="cpu"))
             f = attn.freqs_cis[pos:pos + Rr]
-            kv = attn.kv_norm(kvr)
-            R.apply_rotary_emb(kv[..., -rd:], f)
-            R.act_quant(kv, R.fp8_block_size, R.scale_fmt, R.scale_dtype, True)
+            with self._oracle():
+                kv = attn.kv_norm(kvr)
+                R.apply_rotary_emb(kv[..., -rd:], f)
+                R.act_quant(kv, R.fp8_block_size, R.scale_fmt, R.scale_dtype, True)
             ring = torch.zeros(1, win, HD, dtype=torch.bfloat16, device=self.dev)
             slot = torch.remainder(torch.arange(pos, pos + Rr, dtype=torch.long), win).to(self.dev)
             self._kv_norm_write(attn, kvr, f, ring, slot)
@@ -1767,7 +1878,8 @@ class R2Glue:
                 x = torch.cat([d_[0] for d_ in draws], 0).to(self.dev)
                 sc = torch.stack([d_[1] for d_ in draws]) if Rr > 1 else draws[0][1]
                 bias = draws[0][2]
-                w_r, i_r = gate(x, None)
+                with self._oracle(two_d=True):   # T9b-7: Gate.forward's [R, k] weight sum one row at a time
+                    w_r, i_r = gate(x, None)
                 ids_r, order = torch.sort(i_r, dim=-1)
                 if Rr > 1:
                     ids, w = self.route_rows(moe, x)
@@ -1781,7 +1893,8 @@ class R2Glue:
                 sc, bias = sc.to(self.dev), bias.to(self.dev)
                 idx = (sc + bias).view(Rr, -1).topk(gate.topk, dim=-1)[1]
                 wt = sc.view(Rr, -1).gather(1, idx)
-                wt /= wt.sum(dim=-1, keepdim=True) + 1e-20
+                with self._oracle(two_d=True):
+                    wt /= wt.sum(dim=-1, keepdim=True) + 1e-20
                 wt *= gate.route_scale
                 ids_r2, order2 = torch.sort(idx, dim=-1)
                 ids2 = torch.empty_like(ids_r2)
@@ -1810,7 +1923,8 @@ class R2Glue:
             stub = SimpleNamespace(wkv=lambda _x, kv=kv: kv, embed=lambda _h: torch.zeros(1, 1, 1, 1),
                                    hc_mult=HC, dim=D, q_weight=eng.q_weight, k_weight=eng.k_weight, eps=eng.eps,
                                    clamp_value=eng.clamp_value)
-            ref = R.Engram.forward(stub, x, None, None)
+            with self._oracle():   # [1, R, HC, D]: each row's mean / sum over [1, 1, HC, D], the 1-row call
+                ref = R.Engram.forward(stub, x, None, None)
             got = self._engram_from_kv(eng, x, kv)
             r = self._cmp([("engram out", got, ref)], ap)
             if r:
@@ -1902,7 +2016,8 @@ class R2Glue:
                        mix_eps=layer.norm_eps, q=q.view(-1) if one else q.view(T_, D),
                        s=s.view(-1) if one else s.view(T_, D // BLOCK), dq=dq, ds=ds, split=self.on("hc_split"))
         if mrs is None:   # mix_stat off: the reference statistic, on the same fp32 values (one launch fewer: .float())
-            mrs = torch.rsqrt(xf.square().mean(-1, keepdim=True) + layer.norm_eps)
+            with self._oracle():   # T9b-7: at R > 1 (shape policy) each row's statistic as the 1-row step's
+                mrs = torch.rsqrt(xf.square().mean(-1, keepdim=True) + layer.norm_eps)
         pre, post, comb = self.mix_tail(layer, xf, mrs, side, x=x if x.dtype == torch.bfloat16 else None)
         if side == "ffn":
             self._ffn_ctx = {"ptr": y.data_ptr(), "xf": yf, "q": q, "s": s, "dg": dg}
@@ -2347,7 +2462,10 @@ class R2Glue:
         dev = self.dev
         D, I = b.dim, b.inter
         heads = torch.arange(P, device="cpu") * b.align           # the GEMM probe's rows (one per block / group)
-        for arow_c in (torch.randperm(M, generator=g, device="cpu")[:P], heads[torch.randperm(P, generator=g)]):
+        # T9b-7: every host draw on the CPU generator AND device (the runtime's default device is cuda: a bare
+        # randperm(generator=cpu) raised "Expected a 'cuda' device type for generator", dg_sf_pack off at 6 rows)
+        for arow_c in (torch.randperm(M, generator=g, device="cpu")[:P],
+                       heads[torch.randperm(P, generator=g, device="cpu")]):
             arow = arow_c.to(dev)
             prow = torch.randint(0, Rr, (P,), generator=g, device="cpu").to(dev)
             x = _rand_act(g, Rr, D).to(dev)
@@ -2395,6 +2513,8 @@ class R2Glue:
     def describe_r2(self) -> dict:
         return {"approx": self.approx, "numerics": _jsonable(self.numerics),
                 "orders": {k: v.get("name") for k, v in self.orders.items()}, "hc_pre_mode": self.hc_pre_mode,
+                "order_policy": {"policy": getattr(self, "order_policy", None), "env": GLUE_ORDER_ENV,
+                                 "cal_rows": getattr(self, "cal_rows", None), "step_rows": getattr(self, "rows", 1)},
                 "bytes": dict(getattr(self, "r2_bytes", {})), "indexer_score": INDEXER_SCORE_WHY,
                 "outcome": {c: self.numerics.get(c, {}).get("outcome") for c in R2_CLUSTERS if self.on(c)},
                 "fp32": describe_fp32(), "router_impl": self._describe_router_impl()}
@@ -2414,3 +2534,435 @@ def _jsonable(v):
     if isinstance(v, (list, tuple)):
         return [_jsonable(x) for x in v]
     return v
+
+
+# ------------------------------------------------------------------------------------------------ T9b-7 census
+GLUE_CENSUS_FAMILY = "fused glue"
+# clusters with no per-row arithmetic of their own, or no 1-row counterpart (recorded n/a with the reason)
+GLUE_CENSUS_NA = {
+    "dedup": "R-row only (no 1-row counterpart): a permutation of the routes, == dedup_routes by its self-check; the "
+             "step-level row covers the R-row MoE end to end",
+    "gather": "data movement only (pointer-table copies, no arithmetic)",
+    "concat_free": "not implemented (fused_glue.CONCAT_FREE_WHY)",
+}
+
+
+def _cmp_named(full: Dict[str, torch.Tensor], parts: Dict[str, List[torch.Tensor]]) -> Tuple[dict, str]:
+    """row_census.compare per named output -> (the worst record with equal = all equal, 'name = / !=' note)."""
+    from runtime.row_census import compare
+
+    res = {k: compare(full[k], parts[k]) for k in full}
+    worst = dict(max(res.values(), key=lambda r: (not r["equal"], r.get("max_ulp", 0) or 0)))
+    worst["equal"] = all(r["equal"] for r in res.values())
+    return worst, ", ".join(f"{k} {'=' if r['equal'] else '!='}" for k, r in res.items())
+
+
+def glue_row_census(g1, gR, seed: int = 0) -> List[dict]:
+    """T9b-7 (docs/HANDOFF-T9B7-GLUE-ORDER.md item 3): per fused-glue cluster, the R-row build's call-site operation on
+    R random token rows vs the 1-row build's operation on each row alone, bitwise -> runtime/row_census.py records
+    (family "fused glue <cluster>", so census_table lists each cluster as row-invariant or not). g1 / gR: FusedGlue of
+    a 1-row and an R-row StaticStep of the same model (same impls). First record: the two builds' orders and modes.
+    A cluster off in either build is recorded n/a with its status. The cuBLAS fp32 sites inside a cluster (the mixes'
+    and the head's mm under $DSV41_FP32_IMPL=cublas, the gate's mm) and the GEMV's per-M config ($DSV41_GEMV_PIN_M1)
+    are the step's, not the glue's: run with --fp32-impl fixed and the M=1 config pinned to isolate the glue. Eager;
+    syncs; mutates the builds' scratch / DeepGEMM input buffers (rewritten by the next step); never fatal."""
+    from runtime import fused_glue as FG
+    from runtime.row_census import PIN_ENV
+
+    R_ = int(gR.rows)
+    o1, oR = g1.o, gR.o
+    model = oR.model
+    dev = gR.dev
+    L0 = model.layers[0]
+    attn, ex = L0.attn, L0.ffn.shared_experts
+    HC, D = gR.hc, L0.attn_norm.dim
+    g = torch.Generator(device="cpu").manual_seed(20261109 + seed)
+    out: List[dict] = []
+
+    def rec(c, op, shape, fn):
+        r = {"family": f"{GLUE_CENSUS_FAMILY} {c}", "op": op, "shape": shape, "equal": None, "note": ""}
+        why = None
+        if c in GLUE_CENSUS_NA:
+            why = GLUE_CENSUS_NA[c]
+        elif c != "orders" and not (g1.on(c) and gR.on(c)):
+            why = f"1-row {g1.status.get(c)!s} / {R_}-row {gR.status.get(c)!s}"
+        if why is not None:
+            r["note"] = f"n/a: {why}"
+            out.append(r)
+            return r
+        try:
+            with torch.inference_mode():
+                cmp_, note = fn()
+            r.update(cmp_)
+            r["note"] = note
+        except Exception as e:  # recorded, never fatal (the census convention)
+            r["note"] = f"n/a: {type(e).__name__}: {str(e).splitlines()[0][:160] if str(e) else ''}"
+        out.append(r)
+        return r
+
+    def act(rows, K, lo=-6, hi=7):
+        return FG._rand_act(g, rows, K, lo, hi).to(dev)
+
+    # the builds' orders and modes ---------------------------------------------------------------------------------
+    def f_orders():
+        a = {k: v.get("name") for k, v in g1.orders.items()}
+        b = {k: v.get("name") for k, v in gR.orders.items()}
+        m1 = {"hc_pre": g1.hc_pre_mode, "hc_post": g1.hc_mode, "rope_fwd": tuple(g1.rope_fwd),
+              "rope_inv": tuple(g1.rope_inv)}
+        mR = {"hc_pre": gR.hc_pre_mode, "hc_post": gR.hc_mode, "rope_fwd": tuple(gR.rope_fwd),
+              "rope_inv": tuple(gR.rope_inv)}
+        diff = sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k)) + \
+            sorted(k for k in m1 if m1[k] != mR[k])
+        return ({"equal": not diff, "mismatch_pct": None, "max_ulp": None},
+                f"policy {getattr(gR, 'order_policy', None)}; " + (f"differ: {diff}" if diff else f"same: {b}"))
+    rec("orders", "orders + modes, 1-row vs R-row build", f"R={R_}", f_orders)
+
+    # hc_norm (+ mix_stat, hc_split ride in it): both sides --------------------------------------------------------
+    def stream(rows):
+        x = FG._rand_act(g, rows * HC, D).view(1, rows, HC, D).to(dev)
+        pre = (torch.rand(1, rows, HC, generator=g, device="cpu") + 0.1).float().to(dev)
+        return x, pre
+
+    def f_hc_norm():
+        full, parts = {}, {}
+        for side in ("attn", "ffn"):
+            x, pre = stream(R_)
+            pR, poR, cbR, yR, xqR = gR.mix_pre_norm(L0, x, pre, side)
+            ctx = gR._ffn_ctx
+            gR.ffn_done()
+            outs = {"pre": pR, "post": poR, "comb": cbR, "y": yR}
+            if xqR is not None:
+                outs.update(q=xqR[0], s=xqR[1])
+            if ctx is not None:
+                outs.update({f"ffn {k}": ctx[k] for k in ("q", "s", "xf") if ctx.get(k) is not None})
+            for k, v in outs.items():
+                full[f"{side} {k}"] = v.reshape(R_, -1)
+                parts[f"{side} {k}"] = []
+            for r in range(R_):
+                p1, po1, cb1, y1, xq1 = g1.mix_pre_norm(L0, x[:, r:r + 1].contiguous(), pre[:, r:r + 1].contiguous(),
+                                                        side)
+                c1 = g1._ffn_ctx
+                g1.ffn_done()
+                o1_ = {"pre": p1, "post": po1, "comb": cb1, "y": y1}
+                if xq1 is not None:
+                    o1_.update(q=xq1[0], s=xq1[1])
+                if c1 is not None:
+                    o1_.update({f"ffn {k}": c1[k] for k in ("q", "s", "xf") if c1.get(k) is not None})
+                for k in outs:
+                    parts[f"{side} {k}"].append(o1_[k].reshape(1, -1))
+        c, note = _cmp_named(full, parts)
+        _hc.update(full=full, parts=parts)
+        return c, f"mix_stat {gR.status.get('mix_stat')}, hc_split {gR.status.get('hc_split')}, fp32 {fp32_impl()}; " \
+                  + note
+    _hc: dict = {}
+    rec("hc_norm", "mix_pre_norm attn+ffn", f"[1,{R_},{HC},{D}]", f_hc_norm)
+
+    def f_rides(keys):
+        def f():
+            if not _hc:
+                return {"equal": None}, "n/a: the hc_norm probe did not run"
+            ks = [k for k in _hc["full"] if k.split(" ", 1)[1] in keys]
+            c, note = _cmp_named({k: _hc["full"][k] for k in ks}, {k: _hc["parts"][k] for k in ks})
+            return c, "rides in the hc_norm launch (same probe); " + note
+        return f
+    rec("mix_stat", "hc_mixes statistic -> pre/post/comb", f"[1,{R_},{HC * D}]", f_rides(("pre", "post", "comb")))
+    rec("hc_split", "t9b4_hc_norm (split programs)", f"[1,{R_},{HC},{D}]",
+        f_rides(("pre", "post", "comb", "y", "q", "s", "ffn q", "ffn s", "ffn xf")))
+
+    def f_head():
+        x, pre = stream(R_)
+        full = gR.head(L0, x, pre)
+        parts = [g1.head(L0, x[:, r:r + 1].contiguous(), pre[:, r:r + 1].contiguous()) for r in range(R_)]
+        return _cmp_named({"logits": full.reshape(R_, -1)}, {"logits": [p.reshape(1, -1) for p in parts]})
+    rec("hc_norm", "head (hc_pre + norm + head)", f"[1,{R_},{HC},{D}] x V", f_head)
+
+    # q path / kv path --------------------------------------------------------------------------------------------
+    def f_q():
+        QL = attn.q_lora_rank
+        qa = act(R_, QL, -4, 6).view(1, R_, QL)
+        qr, (q, s) = gR._q_norm_quant(attn, qa)
+        full = {"qr": qr.reshape(R_, -1), "q": q.reshape(R_, -1), "s": s.reshape(R_, -1)}
+        parts = {k: [] for k in full}
+        for r in range(R_):
+            qr1, (q1, s1) = g1._q_norm_quant(attn, qa[:, r:r + 1].contiguous())
+            for k, v in (("qr", qr1), ("q", q1), ("s", s1)):
+                parts[k].append(v.reshape(1, -1))
+        return _cmp_named(full, parts)
+    rec("q_path", "q_norm + act_quant", f"[1,{R_},{attn.q_lora_rank}]", f_q)
+
+    def f_kv():
+        HD, win = attn.head_dim, attn.window_size
+        S = attn.freqs_cis.size(0)
+        kvr = act(R_, HD, -4, 6).view(1, R_, HD)
+        pos = int(torch.randint(1, max(2, S - R_ + 1), (1,), generator=g, device="cpu"))
+        f = attn.freqs_cis[pos:pos + R_]
+        slot = torch.remainder(torch.arange(pos, pos + R_, dtype=torch.long, device="cpu"), win).to(dev)
+        ring = torch.zeros(1, win, HD, dtype=torch.bfloat16, device=dev)
+        gR._kv_norm_write(attn, kvr, f, ring, slot)
+        parts = []
+        for r in range(R_):
+            ring1 = torch.zeros(1, win, HD, dtype=torch.bfloat16, device=dev)
+            g1._kv_norm_write(attn, kvr[:, r:r + 1].contiguous(), f[r:r + 1], ring1, slot[r:r + 1])
+            parts.append(ring1[0, slot[r:r + 1]].reshape(1, -1))
+        return _cmp_named({"ring rows": ring[0, slot].reshape(R_, -1)}, {"ring rows": parts})
+    rec("kv_path", "kv_norm + RoPE + QDQ + ring write", f"[1,{R_},{attn.head_dim}]", f_kv)
+
+    # router ------------------------------------------------------------------------------------------------------
+    def f_router():
+        moe = oR.moes[0].moe
+        x = (torch.randn(R_, D, generator=g, device="cpu") * 0.5).to(torch.bfloat16).to(dev)
+        ids, w = gR.route_rows(moe, x)
+        parts = {"ids": [], "w": []}
+        for r in range(R_):
+            i1, w1 = g1.route(moe, x[r:r + 1].contiguous())
+            parts["ids"].append(i1.reshape(1, -1))
+            parts["w"].append(w1.reshape(1, -1))
+        c, note = _cmp_named({"ids": ids.reshape(R_, -1), "w": w.reshape(R_, -1)}, parts)
+        return c, f"router_impl {getattr(gR, 'router_impl', 'fused')} (gate mm cuBLAS fp32 at the call's M); {note}"
+    rec("router", "gate mm + softplus + pre + topk + post", f"[{R_},{D}]", f_router)
+
+    # Engram ------------------------------------------------------------------------------------------------------
+    eng = next((l.engram for l in model.layers if l.engram is not None), None)
+
+    def f_engram():
+        h = FG._rand_act(g, R_ * HC, D).view(1, R_, HC, D).to(dev)
+        kv = FG._rand_act(g, R_, (HC + 1) * D, -4, 4).view(1, R_, -1).to(dev)
+        full = gR._engram_from_kv(eng, h, kv)
+        parts = [g1._engram_from_kv(eng, h[:, r:r + 1].contiguous(), kv[:, r:r + 1].contiguous()).reshape(1, -1)
+                 for r in range(R_)]
+        return _cmp_named({"out": full.reshape(R_, -1)}, {"out": parts})
+    if eng is not None:
+        rec("engram", "gate math + sigmoid + residual add", f"[1,{R_},{HC},{D}]", f_engram)
+
+    # indexer post ------------------------------------------------------------------------------------------------
+    def f_index():
+        full, parts = {}, {}
+        for r_ in oR.ratios:
+            ix = next((l.attn.indexer for l in model.layers
+                       if l.attn.indexer is not None and l.attn.compress_ratio == r_), None)
+            if ix is None:
+                continue
+            W = oR.W[r_]
+            k = min(ix.index_topk, W)
+            sc = (torch.randint(0, 8, (1, R_, W), generator=g, device="cpu").float() * 0.5).to(torch.bfloat16)
+            sc[..., W // 2:] = float("-inf")
+            sc = sc.to(dev)
+            clen = torch.tensor([max(1, W // 3 - j) for j in range(R_)], dtype=torch.long, device="cpu").to(dev)
+            full[f"r{r_}"] = gR.indexer_topk(sc, clen.view(R_, 1), k, 128).reshape(R_, -1)
+            parts[f"r{r_}"] = [g1.indexer_topk(sc[:, j:j + 1].contiguous(), clen[j:j + 1], k, 128).reshape(1, -1)
+                               for j in range(R_)]
+        if not full:
+            return {"equal": None}, "n/a: no index-source layer"
+        return _cmp_named(full, parts)
+    rec("indexer_post", "topk + sort + where", f"[1,{R_},W]", f_index)
+
+    # R1: hc_post, o path, q RoPE epilogue -----------------------------------------------------------------------
+    def f_hc_post():
+        x, res, post, comb = gR._hc_data(g, D, R_)
+        full = gR.hc_post(x, res, post, comb)
+        parts = [g1.hc_post(x[:, r:r + 1].contiguous(), res[:, r:r + 1].contiguous(), post[:, r:r + 1].contiguous(),
+                            comb[:, r:r + 1].contiguous()).reshape(1, -1) for r in range(R_)]
+        return _cmp_named({"out": full.reshape(R_, -1)}, {"out": parts})
+    rec("hc_post", "post*x + comb*residual sum", f"[1,{R_},{HC},{D}]", f_hc_post)
+
+    def f_o():
+        H, hd = attn.n_local_heads, attn.head_dim
+        S = attn.freqs_cis.size(0)
+        o = act(R_, H * hd).view(1, R_, H, hd)
+        pos = int(torch.randint(1, max(2, S - R_ + 1), (1,), generator=g, device="cpu"))
+        f = attn.freqs_cis[pos:pos + R_]
+        full = o.clone()
+        gR.o_path(attn, full, f)
+        parts = []
+        for r in range(R_):
+            o1_ = o[:, r:r + 1].clone()
+            g1.o_path(attn, o1_, f[r:r + 1])
+            parts.append(o1_.reshape(1, -1))
+        return _cmp_named({"o": full.reshape(R_, -1)}, {"o": parts})
+    rec("o_rope_qdq", "inverse RoPE + QDQ", f"[1,{R_},{attn.n_local_heads},{attn.head_dim}]", f_o)
+
+    def f_qproj():
+        from runtime import patches
+
+        K = attn.wq_b.in_features
+        S = attn.freqs_cis.size(0)
+        prev = torch.get_default_dtype()
+        prev_pin = os.environ.get(PIN_ENV)
+        os.environ[PIN_ENV] = "1"          # the GEMV's M=1 config at every M (the headline's pin)
+        try:
+            torch.set_default_dtype(torch.bfloat16)
+            qr = act(R_, K, -4, 4).view(1, R_, K)
+            pos = int(torch.randint(1, max(2, S - R_ + 1), (1,), generator=g, device="cpu"))
+            f = attn.freqs_cis[pos:pos + R_]
+            with oR._active():
+                full = gR.q_proj(attn, qr, f)
+            parts = []
+            with o1._active():
+                for r in range(R_):
+                    p = g1.q_proj(attn, qr[:, r:r + 1].contiguous(), f[r:r + 1])
+                    parts.append(None if p is None else p.reshape(1, -1))
+            if full is None or any(p is None for p in parts):
+                return {"equal": None}, "n/a: wq_b does not take the GEMV in this scope"
+            c, note = _cmp_named({"q": full.reshape(R_, -1)}, {"q": parts})
+            return c, f"GEMV M=1 config pinned; {note}"
+        finally:
+            torch.set_default_dtype(prev)
+            if prev_pin is None:
+                os.environ.pop(PIN_ENV, None)
+            else:
+                os.environ[PIN_ENV] = prev_pin
+            patches.fp8_gemv_stats(reset=True)
+    rec("q_rope_epilogue", "wq_b GEMV + RoPE epilogue", f"[1,{R_},{attn.wq_b.in_features}]", f_qproj)
+
+    def f_gemv_parts():
+        """gemv_pair / reduce_fold: the q path and the shared expert fed by the paired / folded GEMV (wq_a || wkv,
+        w1 || w3), M=1 config pinned, R rows vs each row alone."""
+        from runtime import patches
+
+        Rm = gR.R
+        prev = torch.get_default_dtype()
+        prev_pin = os.environ.get(PIN_ENV)
+        os.environ[PIN_ENV] = "1"
+        try:
+            torch.set_default_dtype(torch.bfloat16)
+            x = act(R_, D, -4, 6).view(1, R_, D)
+            xq = Rm.act_quant(x, Rm.fp8_block_size, Rm.scale_fmt, Rm.scale_dtype)
+
+            def run(glue, o_, xx, qq):
+                with o_._active():
+                    qr, (q, s) = glue.q_path(attn, xx, qq)
+                    pend, glue._kv_pend = getattr(glue, "_kv_pend", None), None
+                    sh = glue._shared_from_q(ex, xx, qq)
+                d = {"qr": qr, "q": q, "s": s, "shared": sh}
+                if pend is not None:
+                    from runtime.gemv_mxfp8 import materialize
+
+                    d["kv (pair)"] = materialize(pend[1])
+                return d
+
+            full = run(gR, oR, x, xq)
+            parts = {k: [] for k in full}
+            for r in range(R_):
+                p = run(g1, o1, x[:, r:r + 1].contiguous(), (xq[0][:, r:r + 1].contiguous(),
+                                                              xq[1][:, r:r + 1].contiguous()))
+                for k in full:
+                    parts[k].append(p[k].reshape(1, -1))
+            c, note = _cmp_named({k: v.reshape(R_, -1) for k, v in full.items()}, parts)
+            return c, f"pair {gR.status.get('gemv_pair')}, fold {gR.status.get('reduce_fold')}; M=1 pinned; {note}"
+        finally:
+            torch.set_default_dtype(prev)
+            if prev_pin is None:
+                os.environ.pop(PIN_ENV, None)
+            else:
+                os.environ[PIN_ENV] = prev_pin
+            patches.fp8_gemv_stats(reset=True)
+    for c_ in ("gemv_pair", "reduce_fold"):
+        rec(c_, "q path + shared expert on the paired / folded GEMV", f"[1,{R_},{D}]", f_gemv_parts)
+
+    # MoE glue kernels: shared SwiGLU, routed SwiGLU (pair rows), act_quant into the DeepGEMM rows, combine, packed SF
+
+    def f_sw_shared():
+        I = ex.w1.out_features
+        gate, up = gR._rand_gate_up(g, R_, I)
+        q = torch.empty(R_, I, dtype=FP8, device=dev)
+        s = torch.empty(R_, I // BLOCK, dtype=E8, device=dev)
+        FG.launch_swiglu_quant(gate, up, None, q, s, gR.silu_tab, gR.code_tab, ex.swiglu_limit)
+        parts = {"q": [], "s": []}
+        for r in range(R_):
+            q1 = torch.empty(1, I, dtype=FP8, device=dev)
+            s1 = torch.empty(1, I // BLOCK, dtype=E8, device=dev)
+            FG.launch_swiglu_quant(gate[r:r + 1], up[r:r + 1], None, q1, s1, g1.silu_tab, g1.code_tab, ex.swiglu_limit)
+            parts["q"].append(q1)
+            parts["s"].append(s1)
+        return _cmp_named({"q": q, "s": s}, parts)
+    rec("swiglu_shared", "SwiGLU + act_quant (shared)", f"[{R_},{ex.w1.out_features}]", f_sw_shared)
+
+    bR, b1 = getattr(oR, "dg", None), getattr(o1, "dg", None)
+
+    def pairs():
+        P = R_ * oR.topk
+        A = bR.xq[1].numel() // bR.dim
+        prow = torch.randint(0, R_, (P,), generator=g, device="cpu").to(dev)
+        arow = torch.randperm(A, generator=g, device="cpu")[:P].to(dev)
+        return P, A, prow, arow
+
+    def f_sw_routed():
+        P, A, _, arow = pairs()
+        I = bR.inter
+        gate, up = gR._rand_gate_up(g, A, I)
+        w = (torch.rand(P, generator=g, device="cpu") * 2).float().to(dev)
+        q = torch.zeros(A, I, dtype=FP8, device=dev)
+        s = torch.zeros(A, I // BLOCK, dtype=torch.float32, device=dev)
+        FG.launch_swiglu_quant(gate, up, w, q, s, gR.silu_tab, gR.code_tab, bR.swiglu_limit, rows_idx=arow)
+        parts = {"q": [], "s": []}
+        for p in range(P):
+            a = int(arow[p])
+            q1 = torch.empty(1, I, dtype=FP8, device=dev)
+            s1 = torch.empty(1, I // BLOCK, dtype=torch.float32, device=dev)
+            FG.launch_swiglu_quant(gate[a:a + 1], up[a:a + 1], w[p:p + 1], q1, s1, g1.silu_tab, g1.code_tab,
+                                   b1.swiglu_limit)
+            parts["q"].append(q1)
+            parts["s"].append(s1)
+        return _cmp_named({"q": q.index_select(0, arow), "s": s.index_select(0, arow)}, parts)
+    rec("swiglu_routed", "SwiGLU + act_quant (pair rows vs one row)", "R*k pairs", f_sw_routed)
+
+    def f_dg_act():
+        P, A, prow, arow = pairs()
+        Dd = bR.dim
+        x = act(R_, Dd)
+        q = torch.zeros(A, Dd, dtype=FP8, device=dev)
+        s = torch.zeros(A, Dd // BLOCK, dtype=torch.float32, device=dev)
+        FG.launch_act_quant_bcast(x, q, s, gR.code_tab, 1, src_rows=prow, dst_rows=arow)
+        parts = {"q": [], "s": []}
+        k1 = b1.k
+        for p in range(P):
+            r = int(prow[p])
+            q1 = torch.empty(k1, Dd, dtype=FP8, device=dev)
+            s1 = torch.empty(k1, Dd // BLOCK, dtype=torch.float32, device=dev)
+            FG.launch_act_quant_bcast(x[r:r + 1], q1, s1, g1.code_tab, k1)
+            parts["q"].append(q1[:1])
+            parts["s"].append(s1[:1])
+        return _cmp_named({"q": q.index_select(0, arow), "s": s.index_select(0, arow)}, parts)
+    rec("dg_act", "act_quant into the DeepGEMM rows", f"[{R_},{getattr(bR, 'dim', '?')}]", f_dg_act)
+
+    def f_combine():
+        k = oR.topk
+        A = 2 * R_ * k
+        N = bR.dim
+        rows = FG._rand_act(g, A, N, lo=-8, hi=8).to(dev)
+        sh = FG._rand_act(g, R_, N, lo=-8, hi=8).to(dev)
+        posmat = torch.stack([torch.randperm(A, generator=g, device="cpu")[:k] for _ in range(R_)]).to(dev)
+        y = torch.empty(R_, N, dtype=torch.bfloat16, device=dev)
+        FG.launch_moe_combine(rows, sh, y, posmat=posmat)
+        parts = []
+        for r in range(R_):
+            y1 = torch.empty(N, dtype=torch.bfloat16, device=dev)
+            FG.launch_moe_combine(rows.index_select(0, posmat[r]).contiguous(), sh[r].contiguous(), y1)
+            parts.append(y1.view(1, -1))
+        return _cmp_named({"y": y}, {"y": parts})
+    rec("moe_combine", "ascending-id combine + shared", f"[{R_},{getattr(bR, 'dim', '?')}]", f_combine)
+
+    def f_sf_pack():
+        if not (getattr(bR, "sf_pack", False) and getattr(b1, "sf_pack", False)):
+            return {"equal": None}, (f"n/a: packed SF not in use (1-row {getattr(b1, 'sf_pack', None)}, "
+                                     f"{R_}-row {getattr(bR, 'sf_pack', None)})")
+        P, A, prow, arow = pairs()
+        Dd = bR.dim
+        KB = Dd // BLOCK
+        x = act(R_, Dd)
+        FG.launch_act_quant_bcast(x, bR.xq[1].view(-1, Dd), bR.xsp_all[1], gR.code_tab, 1, src_rows=prow,
+                                  dst_rows=arow)
+        full = bR.xsp_all[1].codes_at(arow)[:, :KB].contiguous()
+        parts = []
+        for p in range(P):
+            r = int(prow[p])
+            FG.launch_act_quant_bcast(x[r:r + 1], b1.xq[1][:, 0], b1.xsp_rows[1], g1.code_tab, b1.k)
+            parts.append(b1.xsp_rows[1].codes()[:1, :KB].contiguous())
+        return _cmp_named({"packed codes": full}, {"packed codes": parts})
+    rec("dg_sf_pack", "packed DeepGEMM activation SF codes", f"[{R_},{getattr(bR, 'dim', '?')}]", f_sf_pack)
+
+    for c in ("dedup", "gather", "concat_free"):
+        rec(c, "-", "-", lambda: ({"equal": None}, ""))
+    if dev.type == "cuda":
+        torch.cuda.synchronize(dev)
+    return out

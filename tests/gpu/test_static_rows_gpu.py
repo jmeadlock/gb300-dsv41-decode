@@ -30,6 +30,12 @@ M1-T10-FIX2 (docs/HANDOFF-M1-T10-FIX2.md): the D row at spare_slots = 8 (compact
 T9b-5 (docs/HANDOFF-T9B5-FP32-FIXED.md): the V0 census also lists the fixed-order fp32 kernels (family "T9b-5 fixed
   fp32": mixes + head, row-invariant by construction) next to cuBLAS on the same inputs, and the step-level table has
   "ref, fp32 fixed" and "fast, GEMV M=1 cfg pinned, fp32 fixed" ($DSV41_FP32_IMPL=fixed for both steps).
+T9b-7 (docs/HANDOFF-T9B7-GLUE-ORDER.md): the fused glue's 6-row orders are the 1-row build's ($DSV41_GLUE_ORDER=shape):
+  * G row: the oracle is the ref glue with torch's per-token sums / means one row at a time (per_row_reductions);
+  * test_t9b7_glue_clusters_row_invariant (gated) + the V0 census: one family per fused cluster
+    (fused_glue_r2.glue_row_census: the 6-row build's op at 6 rows vs the 1-row build's on each row alone, fast
+    dg-inplace impls, fp32 fixed, rowmatch on, GEMV M=1 pinned) -- every cluster on at 6 rows must read row-invariant;
+    reported: the `rows` policy's census and the step-level row (6-row row j vs the 1-row step) under both policies.
 
 Run on the box (orchestrator), same line as tests/gpu/test_static_mini_gpu.py, repo at $W:
 
@@ -532,12 +538,29 @@ def _rows_expected_on(moe, fp8="gemv"):
     return set(FG.CLUSTERS) - never
 
 
+def _g_rowwise() -> bool:
+    """T9b-7: under $DSV41_GLUE_ORDER=shape (default) the 6-row fused glue's contract is "each row == the 1-row
+    step's": the G row's oracle is the reference glue with torch's per-token sums / means one row at a time."""
+    from runtime.fused_glue_r2 import glue_order
+
+    return glue_order() == "shape"
+
+
+def _g_oracle():
+    from runtime.fused_glue_r2 import per_row_reductions
+
+    return per_row_reductions(_g_rowwise())
+
+
 def test_static6_fused_glue_equals_ref_glue():
     """G row at 6 rows (M1-T10-FIX Part B 2; M1-T10-PORT: EVERY ported cluster): glue fused -- all clusters
     applicable to the fast impls on at 6 rows, each self-checked at build against the reference glue at 6 rows
     (`verify_<cluster>` == "equal": the per-cluster G rows), only fused_glue.ROWS_WHY n/a -- == glue ref, torch.equal,
     on the fast impls (gemv, flashmla) with dg-masked and dg-inplace; graph == static-eager. Then, dg-inplace, each
-    cluster alone OFF (DSV41_GLUE_DISABLE) == ref glue (bisects a cluster that breaks only in combination)."""
+    cluster alone OFF (DSV41_GLUE_DISABLE) == ref glue (bisects a cluster that breaks only in combination).
+    T9b-7 ($DSV41_GLUE_ORDER=shape, default): the fused glue's 6-row orders are the 1-row build's, so the oracle is
+    the ref glue with torch's per-token sums / means evaluated one row at a time (fused_glue_r2.per_row_reductions,
+    the 1-row reference row by row) -- both sides' eager runs; graph == the plain static-eager."""
     _need_tilelang()
     from runtime import fused_glue as FG
 
@@ -558,13 +581,18 @@ def test_static6_fused_glue_equals_ref_glue():
             print(f"  G {moe} per-cluster self-checks at {ROWS} rows: {', '.join(sorted(ver))} all equal")
             COUNTS["g_clusters"] += len(ver)
             a = _static(model, f, ids, toks, 4)
+            a_plain = a
+            if _g_rowwise():   # T9b-7: the gate's oracle is the 1-row reference row by row (both sides, eager)
+                with _g_oracle():
+                    a = _static(model, f, ids, toks, 4)
             if DEV == "cuda":
                 f.capture()
                 ag = _static(model, f, ids, toks, 4, graph=True)
-                _assert_rows(ag[0], a[0], f"6-row fused glue ({moe}) graph vs static-eager")
+                _assert_rows(ag[0], a_plain[0], f"6-row fused glue ({moe}) graph vs static-eager")
             f.detach()
             r = _need_step(model, pool, rows=ROWS, hidden_layers=hid, **dict(kw, glue_impl="ref"))
-            b = _static(model, r, ids, toks, 4)
+            with _g_oracle():
+                b = _static(model, r, ids, toks, 4)
             r.detach()
             refs[moe] = b
             refs.setdefault("fp8", f.fp8_impl)
@@ -578,7 +606,8 @@ def test_static6_fused_glue_equals_ref_glue():
                 os.environ[FG.DISABLE_ENV] = c
                 f = _need_step(model, pool, rows=ROWS, hidden_layers=hid, **dict(FAST, moe_impl=moe))
                 assert f.glue.status[c].startswith("off"), f.glue.status[c]
-                a = _static(model, f, ids, toks, 4)
+                with _g_oracle():
+                    a = _static(model, f, ids, toks, 4)
                 f.detach()
                 _eq_runs(a, refs[moe], f"G {moe}: 6-row fused glue without {c} vs ref glue")
             print(f"  G {moe}: each of {len(_rows_expected_on(moe, fp8))} clusters alone off == ref glue")
@@ -587,6 +616,110 @@ def test_static6_fused_glue_equals_ref_glue():
                 os.environ.pop(FG.DISABLE_ENV, None)
             else:
                 os.environ[FG.DISABLE_ENV] = prev
+
+
+# ------------------------------------------------------------------------------------------------ T9b-7 glue census
+# docs/HANDOFF-T9B7-GLUE-ORDER.md item 3: every fused-glue cluster, R=6 vs R=1 per row, on the fast dg-inplace impls
+# with the step's other row-dependent sites pinned (fp32 fixed, the DeepGEMM call shape matched, the GEMV's M=1
+# config) -- the conditions of `headline.py --fp32-impl fixed --moe-rowmatch on`.
+T9B7_ENV = {"DSV41_FP32_IMPL": "fixed", "DSV41_MOE_ROWMATCH": "on", "DSV41_GEMV_PIN_M1": "1"}
+
+
+@contextlib.contextmanager
+def _env(**kv):
+    prev = {k: os.environ.get(k) for k in kv}
+    for k, v in kv.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+    try:
+        yield
+    finally:
+        for k, v in prev.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def _t9b7_steps(model, pool):
+    """(s6, s1): the 6-row and the 1-row fused-glue step on the fast dg-inplace impls; s6 first (it grows the pool to
+    its spare budget; the 1-row build's smaller budget is then a no-op)."""
+    kw = dict(FAST, moe_impl="dg-inplace")
+    s6 = _need_step(model, pool, rows=ROWS, spare_slots=8, **kw)
+    try:
+        s1 = _need_step(model, pool, **kw)
+    except BaseException:
+        s6.detach()
+        raise
+    return s6, s1
+
+
+def _glue_census(model, pool, policy=None):
+    """runtime/fused_glue_r2.glue_row_census of the T9b-7 pair of builds (records; a build that fails is one n/a
+    record, the census convention)."""
+    from runtime.fused_glue_r2 import GLUE_ORDER_ENV, glue_row_census
+
+    try:
+        with _env(**T9B7_ENV, **({GLUE_ORDER_ENV: policy} if policy else {})):
+            s6, s1 = _t9b7_steps(model, pool)
+            try:
+                return glue_row_census(s1.glue, s6.glue)
+            finally:
+                s6.detach()
+                s1.detach()
+    except Exception as e:  # recorded, never fatal
+        return [{"family": "fused glue", "op": "build (fast dg-inplace, 1 and 6 rows)", "shape": "-", "equal": None,
+                 "note": f"n/a: {type(e).__name__}: {str(e).splitlines()[0][:160] if str(e) else ''}"}]
+
+
+def test_t9b7_glue_clusters_row_invariant():
+    """T9b-7 gate (mini4, fast dg-inplace impls, fp32 fixed, rowmatch on, GEMV M=1 pinned, $DSV41_GLUE_ORDER=shape):
+    the 6-row build's orders and modes == the 1-row build's, and every fused cluster on at 6 rows reads row-invariant
+    in glue_row_census (row r of the 6-row op == the 1-row build's op on row r alone, bitwise); mix_stat and
+    dg_sf_pack are on at 6 rows. Reported next to it (not gated): the same census under the pre-T9b-7 `rows` policy,
+    and the step-level row (6-row step row j vs the 1-row step at P0 + j) under both policies."""
+    _need_tilelang()
+    from runtime import fused_glue_r2 as R2
+    from runtime.row_census import census_table
+
+    with _model("mini4") as (model, pool):
+        recs = _glue_census(model, pool, "shape")
+        for line in census_table(recs):
+            print("  " + line)
+        by: dict = {}
+        for r in recs:                     # a cluster with several probes (hc_norm: both sides + the head): all of them
+            if not r["family"].startswith(R2.GLUE_CENSUS_FAMILY + " "):
+                continue
+            c = r["family"].split(" ", 2)[-1]
+            prev = by.get(c)
+            by[c] = dict(r) if prev is None else dict(prev, equal=bool(prev.get("equal")) and bool(r.get("equal")),
+                                                      note=f"{prev.get('note')} | {r.get('note')}")
+        assert "orders" in by, recs
+        assert by["orders"]["equal"] is True, by["orders"]
+        want = _rows_expected_on("dg-inplace", "gemv" if FAST.get("fp8_impl") == "gemv" else "ref")
+        bad = {c: by.get(c, {}).get("note") for c in sorted(want - set(R2.GLUE_CENSUS_NA))
+               if not by.get(c, {}).get("equal")}
+        assert not bad, f"clusters not row-invariant (or not run) at 6 rows: {bad}"
+        COUNTS["g_clusters"] += len(want - set(R2.GLUE_CENSUS_NA))
+        print(f"  T9b-7: {len(want - set(R2.GLUE_CENSUS_NA))} fused clusters row-invariant at {ROWS} rows "
+              f"(orders {by['orders']['note'][:160]})")
+        old = _glue_census(model, pool, "rows")
+        no = sorted(r["family"] for r in old if r.get("equal") is False)
+        print(f"  T9b-7 A/B, pre-T9b-7 `rows` policy (reported): NOT row-invariant {no or '-'}")
+        ids, toks = _toks(18, ROWS * 4, 45)
+        n_pos = ROWS * 4
+        for pol in ("shape", "rows"):
+            with _env(**T9B7_ENV, **{R2.GLUE_ORDER_ENV: pol}):
+                s6, s1 = _t9b7_steps(model, pool)
+                a1 = _seq1(model, s1, ids, toks, n_pos)
+                a6 = _static(model, s6, ids, toks, 4)[0]
+                s6.detach()
+                s1.detach()
+            eq, d, agree = _drift(a6, a1)
+            print(f"  T9b-7 STEP-LEVEL ({pol}): 6-row row j vs 1-row step at P0+j, fast dg-inplace, fp32 fixed, "
+                  f"rowmatch on, GEMV M=1 pinned: bit-equal {eq}/{n_pos}, max|dlogit| {d:.4e}, argmax {agree}/{n_pos}")
 
 
 # ------------------------------------------------------------------------------------------------ V0
@@ -602,6 +735,12 @@ def test_v0_census_and_step_level_table():
         from runtime.fused_glue_r2 import fp32_fixed_census
 
         recs += fp32_fixed_census(model, rows=ROWS)
+        # T9b-7: every fused-glue cluster, 6 rows vs 1 row per row (fast dg-inplace, fp32 fixed, rowmatch on, GEMV
+        # M=1 pinned, $DSV41_GLUE_ORDER=shape): one family per cluster ("fused glue <cluster>"). Box only here: the
+        # dg-inplace build grows the pool, which the plain CPU emulation's kernel registry does not follow (the CPU
+        # dry run of this census is tests/test_fused_glue_t9b7_cpu.py, on the dg-inplace emulation)
+        if DEV == "cuda":
+            recs += _glue_census(model, pool, "shape")
         for line in census_table(recs):
             print("  " + line)
         ids, toks = _toks(18, ROWS * 4, 44)
@@ -692,7 +831,7 @@ TESTS = [test_static6_equals_reference_mini_both_parities, test_static6_equals_r
          test_static6_equals_reference_attn_bounded, test_static6_ring_wrapped_both_parities,
          test_static1_ring256_past_wrap_equals_reference, test_static6_graph_replay_relaunch_no_sync,
          test_static6_dg_inplace_equals_dg_masked, test_static6_dg_inplace_forced_overflow_trips_counter,
-         test_static6_fused_glue_equals_ref_glue,
+         test_static6_fused_glue_equals_ref_glue, test_t9b7_glue_clusters_row_invariant,
          test_static6_fast_impls_drift_graded, test_v0_census_and_step_level_table,
          test_first_light_rows_cells_graph]
 

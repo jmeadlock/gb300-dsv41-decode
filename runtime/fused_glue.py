@@ -114,8 +114,10 @@ ACT_CLUSTERS = ("dg_act", "swiglu_routed", "swiglu_shared", "o_rope_qdq",   # ne
 DISABLE_ENV = "DSV41_GLUE_DISABLE"
 # M1-T10-FIX / M1-T10-PORT: the clusters that run at rows > 1 (the 6-row verify step). Every kernel has a row axis
 # (grid axis or one program per row) and keeps the one-row kernel's per-element arithmetic and, per row, its reduction
-# order -- picked again for the R-row reference shapes at build (fused_glue_r2.calibrate_r2) -- so each is self-checked
-# at R rows against the reference glue at R rows (the G rows of tests/gpu/test_static_rows_gpu.py). The R-row MoE's
+# order. T9b-7 (fused_glue_r2 "T9b-7: one order per shape"): that order is the 1-row build's (picked at the 1-row
+# reference shapes, $DSV41_GLUE_ORDER=shape, default) and each cluster is self-checked at R rows against the
+# reference glue evaluated one row at a time; `rows` restores M1-T10-PORT's protocol (orders picked again for the
+# R-row reference shapes, checked against the reference glue at R rows). The R-row MoE's
 # routed glue runs through the dedup map (runtime/moe_rows.py: dedup_fused, then the IDX forms of the act_quant /
 # SwiGLU / combine kernels). Not ported, with the reason: ROWS_WHY.
 ROWS_WHY = {
@@ -1209,11 +1211,11 @@ class FusedGlue(R2Glue):
 
     # hc_post mode -----------------------------------------------------------------------------------
     @_cpu_default
-    def _hc_data(self, g, D):
+    def _hc_data(self, g, D, rows: Optional[int] = None):
         """Random hc_post inputs; in half the columns copy 0 and copy 2 carry the same large value and comb's row 2
         is minus row 0, so a0 + a2 cancels exactly and the 4-term sum's ORDER shows in the result (the three
-        HC_SUM_MODES round differently there)."""
-        HC, T_ = self.hc, self.rows  # T_ token rows: the step's rows (M1-T10-FIX; 1 = the draws of T9b-2)
+        HC_SUM_MODES round differently there). rows: token rows (default the step's; T9b-7: the pick draws 1)."""
+        HC, T_ = self.hc, (self.rows if rows is None else int(rows))  # M1-T10-FIX; 1 = the draws of T9b-2
         x = _rand_act(g, T_, D).view(1, T_, D)
         res = _rand_act(g, T_ * HC, D).view(1, T_, HC, D)
         post = (torch.rand(1, T_, HC, generator=g, device="cpu") * 2).float()
@@ -1229,12 +1231,17 @@ class FusedGlue(R2Glue):
         return [t.to(self.dev) for t in (x, res, post, comb)]
 
     def _pick_hc(self, cal, g) -> None:
+        """hc_post's 4-term sum order (HC_SUM_MODES) against Block.hc_post. T9b-7 shape policy: picked on 1-row draws
+        (the 1-row reference's call, whatever R this step runs), then at R > 1 the R-row launch is checked against the
+        reference evaluated one row at a time (fused_glue_r2.per_row_reductions); rows policy: picked at R rows."""
         layer = self.o.model.layers[0]
         D = layer.attn_norm.dim
         modes = HC_SUM_MODES if self.hc == 4 else (0,)
         mism = {m: 0 for m in modes}
+        shape = getattr(self, "order_policy", "rows") == "shape"
+        pick_rows = 1 if shape else self.rows
         for _ in range(6):
-            x, res, post, comb = self._hc_data(g, D)
+            x, res, post, comb = self._hc_data(g, D, pick_rows)
             ref = layer.hc_post(x, res, post, comb)
             for m in modes:
                 self.hc_mode = m
@@ -1247,6 +1254,18 @@ class FusedGlue(R2Glue):
         else:
             self.hc_mode = 0
             self._off("hc_post", f"no 4-term sum order matches Block.hc_post ({mism})")
+            return
+        if shape and self.rows > 1:
+            bad = 0
+            for _ in range(3):
+                x, res, post, comb = self._hc_data(g, D)
+                with self._oracle():
+                    ref = layer.hc_post(x, res, post, comb)
+                got = self.hc_post(x, res, post, comb)
+                bad += int((got.view(torch.int16) != ref.view(torch.int16)).sum())
+            cal["hc_post"]["rows_check"] = {"rows": self.rows, "mismatches": bad}
+            if bad:
+                self._off("hc_post", f"{self.rows}-row launch differs from the 1-row reference row by row ({bad})")
 
     # end-to-end verifications (None = equal, else why) ---------------------------------------------
     @_cpu_default
@@ -1588,8 +1607,10 @@ class FusedGlue(R2Glue):
         off = [c for c in CLUSTERS if not self.on(c)]
         out = self.describe_r2()["outcome"]
         num = ", ".join(f"{c} {'(i)' if (v or '').startswith('(i)') else '(ii)'}" for c, v in out.items())
-        rows = (f"rows {self.rows} (self-checked at {self.rows} rows; not ported: {','.join(ROWS_WHY)}); "
-                if self.rows > 1 else "")
+        pol = getattr(self, "order_policy", "rows")
+        how = (f"orders of the 1-row shapes, self-checked row by row at {self.rows} rows" if pol == "shape" else
+               f"self-checked at {self.rows} rows")
+        rows = (f"rows {self.rows} ({how}; not ported: {','.join(ROWS_WHY)}); " if self.rows > 1 else "")
         return (f"[glue] fused: {rows}on {','.join(on) or '-'}; approx {','.join(ap) or '-'}; off {','.join(off) or '-'}; "
                 f"r2 numerics {num or '-'}; orders {self.describe_r2()['orders']}")
 

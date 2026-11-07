@@ -380,10 +380,60 @@ def test_fused_step_cell_informative():
         print(f"  mini4 dg-masked/gemv graph step cell p50: glue ref {p50['ref']:.3f} ms, fused {p50['fused']:.3f} ms")
 
 
+def test_t9b7_real_width_orders():
+    """T9b-7 (docs/HANDOFF-T9B7-GLUE-ORDER.md) at DSV4.1's real widths (D 5120, hc*D 20480, q_lora 1280, head_dim 512,
+    topk 6; Engram over D at hc_mult 4 rows): the order picked at the 1-row reference shape reproduces torch's 1-row
+    value on every row of a 6-row batch evaluated one row at a time (fused_glue_r2.per_row_reductions, the R-row
+    oracle) -- gated, bit for bit; reported: how many rows torch's batched [1, 6, ...] reduce gets differently (the
+    R-dependence T9b-7 removes) and the order a `rows` build would pick. And launch_norm_row at 6 rows in the 1-row
+    order == the 1-row launch on each row (q 1280, kv 512, norm_D 5120)."""
+    _need_glue()
+    from runtime import fused_glue_r2 as R2
+
+    dev = torch.device("cuda")
+    R6 = 6
+    sites = [("norm_D", 5120, 1, "sqmean"), ("mix", 4 * 5120, 1, "sqmean"), ("q", 1280, 1, "sqmean"),
+             ("kv", 512, 1, "sqmean"), ("router", 6, 1, "sum"), ("engram", 5120, 4, "sqmean"),
+             ("engram_sum", 5120, 4, "sum")]
+    g = torch.Generator(device="cpu").manual_seed(77)
+    bad = []
+    for name, w, r1, kind in sites:
+        o1 = R2.pick_order(dev, w, r1, kind)
+        oR = R2.pick_order(dev, w, R6 * r1, kind)
+        x = R2._stat_rows(g, R6 * r1, w, kind).to(dev).float()
+        shape = (1, R6, w) if r1 == 1 else (1, R6, r1, w)
+        op = (lambda t: t.square().mean(-1)) if kind == "sqmean" else (lambda t: t.sum(-1))
+        batched = op(x.reshape(shape).clone()).reshape(-1)
+        with R2.per_row_reductions():
+            per_row = op(x.reshape(shape).clone()).reshape(-1)
+        vals = x * x if kind == "sqmean" else x
+        sim = R2.order_sum_torch(vals, o1["order"])
+        sim = R2.mean_finish(sim, w, o1["fin"]) if kind == "sqmean" else sim
+        ok = _eq(sim, per_row)
+        nb = int((batched.view(torch.int32) != per_row.view(torch.int32)).view(R6, r1).any(-1).sum())
+        print(f"  T9b-7 {name:10s} w {w:6d} x{r1}: 1-row order {o1['name']} (exact {o1['exact']}); "
+              f"6-row-shape order {oR['name']}; batched torch rows != per-row: {nb}/{R6}; 1-row order == "
+              f"per-row oracle: {ok}")
+        if not (o1["exact"] and ok):
+            bad.append(name)
+    assert not bad, f"1-row orders not reproducing the per-row oracle at real widths: {bad}"
+    for name, N in (("norm_D", 5120), ("q", 1280), ("kv", 512)):
+        ordd = R2.pick_order(dev, N, 1, "sqmean")
+        x = _act(g, R6, N, -4, 6)
+        nw = (torch.randn(N, generator=g, device="cpu") * 0.3 + 1.0).to(torch.bfloat16).cuda()
+        out = torch.empty(R6, N, dtype=torch.bfloat16, device=dev)
+        R2.launch_norm_row(x, nw, out, eps=1e-6, ordd=ordd)
+        for r in range(R6):
+            o1_ = torch.empty(N, dtype=torch.bfloat16, device=dev)
+            R2.launch_norm_row(x[r].contiguous(), nw, o1_, eps=1e-6, ordd=ordd)
+            assert _eq(out[r], o1_), (name, r)
+    torch.cuda.synchronize()
+
+
 TESTS = [test_act_quant_kernels_vs_reference_all_bf16, test_swiglu_kernels_vs_reference_real_shapes,
          test_combine_and_hc_post_kernels, test_rope_kernels_modes_on_device, test_gather_tables_vs_six_gathers,
          test_fused_vs_ref_mini_refref, test_fused_vs_ref_mini4_refref, test_fused_vs_ref_mini_dg_gemv,
-         test_fused_vs_ref_mini4_dg_gemv, test_fused_step_cell_informative]
+         test_fused_vs_ref_mini4_dg_gemv, test_t9b7_real_width_orders, test_fused_step_cell_informative]
 
 if __name__ == "__main__":
     import traceback
