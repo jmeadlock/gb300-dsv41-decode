@@ -34,19 +34,25 @@ Host launch overhead (graph) · staging gather (in-place) · glue launch count (
 - `story` prompt drift 0.073 nats over a 10-token prefix on the GEMV path (above 0.05; flagged, not gated).
 - M1-T10 fast-path 6-row result + overflow count (running).
 
-## Re-plan v1 (supersedes the M0-PORT-PLAN ordering; M0's deliverables are met except the parity-bar decision)
-| slot (CST) | work | box dark? | status |
+## Re-plan v2 (locked 04:35 CST from W1–W4 + M2 memo + the 6-row measurements)
+**Targets as the physics allows:** (1) first honest 6-row ms/step and ms/token (M1), (2) beat 7.36 ms per 6-row step (M2 ladder), (3) the 5.0 bar is a bytes bar (28.8 GB/step → 4.6 ms at measured HBM rate) → **James re-states or keeps it**; the project does not move its own goalposts.
+
+| slot (CST) | work | box | status |
 |---|---|---|---|
-| 03:40–04:40 | M1-T10 fix-2 GPU tests + fast-path 6-row cell (the ~21 ms number) | box | running |
-| 03:40–05:30 | desk: M2 memo, W1–W4 research, T11 draft graph, A2-2 residency | — | running |
-| 04:45 | lock re-plan v2 from W1–W4 + M2 memo | — | pending |
-| ~05:00 | box: T11 oracle test + draft bench (ms/draft, acceptance on fixture) | box | queued |
-| ~05:45 | box: A2-2 determinism + shifted-workload probe | box | queued |
-| ~06:30 | box: W1 PDL probe (same graph, PDL attributes on Triton launches) if W1 says it works in graphs on CUDA 13 | box | conditional |
-| ≤ 10:00 | M1-T12 loop handoff (accept/commit/emit, async EOS) → first honest 6-row ms/step and tokens/step | — | after T11 lands |
-| morning | blog update 4 (6-row result, R6/R1, the honest M1 projection); PROJECT.md ladder dates pulled in: M0 done 11/07 (pending A3), M1 target **mid-Nov**, M2 start on the memo | — | James awake |
+| 04:00– | M1-T10-PORT coder (row-generic fused glue, GEMV at R rows, dedup kernel, S=16) → gate ≤ 18 ms 6-row | after | running |
+| 04:20– | box: T11 draft gate (real ckpt) + draft bench (ms/draft, acceptance) | box | running |
+| ~05:15 | box: PORT GPU test + 6-row fast-path cell → real R6/R1 | box | queued |
+| ~05:45 | merge a2-2; box: residency determinism + shifted-workload probe | box | queued |
+| ~06:00 | **M1-T12 handoff**: loop (verify → accept by exact match → commit → draft, device-side emission, async EOS) + row-invariance prerequisite (fixed-order fp32 FFMA for mHC mixes + head, W4) → first honest 6-row ms/step + tokens/step + ms/token | — | next coder |
+| ~06:30 | box probes: anatomy at 10.5; PDL probe; cuBLAS batch-invariant mode census | box | queued |
+| 08:00–10:00 | M2 L1–L2 handoff (mixes branch, router+plan) from memo §6 if a coder slot is free before the reset | — | conditional |
+| morning | blog update 4: 6-row results, R6/R1 story, the bytes floor and what it means for the bar (teaching voice, corrections box for the 9 GB / 2,800-kernel numbers) | — | after James |
+| James | decisions: A1, A2, A3 (incl. pin GEMV M=1 config vs drift for the 6-row instrument), **the 5.0 bar**, PROJECT.md ladder dates (M0 done 11/07 pending A3; M1 mid-Nov; M2 start now) | — | — |
 
 ## Session log (newest first)
+- 04:35 re-plan v2 locked; REPORT.md written. W1–W4 + M2 memo in; T11 and A2-2 landed (branches); T10-PORT coding; T11 on box.
+- 04:00 6-row fast path 40.2 ms (glue unported), overflow at S=8.
+- 03:38 M2 memo: 5.0 not reachable by bytes at 6 rows.
 - 03:45 re-plan v1 written; W1–W4 dispatched; 4 coders/desk running.
 - 03:25 M1-T10 gate 11/11; fix-2 dispatched (spare-slot OOM).
 - 02:13 R6/R1 = 2.008 measured; 01:50 T9b-4 10.52 ms; 00:45 R2 13.88; 00:05 T9a-2 17.83; 23:40 FlashMLA 19.87; 23:30 T9b-3a 23.80; 23:05 R1 26.04; 22:39 seed map 30.92.
