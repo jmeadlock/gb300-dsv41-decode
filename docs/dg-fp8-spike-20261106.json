@@ -1,0 +1,230 @@
+{
+ "layers.0.ffn.shared_experts.w1[2304x5120]_M1": {
+  "b32x32": {
+   "mismatch": 0.0013,
+   "rel": 0.000341,
+   "max": 0.5,
+   "us": 79.8
+  },
+  "b_row32": {
+   "mismatch": 0.0013,
+   "rel": 0.000341,
+   "max": 0.5,
+   "us": 37.7
+  },
+  "b_row32_noPad": {
+   "mismatch": 0.0013,
+   "us": 34.7
+  },
+  "ref_us": 49.0
+ },
+ "layers.0.ffn.shared_experts.w1[2304x5120]_M6": {
+  "b32x32": {
+   "mismatch": 0.00137,
+   "rel": 8.2e-05,
+   "max": 0.25,
+   "us": 80.3
+  },
+  "b_row32": {
+   "mismatch": 0.00137,
+   "rel": 8.2e-05,
+   "max": 0.25,
+   "us": 35.9
+  },
+  "b_row32_noPad": {
+   "mismatch": 0.00137,
+   "us": 36.3
+  },
+  "ref_us": 43.9
+ },
+ "layers.0.ffn.shared_experts.w2[5120x2304]_M1": {
+  "b32x32": {
+   "mismatch": 0.0,
+   "rel": 0.0,
+   "max": 0.0,
+   "us": 81.5
+  },
+  "b_row32": {
+   "mismatch": 0.0,
+   "rel": 0.0,
+   "max": 0.0,
+   "us": 37.1
+  },
+  "b_row32_noPad": {
+   "mismatch": 0.0,
+   "us": 35.9
+  },
+  "ref_us": 47.8
+ },
+ "layers.0.ffn.shared_experts.w2[5120x2304]_M6": {
+  "b32x32": {
+   "mismatch": 0.00042,
+   "rel": 7.8e-05,
+   "max": 0.25,
+   "us": 83.3
+  },
+  "b_row32": {
+   "mismatch": 0.00042,
+   "rel": 7.8e-05,
+   "max": 0.25,
+   "us": 33.6
+  },
+  "b_row32_noPad": {
+   "mismatch": 0.00042,
+   "us": 35.2
+  },
+  "ref_us": 44.0
+ },
+ "layers.3.attn.wq_a[1280x5120]_M1": {
+  "b32x32": {
+   "mismatch": 0.00078,
+   "rel": 1e-06,
+   "max": 0.001,
+   "us": 90.3
+  },
+  "b_row32": {
+   "mismatch": 0.00078,
+   "rel": 1e-06,
+   "max": 0.001,
+   "us": 36.8
+  },
+  "b_row32_noPad": {
+   "mismatch": 0.00078,
+   "us": 37.0
+  },
+  "ref_us": 49.5
+ },
+ "layers.3.attn.wq_a[1280x5120]_M6": {
+  "b32x32": {
+   "mismatch": 0.00104,
+   "rel": 0.000191,
+   "max": 0.5,
+   "us": 86.1
+  },
+  "b_row32": {
+   "mismatch": 0.00104,
+   "rel": 0.000191,
+   "max": 0.5,
+   "us": 38.6
+  },
+  "b_row32_noPad": {
+   "mismatch": 0.00104,
+   "us": 35.2
+  },
+  "ref_us": 46.3
+ },
+ "layers.3.attn.wkv[512x5120]_M1": {
+  "b32x32": {
+   "mismatch": 0.00195,
+   "rel": 1e-05,
+   "max": 0.0078,
+   "us": 91.9
+  },
+  "b_row32": {
+   "mismatch": 0.00195,
+   "rel": 1e-05,
+   "max": 0.0078,
+   "us": 37.4
+  },
+  "b_row32_noPad": {
+   "mismatch": 0.00195,
+   "us": 36.7
+  },
+  "ref_us": 47.0
+ },
+ "layers.3.attn.wkv[512x5120]_M6": {
+  "b32x32": {
+   "mismatch": 0.0,
+   "rel": 0.0,
+   "max": 0.0,
+   "us": 88.2
+  },
+  "b_row32": {
+   "mismatch": 0.0,
+   "rel": 0.0,
+   "max": 0.0,
+   "us": 34.8
+  },
+  "b_row32_noPad": {
+   "mismatch": 0.0,
+   "us": 35.2
+  },
+  "ref_us": 47.2
+ },
+ "layers.3.attn.wo_b[5120x8192]_M1": {
+  "b32x32": {
+   "mismatch": 0.00195,
+   "rel": 0.000187,
+   "max": 0.5,
+   "us": 91.1
+  },
+  "b_row32": {
+   "mismatch": 0.00195,
+   "rel": 0.000187,
+   "max": 0.5,
+   "us": 40.1
+  },
+  "b_row32_noPad": {
+   "mismatch": 0.00195,
+   "us": 37.5
+  },
+  "ref_us": 64.9
+ },
+ "layers.3.attn.wo_b[5120x8192]_M6": {
+  "b32x32": {
+   "mismatch": 0.00173,
+   "rel": 0.000164,
+   "max": 0.5,
+   "us": 88.0
+  },
+  "b_row32": {
+   "mismatch": 0.00173,
+   "rel": 0.000164,
+   "max": 0.5,
+   "us": 38.8
+  },
+  "b_row32_noPad": {
+   "mismatch": 0.00173,
+   "us": 35.7
+  },
+  "ref_us": 64.9
+ },
+ "layers.1.engram.wkv[25600x6144]_M1": {
+  "b32x32": {
+   "mismatch": 0.00109,
+   "rel": 4e-05,
+   "max": 0.0625,
+   "us": 99.8
+  },
+  "b_row32": {
+   "mismatch": 0.00109,
+   "rel": 4e-05,
+   "max": 0.0625,
+   "us": 48.3
+  },
+  "b_row32_noPad": {
+   "mismatch": 0.00109,
+   "us": 46.6
+  },
+  "ref_us": 83.1
+ },
+ "layers.1.engram.wkv[25600x6144]_M6": {
+  "b32x32": {
+   "mismatch": 0.00122,
+   "rel": 8.6e-05,
+   "max": 0.25,
+   "us": 96.8
+  },
+  "b_row32": {
+   "mismatch": 0.00122,
+   "rel": 8.6e-05,
+   "max": 0.25,
+   "us": 48.4
+  },
+  "b_row32_noPad": {
+   "mismatch": 0.00122,
+   "us": 44.5
+  },
+  "ref_us": 83.5
+ }
+}

@@ -26,3 +26,7 @@ So the block-scaled UMMA accumulates in the reference's order except at wide dyn
 ## What this changes in the plan
 - T9a-1 is a one-day task after T8: replace the 18 `fp4_gemm` launches in the static MoE with 3 masked calls over the same staging buffer (`[6,N,K/2]` + fp32 scales kept resident per layer; `max_m=128` activation buffer per layer = 128 × 5120 B, trivial). Everything else in the static MoE stays.
 - Bit-identity: not exact under wide-range activations (1 ulp, ~0.01–0.04 %). `--moe-impl ref` remains the parity path, as the design memo specified.
+
+## Addendum — the reference's fp8 GEMMs through DeepGEMM `fp8_gemm_nt` (`bench/dg_fp8_spike.py`, receipt `dg-fp8-spike-20261106.json`)
+
+Works with `a=(fp8 [M,K], fp32 [M,K/32]) recipe_a=(1,32)`, `b=(fp8 [N,K], fp32 [N,K/32]) recipe_b=(1,32)` where the weight scale is the reference's 32×32 e8m0 block scale expanded per row (`repeat_interleave(32, 0)`, exact); no `max_m` padding needed for this non-grouped API. `recipe_b=(32,32)` also runs but is 2× slower. Drift vs reference `fp8_gemm`: 0–0.2 % of outputs 1 ulp. **Speed: only 1.3–1.8× (35–48 µs vs 44–83 µs per call)** on real shapes (2304×5120 … 25600×6144) at M=1/6. Both kernels are tile GEMMs; at M=1 they are launch/latency-bound and read weights at ~300 GB/s against an 8 TB/s HBM. 290 such calls/step ≈ 16 ms is better attacked with a **bandwidth-bound MXFP8 GEMV** (M ≤ 8 rows, per-row K-block loop, fp32 accumulate in the reference's block order) — ~2–4 µs per call at 3–6 TB/s → the 16 ms becomes ~1–2 ms. That is T9b-1.
