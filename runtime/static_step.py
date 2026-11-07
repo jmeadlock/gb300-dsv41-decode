@@ -582,7 +582,8 @@ class StaticStep:
             self._c = None
         sa = self.R.shared_attn
         sa.topk_idxs = sa.candidates = None  # in-graph tensors; the next forward re-publishes them
-        self.cold_acc.zero_()
+        with torch.inference_mode():  # cold_acc is an inference tensor (built under the caller's inference_mode); in-place ops need the mode
+            self.cold_acc.zero_()
         self.n_counted = 0
         self._dev_pos = None
         self.captured_fills = bool(fills)
