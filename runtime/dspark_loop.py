@@ -94,6 +94,9 @@ Exact greedy match, confidence head off, k = 5 drafts -> 6 verify rows:
 So exactly ONE cache needs an explicit commit: the ratio-2 compressor's two-slot state, because it is the only state
 that is not position-indexed (its slots are reused every 2 positions, so the next step's write never lands where the
 rejected row's value sits before it is read).
+T12-FIX2 checked this table on the CPU emulation, cache by cache (tests/gpu/test_dspark_loop_gpu.py `cache_probe`,
+tests/test_dspark_loop_cpu.py test_cache_probe_free_loop_caches_equal_one_row): in the free L = 17 run every cache
+above is bit-equal to the 1-row step's entering and after every step (first step's partial group included).
 
 ## Static-shape details
 

@@ -392,6 +392,77 @@ def test_gpu_eos_gate_dry_run_on_cpu(emu, monkeypatch, capsys):
     print(out)
 
 
+# ------------------------------------------------------------------------------------------------ T12-FIX2
+def _gpu_loop_module(name="gpu_loop_t12fix2"):
+    spec = importlib.util.spec_from_file_location(name, os.path.join(REPO, "tests", "gpu", "test_dspark_loop_gpu.py"))
+    G = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(G)
+    return G
+
+
+def test_rowwise_reduce_mode_semantics_and_restore():
+    """row_invariant_mode(True)'s sum / mean wrappers: same values as torch for every call form, per-row only on
+    [1, s > 1, ...] float tensors reduced over dims >= 2; torch.Tensor.sum / mean / torch.sum / mean restored exactly
+    (the methods are inherited from TensorBase: no attribute left on torch.Tensor); "linear" leaves them alone."""
+    G = _gpu_loop_module()
+    before = {(o, n): (n in vars(o), getattr(o, n)) for o, n in G.REDUCTIONS}
+    g = torch.Generator(device="cpu").manual_seed(1)
+    x = torch.randn(1, 6, 4, 32, generator=g, device="cpu")
+    xi = torch.randint(0, 9, (1, 6, 4, 32), generator=g, device="cpu")
+    calls = [lambda t: t.sum(-1), lambda t: t.mean(-1, keepdim=True), lambda t: t.sum(dim=(2, 3)),
+             lambda t: torch.sum(t, 2), lambda t: torch.mean(t, dim=-1), lambda t: t.sum(), lambda t: t.sum(dim=1),
+             lambda t: t.square().mean(-1, keepdim=True), lambda t: t.sum(-1, dtype=torch.float64)]
+    want = [f(x) for f in calls] + [xi.sum(-1)]
+    with G.row_invariant_mode("linear"):
+        assert all(getattr(o, n) is before[(o, n)][1] for o, n in G.REDUCTIONS)
+    with G.row_invariant_mode(True):
+        assert all(getattr(o, n) is not before[(o, n)][1] for o, n in G.REDUCTIONS)
+        got = [f(x) for f in calls] + [xi.sum(-1)]
+    for w, gv in zip(want, got):
+        assert w.shape == gv.shape and w.dtype == gv.dtype and torch.equal(w, gv)
+    after = {(o, n): (n in vars(o), getattr(o, n)) for o, n in G.REDUCTIONS}
+    assert after == before
+
+
+def test_reduction_census_dry_run_on_cpu():
+    """tests/gpu/test_dspark_loop_gpu.py's census on the CPU: every site row-invariant inside the mode (CPU torch
+    reduces each output with the same loop, so the plain column is expected 0 here too; on CUDA it is reported)."""
+    G = _gpu_loop_module()
+    rows = G._reduction_census("cpu", trials=4)
+    assert len(rows) == len(G.CENSUS_SITES) and all(r["mode_rows_differing"] == 0 for r in rows), rows
+    print("\n".join(f"{r['site']}: plain {r['plain_rows_differing']}/{r['rows']}" for r in rows))
+
+
+def test_cache_probe_free_loop_caches_equal_one_row(emu, monkeypatch):
+    """T12-FIX2 on the CPU emulation, the box's failing free run (mini3, L = 17, seed 317; 1.000 tok/step): every
+    cache a row reads (256-ring, compressed KV, index K, the ratio-2 compressor's two slots, the Engram hash cache)
+    is bit-equal to the 1-row step's at the same position, entering every step (after the previous commit AND draft)
+    and after every commit, through position 40 (past position 33, the first clen 17 > k 16)."""
+    G = _gpu_module(monkeypatch, emu)
+    import engram
+
+    monkeypatch.setattr(engram, "build_compressed_token_map",            # the GPU fixture's map (tests/gpu _model)
+                        lambda tok: (list(range(MINI_CONFIG["vocab_size"])), MINI_CONFIG["engram_compressed_vocab_size"]))
+    model, _ = emu("mini3")
+    L, n = 17, 26
+    with G.row_invariant_mode(True), G.cache_probe() as (rec, tag):
+        gen = G._gen(model, "static")
+        ids = G._toks(L, 300 + L, 2000)
+        tag["t"] = "1row"
+        truth, sha = G._truth(gen, ids, n)
+        tag["t"] = "loop"
+        loop = G._loop(gen, n)
+        r = loop.generate(ids, n, stop_on_eos=False, parity=True)
+        tag["t"] = None
+        loop.close()
+    assert r["token_ids"] == truth and r["step_sha256"] == sha
+    assert set(rec["after"]) >= set(range(L, L + n - 1)), sorted(rec["after"])
+    for p in range(L, L + n - 1):
+        if p > L:                                                         # no 1-row step ran at the prefill's L-1
+            assert G.cache_diff(rec["1row"][p - 1], rec["enter"][p - 1]) == [], (p, "entering")
+        assert G.cache_diff(rec["1row"][p], rec["after"][p]) == [], (p, "after")
+
+
 def test_loop_refuses_bad_setups(emu):
     from runtime.dspark_loop import DSparkLoop
     from runtime.generate import Generator
@@ -414,6 +485,102 @@ def test_loop_refuses_bad_setups(emu):
     gen.static_factory = lambda m, **kw: object()
     with pytest.raises(TypeError):
         DSparkLoop(gen, 32, _allow_cpu=True)
+
+
+# ------------------------------------------------------------------------------------------------ bf16 helpers
+def _draft_gpu_module(name="gpu_draft_t12fix2"):
+    spec = importlib.util.spec_from_file_location(name, os.path.join(REPO, "tests", "gpu", "test_draft_gpu.py"))
+    D_ = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(D_)
+    return D_
+
+
+def test_dg_evidence_fp64_helpers():
+    """T12-FIX2: bf16 spacing at binade edges; fp4 e2m1 x e8m0 rows and fp8 x block-scale dequantization are exact."""
+    from test_static_emulated_cpu import _fp4_deq, _scale_f
+
+    D_ = _draft_gpu_module()
+    v = torch.tensor([1.0, 1.5, 1.9921875, 2.0, 0.5, -3.0, 4.0, 7.9], dtype=torch.float64, device="cpu")
+    assert D_.bf16_spacing(v).tolist() == [2 ** -7, 2 ** -7, 2 ** -7, 2 ** -6, 2 ** -8, 2 ** -6, 2 ** -5, 2 ** -5]
+    g = torch.Generator(device="cpu").manual_seed(2)
+    w = torch.randint(0, 256, (4, 32), generator=g, dtype=torch.uint8, device="cpu")
+    s = torch.randint(120, 134, (4, 2), generator=g, dtype=torch.uint8, device="cpu").view(torch.float8_e8m0fnu)
+    want = _fp4_deq(w).double() * _scale_f(s).double().repeat_interleave(32, -1)
+    assert torch.equal(D_.fp4_rows_f64(w, s), want)
+    q = (torch.randn(3, 256, generator=g, device="cpu") * 50).to(torch.float8_e4m3fn)
+    sc = torch.rand(3, 2, generator=g, device="cpu") + 0.25
+    assert torch.equal(D_.act_f64(q, sc), q.double() * sc.double().repeat_interleave(128, -1))
+    d = D_.oracle_dist(torch.tensor([1.0078125], dtype=torch.bfloat16, device="cpu"),
+                       torch.tensor([1.0], dtype=torch.float64, device="cpu"),
+                       torch.tensor([[1.0]], dtype=torch.float64, device="cpu"))
+    assert d["ulp"] == 1.0 and d["excess"] == 0.0
+
+
+def test_dg_moe_evidence_a3_vs_slips(emu):
+    """T12-FIX2 (tests/gpu/test_draft_gpu.py `dg_moe_evidence`, the P2 gate's A3-or-slip classifier) on the CPU
+    emulation, the reference MoE's own per-pair intermediates standing in for the DG buffers: (a) as-is -> A3,
+    0 ulp; (b) one pair's w2 output 1 ulp off at one element (an accumulation-order flip) -> still A3; (c) a wrong
+    expert's w2 output in one pair (an indexing slip) -> NOT A3; (d) a scatter slip in one pair's w1/w3 input -> NOT
+    A3; (e) a corrupted combine (a pair added twice) -> NOT A3."""
+    from runtime.draft_step import DraftStep
+    from runtime.refmodel import reference_device
+
+    D_ = _draft_gpu_module()
+    model, _ = emu("mini3")
+    ds = DraftStep(model, _allow_cpu=True)
+    st = ds.stages[0]
+    dim = st.ffn.dim
+    g = torch.Generator(device="cpu").manual_seed(4)
+    x = torch.randn(1, ds.block, dim, generator=g, device="cpu").to(torch.bfloat16)
+    with torch.inference_mode(), reference_device(x.device):
+        want = st.ffn(x).clone()
+        sh = st.ffn.shared_experts(x.view(-1, dim))
+
+    def combine(v):
+        with torch.inference_mode():
+            y = torch.zeros(x.view(-1, dim).shape, dtype=torch.float32, device="cpu")
+            for j in range(v["posmat"].size(1)):
+                y += v["out"].index_select(0, v["posmat"][:, j]).float()
+            y += sh
+            return y.type_as(x).view(x.shape)
+
+    def clone(v):
+        return {k: t.clone() for k, t in v.items()}
+
+    view, y0 = D_.reference_pairs_view(ds.R, st, x)
+    assert torch.equal(y0, want)
+    ev = D_.dg_moe_evidence(ds.R, st, x, y0, want, view)
+    assert ev["a3"] and ev["replicate_ok"] and ev["combine_dg_ok"], ev["why"]
+    assert ev["pair_max_ulp"] == 0 and ev["w2_inputs_equal"] == ev["n_pairs"] == ds.block * st.ffn.gate.topk
+    assert not ev["elems"]
+    pm = view["posmat"]
+    a, b = int(pm[0, 0]), int(pm[1, 1])
+    # (b) one element of one pair output 1 bf16 ulp off (magnitude +1 in the sign-magnitude code)
+    v = clone(view)
+    c = int(v["out"][a].float().abs().argmax())
+    with torch.inference_mode():
+        v["out"][a, c] = (v["out"][a, c:c + 1].view(torch.int16) + 1).view(torch.bfloat16)[0]
+    ev = D_.dg_moe_evidence(ds.R, st, x, combine(v), want, v)
+    assert ev["a3"] and ev["pair_max_ulp"] == 1, ev["why"]
+    # (c) the wrong expert's output in pair a
+    v = clone(view)
+    with torch.inference_mode():
+        v["out"][a] = view["out"][b]
+    ev = D_.dg_moe_evidence(ds.R, st, x, combine(v), want, v)
+    assert not ev["a3"] and any("w2" in w for w in ev["why"]), ev["why"]
+    # (d) pair a's w1/w3 input from another row
+    v = clone(view)
+    with torch.inference_mode():
+        v["xq1"][a] = view["xq1"][b]
+    ev = D_.dg_moe_evidence(ds.R, st, x, combine(view), want, v)
+    assert not ev["a3"] and any("scatter" in w for w in ev["why"]), ev["why"]
+    # (e) a pair added twice in the combine
+    v = clone(view)
+    bad = combine(view).clone()
+    with torch.inference_mode():
+        bad.view(-1, dim)[0] = (bad.view(-1, dim)[0].float() + view["out"][a].float()).to(torch.bfloat16)
+    ev = D_.dg_moe_evidence(ds.R, st, x, bad, want, v)
+    assert not ev["a3"] and not ev["combine_dg_ok"], ev["why"]
 
 
 # ------------------------------------------------------------------------------------------------ bench/headline.py
