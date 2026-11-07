@@ -323,6 +323,10 @@ class Generator:
         self.marker = bool(marker)
         self.static_counters = bool(static_counters)
         self.static_factory = static_factory
+        # M1-T12 hooks (runtime/dspark_loop.py): the class the default build uses (None = StaticStep; the loop sets
+        # dspark_loop.VerifyStep) and extra constructor kwargs (CPU tests: {"_allow_cpu": True})
+        self.static_cls = None
+        self.static_kw: dict = {}
         self.static = None  # runtime.static_step.StaticStep (or the factory's stand-in), built on first use
         self._static_max_pos = max_pos
         self._marker_ctr = None
@@ -457,12 +461,13 @@ class Generator:
             else:
                 from runtime.static_step import StaticStep
 
-                self.static = StaticStep(self.model, self.pool, max_pos=self._static_max_pos, marker=self.marker,
-                                         counters=self.static_counters, moe_impl=self.moe_impl,
-                                         fp8_impl=self.fp8_impl, glue_impl=self.glue_impl,
-                                         glue_opts={"approx": True} if self.glue_approx else None,
-                                         attn_impl=self.attn_impl, rows=self.rows, hidden_layers=self.hidden_layers,
-                                         **self._spare_kw())
+                cls = self.static_cls or StaticStep
+                self.static = cls(self.model, self.pool, max_pos=self._static_max_pos, marker=self.marker,
+                                  counters=self.static_counters, moe_impl=self.moe_impl,
+                                  fp8_impl=self.fp8_impl, glue_impl=self.glue_impl,
+                                  glue_opts={"approx": True} if self.glue_approx else None,
+                                  attn_impl=self.attn_impl, rows=self.rows, hidden_layers=self.hidden_layers,
+                                  **self._spare_kw(), **self.static_kw)
         return self.static
 
     def reset_static(self) -> None:
