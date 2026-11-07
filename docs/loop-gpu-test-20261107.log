@@ -1,0 +1,44 @@
+Traceback (most recent call last):
+  File "/work/tests/gpu/test_dspark_loop_gpu.py", line 446, in <module>
+    t()
+  File "/work/tests/gpu/test_dspark_loop_gpu.py", line 342, in test_loop_stream_equals_greedy_static
+    _gate_stream("mini3", 17, 64, mode="static")
+  File "/work/tests/gpu/test_dspark_loop_gpu.py", line 218, in _gate_stream
+    assert not bad, f"{tag}: logits rows {bad[:8]} differ from the 1-row step"
+           ^^^^^^^
+AssertionError: mini3 L=17 mode=static row-invariant : logits rows [17] differ from the 1-row step
+FAIL test_loop_stream_equals_greedy_static (32.5s)
+  mini3 L=17 mode=static as-is : REPORTED divergence at 6
+PASS test_loop_stream_as_is_reported (9.4s)
+  mini3 L=17 mode=static: forced rejections, 14 steps, accept hist [3, 2, 2, 2, 2, 3], positions 17..65: stream == greedy, 47 logit rows == 1-row
+  mini3 L=250 mode=static: forced rejections, 15 steps, accept hist [3, 2, 2, 2, 2, 4], positions 250..304: stream == greedy, 55 logit rows == 1-row
+PASS test_loop_forced_rejections_static (4.8s)
+  mini3 L=19: EOS 1182 at token 17: loop stops there (finish stop, 17 live steps of 32 issued); 3 steps after done change nothing
+PASS test_loop_eos_and_noop_steps_static (4.0s)
+Traceback (most recent call last):
+  File "/work/tests/gpu/test_dspark_loop_gpu.py", line 446, in <module>
+    t()
+  File "/work/tests/gpu/test_dspark_loop_gpu.py", line 365, in test_loop_graph_two_and_one_equal_static_replay_no_sync
+    _gate_stream("mini3", 17, 64, mode="graph", n_graphs=ng)
+  File "/work/tests/gpu/test_dspark_loop_gpu.py", line 218, in _gate_stream
+    assert not bad, f"{tag}: logits rows {bad[:8]} differ from the 1-row step"
+           ^^^^^^^
+AssertionError: mini3 L=17 mode=graph/2g row-invariant : logits rows [17] differ from the 1-row step
+FAIL test_loop_graph_two_and_one_equal_static_replay_no_sync (1.8s)
+Traceback (most recent call last):
+  File "/work/tests/gpu/test_dspark_loop_gpu.py", line 446, in <module>
+    t()
+  File "/work/tests/gpu/test_dspark_loop_gpu.py", line 407, in test_loop_stream_gemv_pinned
+    _gate_stream("mini3", 17, 64, mode="graph", n_graphs=2, pin=True, fp8_impl="gemv")
+  File "/work/tests/gpu/test_dspark_loop_gpu.py", line 218, in _gate_stream
+    assert not bad, f"{tag}: logits rows {bad[:8]} differ from the 1-row step"
+           ^^^^^^^
+AssertionError: mini3 L=17 mode=graph/2g row-invariant gemv-pinned {'fp8_impl': 'gemv'}: logits rows [17] differ from the 1-row step
+FAIL test_loop_stream_gemv_pinned (1.8s)
+SKIP (DSV41_MODEL_DIR not set) test_loop_real (0.0s)
+  note: mini3 L=17 mode=static row-invariant : 64 tokens, 63 steps, 1.000 tok/step, stream == greedy, logits rows differing 1/64
+  note: mini3 L=17 mode=static as-is : 64 tokens, 63 steps, 1.000 tok/step, stream diverges at 6, logits rows differing 63/64
+  note: mini3 L=17 mode=graph/2g row-invariant : 64 tokens, 63 steps, 1.000 tok/step, stream == greedy, logits rows differing 1/64
+  note: mini3 L=17 mode=graph/2g row-invariant gemv-pinned {'fp8_impl': 'gemv'}: 64 tokens, 63 steps, 1.000 tok/step, stream == greedy, logits rows differing 1/64
+comparisons executed: {'gates': 4, 'tokens': 64, 'logit_rows': 166, 'steps': 63, 'forced_steps': 29, 'graph': 0}
+4/7 not failed; 3 failed
