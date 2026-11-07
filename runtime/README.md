@@ -758,3 +758,57 @@ Pg61 within the A3 class (2/8 identical, 0 weighted flips), step cell <= 22 ms; 
 Then check `attn_bound` in the report (`impl: flashmla`, `on: true`, `load.vllm_modules: []`, the self-check's
 `max_err_ratio`), the level-A drift row (`parity_levels.attn_drift.mean_abs_dlogit`), and the parity table vs Pg61.
 Kernel name in nsys: FlashMLA's sparse prefill kernel (40 per step); no `sparse_attn_kernel_` should remain.
+
+## T9b-4: the last straightforward 1-row wins (same flags; `fused_glue*.py`, `gemv_mxfp8.py`, `dg_inplace.py`)
+
+Spec `docs/HANDOFF-T9B4-RESIDUAL.md`, residual `docs/STEP-ANATOMY-R2-20261107.md`. No new user flag: every change is a
+part of an existing switch (`--glue-impl fused` + `--fp8-impl gemv` / `--moe-impl dg-inplace`), listed in
+`st.glue.describe()["r4"]` and in `clusters`, self-checked at build against the path it replaces (bitwise, on the
+device; a mismatch or a raise turns only that part off, reason in `calibration.r4`), and nameable in
+`$DSV41_GLUE_DISABLE` (`hc_split,gemv_pair,reduce_fold,dg_sf_pack`) for A/B and bisecting.
+
+| part | lever | what | numerics |
+|---|---|---|---|
+| `hc_split` | 1 | `t9b4_hc_norm`: the hc_norm work over 1 + ceil(D/32 / 8) programs (D = 5120: 20 apply + 1 mix) instead of one; every apply program recomputes the norm statistic with the calibrated order's exact code (redundant, no combine), then writes its 8 blocks; the mix program writes xf + the mix statistic; tile loops unrolled (`static_range`: loads in flight, adds in order) | bit-identical by construction (same adds, same order); build check split == one-program on all outputs, before hc_norm's own end-to-end check |
+| `gemv_pair` | 2a | `gemv_mxfp8.gemv_pair` / `t9b4_mxfp8_gemv2`: wq_a ‖ wkv and shared w1 ‖ w3 (same input) in ONE launch, weights untouched (pointer pair); each half keeps its own tuned split partition (PER, NSPLIT); formed only when both tuned configs share the block-partial form (MMA), else two launches (`describe()["r4"]["pair_launches"]`) | bit-identical: each half's `numerics_key` is its single launch's |
+| `reduce_fold` | 2b | `gemv_partials` -> `SplitK` (fp32 partials, `t9b_splitk_reduce` not launched); the consumer (`t9b2r2_norm_row` for q_norm / kv_norm, `t9b2_swiglu_quant` for the shared expert) sums the partials on load in the reduce's order (`_t9b4_ld`: +0.0, split 0..NS-1, fp32, then bf16 RNE). Partials live in per-role tagged workspaces (`workspace(..., tag)`) so w1's survive w3's GEMV | bit-identical by construction |
+| `dg_sf_pack` | 4 | dg-inplace only: the fused writers of DeepGEMM's activation rows (hc_norm's DG rows, `dg_act`, routed SwiGLU) store e8m0 codes straight into a packed MN-major int32 SF (`dg_inplace.packed_act_sf` / `PackedRows`: DeepGEMM's `pack_ue8m0_to_int` bytes, padding rows code 127 = 1.0); `gemm_inplace` passes it, so DeepGEMM's `transpose_and_pack_fp32_into_ue8m0` (120 launches/step) has nothing to do | data movement only; build check: packed codes == fp32 scales' codes, and the contiguous GEMM on layer 0's pool packed == fp32 bitwise (w1 and w2 shapes). If this DeepGEMM build rejects an int32 activation SF the part stays off with the exception text |
+
+Also (existing `router` cluster): `DGInplaceMoE` now routes through `glue.route` like StaticMoE / DGMaskedMoE do -- the
+T9a-2 class had its own `__call__` that still ran `moe.gate` + sort, so R2's router fusion never ran on the dg-inplace
+path. Same self-checked route() as R2 (bit-identical).
+
+Not done, and why (handoff levers 3 and 5, and two of lever 2's sites):
+  * lever 3 (`nvjet` mm -> GEMV): not implemented. A replacement is bit-identical only if a calibrated order matches
+    cuBLAS's nvjet split (FMA chains per thread, then a cross-warp combine) -- a probe that needs the box first.
+  * lever 5 (`t9a2_stage_inplace` early exit): invalid as specified under `sf_store="step"` (the default, and what the
+    13.88 run used): the shared packed weight SF is rewritten for ALL k experts every layer (other layers' experts sit
+    in the same groups), so a zero-cold layer still has 3 x k scale transposes to do; the weight copy is already
+    skipped per program for hot experts. The data-movement-only option is the existing `DSV41_DG_SF_STORE=resident`
+    (scales packed once per layer at build, the stage kernel then moves cold rows only): +12.1 GiB HBM (20.0 GiB free
+    after build in `first-light-r2-20261107.json`) -- an orchestrator decision.
+  * indexer `wq_b ‖ wk`: not a pair -- `wk` reads the compressor latent, `wq_b` reads qr (different inputs), and `wk` is
+    not an fp8 GEMV call. wo_b / shared w2 / indexer wq_b / Engram wkv reduces (90 launches) are not folded: their
+    consumers are hc_post / the MoE combine / torch ops (fold candidates for a later round).
+
+CPU: `tests/test_t9b4_cpu.py` (shim-executed kernel bodies == the kernels they replace and the torch mirrors; real
+split partials on CPU via `gemv_mxfp8.CPU_SPLIT_K`; StaticStep fused + T9b-4 == without == ref glue for dg-masked and
+dg-inplace; the self-check turning broken parts off). Census: `bench/glue_census.py` adds the
+`static-dg-gemv-fused-r2` path (R1 + R2, T9b-4 off) and a `t9b4` table (the CPU census sees the two pairs: -80
+launches/step; the folded reduces, hc_split's programs, the SF pack and the dg-inplace router are box-only rows).
+
+**Box, GPU test** (each part `torch.equal` vs what it replaces at the real shapes, graph-timed us informative; mini4
+fused + T9b-4 == without over 10 steps for dg-masked and dg-inplace; graph == static):
+
+    docker run --rm --device nvidia.com/gpu=GPU-1c1855c8-dd10-0247-583e-3c3880ddbf55 --ipc=host --ulimit memlock=-1:-1 \
+      --cap-add IPC_LOCK -v "$W":/work -w /work -e CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+      -v "$HOME/dsv41/w0/jit-cache/tilelang":/root/.tilelang -v "$HOME/dsv41/w0/jit-cache/triton":/root/.triton \
+      -v "$HOME/dsv41/w0/jit-cache/nv":/root/.nv \
+      -v "$HOME/dsv41/w0/jit-cache/dg":/root/.deep_gemm -e DG_JIT_CACHE_DIR=/root/.deep_gemm \
+      --entrypoint python3 vllm/vllm-openai:v0.31.0 tests/gpu/test_t9b4_gpu.py
+
+**Box, first light**: the 13.88 command unchanged (`--mode graph --moe-impl dg-inplace --fp8-impl gemv --glue-impl
+fused --attn-impl flashmla --map docs/maps/hot-v26ar-seed-295.json`); check `fused_glue.r4.parts` (all `on`, or the
+self-check's reason), `fused_glue.calibration.r4`, `dg_moe.act_sf_packed`, the G/D/L rows, and output bytes vs the
+13.88 run. A/B any part with `-e DSV41_GLUE_DISABLE=<part>`. nsys: `t9b4_hc_norm` replaces `t9b2r2_hc_norm`;
+`t9b4_mxfp8_gemv2` 80/step; `t9b_splitk_reduce` 250 -> 90; `transpose_and_pack_fp32_into_ue8m0` 120 -> 0.

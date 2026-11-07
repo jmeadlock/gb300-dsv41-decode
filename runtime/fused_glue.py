@@ -91,11 +91,16 @@ R1_CLUSTERS = ("gather", "dg_act", "swiglu_routed", "swiglu_shared", "moe_combin
                "q_rope_epilogue", "concat_free")
 # T9b-2 round 2 (runtime/fused_glue_r2.py): the medium-risk clusters
 R2_CLUSTER_NAMES = ("hc_norm", "mix_stat", "kv_path", "q_path", "router", "engram", "indexer_post")
-CLUSTERS = R1_CLUSTERS + R2_CLUSTER_NAMES
+# T9b-4 (docs/HANDOFF-T9B4-RESIDUAL.md): sub-switches of existing clusters / impls, each bit-identical or data movement
+# only and self-checked at build like the rest (DSV41_GLUE_DISABLE names them for A/B and bisecting)
+R4_PARTS = ("hc_split", "gemv_pair", "reduce_fold", "dg_sf_pack")
+CLUSTERS = R1_CLUSTERS + R2_CLUSTER_NAMES + R4_PARTS
 CLUSTER_AUDIT = {"gather": "#11+#9", "dg_act": "#9", "swiglu_routed": "#2+#9", "swiglu_shared": "#2",
                  "moe_combine": "#8", "hc_post": "#7", "o_rope_qdq": "#10", "q_rope_epilogue": "#13",
                  "concat_free": "#16", "hc_norm": "#1", "mix_stat": "#5", "kv_path": "#3", "q_path": "#6",
-                 "router": "#4 (non-topk)", "engram": "#15", "indexer_post": "#14 (non-topk)"}
+                 "router": "#4 (non-topk)", "engram": "#15", "indexer_post": "#14 (non-topk)",
+                 "hc_split": "T9b-4 L1", "gemv_pair": "T9b-4 L2a", "reduce_fold": "T9b-4 L2b",
+                 "dg_sf_pack": "T9b-4 L4"}
 CONCAT_FREE_WHY = ("not implemented in round 1: the window ring is per layer while the compressed cache and the "
                    "published topk_idxs are shared by every layer of a kv/index group, so one buffer per layer "
                    "needs either per-layer copies of the compressed rows (no launch saved) or re-allocating the "
@@ -344,10 +349,35 @@ if HAVE_TRITON:
         return v.to(tl.bfloat16, fp_downcast_rounding="rtne").to(tl.float32)
 
     @triton.jit
-    def t9b2_act_quant_bcast(x, x_rs, q, q_gs, s, s_gs, G, KB, tab, BB: tl.constexpr, S_F32: tl.constexpr):
+    def _t9b4_ld(x, e, m, NS: tl.constexpr, XS):
+        """fp32 value of x[e]: a bf16 load (NS == 0), or (T9b-4 reduce fold) the bf16 rounding of the fixed-order sum
+        of NS fp32 split partials x[j*XS + e], j = 0..NS-1, from +0.0 -- t9b_splitk_reduce's value."""
+        if NS == 0:
+            v = tl.load(x + e, mask=m, other=0.0).to(tl.float32)
+        else:
+            acc = tl.zeros(e.shape, dtype=tl.float32)
+            for j in tl.static_range(NS):
+                acc = acc + tl.load(x + j * XS + e, mask=m, other=0.0)
+            v = _t9b2_bf16(acc)
+        return v
+
+    @triton.jit
+    def _t9b4_store_code(s, row, bi, code, bok, s_gs, s_cs, PACK: tl.constexpr):
+        """T9b-4 lever 4: the e8m0 code of 32-block bi of output row `row` into DeepGEMM's packed MN-major activation
+        SF (uint8 view of int32 storage [K/128][M]): byte row*s_gs + (bi // 4)*s_cs + bi % 4 (PACK), else the fp32
+        scale 2^(code-127) at s[row*s_gs + bi]."""
+        if PACK:
+            tl.store(s + row * s_gs + (bi >> 2) * s_cs + (bi & 3), code.to(tl.uint8), mask=bok)
+        else:
+            tl.store(s + row * s_gs + bi, _t9b2_pow2(code), mask=bok)
+
+    @triton.jit
+    def t9b2_act_quant_bcast(x, x_rs, q, q_gs, s, s_gs, G, KB, tab, BB: tl.constexpr, S_F32: tl.constexpr,
+                             s_cs=0, S_PACK: tl.constexpr = False):
         """Program (pb, r): 32-blocks [pb*BB, (pb+1)*BB) of input row r (bf16, row stride x_rs) -> fp8 values and the
         block scales (fp32 value or uint8 e8m0 code) written to output rows r*G + g for g < G (strides q_gs, s_gs):
-        dg_act writes one activation row into row 0 of every DeepGEMM group this way."""
+        dg_act writes one activation row into row 0 of every DeepGEMM group this way. T9b-4 S_PACK: the codes go
+        into DeepGEMM's packed MN-major SF bytes (_t9b4_store_code; s_gs / s_cs in bytes)."""
         pb = tl.program_id(0)
         r = tl.program_id(1)
         bi = pb * BB + tl.arange(0, BB)
@@ -360,24 +390,30 @@ if HAVE_TRITON:
         for g in range(G):
             o = r * G + g
             tl.store(q + o * q_gs + cols, qv, mask=m)
-            if S_F32:
+            if S_PACK:
+                _t9b4_store_code(s, o, bi, code, bok, s_gs, s_cs, True)
+            elif S_F32:
                 tl.store(s + o * s_gs + bi, _t9b2_pow2(code), mask=bok)
             else:
                 tl.store(s + o * s_gs + bi, code.to(tl.uint8), mask=bok)
 
     @triton.jit
     def t9b2_swiglu_quant(g, g_gs, u, u_gs, w, q, q_gs, s, s_gs, KB, silu_tab, tab, lim,
-                          BB: tl.constexpr, HAS_W: tl.constexpr, HAS_LIM: tl.constexpr, S_F32: tl.constexpr):
+                          BB: tl.constexpr, HAS_W: tl.constexpr, HAS_LIM: tl.constexpr, S_F32: tl.constexpr,
+                          s_cs=0, GS=0, US=0, S_PACK: tl.constexpr = False, NSG: tl.constexpr = 0,
+                          NSU: tl.constexpr = 0):
         """Program (pb, j): group/row j, 32-blocks [pb*BB, (pb+1)*BB). gate/up bf16 -> silu(clamp(gate)) by table,
-        clamp(up), silu*up, (w[j] *), bf16 RNE, then act_quant -> fp8 q and the scale (fp32 or e8m0 code)."""
+        clamp(up), silu*up, (w[j] *), bf16 RNE, then act_quant -> fp8 q and the scale (fp32 or e8m0 code). T9b-4:
+        NSG / NSU > 0 = gate / up are the GEMV's fp32 split partials (split strides GS / US) reduced on load in the
+        split-K reduce's order (_t9b4_ld); S_PACK = codes into DeepGEMM's packed SF bytes (_t9b4_store_code)."""
         pb = tl.program_id(0)
         j = tl.program_id(1)
         bi = pb * BB + tl.arange(0, BB)
         bok = bi < KB
         cols = bi[:, None] * 32 + tl.arange(0, 32)[None, :]
         m = bok[:, None] & (cols >= 0)
-        gv = tl.load(g + j * g_gs + cols, mask=m, other=0.0).to(tl.float32)
-        uv = tl.load(u + j * u_gs + cols, mask=m, other=0.0).to(tl.float32)
+        gv = _t9b4_ld(g + j * g_gs, cols, m, NSG, GS)
+        uv = _t9b4_ld(u + j * u_gs, cols, m, NSU, US)
         sv = tl.load(silu_tab + ((gv.to(tl.int32, bitcast=True) >> 16) & 0xFFFF))
         if HAS_LIM:
             sv = tl.where(gv > lim, tl.load(silu_tab + 65536), sv)
@@ -389,7 +425,9 @@ if HAVE_TRITON:
         h = _t9b2_bf16(h)
         code = _t9b2_code(tl.max(tl.abs(h), axis=1), tab)
         tl.store(q + j * q_gs + cols, _t9b2_q8(h, _t9b2_ipow2(code)[:, None]), mask=m)
-        if S_F32:
+        if S_PACK:
+            _t9b4_store_code(s, j, bi, code, bok, s_gs, s_cs, True)
+        elif S_F32:
             tl.store(s + j * s_gs + bi, _t9b2_pow2(code), mask=bok)
         else:
             tl.store(s + j * s_gs + bi, code.to(tl.uint8), mask=bok)
@@ -492,46 +530,82 @@ PROBE_BLOCK = 1024
 # ------------------------------------------------------------------------------------------------ launch wrappers
 # Each wrapper is one kernel launch on CUDA (the census counts it as one) and the torch mirror on CPU. Call sites
 # reach them through this module's globals at call time (bench/glue_census.py wraps them).
+def _is_packed(s) -> bool:
+    return getattr(s, "packed", False)
+
+
+def _split_src(t):
+    """(tensor, rows, cols, row stride, NS, split stride) of a bf16 [R, I] row view or (T9b-4) a gemv_mxfp8.SplitK."""
+    if hasattr(t, "nsplit") and hasattr(t, "ws"):
+        return t.ws, t.M, t.N, t.N, t.nsplit, t.split_stride
+    return t, t.size(0), t.size(1), t.stride(0), 0, 0
+
+
+def _store_scales_torch(s, row: int, code: torch.Tensor) -> None:
+    """CPU mirror of a scale-row store: fp32 2^(code-127), e8m0 bytes, or (T9b-4) packed DeepGEMM SF bytes."""
+    if _is_packed(s):
+        s.store_codes_torch(row, code)
+    elif s.dtype == torch.float32:
+        s[row].copy_(pow2_code(code))
+    else:
+        s.view(torch.uint8)[row].copy_(code.to(torch.uint8))
+
+
 def launch_act_quant_bcast(x, q, s, code_tab, groups: int):
-    """x [R, K] bf16 (unit inner stride) -> q rows (r*groups + g) fp8 [.., K] and s rows (fp32 or e8m0/uint8)."""
+    """x [R, K] bf16 (unit inner stride) -> q rows (r*groups + g) fp8 [.., K] and s rows (fp32 or e8m0/uint8, or
+    T9b-4: a runtime.dg_inplace.PackedRows -- the codes straight into DeepGEMM's packed activation SF)."""
     R_, K = x.shape
     KB = K // BLOCK
-    s_f32 = s.dtype == torch.float32
+    pk = _is_packed(s)
+    s_f32 = (not pk) and s.dtype == torch.float32
     if _kern(x):
-        su = s if s_f32 else s.view(torch.uint8)
+        if pk:
+            su, s_gs, s_cs = s.u8, s.row_stride, s.col_stride
+        else:
+            su = s if s_f32 else s.view(torch.uint8)
+            s_gs, s_cs = su.stride(0), 0
         t9b2_act_quant_bcast[(triton.cdiv(KB, AQ_BB), R_)](
-            x, x.stride(0), q, q.stride(0), su, su.stride(0), int(groups), KB, code_tab, BB=AQ_BB, S_F32=s_f32,
-            **LAUNCH)
+            x, x.stride(0), q, q.stride(0), su, s_gs, int(groups), KB, code_tab, BB=AQ_BB, S_F32=s_f32,
+            s_cs=int(s_cs), S_PACK=pk, **LAUNCH)
         return
     qv, code = act_quant_torch(x.float(), code_tab)
     for r in range(R_):
         for g in range(groups):
             o = r * groups + g
             q[o].copy_(qv[r])
-            if s_f32:
-                s[o].copy_(pow2_code(code[r]))
-            else:
-                s.view(torch.uint8)[o].copy_(code[r].to(torch.uint8))
+            _store_scales_torch(s, o, code[r])
 
 
 def launch_swiglu_quant(g, u, w, q, s, silu_tab, code_tab, lim: float):
-    """g, u: [G, I] bf16 row views (unit inner stride); w: [G] fp32 or None; q [G, I] fp8; s [G, I/32] fp32/e8m0."""
-    G_, I = g.shape
+    """g, u: [G, I] bf16 row views (unit inner stride) or (T9b-4 reduce fold) gemv_mxfp8.SplitK partials of the
+    shared expert's w1 / w3 GEMVs; w: [G] fp32 or None; q [G, I] fp8; s [G, I/32] fp32/e8m0 or (T9b-4) a
+    runtime.dg_inplace.PackedRows."""
+    gt, G_, I, g_gs, nsg, gs = _split_src(g)
+    ut, _, _, u_gs, nsu, us = _split_src(u)
     KB = I // BLOCK
-    s_f32 = s.dtype == torch.float32
-    if _kern(g):
-        su = s if s_f32 else s.view(torch.uint8)
+    pk = _is_packed(s)
+    s_f32 = (not pk) and s.dtype == torch.float32
+    if _kern(gt):
+        if pk:
+            su, s_gs, s_cs = s.u8, s.row_stride, s.col_stride
+        else:
+            su = s if s_f32 else s.view(torch.uint8)
+            s_gs, s_cs = su.stride(0), 0
         t9b2_swiglu_quant[(triton.cdiv(KB, AQ_BB), G_)](
-            g, g.stride(0), u, u.stride(0), w if w is not None else g, q, q.stride(0), su, su.stride(0), KB,
-            silu_tab, code_tab, float(lim), BB=AQ_BB, HAS_W=w is not None, HAS_LIM=lim > 0, S_F32=s_f32, **LAUNCH)
+            gt, g_gs, ut, u_gs, w if w is not None else gt, q, q.stride(0), su, s_gs, KB,
+            silu_tab, code_tab, float(lim), BB=AQ_BB, HAS_W=w is not None, HAS_LIM=lim > 0, S_F32=s_f32,
+            s_cs=int(s_cs), GS=int(gs), US=int(us), S_PACK=pk, NSG=int(nsg), NSU=int(nsu), **LAUNCH)
         return
-    h = swiglu_torch(g, u, w, silu_tab, lim)
+    gb = g.reduce_torch() if nsg else g
+    ub = u.reduce_torch() if nsu else u
+    h = swiglu_torch(gb, ub, w, silu_tab, lim)
     qv, code = act_quant_torch(h, code_tab)
     q.copy_(qv)
-    if s_f32:
-        s.copy_(pow2_code(code))
+    if pk or not s_f32:
+        for r in range(G_):
+            _store_scales_torch(s, r, code[r])
     else:
-        s.view(torch.uint8).copy_(code.to(torch.uint8))
+        s.copy_(pow2_code(code))
 
 
 def launch_moe_combine(rows, shared, out):
@@ -634,6 +708,7 @@ class FusedGlue(R2Glue):
         else:
             self.calib["skipped"] = True
             self._r2_default_orders()
+            self._off("dg_sf_pack", "not self-checked (calibrate=False)")
 
     # ---------------------------------------------------------------- status
     def on(self, c: str) -> bool:
@@ -649,6 +724,8 @@ class FusedGlue(R2Glue):
         dg = o.moe_impl in ("dg-masked", "dg-inplace")  # T9a-2: dg-inplace reuses dg-masked's act/SwiGLU/combine
         if c in R2_CLUSTER_NAMES:
             return self._applicable_r2(c, layers, mx)
+        if c in R4_PARTS:
+            return self._applicable_r4(c, layers, mx)
         if c in ACT_CLUSTERS and not mx:
             return "needs the MXFP8 act_quant globals (block 32, ue8m0, e8m0 scales)"
         if c == "concat_free":
@@ -713,13 +790,19 @@ class FusedGlue(R2Glue):
     def dg_act(self, x: torch.Tensor) -> None:
         """act_quant(x) into row 0 of every group of DeepGEMM's w1/w3 input buffer (fp8 + fp32 scales)."""
         b = self.o.dg
-        launch_act_quant_bcast(x.view(1, -1), b.xq[1][:, 0], b.xs[1][:, 0], self.code_tab, b.k)
+        launch_act_quant_bcast(x.view(1, -1), b.xq[1][:, 0], self.dg_scale_dst(1), self.code_tab, b.k)
 
     def routed_swiglu(self, w: torch.Tensor) -> None:
         """Routed SwiGLU on the w1/w3 GEMM outputs (row 0 of each group) -> act_quant -> row 0 of the w2 input."""
         b = self.o.dg
-        launch_swiglu_quant(b.d["w1"][:, 0], b.d["w3"][:, 0], w, b.xq[2][:, 0], b.xs[2][:, 0], self.silu_tab,
+        launch_swiglu_quant(b.d["w1"][:, 0], b.d["w3"][:, 0], w, b.xq[2][:, 0], self.dg_scale_dst(2), self.silu_tab,
                             self.code_tab, b.swiglu_limit)
+
+    def dg_scale_dst(self, which: int):
+        """Where the DeepGEMM input `which`'s row-0 scales go: the fp32 xs rows, or (T9b-4 dg_sf_pack) the packed
+        activation SF that the contiguous GEMM then takes as is."""
+        b = self.o.dg
+        return b.xsp_rows[which] if getattr(b, "sf_pack", False) else b.xs[which][:, 0]
 
     def combine(self, out_rows: torch.Tensor, shared: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         """y = bf16((0 + sum_j out[j]) + shared) as MoE.forward's fp32 accumulation (model.py:895-906)."""
@@ -733,19 +816,34 @@ class FusedGlue(R2Glue):
         from runtime.patches import fp8_linear_prequant
 
         ctx = self.ffn_pre(x) if self.on("hc_norm") else None
+        xq = None
         if ctx is not None and ctx.get("q") is not None:      # round 2 #1: act_quant(x) already made by hc_norm
             xq = (ctx["q"].view(*x.shape), ctx["s"].view(*x.shape[:-1], -1))
-            g = self.linear_pre(xq, ex.w1, x)
-            u = self.linear_pre(xq, ex.w3, x)
+        return self._shared_from_q(ex, x, xq)
+
+    def _shared_from_q(self, ex, x: torch.Tensor, xq) -> torch.Tensor:
+        from runtime.patches import fp8_linear_prequant
+
+        I = ex.w1.weight.size(0)
+        lead = tuple(x.shape[:-1])
+        g2 = u2 = None
+        if xq is not None and (self.on("gemv_pair") or self.on("reduce_fold")) and \
+                self._gemv_ok(xq, ex.w1, ex.w3):              # T9b-4 L2: one launch for w1 || w3, reduce folded
+            if self.on("gemv_pair"):
+                g2, u2 = self._gemv_pair(xq, ex.w1, ex.w3, ("w1", "w3"))
+            else:
+                g2, u2 = self._gemv_fold(xq, ex.w1, "w1"), self._gemv_fold(xq, ex.w3, "w3")
+        elif xq is not None:
+            g2 = self.linear_pre(xq, ex.w1, x).view(-1, I)
+            u2 = self.linear_pre(xq, ex.w3, x).view(-1, I)
         else:
-            g = ex.w1(x)
-            u = ex.w3(x)
-        I = g.size(-1)
-        g2, u2 = g.view(-1, I), u.view(-1, I)
-        q = torch.empty(g2.shape, dtype=FP8, device=x.device)
-        s = torch.empty(g2.size(0), I // BLOCK, dtype=E8, device=x.device)
+            g2 = ex.w1(x).view(-1, I)
+            u2 = ex.w3(x).view(-1, I)
+        rows = g2.M if hasattr(g2, "nsplit") else g2.size(0)
+        q = torch.empty(rows, I, dtype=FP8, device=x.device)
+        s = torch.empty(rows, I // BLOCK, dtype=E8, device=x.device)
         launch_swiglu_quant(g2, u2, None, q, s, self.silu_tab, self.code_tab, ex.swiglu_limit)
-        return fp8_linear_prequant(q.view(*g.shape), s.view(*g.shape[:-1], I // BLOCK), ex.w2.weight)
+        return fp8_linear_prequant(q.view(*lead, I), s.view(*lead, I // BLOCK), ex.w2.weight)
 
     # ---------------------------------------------------------------- mHC post (#7)
     def hc_post(self, x, residual, post, comb) -> torch.Tensor:
@@ -806,6 +904,7 @@ class FusedGlue(R2Glue):
                     if why:
                         self._off(c, f"self-check: {why}")
             self.calibrate_r2(cal, g)        # round 2 (runtime/fused_glue_r2.py): orders, then end-to-end checks
+            self.calibrate_r4(cal, g)        # T9b-4 parts (runtime/fused_glue_r2.py): each == the path it replaces
         finally:
             if self.dev.type == "cuda":
                 torch.cuda.synchronize(self.dev)
@@ -1143,6 +1242,7 @@ class FusedGlue(R2Glue):
                        "hc_pre_sum": self.hc_pre_mode},
              "calibration": _jsonable(self.calib), "disable_env": os.environ.get(DISABLE_ENV)}
         d["r2"] = self.describe_r2()
+        d["r4"] = self.describe_r4()
         return d
 
     def glue_line(self) -> str:

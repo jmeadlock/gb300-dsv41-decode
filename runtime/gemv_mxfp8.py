@@ -257,7 +257,7 @@ _TUNE_LOG: Dict[Tuple[int, int, int], dict] = {}
 _CACHE_LOADED: Optional[str] = None
 _CACHE_IGNORED: List[str] = []
 _SMS: Dict[str, int] = {}
-_WORKSPACE: Dict[Tuple[str, int, int, int], torch.Tensor] = {}
+_WORKSPACE: Dict[tuple, torch.Tensor] = {}   # (device, M, N, nsplit[, tag])
 
 
 def config_key(N: int, K: int, M: int) -> Tuple[int, int, int]:
@@ -427,13 +427,15 @@ def get_config(N: int, K: int, M: int, device=None) -> GemvConfig:
     return cfg
 
 
-def workspace(device, M: int, N: int, nsplit: int) -> torch.Tensor:
+def workspace(device, M: int, N: int, nsplit: int, tag: str = "") -> torch.Tensor:
     """The static fp32 split-K workspace [nsplit, M, N] for (device, M, N, nsplit): allocated on first (eager) use and
     kept for the life of the process (a captured graph keeps pointing at it). Calls sharing it run in stream order
-    (main kernel, then its reduce) so they never overlap. Never allocates inside a capture."""
+    (main kernel, then its reduce) so they never overlap. Never allocates inside a capture. T9b-4 `tag`: a GEMV whose
+    reduce is folded into a later consumer (`gemv_partials`) keeps its partials alive past other GEMVs of the same
+    shape (shared w1 / w3), so it names its own workspace."""
     dev = torch.device(device)
-    idx = dev.index if dev.index is not None else torch.cuda.current_device()
-    key = (f"{dev.type}:{idx}", int(M), int(N), int(nsplit))
+    idx = dev.index if dev.index is not None else (torch.cuda.current_device() if dev.type == "cuda" else 0)
+    key = (f"{dev.type}:{idx}", int(M), int(N), int(nsplit)) + ((str(tag),) if tag else ())
     t = _WORKSPACE.get(key)
     if t is None:
         if _capturing():
@@ -536,7 +538,8 @@ def describe() -> dict:
             "cache_ignored": list(_CACHE_IGNORED),
             "configs": {_key_str(k): c.as_dict() for k, c in sorted(_CONFIGS.items())},
             "tuned_us": {_key_str(k): v.get("best_us") for k, v in sorted(_TUNE_LOG.items())},
-            "workspaces": {f"{k[0]}/m{k[1]}/n{k[2]}/s{k[3]}": int(t.numel()) * 4 for k, t in _WORKSPACE.items()}}
+            "workspaces": {f"{k[0]}/m{k[1]}/n{k[2]}/s{k[3]}" + (f"/{k[4]}" if len(k) > 4 else ""): int(t.numel()) * 4
+                           for k, t in _WORKSPACE.items()}}
 
 
 # ------------------------------------------------------------------------------------------------ Triton kernels
@@ -768,7 +771,7 @@ def mxfp8_gemv(xq: torch.Tensor, xs: torch.Tensor, w: torch.Tensor, s: torch.Ten
     if rope is not None:
         check_rope(rope, N)
     if not xq.is_cuda:
-        sk = resolve_config(config, N, K).split_k if config is not None else 1
+        sk = resolve_config(config, N, K).split_k if config is not None else max(1, int(CPU_SPLIT_K))
         res = gemv_torch(xq, xs, w, s, out, split_k=sk)
         if rope is not None:
             from runtime.fused_glue import rope_rows_torch
@@ -784,10 +787,11 @@ def mxfp8_gemv(xq: torch.Tensor, xs: torch.Tensor, w: torch.Tensor, s: torch.Ten
     return _launch(xq, xs, w, s, out, cfg, ws, rope=rope)
 
 
-def _launch(xq, xs, w, s, out, cfg: GemvConfig, ws, rope=None) -> torch.Tensor:
+def _launch(xq, xs, w, s, out, cfg: GemvConfig, ws, rope=None, reduce: bool = True) -> torch.Tensor:
     """The kernel launch(es) of one call for a resolved config; `ws` is the [NSPLIT, M, N] fp32 workspace when the
     plan splits (else unused). Separate from mxfp8_gemv so tests can drive the kernels through a Triton stand-in.
-    rope: as mxfp8_gemv (the epilogue goes to the main kernel's store, or to the reduce when the plan splits)."""
+    rope: as mxfp8_gemv (the epilogue goes to the main kernel's store, or to the reduce when the plan splits).
+    reduce=False (T9b-4 `gemv_partials`): a split plan stops after the main kernel; ws holds the partials."""
     M, K = xq.shape
     N = w.size(0)
     p = launch_plan(cfg, M, N, K)
@@ -801,7 +805,7 @@ def _launch(xq, xs, w, s, out, cfg: GemvConfig, ws, rope=None) -> torch.Tensor:
         xq.stride(0), xs.stride(0), w.stride(0), s.stride(0), out.stride(0), freqs,
         BLOCK_M=p["BLOCK_M"], BLOCK_N=cfg.block_n, KU=cfg.ku, EVEN=p["EVEN"], MMA=bool(cfg.mma), SPLIT=p["SPLIT"],
         num_warps=cfg.num_warps, num_stages=cfg.num_stages, **({} if p["SPLIT"] else rk))
-    if p["SPLIT"]:
+    if p["SPLIT"] and reduce:
         t9b_splitk_reduce[p["reduce_grid"]](ws, out, M, N, p["NSPLIT"], out.stride(0), freqs, BLOCK_R=REDUCE_BLOCK,
                                             num_warps=4, **rk)
     return out
@@ -827,3 +831,250 @@ def linear_fp8_rope(xq: torch.Tensor, xs: torch.Tensor, w: torch.Tensor, s: torc
     mxfp8_gemv(xq.view(-1, K), xs.view(-1, K // BLOCK), w, s, out.view(-1, N),
                rope=(freqs, int(head_dim), int(rope_dim), tuple(int(m) for m in modes)))
     return out
+
+
+# ------------------------------------------------------------------------------------------------ T9b-4: pair + fold
+# docs/HANDOFF-T9B4-RESIDUAL.md lever 2. Two changes, both bit-identical by construction (asserted on the box by
+# tests/gpu/test_t9b4_gpu.py and at build by runtime/fused_glue.py's self-check):
+#   (a) `gemv_pair`: two weights that read the SAME activation (wq_a || wkv, shared w1 || w3) in ONE launch. The
+#       weights stay separate tensors (pointer pair, no copy): program pn < TA works on weight a, else on b. Each
+#       half keeps its OWN tuned split partition (PER, NSPLIT) -- the only thing besides the block-partial form (MMA)
+#       that fixes a GEMV's bits (`numerics_key`) -- so each half's output bits are its single launch's. The pair is
+#       formed only when both halves' tuned configs agree on MMA; BLOCK_N / KU / warps / stages come from half a
+#       (they change speed, not bits). Otherwise: two launches.
+#   (b) `gemv_partials`: a split plan stops after the main kernel; the result is a `SplitK` handle on the fp32
+#       partials ws[NSPLIT, M, N] and the CONSUMER kernel (runtime/fused_glue*.py: q_norm / kv_norm rows, the shared
+#       SwiGLU) sums them in t9b_splitk_reduce's fixed order (+0.0, then split 0, 1, ..., NSPLIT-1, fp32 adds) and
+#       rounds to bf16: the value the reduce would have stored. A plan without split returns the bf16 output itself.
+CPU_SPLIT_K = 1   # CPU (Mac tests) split for gemv_partials / gemv_pair / mxfp8_gemv without a config: 1 = unchanged
+KERNELS_ON_CPU = False   # tests set it under tests/triton_shim.py: gemv_partials / gemv_pair launch the kernels
+
+
+class SplitK:
+    """A GEMV output left as its fp32 split-K partials (see the section comment): ws [nsplit, M, N] fp32 contiguous
+    (a static workspace), nsplit >= 2. `reduce_torch()` is the reduce's value in torch (CPU mirrors, tests)."""
+    __slots__ = ("ws", "nsplit")
+
+    def __init__(self, ws: torch.Tensor, nsplit: int):
+        if ws.dtype != torch.float32 or ws.dim() != 3 or int(ws.size(0)) != int(nsplit) or not ws.is_contiguous():
+            raise ValueError(f"SplitK: ws {tuple(ws.shape)} {ws.dtype} is not a contiguous fp32 [{nsplit}, M, N]")
+        self.ws, self.nsplit = ws, int(nsplit)
+
+    @property
+    def M(self) -> int:
+        return int(self.ws.size(1))
+
+    @property
+    def N(self) -> int:
+        return int(self.ws.size(2))
+
+    @property
+    def split_stride(self) -> int:
+        return self.M * self.N
+
+    @property
+    def device(self):
+        return self.ws.device
+
+    def reduce_torch(self) -> torch.Tensor:
+        """bf16 [M, N] = ((0 + ws[0]) + ws[1]) + ... (t9b_splitk_reduce's order), rounded to nearest even."""
+        acc = torch.zeros(self.M, self.N, dtype=torch.float32, device=self.ws.device)
+        for j in range(self.nsplit):
+            acc = acc + self.ws[j]
+        return acc.to(torch.bfloat16)
+
+
+def materialize(r) -> torch.Tensor:
+    """bf16 [M, N] of a gemv_partials result (a bf16 tensor is returned as is; a SplitK runs the reduce: one launch
+    on CUDA -- for a consumer that cannot fold it)."""
+    if not (hasattr(r, "nsplit") and hasattr(r, "ws")):     # duck-typed (a test's shim-loaded copy of this module)
+        return r
+    if not r.ws.is_cuda and not (KERNELS_ON_CPU and HAVE_TRITON):
+        return r.reduce_torch()
+    out = torch.empty(r.M, r.N, dtype=torch.bfloat16, device=r.device)
+    t9b_splitk_reduce[(-(-(r.M * r.N) // REDUCE_BLOCK),)](r.ws, out, r.M, r.N, r.nsplit, out.stride(0), out,
+                                                          BLOCK_R=REDUCE_BLOCK, num_warps=4)
+    return out
+
+
+def gemv_torch_partials(xq, xs, w, s, split_k: int) -> torch.Tensor:
+    """fp32 [NSPLIT, M, N]: split j's K-order chain from +0.0 (gemv_torch_f32 before its split sum). Summing these in
+    split order from +0.0 is gemv_torch_f32 exactly (tests/test_t9b4_cpu.py)."""
+    M, N, K = check_operands(xq, xs, w, s)
+    kb = K // BLOCK
+    part = block_partials(xq, w)
+    sa = xs.view(torch.uint8).to(torch.int32).view(M, 1, kb)
+    rows = weight_scale_rows(torch.arange(N, device=w.device))
+    sb = s.view(torch.uint8).to(torch.int32).index_select(0, rows).view(1, N, kb)
+    q = part * (pow2_code(sa) * pow2_code(sb))
+    per, nsplit = split_plan(kb, split_k)
+    out = torch.empty(nsplit, M, N, dtype=torch.float32, device=xq.device)
+    for j in range(nsplit):
+        acc = torch.zeros(M, N, dtype=torch.float32, device=xq.device)
+        for k in range(j * per, min((j + 1) * per, kb)):
+            acc = acc + q[:, :, k]
+        out[j] = acc
+    return out
+
+
+def _kern_gemv(t: torch.Tensor) -> bool:
+    return t.is_cuda or (KERNELS_ON_CPU and HAVE_TRITON)
+
+
+def _resolved(N: int, K: int, M: int, device, config: Optional[GemvConfig]) -> GemvConfig:
+    if config is None:
+        if not torch.device(device).type == "cuda":
+            return resolve_config(replace(DEFAULT_CONFIG, split_k=max(1, int(CPU_SPLIT_K))), N, K)
+        config = get_config(N, K, M, device)
+    return resolve_config(config, N, K, num_sms(device) if torch.device(device).type == "cuda" else None)
+
+
+def _partials_impl(xq, xs, w, s, tag: str, config: Optional[GemvConfig] = None):
+    M, N, K = check_operands(xq, xs, w, s)
+    cfg = _resolved(N, K, M, xq.device, config)
+    p = launch_plan(cfg, M, N, K)
+    if not p["SPLIT"]:
+        out = torch.empty(M, N, dtype=torch.bfloat16, device=xq.device)
+        if _kern_gemv(xq):
+            return _launch(xq, xs, w, s, out, cfg, out)
+        return gemv_torch(xq, xs, w, s, out, split_k=cfg.split_k)
+    ws = workspace(xq.device, M, N, p["NSPLIT"], tag or f"t9b4:{w.data_ptr():x}")
+    if _kern_gemv(xq):
+        _launch(xq, xs, w, s, ws[0], cfg, ws, reduce=False)
+    else:
+        ws.copy_(gemv_torch_partials(xq, xs, w, s, cfg.split_k))
+    return SplitK(ws, p["NSPLIT"])
+
+
+def gemv_partials(xq, xs, w, s, tag: str = "", config: Optional[GemvConfig] = None):
+    """The GEMV of mxfp8_gemv (same tuned config, same main kernel) WITHOUT its split-K reduce: -> bf16 [M, N] when
+    the plan does not split, else SplitK over the static workspace named `tag` (default: per weight). One launch."""
+    return _partials_impl(xq, xs, w, s, tag, config)
+
+
+def pair_plan(cfg_a: GemvConfig, cfg_b: GemvConfig, M: int, NA: int, NB: int, K: int) -> Optional[dict]:
+    """Grid / constexprs of the one-launch pair (metadata only), or None when the halves cannot share a launch (their
+    block-partial forms differ). Each half keeps its own (PER, NSPLIT); tile width etc. come from cfg_a."""
+    if int(cfg_a.mma) != int(cfg_b.mma):
+        return None
+    kb = K // BLOCK
+    pera, nsa = split_plan(kb, cfg_a.split_k)
+    perb, nsb = split_plan(kb, cfg_b.split_k)
+    bn, ku = int(cfg_a.block_n), int(cfg_a.ku)
+    ta, tb = -(-NA // bn), -(-NB // bn)
+    return {"grid": (ta + tb, max(nsa, nsb)), "TA": ta, "TB": tb, "PERA": pera, "PERB": perb, "NSA": nsa, "NSB": nsb,
+            "EVENA": pera % ku == 0 and kb % pera == 0, "EVENB": perb % ku == 0 and kb % perb == 0,
+            "BLOCK_M": kernel_block_m(cfg_a, M), "BLOCK_N": bn, "KU": ku, "MMA": bool(cfg_a.mma),
+            "num_warps": int(cfg_a.num_warps), "num_stages": int(cfg_a.num_stages)}
+
+
+def _launch_pair(xq, xs, wa, sa, wb, sb, pp: dict, outa, wsa, outb, wsb) -> None:
+    M = xq.size(0)
+    t9b4_mxfp8_gemv2[pp["grid"]](
+        xq, xs.view(torch.uint8), wa, sa.view(torch.uint8), outa, wsa, wb, sb.view(torch.uint8), outb, wsb,
+        M, wa.size(0), wb.size(0), xq.size(1) // BLOCK, pp["PERA"], pp["PERB"], pp["NSA"], pp["NSB"], pp["TA"],
+        xq.stride(0), xs.stride(0), wa.stride(0), sa.stride(0), outa.stride(0), wb.stride(0), sb.stride(0),
+        outb.stride(0),
+        BLOCK_M=pp["BLOCK_M"], BLOCK_N=pp["BLOCK_N"], KU=pp["KU"], EVENA=pp["EVENA"], EVENB=pp["EVENB"],
+        MMA=pp["MMA"], SPLITA=pp["NSA"] > 1, SPLITB=pp["NSB"] > 1, num_warps=pp["num_warps"],
+        num_stages=pp["num_stages"])
+
+
+PAIR_STATS = {"pair": 0, "split": 0}   # host-side counts of gemv_pair calls that took one launch / fell back to two
+
+
+def gemv_pair(xq, xs, wa, sa, wb, sb, tags: Tuple[str, str] = ("", ""),
+              configs: Tuple[Optional[GemvConfig], Optional[GemvConfig]] = (None, None)):
+    """gemv_partials(xq, xs, wa, sa) and gemv_partials(xq, xs, wb, sb) -- each half's own tuned config, its bits
+    unchanged -- in ONE launch when `pair_plan` allows (else two). -> (result_a, result_b), each bf16 [M, N] or
+    SplitK (section comment)."""
+    M, NA, K = check_operands(xq, xs, wa, sa)
+    _, NB, _ = check_operands(xq, xs, wb, sb)
+    cfg_a = _resolved(NA, K, M, xq.device, configs[0])
+    cfg_b = _resolved(NB, K, M, xq.device, configs[1])
+    pp = pair_plan(cfg_a, cfg_b, M, NA, NB, K) if _kern_gemv(xq) else None
+    if pp is None:
+        PAIR_STATS["split"] += 1
+        return (_partials_impl(xq, xs, wa, sa, tags[0], cfg_a), _partials_impl(xq, xs, wb, sb, tags[1], cfg_b))
+    PAIR_STATS["pair"] += 1
+    res, bufs = [], []
+    for w, ns, tag in ((wa, pp["NSA"], tags[0]), (wb, pp["NSB"], tags[1])):
+        N = w.size(0)
+        if ns > 1:
+            ws = workspace(xq.device, M, N, ns, tag or f"t9b4:{w.data_ptr():x}")
+            bufs.append((ws[0], ws))
+            res.append(SplitK(ws, ns))
+        else:
+            out = torch.empty(M, N, dtype=torch.bfloat16, device=xq.device)
+            bufs.append((out, out))
+            res.append(out)
+    _launch_pair(xq, xs, wa, sa, wb, sb, pp, bufs[0][0], bufs[0][1], bufs[1][0], bufs[1][1])
+    return res[0], res[1]
+
+
+if HAVE_TRITON:
+
+    @triton.jit
+    def _t9b4_gemv_tile(xq, xs, w, s, out, ws, M, N, KB, PER, pid_n, ks, stride_xm, stride_xsm, stride_wn,
+                        stride_sn, stride_om, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, KU: tl.constexpr,
+                        EVEN: tl.constexpr, MMA: tl.constexpr, SPLIT: tl.constexpr):
+        """t9b_mxfp8_gemv's body for one (pn, ks) tile, line for line (no RoPE epilogue): the same loads, the same
+        block partial (tl.dot or broadcast + tl.sum), the same scale product and the same K-order fp32 adds."""
+        kb_lo = ks * PER
+        kb_hi = tl.minimum(kb_lo + PER, KB)
+        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        n_ok = rn < N
+        rn_in = tl.where(n_ok, rn, 0)
+        rm = tl.arange(0, BLOCK_M)
+        m_ok = rm < M
+        rm_in = tl.where(m_ok, rm, 0)
+        rj = tl.arange(0, 32)
+        w_rows = w + rn_in.to(tl.int64)[:, None] * stride_wn + rj[None, :]          # [BN, 32] block-0 bytes
+        x_rows = xq + rm_in.to(tl.int64)[:, None] * stride_xm + rj[None, :]          # [BM, 32]
+        s_rows = s + (rn_in // 32).to(tl.int64) * stride_sn                           # [BN]
+        xs_rows = xs + rm_in.to(tl.int64) * stride_xsm                                # [BM]
+        acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        for kb0 in range(kb_lo, kb_hi, KU):
+            for u in tl.static_range(KU):                                             # K order within the window
+                kb = kb0 + u
+                if EVEN:
+                    kbc = kb
+                else:
+                    kbc = tl.minimum(kb, kb_hi - 1)
+                wt = tl.load(w_rows + kbc * 32)                                       # [BN, 32] fp8
+                xt = tl.load(x_rows + kbc * 32)                                       # [BM, 32] fp8
+                sbf = _t9b_pow2(tl.load(s_rows + kbc).to(tl.int32))                   # [BN] 2^(sb-127)
+                saf = _t9b_pow2(tl.load(xs_rows + kbc).to(tl.int32))                  # [BM] 2^(sa-127)
+                if MMA:
+                    part = tl.dot(xt, tl.trans(wt))                                   # [BM, BN] fp32, tensor core
+                else:
+                    part = tl.sum(xt.to(tl.float32)[:, None, :] * wt.to(tl.float32)[None, :, :], axis=2)
+                q = part * (saf[:, None] * sbf[None, :])                              # exact power-of-two scaling
+                if EVEN:
+                    acc += q
+                else:
+                    acc = tl.where(kb < kb_hi, acc + q, acc)
+        mask = m_ok[:, None] & n_ok[None, :]
+        if SPLIT:
+            tl.store(ws + ks * M * N + rm[:, None] * N + rn[None, :], acc, mask=mask)
+        else:
+            tl.store(out + rm[:, None] * stride_om + rn[None, :], acc.to(tl.bfloat16), mask=mask)
+
+    @triton.jit
+    def t9b4_mxfp8_gemv2(xq, xs, wa, sa, outa, wsa, wb, sb, outb, wsb, M, NA, NB, KB, PERA, PERB, NSA, NSB, TA,
+                         stride_xm, stride_xsm, stride_wan, stride_san, stride_oam, stride_wbn, stride_sbn,
+                         stride_obm, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, KU: tl.constexpr,
+                         EVENA: tl.constexpr, EVENB: tl.constexpr, MMA: tl.constexpr, SPLITA: tl.constexpr,
+                         SPLITB: tl.constexpr):
+        """T9b-4 (a): grid (TA + TB, max(NSA, NSB)). Program (pn, ks): pn < TA -> tile pn of weight a over its split
+        ks (if ks < NSA), else tile pn - TA of weight b (if ks < NSB). Each half: its own PER / NSPLIT / EVEN."""
+        pid_n = tl.program_id(0)
+        ks = tl.program_id(1)
+        if pid_n < TA:
+            if ks < NSA:
+                _t9b4_gemv_tile(xq, xs, wa, sa, outa, wsa, M, NA, KB, PERA, pid_n, ks, stride_xm, stride_xsm,
+                                stride_wan, stride_san, stride_oam, BLOCK_M, BLOCK_N, KU, EVENA, MMA, SPLITA)
+        else:
+            if ks < NSB:
+                _t9b4_gemv_tile(xq, xs, wb, sb, outb, wsb, M, NB, KB, PERB, pid_n - TA, ks, stride_xm, stride_xsm,
+                                stride_wbn, stride_sbn, stride_obm, BLOCK_M, BLOCK_N, KU, EVENB, MMA, SPLITB)

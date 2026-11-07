@@ -257,6 +257,7 @@ def _fake_dg_contig():
     mod = _fake_deep_gemm()
     mod.align = [128]
     mod.contig_calls = []
+    mod.packed_a = []
 
     def set_mk_alignment_for_contiguous_layout(v):
         mod.align[0] = int(v)
@@ -269,6 +270,10 @@ def _fake_dg_contig():
         M, K = xq.shape
         G, N, KH = W.shape
         assert not kw and recipe_a == (1, 32) and recipe_b == (1, 32)
+        if xs.dtype == torch.int32:   # T9b-4: pre-packed activation SF, int32 [M, K/128] MN-major (TMA-aligned M)
+            assert tuple(xs.shape) == (M, K // 128) and xs.stride(0) == 1 and xs.stride(1) >= M, (xs.shape, xs.stride())
+            mod.packed_a.append(M)
+            xs = DI.unpack_sf(xs).view(E8).float()
         assert xq.dtype == torch.float8_e4m3fn and xs.dtype == torch.float32 and tuple(xs.shape) == (M, K // 32)
         assert W.dtype == torch.int8 and W.is_contiguous() and KH == K // 2
         assert DI.is_mn_major_packed(S, G, N, K // 128), (tuple(S.shape), S.stride())

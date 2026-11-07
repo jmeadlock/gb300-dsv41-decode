@@ -96,6 +96,7 @@ R2_AUDIT_PREDICTED = {"#1 hc_pre+RMSNorm+act_quant": 840, "#5 mHC mixes statisti
                       "#6 q path (q_norm+act_quant)": 320, "#3 kv path (norm+RoPE+QDQ+ring)": 520,
                       "#4 router (non-topk)": 520, "#15 Engram gate": 120, "#14 indexer post-topk": 150}
 R2_NAMES = ("hc_norm", "mix_stat", "kv_path", "q_path", "router", "engram", "indexer_post")
+R4_NAMES = ("hc_split", "gemv_pair", "reduce_fold", "dg_sf_pack")   # T9b-4 parts (runtime/fused_glue.R4_PARTS)
 
 
 def real_structure_config():
@@ -223,6 +224,14 @@ def install(R):
 
     setattr_saved(gemv_mxfp8, "linear_fp8_rope", kernel(gemv_mxfp8.linear_fp8_rope, "mxfp8_gemv_rope",
                                                         lambda *a, **k: [("alloc", "empty")]))
+    # T9b-4 lever 2: the GEMV without its reduce (folded into the consumer) and the one-launch pair; `materialize`
+    # is the reduce for a consumer that cannot fold (the split-K reduce of linear_fp8 is not counted either)
+    setattr_saved(gemv_mxfp8, "gemv_partials", kernel(gemv_mxfp8.gemv_partials, "mxfp8_gemv",
+                                                      lambda *a, **k: [("alloc", "empty")]))
+    setattr_saved(gemv_mxfp8, "gemv_pair", kernel(gemv_mxfp8.gemv_pair, "mxfp8_gemv_pair",
+                                                  lambda *a, **k: [("alloc", "empty")] * 2))
+    setattr_saved(gemv_mxfp8, "materialize", kernel(gemv_mxfp8.materialize, "t9b_splitk_reduce",
+                                                    lambda *a, **k: [("alloc", "empty")]))
     for fn, kname in (("launch_act_quant_bcast", "t9b2_act_quant_bcast"), ("launch_swiglu_quant", "t9b2_swiglu_quant"),
                       ("launch_moe_combine", "t9b2_moe_combine"), ("launch_hc_post", "t9b2_hc_post"),
                       ("launch_o_rope_qdq", "t9b2_o_rope_qdq")):
@@ -385,7 +394,10 @@ def run_path(path: str, R, model, pool, ids: List[int], steps: int) -> dict:
         kw = {"static-ref": {}, "static-dg-gemv": {"moe_impl": "dg-masked", "fp8_impl": "gemv"},
               "static-dg-gemv-fused": {"moe_impl": "dg-masked", "fp8_impl": "gemv", "glue_impl": "fused"},
               "static-dg-gemv-fused-r1": {"moe_impl": "dg-masked", "fp8_impl": "gemv", "glue_impl": "fused",
-                                          "glue_opts": {"disable": list(R2_NAMES)}}}[path]
+                                          "glue_opts": {"disable": list(R2_NAMES) + list(R4_NAMES)}},
+              # T9b-4: R1 + R2 without the T9b-4 parts (fused_glue.R4_PARTS) -- the "before" of the T9b-4 table
+              "static-dg-gemv-fused-r2": {"moe_impl": "dg-masked", "fp8_impl": "gemv", "glue_impl": "fused",
+                                          "glue_opts": {"disable": list(R4_NAMES)}}}[path]
         st = StaticStep(model, pool, max_pos=127, _allow_cpu=True, **kw)  # (fused: self-check runs here, uncounted)
     import engram
 
@@ -435,6 +447,26 @@ def run_path(path: str, R, model, pool, ids: List[int], steps: int) -> dict:
         out["fused_glue"] = {k: glue[k] for k in ("clusters", "modes")}
         out["fused_glue"]["r2"] = {k: glue["r2"][k] for k in ("orders", "outcome")}
     return out
+
+
+def t9b4_table(before: dict, after: dict) -> dict:
+    """T9b-4 parts on the CPU census (dg-masked structure): launches per step and the GEMV-family kernel counts.
+    What the CPU census can show is lever 2(a), the pairs (one launch for wq_a || wkv and for shared w1 || w3); the
+    folded split-K reduces are box-only (the census never counted linear_fp8's reduce), hc_split is still one launch
+    (more programs), dg_sf_pack and the dg-inplace router are dg-inplace only (DeepGEMM's own SF conversion is not
+    a torch op): their removals are the nsys rows of docs/STEP-ANATOMY-R2-20261107.md, not this table."""
+    def kern(p):
+        c = {}
+        for reg in p["regions"].values():
+            for op, n in reg["ops"].items():
+                if op.startswith("K:") and ("gemv" in op or "splitk" in op):
+                    c[op[2:]] = c.get(op[2:], 0) + n
+        return c
+    return {"launches_per_step": {"static-dg-gemv-fused-r2": before["launches_per_step"],
+                                  "static-dg-gemv-fused": after["launches_per_step"]},
+            "removed": round(before["launches_per_step"] - after["launches_per_step"], 1),
+            "gemv_kernels_per_step": {"static-dg-gemv-fused-r2": kern(before), "static-dg-gemv-fused": kern(after)},
+            "parts": {k: v for k, v in after.get("fused_glue", {}).get("clusters", {}).items() if k in R4_NAMES}}
 
 
 def region_launches(path_report: dict, region: str) -> float:
@@ -488,7 +520,7 @@ def main(argv=None) -> int:
     ap.add_argument("--json", default=os.path.join(REPO, "scratch", "glue-census.json"))
     ap.add_argument("--steps", type=int, default=2, help="decode steps counted (2 = one per pos parity)")
     ap.add_argument("--paths", default="eager-ref,static-ref,static-dg-gemv,static-dg-gemv-fused-r1,"
-                                        "static-dg-gemv-fused")
+                                        "static-dg-gemv-fused-r2,static-dg-gemv-fused")
     a = ap.parse_args(argv)
     import types
 
@@ -534,6 +566,9 @@ def main(argv=None) -> int:
     if "static-dg-gemv-fused-r1" in res and "static-dg-gemv-fused" in res:
         t = report["t9b2_r2"] = t9b2_r2_table(res["static-dg-gemv-fused-r1"], res["static-dg-gemv-fused"])
         _print_table("T9b-2 R2 (fused R1 -> fused R1+R2)", t, "static-dg-gemv-fused-r1", "static-dg-gemv-fused")
+    if "static-dg-gemv-fused-r2" in res and "static-dg-gemv-fused" in res:
+        t = report["t9b4"] = t9b4_table(res["static-dg-gemv-fused-r2"], res["static-dg-gemv-fused"])
+        print(f"T9b-4 (fused R1+R2 -> + T9b-4 parts): {t}")
     os.makedirs(os.path.dirname(os.path.abspath(a.json)), exist_ok=True)
     with open(a.json, "w") as f:
         json.dump(report, f, indent=1)

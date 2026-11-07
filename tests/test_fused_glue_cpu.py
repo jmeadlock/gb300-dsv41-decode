@@ -489,6 +489,10 @@ def _expected_status(moe, fp8):
     # round 2 (runtime/fused_glue_r2.py): every cluster applies to the mini checkpoints on CPU (torch's own
     # reduction order: outcome (i)); tests/test_fused_glue_r2_cpu.py covers them
     on |= {"hc_norm", "mix_stat", "kv_path", "q_path", "router", "engram", "indexer_post"}
+    # T9b-4 parts (fused_glue.R4_PARTS; tests/test_t9b4_cpu.py covers them): dg_sf_pack is dg-inplace only
+    on.add("hc_split")
+    if fp8 == "gemv":
+        on |= {"gemv_pair", "reduce_fold"}
     return on
 
 

@@ -113,6 +113,47 @@ def is_mn_major_packed(sf: torch.Tensor, G: int, N: int, C: int) -> bool:
             and (G == 1 or sf.stride(0) == C * N))
 
 
+def packed_act_sf(M: int, KS: int, device, fill_code: int = 127) -> torch.Tensor:
+    """T9b-4 lever 4: DeepGEMM's packed activation SF for A [M, K]: int32 [M, KS/4] MN-major (strides (1, Ma), Ma =
+    M rounded up to 4 = get_mn_major_tma_aligned_packed_ue8m0_tensor's TMA alignment for 4-byte words) over storage
+    [KS/4][Ma], every byte = `fill_code` (127 = 2^0, the fp32 path's padding-row scale 1.0)."""
+    C = sf_words(KS)
+    Ma = -(-int(M) // 4) * 4
+    word = int.from_bytes(bytes([fill_code] * 4), "little", signed=True)
+    base = torch.full((C, Ma), word, dtype=torch.int32, device=device)
+    return base.t()[: int(M)]
+
+
+class PackedRows:
+    """T9b-4 lever 4: `rows` output rows of an act_quant writer (row r = A row r*`align`, the head of block r) as
+    bytes of a packed MN-major activation SF `sf` (packed_act_sf). The code of 32-block b of row r lives at byte
+    r*row_stride + (b // 4)*col_stride + b % 4 of the storage (little-endian: byte i of word c = K-block 4c + i,
+    DeepGEMM's pack_ue8m0_to_int). The fused writers (runtime/fused_glue*.py) store there instead of fp32 scales."""
+    packed = True
+
+    def __init__(self, sf: torch.Tensor, align: int, rows: int):
+        M, C = sf.shape
+        if sf.dtype != torch.int32 or sf.stride(0) != 1 or sf.stride(1) < M:
+            raise ValueError(f"PackedRows: sf {tuple(sf.shape)} {sf.dtype} strides {sf.stride()} is not MN-major int32")
+        if (rows - 1) * align >= M:
+            raise ValueError(f"PackedRows: {rows} rows x align {align} > M = {M}")
+        self.sf, self.align, self.rows, self.kb = sf, int(align), int(rows), 4 * int(C)
+        self.u8 = sf.as_strided((C * sf.stride(1),), (1,), sf.storage_offset()).view(torch.uint8)
+        self.row_stride = 4 * self.align
+        self.col_stride = 4 * int(sf.stride(1))
+
+    def _index(self, row: int) -> torch.Tensor:
+        b = torch.arange(self.kb, device=self.u8.device)
+        return row * self.row_stride + (b // 4) * self.col_stride + b % 4
+
+    def store_codes_torch(self, row: int, codes: torch.Tensor) -> None:
+        self.u8[self._index(int(row))] = codes.reshape(-1).to(torch.uint8).to(self.u8.device)
+
+    def codes(self) -> torch.Tensor:
+        """uint8 [rows, KS]: the codes the writers stored (tests, the self-check)."""
+        return torch.stack([self.u8[self._index(r)] for r in range(self.rows)])
+
+
 # ------------------------------------------------------------------------------------------------ index math
 def check_align(align: int) -> int:
     a = int(align)
@@ -248,6 +289,13 @@ class DGInplaceBuffers(DGBuffers):
         self.alignment = self._set_alignment(align)
         d, k = self.dev, self.k
         self.mi = torch.full((k * align,), -1, dtype=torch.int32, device=d)
+        # T9b-4 lever 4: packed activation SF (A [k*ALIGN, K]) for the w1/w3 input (1) and the w2 input (2); used
+        # instead of the fp32 xs only once runtime/fused_glue.py's self-check turned `sf_pack` on (it owns every
+        # writer of row 0 of each block then)
+        self.sf_pack = False
+        self.sf_pack_why: Optional[str] = "not enabled (needs glue_impl fused: dg_act + swiglu_routed + self-check)"
+        self.xsp = {w: packed_act_sf(k * align, (self.dim if w == 1 else self.inter) // ACT_BLOCK, d) for w in (1, 2)}
+        self.xsp_rows = {w: PackedRows(self.xsp[w], align, k) for w in (1, 2)}
         self.C = {p: sf_words(self.K[p] // WEIGHT_BLOCK) for p in PROJS}
         self.sf_dims = ((self.N["w1"], self.C["w1"]), (self.N["w2"], self.C["w2"]))
         rw = {p: self.N[p] * self.K[p] // 2 for p in PROJS}
@@ -320,7 +368,8 @@ class DGInplaceBuffers(DGBuffers):
         """d[p] [k, ALIGN, N] <- contiguous grouped GEMM of A = xq[which] as [k*ALIGN, K] (+ fp32 scales) against the
         layer's whole pool W [G, N, K/2] with packed SF, groups from m_indices. Row j*ALIGN = sorted slot j."""
         M = self.k * self.align
-        self.fn((self.xq[which].view(M, -1), self.xs[which].view(M, -1)), (t["w"][p], t["sf"][p]),
+        sfa = self.xsp[which] if self.sf_pack else self.xs[which].view(M, -1)   # T9b-4: pre-packed (no DG convert)
+        self.fn((self.xq[which].view(M, -1), sfa), (t["w"][p], t["sf"][p]),
                 self.d[p].view(M, -1), self.mi, recipe_a=RECIPE_A, recipe_b=RECIPE_B)
         self.n_calls += 1
         return self.d[p]
@@ -352,6 +401,7 @@ class DGInplaceBuffers(DGBuffers):
         spare_b = sum((pool.hbm_full[l][p].numel() - pool.hbm[l][p][0].numel()) * pool.hbm_full[l][p].element_size()
                       for l in range(pool.n_layers) for p in PROJS)
         r.update({"impl": "dg-inplace", "align": self.align, "alignment": self.alignment, "sf_store": self.sf_store,
+                  "act_sf_packed": self.sf_pack, "act_sf_packed_why": None if self.sf_pack else self.sf_pack_why,
                   "spare_slots": self.pool.spare, "G_max": self.G_max, "max_m": self.align,
                   "groups_per_layer": sorted({t["G"] for t in self.layers.values()}),
                   "hbm_added_B": {"spare_weight_slots": spare_b, "packed_sf": sf_b,
@@ -375,9 +425,12 @@ class DGInplaceMoE(DGMaskedMoE):
         glue = o.glue
         shape = x.size()
         x = x.view(-1, moe.dim)                                        # model.py:893
-        weights, indices = moe.gate(x, None)                           # model.py:894
-        ids, order = torch.sort(indices[0])                            # ascending id = model.py:897 loop order
-        w = weights[0, order]
+        if glue is not None and glue.on("router"):
+            ids, w = glue.route(moe, x)                                # T9b-2 R2 #4 (T9b-4: was not wired here)
+        else:
+            weights, indices = moe.gate(x, None)                       # model.py:894
+            ids, order = torch.sort(indices[0])                        # ascending id = model.py:897 loop order
+            w = weights[0, order]
         self._stage(ids)                                               # 1 launch: cold rows, scales, m_indices
         self._act(x)                                                   # model.py:187, once for w1 and w3
         if glue is not None and glue.on("swiglu_routed"):

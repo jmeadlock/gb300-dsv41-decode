@@ -38,12 +38,18 @@ The reduction-order question (docs/T9B3-ATTN-DESIGN.md section 3, probes (a)-(c)
   * topk: never fused. The router post kernel consumes torch.topk's indices as they come (the weight sum runs in
     torch's topk output order, as the reference's); the sorts that follow are of distinct ids (rank by comparison
     count), hence exact.
+T9b-4 (docs/HANDOFF-T9B4-RESIDUAL.md; runtime/README.md section T9b-4): `t9b4_hc_norm` (hc_split: the same work over
+1 + ceil(D/32 / HC_SPLIT_BB) programs, the statistic recomputed per program in the calibrated order -- the sums are
+not partitioned, so no order is re-derived), norm_row reading GEMV split partials (reduce_fold, `_t9b4_ld`), the
+wq_a || wkv pair (gemv_pair) feeding the q and kv paths, and packed DeepGEMM activation-SF stores (dg_sf_pack,
+`_t9b4_store_code`); `calibrate_r4` checks each against the path it replaces, bitwise, on the device.
 CPU (the Mac tests, the census): the wrappers run torch mirrors; with no device to calibrate on, the statistics run
 torch's own op (order "native"), so the CPU step is bit-identical by construction; the explicit-order mirrors and the
 Triton bodies (under tests/triton_shim.py) are tested against each other and against the family's definition.
 """
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 from types import SimpleNamespace
@@ -436,6 +442,29 @@ if HAVE_TRITON:
     def _t9b2_bf16(v):
         return v.to(tl.bfloat16, fp_downcast_rounding="rtne").to(tl.float32)
 
+    @triton.jit
+    def _t9b4_ld(x, e, m, NS: tl.constexpr, XS):
+        """fp32 value of x[e]: a bf16 load (NS == 0), or (T9b-4 reduce fold) the bf16 rounding of the fixed-order sum
+        of NS fp32 split partials x[j*XS + e], j = 0..NS-1, from +0.0 -- t9b_splitk_reduce's value."""
+        if NS == 0:
+            v = tl.load(x + e, mask=m, other=0.0).to(tl.float32)
+        else:
+            acc = tl.zeros(e.shape, dtype=tl.float32)
+            for j in tl.static_range(NS):
+                acc = acc + tl.load(x + j * XS + e, mask=m, other=0.0)
+            v = _t9b2_bf16(acc)
+        return v
+
+    @triton.jit
+    def _t9b4_store_code(s, row, bi, code, bok, s_gs, s_cs, PACK: tl.constexpr):
+        """T9b-4 lever 4: the e8m0 code of 32-block bi of output row `row` into DeepGEMM's packed MN-major activation
+        SF (uint8 view of int32 storage [K/128][M]): byte row*s_gs + (bi // 4)*s_cs + bi % 4 (PACK), else the fp32
+        scale 2^(code-127) at s[row*s_gs + bi]."""
+        if PACK:
+            tl.store(s + row * s_gs + (bi >> 2) * s_cs + (bi & 3), code.to(tl.uint8), mask=bok)
+        else:
+            tl.store(s + row * s_gs + bi, _t9b2_pow2(code), mask=bok)
+
     # --- the reduction family (module docstring): tile offsets, the V fold, the T tree
     @triton.jit
     def _r2_offs(k, T: tl.constexpr, V: tl.constexpr, U: tl.constexpr):
@@ -534,19 +563,21 @@ if HAVE_TRITON:
 
     # --- #1 + #5
     @triton.jit
-    def t9b2r2_hc_norm(x, pre, nw, y, yf, xf, mrs, q, s, dq, ds, dq_gs, ds_gs, G, tab,
+    def t9b2r2_hc_norm(x, pre, nw, y, yf, xf, mrs, q, s, dq, ds, dq_gs, ds_gs, ds_cs, G, tab,
                        eps, fac, wf, meps, mfac, mwf,
                        D: tl.constexpr, HC: tl.constexpr, HCMODE: tl.constexpr,
                        NT: tl.constexpr, NV: tl.constexpr, NU: tl.constexpr, NDEC: tl.constexpr, NDIV: tl.constexpr,
                        MT: tl.constexpr, MV: tl.constexpr, MU: tl.constexpr, MDEC: tl.constexpr, MDIV: tl.constexpr,
                        PASS_A: tl.constexpr, HAS_MIX: tl.constexpr, HAS_XF: tl.constexpr, HAS_YF: tl.constexpr,
-                       QQ: tl.constexpr, HAS_Q: tl.constexpr, HAS_DG: tl.constexpr, BB: tl.constexpr):
+                       QQ: tl.constexpr, HAS_Q: tl.constexpr, HAS_DG: tl.constexpr, BB: tl.constexpr,
+                       DG_PACK: tl.constexpr = False):
         """One program. x [HC, D] bf16 (the residual stream copies), pre [HC] fp32 (pre_mix), nw [D] (norm weight).
         A (PASS_A): xf = x.flatten().float() (HAS_XF) and mrs = rsqrt(mean(xf^2) + meps) in order M* (HAS_MIX:
         hc_mixes' statistic, model.py:954-955). B: y0 = hc_pre(x, pre) (bf16), var = mean(y0^2) in order N*,
         r = rsqrt(var + eps). C, per 32-block: y = bf16(nw * (y0 * r)) -> y (bf16), yf (fp32, HAS_YF), and (QQ) its
         act_quant: q fp8 + s e8m0 code (HAS_Q), the same q into rows g*dq_gs of dq and fp32 scales into ds (HAS_DG:
-        DeepGEMM's w1/w3 input, G groups)."""
+        DeepGEMM's w1/w3 input, G groups; T9b-4 DG_PACK: e8m0 codes into DeepGEMM's packed SF, _t9b4_store_code).
+        T9b-4: t9b4_hc_norm is the same work over several programs (kept here for the fallback / A-B)."""
         if PASS_A:
             acc = tl.zeros([MT, MV], dtype=tl.float32)
             for k in range((HC * D + MT * MV - 1) // (MT * MV)):
@@ -585,7 +616,85 @@ if HAVE_TRITON:
                 if HAS_DG:
                     for gi in range(G):
                         tl.store(dq + gi * dq_gs + cols, qv, mask=m)
-                        tl.store(ds + gi * ds_gs + bi, _t9b2_pow2(code), mask=bok)
+                        _t9b4_store_code(ds, gi, bi, code, bok, ds_gs, ds_cs, DG_PACK)
+
+    # --- T9b-4 lever 1: the hc_norm work over 1 + ceil(D/32 / BB) programs (docs/HANDOFF-T9B4-RESIDUAL.md)
+    @triton.jit
+    def _t9b4_hc_mix(x, xf, mrs, meps, mfac, mwf, D: tl.constexpr, HC: tl.constexpr, MT: tl.constexpr,
+                     MV: tl.constexpr, MU: tl.constexpr, MDEC: tl.constexpr, MDIV: tl.constexpr, HAS_MIX: tl.constexpr,
+                     HAS_XF: tl.constexpr):
+        """t9b2r2_hc_norm's pass A with its tile loop unrolled (static_range: the loads are independent, the adds
+        keep their order -- no reassociation without fast-math), same tiles, same tree."""
+        acc = tl.zeros([MT, MV], dtype=tl.float32)
+        for k in tl.static_range((HC * D + MT * MV - 1) // (MT * MV)):
+            e = _r2_offs(k, MT, MV, MU)
+            m = e < HC * D
+            v = tl.load(x + e, mask=m, other=0.0).to(tl.float32)
+            if HAS_XF:
+                tl.store(xf + e, v, mask=m)
+            acc = acc + v * v
+        if HAS_MIX:
+            ms = _r2_fin(_r2_finish(acc, MT, MV, MDEC), mfac, mwf, MDIV)
+            tl.store(mrs, libdevice.rsqrt(ms + meps))
+
+    @triton.jit
+    def _t9b4_hc_apply(x, pre, nw, y, yf, q, s, dq, ds, dq_gs, ds_gs, ds_cs, G, tab, eps, fac, wf, b0,
+                       D: tl.constexpr, HC: tl.constexpr, HCMODE: tl.constexpr, NT: tl.constexpr, NV: tl.constexpr,
+                       NU: tl.constexpr, NDEC: tl.constexpr, NDIV: tl.constexpr, HAS_YF: tl.constexpr,
+                       QQ: tl.constexpr, HAS_Q: tl.constexpr, HAS_DG: tl.constexpr, DG_PACK: tl.constexpr,
+                       BB: tl.constexpr):
+        """Pass B -- the WHOLE statistic, exactly t9b2r2_hc_norm's (same tiles, same order; every program computes
+        the same r bit for bit, no cross-program combine) -- then pass C for the 32-blocks [b0, b0 + BB) only."""
+        acc2 = tl.zeros([NT, NV], dtype=tl.float32)
+        for k in tl.static_range((D + NT * NV - 1) // (NT * NV)):
+            e = _r2_offs(k, NT, NV, NU)
+            m = e < D
+            yv = _r2_hcpre(x, pre, e, m, D, HC, HCMODE)
+            acc2 = acc2 + yv * yv
+        r = libdevice.rsqrt(_r2_fin(_r2_finish(acc2, NT, NV, NDEC), fac, wf, NDIV) + eps)
+        bi = b0 + tl.arange(0, BB)
+        bok = bi < D // 32
+        cols = bi[:, None] * 32 + tl.arange(0, 32)[None, :]
+        m = bok[:, None] & (cols >= 0)
+        yv = _r2_hcpre(x, pre, cols, m, D, HC, HCMODE)
+        o = _t9b2_bf16(tl.load(nw + cols, mask=m, other=0.0).to(tl.float32) * (yv * r))
+        tl.store(y + cols, o.to(tl.bfloat16), mask=m)
+        if HAS_YF:
+            tl.store(yf + cols, o, mask=m)
+        if QQ:
+            code = _t9b2_code(tl.max(tl.abs(o), axis=1), tab)
+            qv = _t9b2_q8(o, _t9b2_ipow2(code)[:, None])
+            if HAS_Q:
+                tl.store(q + cols, qv, mask=m)
+                tl.store(s + bi, code.to(tl.uint8), mask=bok)
+            if HAS_DG:
+                for gi in range(G):
+                    tl.store(dq + gi * dq_gs + cols, qv, mask=m)
+                    _t9b4_store_code(ds, gi, bi, code, bok, ds_gs, ds_cs, DG_PACK)
+
+    @triton.jit
+    def t9b4_hc_norm(x, pre, nw, y, yf, xf, mrs, q, s, dq, ds, dq_gs, ds_gs, ds_cs, G, tab,
+                     eps, fac, wf, meps, mfac, mwf, NAP,
+                     D: tl.constexpr, HC: tl.constexpr, HCMODE: tl.constexpr,
+                     NT: tl.constexpr, NV: tl.constexpr, NU: tl.constexpr, NDEC: tl.constexpr, NDIV: tl.constexpr,
+                     MT: tl.constexpr, MV: tl.constexpr, MU: tl.constexpr, MDEC: tl.constexpr, MDIV: tl.constexpr,
+                     PASS_A: tl.constexpr, HAS_MIX: tl.constexpr, HAS_XF: tl.constexpr, HAS_YF: tl.constexpr,
+                     QQ: tl.constexpr, HAS_Q: tl.constexpr, HAS_DG: tl.constexpr, DG_PACK: tl.constexpr,
+                     BB: tl.constexpr):
+        """t9b2r2_hc_norm's outputs, bit for bit, from NAP (+1 with PASS_A) programs: program p < NAP recomputes the
+        norm statistic (identical code -> identical r) and writes the 32-blocks [p*BB, (p+1)*BB); program NAP (PASS_A)
+        writes xf and the mix statistic. The reduction ORDER is the calibrated one, untouched: the work is split, the
+        sums are not (redundant statistic instead of a partitioned reduction + combine)."""
+        pid = tl.program_id(0)
+        if PASS_A:
+            if pid >= NAP:
+                _t9b4_hc_mix(x, xf, mrs, meps, mfac, mwf, D, HC, MT, MV, MU, MDEC, MDIV, HAS_MIX, HAS_XF)
+            else:
+                _t9b4_hc_apply(x, pre, nw, y, yf, q, s, dq, ds, dq_gs, ds_gs, ds_cs, G, tab, eps, fac, wf, pid * BB,
+                               D, HC, HCMODE, NT, NV, NU, NDEC, NDIV, HAS_YF, QQ, HAS_Q, HAS_DG, DG_PACK, BB)
+        else:
+            _t9b4_hc_apply(x, pre, nw, y, yf, q, s, dq, ds, dq_gs, ds_gs, ds_cs, G, tab, eps, fac, wf, pid * BB,
+                           D, HC, HCMODE, NT, NV, NU, NDEC, NDIV, HAS_YF, QQ, HAS_Q, HAS_DG, DG_PACK, BB)
 
     # --- #3 / #6
     @triton.jit
@@ -593,16 +702,17 @@ if HAVE_TRITON:
                         N: tl.constexpr, T: tl.constexpr, V: tl.constexpr, U: tl.constexpr, DEC: tl.constexpr,
                         DIV: tl.constexpr, HAS_SLOT: tl.constexpr, QQ: tl.constexpr, HAS_Q: tl.constexpr,
                         QDQ: tl.constexpr, RD: tl.constexpr, RE_MODE: tl.constexpr, IM_MODE: tl.constexpr,
-                        BB: tl.constexpr):
+                        BB: tl.constexpr, XS=0, NS: tl.constexpr = 0):
         """One program: RMSNorm of one bf16 row x [N] (model.py:288-293, statistic in order T/V/U/DEC/DIV), then per
         32-block as even/odd pairs: RoPE on the last RD columns (RD > 0; the forward rotation by freqs [RD/2, 2],
         contraction forms RE/IM_MODE, bf16), act_quant QDQ in place (QDQ) -> out (+ slot[0] * N: the window ring
-        row, HAS_SLOT); and/or the act_quant of the row: q fp8 + s e8m0 (HAS_Q)."""
+        row, HAS_SLOT); and/or the act_quant of the row: q fp8 + s e8m0 (HAS_Q). T9b-4 (NS > 0): x is the GEMV's
+        fp32 split partials [NS, N] (split stride XS), reduced on load in the split-K reduce's order (_t9b4_ld)."""
         acc = tl.zeros([T, V], dtype=tl.float32)
         for k in range((N + T * V - 1) // (T * V)):
             e = _r2_offs(k, T, V, U)
             m = e < N
-            v = tl.load(x + e, mask=m, other=0.0).to(tl.float32)
+            v = _t9b4_ld(x, e, m, NS, XS)
             acc = acc + v * v
         r = libdevice.rsqrt(_r2_fin(_r2_finish(acc, T, V, DEC), fac, wf, DIV) + eps)
         if HAS_SLOT:
@@ -615,9 +725,9 @@ if HAVE_TRITON:
             ce = bi[:, None] * 32 + 2 * tl.arange(0, 16)[None, :]
             m = bok[:, None] & (ce >= 0)
             a = _t9b2_bf16(tl.load(nw + ce, mask=m, other=0.0).to(tl.float32)
-                           * (tl.load(x + ce, mask=m, other=0.0).to(tl.float32) * r))
+                           * (_t9b4_ld(x, ce, m, NS, XS) * r))
             b = _t9b2_bf16(tl.load(nw + ce + 1, mask=m, other=0.0).to(tl.float32)
-                           * (tl.load(x + ce + 1, mask=m, other=0.0).to(tl.float32) * r))
+                           * (_t9b4_ld(x, ce + 1, m, NS, XS) * r))
             if RD > 0:
                 is_r = ce >= N - RD
                 fi = tl.where(is_r, (ce - (N - RD)) // 2, 0)
@@ -756,10 +866,27 @@ def _np2(n: int) -> int:
     return 1 << max(0, (int(n) - 1).bit_length())
 
 
+HC_SPLIT_BB = 8       # T9b-4: 32-blocks per apply program of t9b4_hc_norm (D = 5120: 20 apply + 1 mix programs)
+HC_SPLIT_WARPS = 8
+
+
+def _ds_args(ds, dummy):
+    """(pointer tensor, row stride, column stride, packed) of the DeepGEMM scale destination: fp32 rows [G, D/32]
+    (stride(0)), or a runtime.dg_inplace.PackedRows (T9b-4: bytes of the packed MN-major SF)."""
+    if ds is None:
+        return dummy, 0, 0, False
+    if getattr(ds, "packed", False):
+        return ds.u8, ds.row_stride, ds.col_stride, True
+    return ds, ds.stride(0), 0, False
+
+
 def launch_hc_norm(x, pre, nw, y, *, eps: float, norm_ord: dict, hc_mode: int, code_tab=None, yf=None, xf=None,
-                   mrs=None, mix_ord: Optional[dict] = None, mix_eps: float = 0.0, q=None, s=None, dq=None, ds=None):
+                   mrs=None, mix_ord: Optional[dict] = None, mix_eps: float = 0.0, q=None, s=None, dq=None, ds=None,
+                   split: bool = False):
     """x [HC, D] bf16 contiguous, pre [HC] fp32, nw [D]; y [D] bf16; yf [D] fp32; xf [HC*D] fp32; mrs [1] fp32;
-    q [D] fp8, s [D/32] e8m0; dq [G, D] fp8 rows (unit inner stride), ds [G, D/32] fp32."""
+    q [D] fp8, s [D/32] e8m0; dq [G, D] fp8 rows (unit inner stride), ds [G, D/32] fp32 or (T9b-4) a
+    runtime.dg_inplace.PackedRows (the codes go straight into DeepGEMM's packed activation SF). split (T9b-4 lever
+    1): t9b4_hc_norm over 1 + ceil(D/32 / HC_SPLIT_BB) programs instead of t9b2r2_hc_norm's one (same outputs)."""
     HC, D = x.shape
     if _kern(x):
         na = order_args(norm_ord)
@@ -767,19 +894,25 @@ def launch_hc_norm(x, pre, nw, y, *, eps: float, norm_ord: dict, hc_mode: int, c
         dummy = y
         G = dq.size(0) if dq is not None else 0
         su = s.view(torch.uint8) if s is not None else dummy
-        t9b2r2_hc_norm[(1,)](
-            x, pre, nw, y, yf if yf is not None else dummy, xf if xf is not None else dummy,
-            mrs if mrs is not None else dummy, q if q is not None else dummy, su,
-            dq if dq is not None else dummy, ds if ds is not None else dummy,
-            dq.stride(0) if dq is not None else 0, ds.stride(0) if ds is not None else 0, G,
-            code_tab if code_tab is not None else dummy,
-            float(eps), fac_of(D), float(D), float(mix_eps), fac_of(HC * D), float(HC * D),
-            D=D, HC=HC, HCMODE=int(hc_mode),
-            NT=na["T"], NV=na["V"], NU=na["U"], NDEC=na["DEC"], NDIV=na["DIV"],
-            MT=ma["T"], MV=ma["V"], MU=ma["U"], MDEC=ma["DEC"], MDIV=ma["DIV"],
-            PASS_A=xf is not None or mrs is not None, HAS_MIX=mrs is not None, HAS_XF=xf is not None,
-            HAS_YF=yf is not None, QQ=q is not None or dq is not None, HAS_Q=q is not None, HAS_DG=dq is not None,
-            BB=8, num_warps=NORM_WARPS, **LAUNCH)
+        dsk, ds_gs, ds_cs, packed = _ds_args(ds, dummy)
+        args = (x, pre, nw, y, yf if yf is not None else dummy, xf if xf is not None else dummy,
+                mrs if mrs is not None else dummy, q if q is not None else dummy, su,
+                dq if dq is not None else dummy, dsk, dq.stride(0) if dq is not None else 0, ds_gs, ds_cs, G,
+                code_tab if code_tab is not None else dummy,
+                float(eps), fac_of(D), float(D), float(mix_eps), fac_of(HC * D), float(HC * D))
+        pass_a = xf is not None or mrs is not None
+        ce = dict(D=D, HC=HC, HCMODE=int(hc_mode),
+                  NT=na["T"], NV=na["V"], NU=na["U"], NDEC=na["DEC"], NDIV=na["DIV"],
+                  MT=ma["T"], MV=ma["V"], MU=ma["U"], MDEC=ma["DEC"], MDIV=ma["DIV"],
+                  PASS_A=pass_a, HAS_MIX=mrs is not None, HAS_XF=xf is not None,
+                  HAS_YF=yf is not None, QQ=q is not None or dq is not None, HAS_Q=q is not None, HAS_DG=dq is not None,
+                  DG_PACK=packed)
+        if split:
+            nap = -(-(D // BLOCK) // HC_SPLIT_BB)
+            t9b4_hc_norm[(nap + (1 if pass_a else 0),)](*args, nap, **ce, BB=HC_SPLIT_BB, num_warps=HC_SPLIT_WARPS,
+                                                        **LAUNCH)
+        else:
+            t9b2r2_hc_norm[(1,)](*args, **ce, BB=8, num_warps=NORM_WARPS, **LAUNCH)
         return
     xv = x.float()
     if xf is not None:
@@ -800,27 +933,43 @@ def launch_hc_norm(x, pre, nw, y, *, eps: float, norm_ord: dict, hc_mode: int, c
         if dq is not None:
             for gi in range(dq.size(0)):
                 dq[gi].copy_(qv.view(-1))
-                ds[gi].copy_(pow2_code(code.view(-1)))
+                if getattr(ds, "packed", False):
+                    ds.store_codes_torch(gi, code.view(-1))
+                else:
+                    ds[gi].copy_(pow2_code(code.view(-1)))
+
+
+def _row_src(x):
+    """(tensor, N, NS, XS): a bf16 row [N], or (T9b-4 reduce fold) a gemv_mxfp8.SplitK of one row -> its fp32
+    partials, nsplit and split stride."""
+    if hasattr(x, "nsplit") and hasattr(x, "ws"):
+        if x.M != 1:
+            raise ValueError(f"norm row: SplitK of {x.M} rows (one row expected)")
+        return x.ws, x.N, x.nsplit, x.split_stride
+    return x, x.numel(), 0, 0
 
 
 def launch_norm_row(x, nw, out, *, eps: float, ordd: dict, code_tab=None, slot=None, q=None, s=None,
                     qdq: bool = False, rope=None):
-    """x [N] bf16, nw [N]; out bf16 [N] (or the ring [win, N] with slot [1] int64); q [N] fp8 + s [N/32] e8m0;
+    """x [N] bf16 (or, T9b-4, a one-row gemv_mxfp8.SplitK: the GEMV's partials, reduced in the kernel's load), nw [N];
+    out bf16 [N] (or the ring [win, N] with slot [1] int64); q [N] fp8 + s [N/32] e8m0;
     rope = (freqs fp32 [RD/2, 2], RD, (re, im) modes)."""
-    N = x.numel()
+    xt, N, NS, XS = _row_src(x)
     RD = int(rope[1]) if rope is not None else 0
     modes = tuple(rope[2]) if rope is not None else (0, 0)
-    if _kern(x):
+    if _kern(xt):
         a = order_args(ordd)
         dummy = out
         t9b2r2_norm_row[(1,)](
-            x, nw, out, slot if slot is not None else x, q if q is not None else dummy,
+            xt, nw, out, slot if slot is not None else xt, q if q is not None else dummy,
             s.view(torch.uint8) if s is not None else dummy, rope[0] if rope is not None else nw,
             code_tab if code_tab is not None else dummy, float(eps), fac_of(N), float(N),
             N=N, T=a["T"], V=a["V"], U=a["U"], DEC=a["DEC"], DIV=a["DIV"], HAS_SLOT=slot is not None,
             QQ=q is not None or qdq, HAS_Q=q is not None, QDQ=bool(qdq), RD=RD, RE_MODE=int(modes[0]),
-            IM_MODE=int(modes[1]), BB=min(16, _np2(N // 32)), num_warps=NORM_WARPS, **LAUNCH)
+            IM_MODE=int(modes[1]), BB=min(16, _np2(N // 32)), XS=int(XS), NS=int(NS), num_warps=NORM_WARPS, **LAUNCH)
         return
+    if NS:
+        x = x.reduce_torch().view(-1)
     v = x.float().view(1, N)
     o = rms_apply_torch(v, rms_rsqrt_torch(v, eps, ordd, (1, 1, N)), nw).view(-1)
     if RD:
@@ -1013,6 +1162,19 @@ class R2Glue:
             return None
         return "unknown"
 
+    def _applicable_r4(self, c: str, layers, mx: bool) -> Optional[str]:
+        """T9b-4 parts (fused_glue.R4_PARTS)."""
+        o = self.o
+        if c == "hc_split":
+            return self._applicable_r2("hc_norm", layers, mx)
+        if c in ("gemv_pair", "reduce_fold"):
+            return None if o.fp8_impl == "gemv" else "fp8_impl ref (the pair / the fold live in the T9b-1 GEMV)"
+        if c == "dg_sf_pack":
+            if o.moe_impl != "dg-inplace":
+                return "moe_impl is not dg-inplace (the contiguous GEMM is the one that converts the activation SF)"
+            return None if mx else "needs the MXFP8 act_quant globals"
+        return "unknown"
+
     # ---------------------------------------------------------------- status helpers
     def _r2_norm(self, key: str) -> dict:
         return self.orders[key]
@@ -1074,6 +1236,9 @@ class R2Glue:
             self._off("mix_stat", "needs hc_norm (its statistic rides in the hc_norm launch)")
         r2["orders"] = {k: {kk: (order_name(vv) if kk == "order" else vv) for kk, vv in v.items()}
                         for k, v in self.orders.items()}
+        # T9b-4: the split hc_norm kernel against the one-program kernel FIRST, so that a broken split costs hc_split
+        # only (the end-to-end hc_norm check below then runs on whichever kernel is in force)
+        self._r4_check(cal, "hc_split", self._verify_hc_split, g)
         for c, fn in (("hc_norm", self._verify_hc_norm), ("kv_path", self._verify_kv_path),
                       ("q_path", self._verify_q_path), ("router", self._verify_router),
                       ("engram", self._verify_engram), ("indexer_post", self._verify_indexer_post)):
@@ -1374,12 +1539,12 @@ class R2Glue:
             if self.on("router"):
                 yf = torch.empty(1, D, dtype=torch.float32, device=dev)
             if o.dg is not None and self.on("dg_act"):
-                dq, ds, dg = o.dg.xq[1][:, 0], o.dg.xs[1][:, 0], True
+                dq, ds, dg = o.dg.xq[1][:, 0], self.dg_scale_dst(1), True
         launch_hc_norm(x.reshape(HC, D), pre_mix.reshape(HC).contiguous(), norm.weight, y.view(-1), eps=norm.eps,
                        norm_ord=self.orders["norm_D"], hc_mode=self.hc_pre_mode, code_tab=self.code_tab,
                        yf=yf.view(-1) if yf is not None else None, xf=xf.view(-1),
                        mrs=mrs.view(-1) if mrs is not None else None, mix_ord=self.orders.get("mix"),
-                       mix_eps=layer.norm_eps, q=q.view(-1), s=s.view(-1), dq=dq, ds=ds)
+                       mix_eps=layer.norm_eps, q=q.view(-1), s=s.view(-1), dq=dq, ds=ds, split=self.on("hc_split"))
         if mrs is None:   # mix_stat off: the reference statistic, on the same fp32 values (one launch fewer: .float())
             mrs = torch.rsqrt(xf.square().mean(-1, keepdim=True) + layer.norm_eps)
         pre, post, comb = self.mix_tail(layer, xf, mrs, side)
@@ -1412,33 +1577,92 @@ class R2Glue:
         y = torch.empty(1, 1, D, dtype=h.dtype, device=h.device)
         yf = torch.empty(1, D, dtype=torch.float32, device=h.device)
         launch_hc_norm(h.reshape(HC, D), pre_mix.reshape(HC).contiguous(), model.norm.weight, y.view(-1),
-                       eps=model.norm.eps, norm_ord=self.orders["norm_D"], hc_mode=self.hc_pre_mode, yf=yf.view(-1))
+                       eps=model.norm.eps, norm_ord=self.orders["norm_D"], hc_mode=self.hc_pre_mode, yf=yf.view(-1),
+                       split=self.on("hc_split"))
         return F.linear(yf, model.head.weight)          # = F.linear(x[:, -1].float(), weight) (model.py:1013-1014)
 
     def _q_norm_quant(self, attn, qa):
-        QL = qa.size(-1)
+        """qa: wq_a's output [1, 1, QL] bf16, or (T9b-4) its one-row gemv_mxfp8.SplitK."""
+        sk = hasattr(qa, "nsplit")
+        QL = qa.N if sk else qa.size(-1)
         qr = torch.empty(1, 1, QL, dtype=torch.bfloat16, device=qa.device)
         q = torch.empty(1, 1, QL, dtype=FP8, device=qa.device)
         s = torch.empty(1, 1, QL // BLOCK, dtype=E8, device=qa.device)
-        launch_norm_row(qa.reshape(-1), attn.q_norm.weight, qr.view(-1), eps=attn.q_norm.eps, ordd=self.orders["q"],
-                        code_tab=self.code_tab, q=q.view(-1), s=s.view(-1))
+        launch_norm_row(qa if sk else qa.reshape(-1), attn.q_norm.weight, qr.view(-1), eps=attn.q_norm.eps,
+                        ordd=self.orders["q"], code_tab=self.code_tab, q=q.view(-1), s=s.view(-1))
         return qr, (q, s)
+
+    # T9b-4 lever 2: the GEMVs that feed these fused consumers --------------------------------------------------
+    def _gemv_ok(self, xq, *lins) -> bool:
+        """The linear_pre / fp8_linear_prequant routing decision for x's act_quant xq = (q, s): would every one of
+        `lins` take the T9b-1 GEMV here?"""
+        from runtime import patches
+
+        if xq is None or not (patches.fp8_gemv_active() and patches.fp8_linear_gemv_enabled()):
+            return False
+        return all(patches.fp8_gemv_reason(self.R, xq[0], l.weight) is None for l in lins)
+
+    def _rows(self, xq) -> int:
+        return xq[0].numel() // xq[0].size(-1)
+
+    def _gemv_fold(self, xq, lin, tag: str):
+        """lin(x) on the GEMV WITHOUT its split-K reduce (the consumer folds it): bf16 [M, N] or SplitK."""
+        from runtime import patches
+        from runtime.gemv_mxfp8 import gemv_partials
+
+        K = xq[0].size(-1)
+        patches.count_gemv_routed(lin.weight, xq[0])
+        return gemv_partials(xq[0].reshape(-1, K), xq[1].reshape(-1, K // BLOCK), lin.weight, lin.weight.scale,
+                             tag=tag)
+
+    def _gemv_pair(self, xq, la, lb, tags):
+        """la(x), lb(x) (same input) in one GEMV launch (gemv_mxfp8.gemv_pair); partials stay partials only with
+        reduce_fold on (else each is reduced to bf16 here: one reduce launch per split half)."""
+        from runtime import patches
+        from runtime.gemv_mxfp8 import gemv_pair, materialize
+
+        K = xq[0].size(-1)
+        patches.count_gemv_routed(la.weight, xq[0])
+        patches.count_gemv_routed(lb.weight, xq[0])
+        ra, rb = gemv_pair(xq[0].reshape(-1, K), xq[1].reshape(-1, K // BLOCK), la.weight, la.weight.scale,
+                           lb.weight, lb.weight.scale, tags=tags)
+        if not self.on("reduce_fold"):
+            ra, rb = materialize(ra), materialize(rb)
+        return ra, rb
+
+    def _q_input(self, attn, x, xq):
+        """wq_a(x) for the fused q path: with gemv_pair (and the fused kv path) wq_a || wkv in one launch -- wkv's
+        result is held for this layer's kv_path --, else wq_a alone (reduce folded with reduce_fold)."""
+        self._kv_pend = None
+        one = xq is not None and self._rows(xq) == 1
+        if one and self.on("gemv_pair") and self.on("kv_path") and self._gemv_ok(xq, attn.wq_a, attn.wkv):
+            qa, kvr = self._gemv_pair(xq, attn.wq_a, attn.wkv, ("wq_a", "wkv"))
+            self._kv_pend = (id(attn), kvr)
+            return qa
+        if one and self.on("reduce_fold") and self._gemv_ok(xq, attn.wq_a):
+            return self._gemv_fold(xq, attn.wq_a, "wq_a")
+        return self.linear_pre(xq, attn.wq_a, x)
 
     def q_path(self, attn, x, xq):
         """qr = q_norm(wq_a(x)) (model.py:771) and act_quant(qr) for wq_b (model.py:772, 197) in one launch."""
-        qa = self.linear_pre(xq, attn.wq_a, x)
-        return self._q_norm_quant(attn, qa)
+        return self._q_norm_quant(attn, self._q_input(attn, x, xq))
 
     def _kv_norm_write(self, attn, kvr, freqs_cis, ring, slot):
         HD, rd = attn.head_dim, attn.rope_head_dim
-        launch_norm_row(kvr.reshape(-1), attn.kv_norm.weight, ring, eps=attn.kv_norm.eps, ordd=self.orders["kv"],
+        launch_norm_row(kvr if hasattr(kvr, "nsplit") else kvr.reshape(-1), attn.kv_norm.weight, ring, eps=attn.kv_norm.eps, ordd=self.orders["kv"],
                         code_tab=self.code_tab, slot=slot, qdq=True,
                         rope=(torch.view_as_real(freqs_cis).reshape(-1, 2), rd, self.rope_fwd) if rd else None)
 
     def kv_path(self, attn, x, xq, freqs_cis, slot):
         """_window_kv's kv (model.py:706-708) into the ring slot (model.py:719): wkv, then kv_norm + RoPE + QDQ +
         the ring write in one launch."""
-        kvr = self.linear_pre(xq, attn.wkv, x)
+        pend, self._kv_pend = getattr(self, "_kv_pend", None), None
+        if pend is not None and pend[0] == id(attn):                 # T9b-4: made by this layer's q path (pair)
+            kvr = pend[1]
+        elif xq is not None and self._rows(xq) == 1 and self.on("reduce_fold") and self._gemv_ok(xq, attn.wkv):
+            kvr = self._gemv_fold(xq, attn.wkv, "wkv")
+        else:
+            kvr = self.linear_pre(xq, attn.wkv, x)
         self._kv_norm_write(attn, kvr, freqs_cis, attn.window_kv_cache, slot)
 
     def route(self, moe, x):
@@ -1485,6 +1709,202 @@ class R2Glue:
         out = torch.empty(idx.shape, dtype=torch.int32, device=idx.device)
         launch_topk_post(idx.reshape(-1), compress_lens.reshape(-1), out.view(-1), offset)
         return out
+
+    # ---------------------------------------------------------------- T9b-4 self-checks (build time, eager, device)
+    @contextlib.contextmanager
+    def _with_parts(self, **on):
+        """Temporarily force T9b-4 parts on/off (the A/B of the self-check); restores the statuses."""
+        saved = {k: self.status[k] for k in on}
+        try:
+            for k, v in on.items():
+                self.status[k] = "on" if v else "off: (self-check A/B)"
+            yield
+        finally:
+            self.status.update(saved)
+
+    def calibrate_r4(self, cal: dict, g) -> None:
+        """Each T9b-4 part against the path it replaces, bitwise, on the device; a mismatch (or a raise) turns the
+        part off with the reason (cal["r4"]). dg_sf_pack is switched on in the DeepGEMM buffers only here."""
+        if not self.on("hc_norm"):
+            self._off("hc_split", "hc_norm is off")
+        self._r4_check(cal, "gemv", self._verify_gemv_r4, g)
+        self._r4_check(cal, "dg_sf_pack", self._verify_sf_pack, g)
+        b = self.o.dg
+        if b is not None and hasattr(b, "sf_pack"):
+            b.sf_pack = self.on("dg_sf_pack")
+            b.sf_pack_why = None if b.sf_pack else self.status.get("dg_sf_pack")
+        if not self.on("dg_sf_pack") and b is not None and hasattr(b, "sf_pack"):
+            b.sf_pack = False
+
+    def _r4_check(self, cal: dict, name: str, fn, g) -> None:
+        r4 = cal.setdefault("r4", {})
+        try:
+            res = fn(g)
+        except Exception as e:  # a part that does not compile/run here stays off, with the reason
+            parts = ("gemv_pair", "reduce_fold") if name == "gemv" else (name,)
+            res = {c: f"raised {type(e).__name__}: {str(e)[:300]}" for c in parts if self.on(c)}
+        for c, why in res.items():
+            r4[f"verify_{c}"] = why or "equal"
+            if why:
+                self._off(c, f"self-check: {why}")
+
+    def _verify_hc_split(self, g) -> dict:
+        """t9b4_hc_norm == t9b2r2_hc_norm on every output (both sides' forms, the head's form, the DeepGEMM rows in
+        fp32 and -- dg-inplace -- packed form)."""
+        if not (self.on("hc_split") and self.on("hc_norm")):
+            return {}
+        layer = self.o.model.layers[0]
+        D, HC, dev = layer.attn_norm.dim, self.hc, self.dev
+        mix = self.orders.get("mix") if self.on("mix_stat") else None
+        b = self.o.dg
+        packed = getattr(b, "xsp_rows", None) is not None and self.on("dg_sf_pack")
+        for i in range(4):
+            x, pre = self._hc_inputs(g, HC, D, i)
+            outs = []
+            for split in (False, True):
+                o = dict(y=torch.empty(D, dtype=torch.bfloat16, device=dev), yf=torch.empty(D, device=dev),
+                         xf=torch.empty(HC * D, device=dev), q=torch.empty(D, dtype=FP8, device=dev),
+                         s=torch.empty(D // BLOCK, dtype=E8, device=dev),
+                         dq=torch.zeros(3, D, dtype=FP8, device=dev),
+                         ds=torch.zeros(3, D // BLOCK, dtype=torch.float32, device=dev))
+                if mix is not None:
+                    o["mrs"] = torch.empty(1, device=dev)
+                launch_hc_norm(x.reshape(HC, D), pre.reshape(HC).contiguous(), layer.ffn_norm.weight, o["y"],
+                               eps=layer.ffn_norm.eps, norm_ord=self.orders["norm_D"], hc_mode=self.hc_pre_mode,
+                               code_tab=self.code_tab, yf=o["yf"], xf=o["xf"], mrs=o.get("mrs"), mix_ord=mix,
+                               mix_eps=layer.norm_eps, q=o["q"], s=o["s"], dq=o["dq"], ds=o["ds"], split=split)
+                h = dict(y=torch.empty(D, dtype=torch.bfloat16, device=dev), yf=torch.empty(D, device=dev))
+                launch_hc_norm(x.reshape(HC, D), pre.reshape(HC).contiguous(), self.o.model.norm.weight, h["y"],
+                               eps=self.o.model.norm.eps, norm_ord=self.orders["norm_D"], hc_mode=self.hc_pre_mode,
+                               yf=h["yf"], split=split)
+                o.update({f"head {k}": v for k, v in h.items()})
+                if packed:
+                    pr = b.xsp_rows[1]
+                    launch_hc_norm(x.reshape(HC, D), pre.reshape(HC).contiguous(), layer.ffn_norm.weight,
+                                   torch.empty(D, dtype=torch.bfloat16, device=dev), eps=layer.ffn_norm.eps,
+                                   norm_ord=self.orders["norm_D"], hc_mode=self.hc_pre_mode, code_tab=self.code_tab,
+                                   dq=b.xq[1][:, 0], ds=pr, split=split)
+                    o["packed codes"] = pr.codes().clone()
+                outs.append(o)
+            bad = [k for k in outs[0] if not _same(outs[0][k], outs[1][k])]
+            if bad:
+                return {"hc_split": f"t9b4_hc_norm differs from t9b2r2_hc_norm on {bad}"}
+            if packed:
+                want = ((outs[0]["ds"].view(torch.int32) >> 23) & 0xFF).to(torch.uint8)[:1].expand(b.k, -1)
+                if not torch.equal(outs[0]["packed codes"], want):
+                    return {"dg_sf_pack": "hc_norm's packed DeepGEMM codes differ from its fp32 scales"}
+        return {"hc_split": None}
+
+    def _verify_gemv_r4(self, g) -> dict:
+        """The fused q / kv / shared-expert consumers fed by the folded GEMV (reduce_fold), the pair (gemv_pair) and
+        both, against the same consumers fed by linear_pre's bf16 outputs: qr, q, s, the ring row, the shared out."""
+        o, R = self.o, self.R
+        parts = [c for c in ("reduce_fold", "gemv_pair") if self.on(c)]
+        if not parts:
+            return {}
+        layer = o.model.layers[0]
+        attn, ex = layer.attn, layer.ffn.shared_experts
+        D, HD, win = layer.attn_norm.dim, attn.head_dim, attn.window_size
+        variants = []
+        if self.on("reduce_fold"):
+            variants.append(("reduce_fold", dict(gemv_pair=False, reduce_fold=True)))
+        if self.on("gemv_pair"):
+            variants.append(("gemv_pair", dict(gemv_pair=True, reduce_fold=False)))
+            if self.on("reduce_fold"):
+                variants.append(("gemv_pair", dict(gemv_pair=True, reduce_fold=True)))
+        res = {c: None for c in parts}
+        prev = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(torch.bfloat16)
+            with o._active():
+                for t in range(2):
+                    x = self._stream(g, 1, D, -4, 6).view(1, 1, D).to(self.dev)
+                    xq = R.act_quant(x, R.fp8_block_size, R.scale_fmt, R.scale_dtype)
+                    if not self._gemv_ok(xq, attn.wq_a, attn.wkv, ex.w1, ex.w3):
+                        return {c: "wq_a / wkv / w1 / w3 do not take the GEMV in this step's scope" for c in parts}
+                    pos = 1 + t * 7
+                    f = attn.freqs_cis[pos:pos + 1]
+                    slot = torch.tensor([pos % win], dtype=torch.long, device=self.dev)
+
+                    def run():
+                        qr, (q, s) = self.q_path(attn, x, xq)
+                        pend, self._kv_pend = self._kv_pend, None
+                        if pend is not None:
+                            kvr = pend[1]
+                        elif self.on("reduce_fold"):
+                            kvr = self._gemv_fold(xq, attn.wkv, "wkv")
+                        else:
+                            kvr = self.linear_pre(xq, attn.wkv, x)
+                        ring = torch.zeros(1, win, HD, dtype=torch.bfloat16, device=self.dev)
+                        self._kv_norm_write(attn, kvr, f, ring, slot)
+                        sh = self._shared_from_q(ex, x, xq)
+                        return {"qr": qr, "q": q, "s": s, "ring": ring, "shared": sh}
+
+                    with self._with_parts(gemv_pair=False, reduce_fold=False):
+                        base = run()
+                    for c, st in variants:
+                        if res[c]:
+                            continue
+                        with self._with_parts(**st):
+                            got = run()
+                        bad = [k for k in base if not _same(got[k], base[k])]
+                        if bad:
+                            res[c] = f"{bad} differ ({st})"
+        finally:
+            torch.set_default_dtype(prev)
+            from runtime import patches
+            patches.fp8_gemv_stats(reset=True)
+        return res
+
+    def _verify_sf_pack(self, g) -> dict:
+        """dg_sf_pack: the fused writers' packed codes == their fp32 scales' codes, then DeepGEMM's contiguous GEMM
+        on layer 0's real pool with the packed activation SF == with the fp32 one, bitwise (w1 and w2 shapes)."""
+        if not self.on("dg_sf_pack"):
+            return {}
+        b = self.o.dg
+        if b is None or not hasattr(b, "xsp_rows") or not b.layers:
+            return {"dg_sf_pack": "no dg-inplace buffers / layer tables"}
+        if not (self.on("dg_act") and self.on("swiglu_routed")):
+            return {"dg_sf_pack": "needs dg_act and swiglu_routed on (every writer of row 0's scales)"}
+        from runtime.fused_glue import _rand_act, launch_act_quant_bcast, launch_swiglu_quant
+
+        k = b.k
+        x = _rand_act(g, 1, b.dim).to(self.dev)
+        launch_act_quant_bcast(x, b.xq[1][:, 0], b.xs[1][:, 0], self.code_tab, k)
+        launch_act_quant_bcast(x, b.xq[1][:, 0], b.xsp_rows[1], self.code_tab, k)
+        gate, up = self._rand_gate_up(g, k, b.inter)
+        w = (torch.rand(k, generator=g, device="cpu") * 2).float().to(self.dev)
+        launch_swiglu_quant(gate, up, w, b.xq[2][:, 0], b.xs[2][:, 0], self.silu_tab, self.code_tab, b.swiglu_limit)
+        launch_swiglu_quant(gate, up, w, b.xq[2][:, 0], b.xsp_rows[2], self.silu_tab, self.code_tab, b.swiglu_limit)
+        for wi in (1, 2):
+            want = ((b.xs[wi][:, 0].contiguous().view(torch.int32) >> 23) & 0xFF).to(torch.uint8)
+            if not torch.equal(b.xsp_rows[wi].codes(), want):
+                return {"dg_sf_pack": f"packed codes of DeepGEMM input {wi} differ from the fp32 scales"}
+        t = b.layers[min(b.layers)]
+        prev = b.sf_pack
+        try:
+            b.mi.view(k, b.align)[:, 0] = torch.arange(k, dtype=torch.int32, device=self.dev) % t["G"]
+            for p_, wi in (("w1", 1), ("w2", 2)):
+                b.sf_pack = False
+                d32 = b.gemm_inplace(p_, t, wi).clone()
+                b.sf_pack = True
+                dpk = b.gemm_inplace(p_, t, wi).clone()
+                if not _same(dpk, d32):
+                    return {"dg_sf_pack": f"contiguous GEMM ({p_}) with the packed activation SF differs from fp32 "
+                                          f"({_mismatch(dpk, d32):.3e} of outputs)"}
+        finally:
+            b.sf_pack = prev
+            b.mi.fill_(-1)
+        return {"dg_sf_pack": None}
+
+    def describe_r4(self) -> dict:
+        from runtime.gemv_mxfp8 import PAIR_STATS
+
+        b = self.o.dg
+        return {"parts": {c: self.status.get(c) for c in ("hc_split", "gemv_pair", "reduce_fold", "dg_sf_pack")},
+                "calibration": dict(self.calib.get("r4", {})) if isinstance(self.calib, dict) else {},
+                "pair_launches": dict(PAIR_STATS), "hc_split_bb": HC_SPLIT_BB,
+                "dg_act_sf_packed": bool(getattr(b, "sf_pack", False)) if b is not None else None}
 
     def describe_r2(self) -> dict:
         return {"approx": self.approx, "numerics": _jsonable(self.numerics),
