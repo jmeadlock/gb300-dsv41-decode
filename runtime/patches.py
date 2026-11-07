@@ -13,6 +13,8 @@ static_moe(enable):
     `torch.where`) -> the graph-capturable static MoE of runtime/static_step.py (`StaticMoE`: device gate, ids sorted
     ascending = the reference's accumulation order, pointer-table gather into static staging, fixed-k reference
     `Expert` evaluations, fp32 sum in slot order, + shared expert; bench/moe_static_spike.py measured it bit-identical).
+    The bound object is whatever `StaticStep(..., moe_impl=...)` built: `StaticMoE` for "ref", runtime/dg_moe.py
+    `DGMaskedMoE` for "dg-masked" (T9a-1); this patch only dispatches, so the impl is chosen by the StaticStep.
     Takes effect only for a MoE instance a `StaticStep` has bound (`_static_moe`), only while that StaticStep is
     running a step (`active`), and only for one row with no image mask; every other call -- the prefill, the eager
     reference decode, multi-row input -- runs the original forward. `StaticStep.__init__` enables it.

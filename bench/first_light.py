@@ -24,6 +24,13 @@ and one timed step cell.
     replay twice + a relaunch (fresh StaticStep, new capture) equal, plus fills-on == fills-off; prints the table
     (`parity_levels` in the report). `--levels-ref <earlier report.json>` adds "this process vs that one" rows (the
     cross-process relaunch). `--marker` launches the fixed-name `t8_step_marker` kernel once per decode step.
+(g) T9a-1: `--moe-impl dg-masked` (default `ref`) runs every static/graph step's routed experts through DeepGEMM's
+    masked grouped GEMM (runtime/dg_moe.py). With --parity-levels: L1/L2 are gated as before; L0 (static-eager vs
+    reference-eager) is reported, not gated (not bit-identical by design); an extra ref static-eager run adds the gated
+    row "ref static-eager vs reference-eager" and the drift row "dg-masked vs ref static-eager" (first token
+    divergence + mean |delta logit| over same-context positions). The report records `generator.moe_impl`,
+    `step_cell.moe_impl` and `dg_moe` (deep_gemm path, e8m0 conversion, deterministic flag). `--levels-ref` x-proc rows
+    compare runs of the same label: point it at a report made with the same --moe-impl.
 Writes docs/first-light-<YYYYMMDD>.json (or --json) and prints a 12-line summary. One prompt failing logs its
 traceback and the run continues.
 
@@ -242,13 +249,53 @@ def _det_module():
     return getattr(torch.utils, "deterministic", None)
 
 
-def _level_run(gen: Generator, prompts, steps: int) -> Dict[str, dict]:
+def _level_run(gen: Generator, prompts, steps: int, keep: Optional[Dict[str, list]] = None) -> Dict[str, dict]:
+    """Greedy `steps`+1 forwards per prompt -> per-tag digests and tokens. `keep` (a dict) also receives each tag's
+    fp32 CPU logits per position (for the dg-vs-ref drift row; not stored in the report)."""
     out = {}
     for tag, ids in prompts:
-        gen.greedy(ids, steps + 1, stop_on_eos=False)
+        sink_prev = getattr(gen, "logits_sink", None)
+        if keep is not None:
+            store = keep[tag] = []
+            gen.logits_sink = lambda i, lc, store=store: store.append(lc.detach().to("cpu", torch.float32).clone())
+        try:
+            gen.greedy(ids, steps + 1, stop_on_eos=False)
+        finally:
+            if keep is not None:
+                gen.logits_sink = sink_prev
         m = gen.last_meta
         out[tag] = {"sha": m["logits_sha256"], "steps": list(m["step_sha256"]), "tokens": list(m["token_ids"])}
     return out
+
+
+def logit_drift(a_logits: Dict[str, list], b_logits: Dict[str, list], a_run: Dict[str, dict],
+                b_run: Dict[str, dict]) -> dict:
+    """Drift of run a vs run b (same prompts): per prompt, the first token divergence (index into the generated ids;
+    0 = the prefill's argmax) and |delta logit| over the positions whose context is still identical in both runs
+    (every position up to and including the first token divergence; position 0 = prefill, identical by construction,
+    is excluded). mean_abs_dlogit = mean over compared decode positions of the vocab-mean |a - b|."""
+    per, all_means, mx, first = {}, [], 0.0, None
+    for tag in sorted(set(a_logits) & set(b_logits)):
+        ta, tb = a_run[tag]["tokens"], b_run[tag]["tokens"]
+        la, lb = a_logits[tag], b_logits[tag]
+        n = min(len(ta), len(tb), len(la), len(lb))
+        div = next((i for i in range(n) if ta[i] != tb[i]), None)
+        last = n - 1 if div is None else div
+        means = []
+        for i in range(1, last + 1):
+            d = (la[i] - lb[i]).abs()
+            means.append(float(d.mean()))
+            mx = max(mx, float(d.max()))
+        all_means += means
+        per[tag] = {"first_token_divergence": div, "positions_compared": len(means),
+                    "mean_abs_dlogit": sum(means) / len(means) if means else 0.0,
+                    "max_pos_mean_abs_dlogit": max(means) if means else 0.0}
+        if div is not None and first is None:
+            first = f"{tag}@{div}"
+    return {"first_token_divergence": first, "positions_compared": len(all_means),
+            "mean_abs_dlogit": sum(all_means) / len(all_means) if all_means else 0.0, "max_abs_dlogit": mx,
+            "prompts_token_identical": sum(1 for v in per.values() if v["first_token_divergence"] is None),
+            "per_prompt_drift": per}
 
 
 def compare_levels(a: Dict[str, dict], b: Dict[str, dict]) -> dict:
@@ -277,14 +324,22 @@ def parity_levels(gen: Generator, rows: List[dict], steps: int = 32, log=print,
     """T8 design 2.4 on `steps` decode steps x every row: L0 (static-eager vs reference-eager), L1 (graph vs
     static-eager), L2 (graph replay #2 and a relaunch vs replay #1), each with fill_uninitialized_memory off and on,
     plus fills-on vs fills-off. `ref_runs` (an earlier report's `parity_levels.runs`) adds cross-process rows.
-    Leaves the Generator in its original mode with fills restored and, in graph mode, graphs captured fills-off."""
+    T9a-1: with `gen.moe_impl != "ref"` every static/graph run uses that impl; L0 is then reported but not gated (the
+    DeepGEMM MoE is not bit-identical by design), and one more static-eager run with moe_impl "ref" (fills off) adds
+    two rows: "ref static-eager vs reference-eager" (the T8 invariant, gated) and the drift row "<impl> vs ref
+    static-eager" (first token divergence + mean |delta logit| over same-context positions, `logit_drift`; reported,
+    not gated). Leaves the Generator in its original mode and moe_impl with fills restored and, in graph mode, graphs
+    captured fills-off."""
     prompts = [(r["tag"], gen.encode([{"role": "user", "content": r["prompt"]}])) for r in rows]
     det = _det_module()
     fill0 = getattr(det, "fill_uninitialized_memory", None) if det is not None else None
     mode0 = gen.mode
+    impl = getattr(gen, "moe_impl", "ref")
     runs: Dict[str, Dict[str, dict]] = {}
     timings: Dict[str, float] = {}
     fills_list = [False, True] if fill0 is not None else [None]
+    sfx0 = "" if fills_list[0] is None else "/fills-off"
+    kept: Dict[str, Dict[str, list]] = {}
 
     def timed(label, fn):
         t = time.time()
@@ -304,7 +359,8 @@ def parity_levels(gen: Generator, rows: List[dict], steps: int = 32, log=print,
             timed("eager" + sfx, lambda: _level_run(gen, prompts, steps))
             gen.reset_static()
             gen.set_mode("static")
-            timed("static" + sfx, lambda: _level_run(gen, prompts, steps))
+            keep = kept.setdefault(impl, {}) if impl != "ref" and sfx == sfx0 else None
+            timed("static" + sfx, lambda: _level_run(gen, prompts, steps, keep))
             gen.set_mode("graph")
             gen.capture(fills=bool(f))
             timed("graph1" + sfx, lambda: _level_run(gen, prompts, steps))
@@ -313,38 +369,68 @@ def parity_levels(gen: Generator, rows: List[dict], steps: int = 32, log=print,
             gen.set_mode("graph")
             gen.capture(fills=bool(f))
             timed("relaunch" + sfx, lambda: _level_run(gen, prompts, steps))
+        if impl != "ref":  # the drift reference: the same static step with the bit-identical MoE
+            set_fill(fills_list[0])
+            gen.set_moe_impl("ref")
+            gen.set_mode("static")
+            timed("static-ref" + sfx0, lambda: _level_run(gen, prompts, steps, kept.setdefault("ref", {})))
     finally:
         set_fill(fill0)
+        if impl != "ref":
+            gen.set_moe_impl(impl)
         gen.set_mode(mode0)
         if mode0 == "graph":
             gen.capture(fills=False)
 
+    gated_l0 = impl == "ref"
     table = []
     for f in fills_list:
         sfx = "" if f is None else ("/fills-on" if f else "/fills-off")
         fl = "-" if f is None else ("on" if f else "off")
-        table += [(fl, "L0", "static-eager vs reference-eager", compare_levels(runs["static" + sfx], runs["eager" + sfx])),
-                  (fl, "L1", "graph vs static-eager", compare_levels(runs["graph1" + sfx], runs["static" + sfx])),
-                  (fl, "L2", "graph replay#2 vs replay#1", compare_levels(runs["graph2" + sfx], runs["graph1" + sfx])),
-                  (fl, "L2", "graph relaunch vs replay#1", compare_levels(runs["relaunch" + sfx], runs["graph1" + sfx]))]
+        table += [(fl, "L0", "static-eager vs reference-eager", gated_l0,
+                   compare_levels(runs["static" + sfx], runs["eager" + sfx])),
+                  (fl, "L1", "graph vs static-eager", True, compare_levels(runs["graph1" + sfx], runs["static" + sfx])),
+                  (fl, "L2", "graph replay#2 vs replay#1", True,
+                   compare_levels(runs["graph2" + sfx], runs["graph1" + sfx])),
+                  (fl, "L2", "graph relaunch vs replay#1", True,
+                   compare_levels(runs["relaunch" + sfx], runs["graph1" + sfx]))]
     if len(fills_list) == 2:
         for k in ("eager", "static", "graph1"):
-            table.append(("on/off", "L2", f"{k}: fills-on vs fills-off",
+            # "eager: fills-on vs fills-off" is the reference's own determinism: reported, not gated
+            table.append(("on/off", "L2", f"{k}: fills-on vs fills-off", k != "eager",
                           compare_levels(runs[k + "/fills-on"], runs[k + "/fills-off"])))
+    drift = None
+    if impl != "ref":
+        fl0 = "-" if fills_list[0] is None else "off"
+        table.append((fl0, "L0", "ref static-eager vs reference-eager", True,
+                      compare_levels(runs["static-ref" + sfx0], runs["eager" + sfx0])))
+        drift = logit_drift(kept[impl], kept["ref"], runs["static" + sfx0], runs["static-ref" + sfx0])
+        c = compare_levels(runs["static" + sfx0], runs["static-ref" + sfx0])
+        c.update({k: v for k, v in drift.items() if k != "per_prompt_drift"})
+        c["per_prompt"] = {t: dict(v, **drift["per_prompt_drift"].get(t, {})) for t, v in c["per_prompt"].items()}
+        table.append((fl0, "drift", f"{impl} vs ref static-eager", False, c))
     if ref_runs:
         for k in sorted(set(runs) & set(ref_runs)):
-            table.append(("x-proc", "L2", f"{k}: this process vs --levels-ref", compare_levels(runs[k], ref_runs[k])))
-    rows_out = [{"fills": fl, "level": lv, "what": what, **{k: v for k, v in c.items() if k != "per_prompt"},
-                 "per_prompt": c["per_prompt"]} for fl, lv, what, c in table]
-    # the T8 gate is the bit-identity rows; "eager: fills-on vs fills-off" is the reference's own determinism
-    gate_rows = [r for r in rows_out if not r["what"].startswith("eager:")]
+            table.append(("x-proc", "L2", f"{k}: this process vs --levels-ref", True,
+                          compare_levels(runs[k], ref_runs[k])))
+    rows_out = [{"fills": fl, "level": lv, "what": what, "gate": gate,
+                 **{k: v for k, v in c.items() if k != "per_prompt"}, "per_prompt": c["per_prompt"]}
+                for fl, lv, what, gate, c in table]
+    gate_rows = [r for r in rows_out if r["gate"]]
     verdict = "PASS" if all(r["all_equal"] for r in gate_rows) else "FAIL"
+    log(f"moe impl {impl}" + ("" if gated_l0 else " (L0 static-eager rows and the drift row are reported, not gated)"))
     log(f"{'fills':7s}{'level':6s}{'comparison':42s}{'equal':>8s}  first diff (tag@position)")
     for r in rows_out:
-        log(f"{r['fills']:7s}{r['level']:6s}{r['what']:42s}{r['equal']:>4d}/{r['n']:<3d}  {r['first_diff'] or '-'}")
+        log(f"{r['fills']:7s}{r['level']:6s}{r['what']:42s}{r['equal']:>4d}/{r['n']:<3d}  {r['first_diff'] or '-'}"
+            + ("" if r["gate"] else "  (not gated)"))
+    if drift is not None:
+        log(f"drift {impl} vs ref static-eager: first token divergence {drift['first_token_divergence'] or 'none'}, "
+            f"{drift['prompts_token_identical']}/{len(prompts)} prompts token-identical, mean |dlogit| "
+            f"{drift['mean_abs_dlogit']:.3e} (max {drift['max_abs_dlogit']:.3e}) over {drift['positions_compared']} "
+            f"same-context positions")
     log(f"PARITY LEVELS ({steps} steps x {len(prompts)} prompts, fp32-logit sha256 per position): {verdict}")
-    return {"steps": steps, "n_prompts": len(prompts), "verdict": verdict, "rows": rows_out, "timings_s": timings,
-            "runs": runs}
+    return {"steps": steps, "n_prompts": len(prompts), "moe_impl": impl, "verdict": verdict, "rows": rows_out,
+            "drift": drift, "timings_s": timings, "runs": runs}
 
 
 # ------------------------------------------------------------------------------------------------ main
@@ -377,6 +463,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--json", default=None, help="default docs/first-light-<YYYYMMDD>.json")
     ap.add_argument("--mode", choices=["eager", "static", "graph"], default="eager",
                     help="decode step: reference forward / T8 static step eagerly / its CUDA-graph replay")
+    ap.add_argument("--moe-impl", choices=["ref", "dg-masked"], default="ref",
+                    help="static/graph routed MoE: ref = reference fp4_gemm per expert (bit-identical, T8) / "
+                         "dg-masked = 3 DeepGEMM masked grouped GEMMs per layer (T9a-1, runtime/dg_moe.py)")
     ap.add_argument("--max-pos", type=int, default=4095,
                     help="static/graph: largest decode position (fixes the compressed-KV cat and index-score widths)")
     ap.add_argument("--marker", action="store_true", help="launch t8_step_marker once per decode step (nsys)")
@@ -414,10 +503,11 @@ def main(argv=None) -> int:
     report["env"] = {"torch": torch.__version__, "cuda": torch.version.cuda,
                      "device": torch.cuda.get_device_name() if torch.cuda.is_available() else None,
                      "capability": torch.cuda.get_device_capability() if torch.cuda.is_available() else None}
-    gen = Generator(model, a.tokenizer_dir or a.model_dir, mode=a.mode, max_pos=a.max_pos, marker=a.marker)
+    gen = Generator(model, a.tokenizer_dir or a.model_dir, mode=a.mode, max_pos=a.max_pos, marker=a.marker,
+                    moe_impl=a.moe_impl)
     report["generator"] = {"eos_ids": gen.eos_ids, "top_k": gen.top_k, "max_seq_len": gen.max_seq_len,
                            "tokenizer_dir": gen.tokenizer_dir, "mode": gen.mode, "max_pos": gen.max_pos,
-                           "marker": gen.marker}
+                           "marker": gen.marker, "moe_impl": gen.moe_impl}
     if a.nvtx_layers:
         install_layer_nvtx(model)
     return measure(gen, a, report, n_layers=len(model.layers), out=out, json_path=json_path, fixture2=fixture2)
@@ -496,6 +586,7 @@ def measure(gen: Generator, a, report: Dict, *, n_layers: int, out: str, json_pa
             if a.profile:
                 report["profile_window"] = gen.arm_profile(a.profile_warm, a.profile_steps)
             sc = step_cell(gen, ids, a.step_cell, a.stats_from)
+            sc["mode"], sc["moe_impl"] = gen.mode, getattr(gen, "moe_impl", "ref")
             r1 = next((r for r in reps.get(1, {}).get("prompts", []) if r["tag"] == a.step_tag and "token_ids" in r), None)
             if r1 is not None:
                 n = min(len(r1["token_ids"]), len(sc["token_ids"]))
@@ -508,6 +599,10 @@ def measure(gen: Generator, a, report: Dict, *, n_layers: int, out: str, json_pa
             report["errors"].append({"stage": "step_cell", "traceback": tb})
 
     os.makedirs(os.path.dirname(os.path.abspath(json_path)), exist_ok=True)
+    report.setdefault("generator", {})["moe_impl"] = getattr(gen, "moe_impl", "ref")
+    dg = getattr(getattr(gen, "static", None), "dg", None)
+    if dg is not None and hasattr(dg, "describe"):
+        report["dg_moe"] = dg.describe()  # deep_gemm path/version, e8m0 conversion, deterministic flag, buffers
     with open(json_path, "w") as f:
         json.dump(report, f, indent=1, default=str)
     for line in summary_lines(report, json_path):
@@ -521,7 +616,9 @@ def summary_lines(r: dict, json_path: str) -> List[str]:
     b = r.get("boot", {})
     g = r.get("generator", {})
     pl = (r.get("parity_levels") or {}).get("verdict")
-    lines = [f"FIRST LIGHT {r['date']} | mode {g.get('mode', 'eager')}{'' if pl is None else f' levels {pl}'} | "
+    moe = g.get("moe_impl", "ref")
+    lines = [f"FIRST LIGHT {r['date']} | mode {g.get('mode', 'eager')}{'' if moe == 'ref' else f' moe {moe}'}"
+             f"{'' if pl is None else f' levels {pl}'} | "
              f"map {b.get('map')} | boot {f(b.get('wall_s'), 0)} s | "
              f"HBM {f(b.get('cuda_allocated_GiB'))} GiB | {r['env'].get('device')}"]
     reps = r.get("reps", {})

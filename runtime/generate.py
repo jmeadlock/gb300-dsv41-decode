@@ -62,6 +62,9 @@ from position 0). In static/graph modes `step` returns the StaticStep's static l
 step) and `next_token_tensor()` its static `tok`; the record format of `greedy` is unchanged, and `last_meta` gains
 `step_sha256` (one fp32-logit digest per position) and `mode`. `marker=True` launches the fixed-name Triton kernel
 `t8_step_marker` once per decode step (inside the graph in graph mode) so nsys finds step boundaries after replay.
+T9a-1: `moe_impl="ref"|"dg-masked"` selects the static step's routed-MoE implementation (runtime/dg_moe.py; `ref` is
+the bit-identical T8 path); `last_meta["moe_impl"]` records it; `logits_sink(i, lc)` (default None) sees every
+position's fp32 CPU logits in `greedy` (first_light's dg-vs-ref drift row).
 """
 from __future__ import annotations
 
@@ -79,6 +82,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VENDORED_ENCODING = os.path.join(REPO, "reference", "deepseek-inference", "encoding", "encoding.py")
 CUBLAS_WORKSPACE_CONFIG = ":4096:8"
 MODES = ("eager", "static", "graph")
+MOE_IMPLS = ("ref", "dg-masked")  # = runtime.static_step.MOE_IMPLS (not imported: that module needs the reference)
 RECORD_KEYS = ("tag", "prompt", "model", "finish_reason", "n_tokens", "text", "logprobs", "usage")
 
 
@@ -273,7 +277,7 @@ class Generator:
                  eos_ids: Optional[Iterable[int]] = None, device=None, top_k: int = 20, nvtx: bool = True,
                  model_name: str = "m0-reference-runtime", profiler=None, set_default_device: bool = True,
                  mode: str = "eager", max_pos: Optional[int] = None, marker: bool = False,
-                 static_counters: bool = True, static_factory: Optional[Callable] = None):
+                 static_counters: bool = True, static_factory: Optional[Callable] = None, moe_impl: str = "ref"):
         self.model = model
         self.tokenizer_dir = tokenizer_dir
         self.tokenizer = tokenizer if tokenizer is not None else (load_tokenizer(tokenizer_dir) if tokenizer_dir else None)
@@ -307,6 +311,9 @@ class Generator:
         self.static = None  # runtime.static_step.StaticStep (or the factory's stand-in), built on first use
         self._static_max_pos = max_pos
         self._marker_ctr = None
+        self.moe_impl = "ref"
+        self.set_moe_impl(moe_impl)
+        self.logits_sink: Optional[Callable] = None  # greedy calls sink(i, fp32 CPU logits) per position (drift rows)
         self.mode = "eager"
         self.set_mode(mode)
 
@@ -315,6 +322,15 @@ class Generator:
         if mode not in MODES:
             raise ValueError(f"mode {mode!r} not in {MODES}")
         self.mode = mode
+
+    def set_moe_impl(self, impl: str) -> None:
+        """T9a-1: the static step's routed-MoE implementation ("ref" | "dg-masked"). A change drops the StaticStep (and
+        its graphs); the next static/graph use rebuilds it with the new impl. Eager mode never uses it."""
+        if impl not in MOE_IMPLS:
+            raise ValueError(f"moe_impl {impl!r} not in {MOE_IMPLS}")
+        if impl != self.moe_impl and self.static is not None:
+            self.reset_static()
+        self.moe_impl = impl
 
     @property
     def max_pos(self) -> int:
@@ -328,12 +344,14 @@ class Generator:
         """The StaticStep (built on first call: pointer tables, staging, static buffers; no capture)."""
         if self.static is None:
             if self.static_factory is not None:
-                self.static = self.static_factory(self.model)
+                # factories predating T9a-1 take only the model; they are given moe_impl only when it is not "ref"
+                kw = {} if self.moe_impl == "ref" else {"moe_impl": self.moe_impl}
+                self.static = self.static_factory(self.model, **kw)
             else:
                 from runtime.static_step import StaticStep
 
                 self.static = StaticStep(self.model, self.pool, max_pos=self._static_max_pos, marker=self.marker,
-                                         counters=self.static_counters)
+                                         counters=self.static_counters, moe_impl=self.moe_impl)
         return self.static
 
     def reset_static(self) -> None:
@@ -524,6 +542,8 @@ class Generator:
                 raise RuntimeError(f"position {pos}: model argmax {tok} != argmax of returned logits {amax}")
             digest.update(lc.numpy().tobytes())
             step_digests.append(hashlib.sha256(lc.numpy().tobytes()).hexdigest())
+            if self.logits_sink is not None:
+                self.logits_sink(i, lc)
             entries.append(logprob_entry(lc, tok, top_k, self.token_str))
             gen.append(tok)
             if stop_on_eos and tok in eos:
@@ -540,6 +560,7 @@ class Generator:
         c1 = self.cold_totals()
         meta = {"logits_sha256": digest.hexdigest(), "token_ids": gen, "prompt_tokens": L, "wall_s": wall,
                 "prefill_s": t_prefill, "n_forward": len(gen), "mode": self.mode, "step_sha256": step_digests,
+                "moe_impl": self.moe_impl,
                 "decode_ms_per_token": (wall - t_prefill) / max(1, len(gen) - 1) * 1e3 if len(gen) > 1 else None}
         if c0 is not None and c1 is not None:
             hot, cold = c1[0] - c0[0], c1[1] - c0[1]

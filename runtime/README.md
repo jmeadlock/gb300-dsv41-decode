@@ -15,6 +15,7 @@ Standalone: no vllm import anywhere (charter decision 3). The reference `model.p
 | `generate.py` | T5 driver: `Generator(model, tokenizer_dir)` -- `encode`/`decode` (checkpoint `encoding.py` chat mode + `tokenizer.json`), `prefill`/`step` (generate.py's call pattern), `greedy` -> one parity JSONL record (fp32 log-softmax top-20), NVTX `decode_step`, `arm_profile` (cudaProfilerApi window), `set_determinism`; T8 `mode="eager"|"static"|"graph"`, `marker=True` |
 | `static_step.py` | T8: `StaticStep(model, pool, max_pos=)` -- the fixed-shape 1-row decode step (design table 2.1 #1-#15 row by row in its docstring), `forward_static(parity)` eager, `capture()` g_even/g_odd, `replay(pos)` |
 | `static_kernels.py` | T8 Triton kernels (GPU only): the spike's pointer-table gather `t8_gather_rows`, the per-step `t8_step_marker` |
+| `dg_moe.py` | T9a-1: `DGMaskedMoE` (`--moe-impl dg-masked`): the static MoE's routed GEMMs as 3 DeepGEMM masked grouped GEMMs over the same staging; `import_deep_gemm` (no vllm import); exact e8m0 → fp32 |
 | `patches.py` | flag-gated monkeypatches: `kv_numerics_pg61` (model.py:761), `static_moe` (model.py:891-906, design #14) |
 
 ## Value paths (bit-identity rule)
@@ -246,3 +247,61 @@ in graph mode; same mounts as T6's first light):
 `--no-fill-uninit` applies to the reps/step cell (timed runs fills off, design 1(b)); `--parity-levels` runs its own
 fills-off and fills-on passes regardless. Add `--levels-ref <earlier report>` on a second run for the cross-process
 relaunch rows; add `--marker` (+ `--skip-parity --profile`) under nsys to find step boundaries after replay.
+
+## T9a-1: routed experts on DeepGEMM (`--moe-impl dg-masked`, `dg_moe.py`)
+
+Spec: `docs/HANDOFF-T9A1-DG-MOE.md`; ABI and numerics: `docs/T9A-DEEPGEMM-ABI-20261106.md` (the call is
+`bench/dg_masked_spike.py`'s, copied). `StaticStep(..., moe_impl="dg-masked")` / `Generator(..., moe_impl=...)` /
+`first_light.py --moe-impl dg-masked` keep the T8 step and its gate, sort and pointer-table gather unchanged, then
+per layer:
+1. one `act_quant(x, 32, "ue8m0")` written to row 0 of every group of a shared `xq[k,128,DIM]` fp8 / `xs[k,128,DIM/32]`
+   fp32 buffer (rows 1.. stay zero/one; `max_m >= 128` is required, smaller silently corrupts groups >= 1);
+2. e8m0 → fp32 of the gathered scales, one device op per projection inside the graph (torch's e8m0 cast, or the
+   spike's `exp2(e8m0-127)`; whichever is bit-exact over all 256 codes on the device, checked at build);
+3. w1 and w3 as `m_grouped_fp8_fp4_gemm_nt_masked(..., masked_m=ones(k), expected_m=8, recipe_a=(1,32),
+   recipe_b=(1,32))` over `staging[(w1|w3, weight)]` (checkpoint bytes as-is) → row 0 → the reference glue
+   (`.float()`, clamps, `silu(gate)*up*weight` in fp32, `.to(bf16)`);
+4. `act_quant` of that → the w2 masked call → row 0 → fp32 sum in slot order (ascending id) → + shared expert.
+
+`ref` (the default) is the T8 path, untouched and bit-identical; `dg-masked` is not bit-identical by design (DeepGEMM's
+block-scaled UMMA: ~1 bf16 ulp on 0.01–0.04 % of GEMM outputs in the spike). DeepGEMM comes from the image's
+`/usr/local/lib/python3.12/dist-packages/vllm/third_party` (override: `DSV41_DEEP_GEMM_PATH`) with vllm never imported.
+It JIT-compiles on first call: `capture()` warms both GEMM shapes before capturing, and the cache must be mounted
+(`-v $HOME/dsv41/w0/jit-cache/dg:/root/.deep_gemm -e DG_JIT_CACHE_DIR=/root/.deep_gemm`).
+`deep_gemm.use_deterministic_algorithms(True)` is applied at build (design §4); the report's `dg_moe` records what
+happened, the e8m0 method, and the deep_gemm path/version.
+
+**Mac:** `.venv/bin/python -m pytest -q tests/` — `tests/test_dg_moe_cpu.py`: e8m0 table exactness, the call-contract
+constants and buffer shapes, the deep_gemm import guard, and the whole dg-masked `StaticStep` == the reference
+forward (`torch.equal`, every position) with the reference kernels and DeepGEMM both emulated by the same math (a
+contract-checking fake that NaN-poisons padding rows), plus `--moe-impl` / the parity-levels drift row on the fake.
+
+**Box, GPU test** (mini checkpoints: dg static-eager runs and self-replays, no host sync, graph == static-eager, replay
+x2, fills-on recapture, relaunch; top-1 stream == ref over 10 steps; per-layer MoE bf16 mismatch vs ref printed):
+
+    W=$HOME/hermes/gb300-dsv41-decode
+    docker run --rm --device nvidia.com/gpu=GPU-1c1855c8-dd10-0247-583e-3c3880ddbf55 --ipc=host --ulimit memlock=-1:-1 \
+      -v "$W":/work -w /work -e CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+      -v "$HOME/dsv41/w0/jit-cache/tilelang":/root/.tilelang -v "$HOME/dsv41/w0/jit-cache/triton":/root/.triton \
+      -v "$HOME/dsv41/w0/jit-cache/nv":/root/.nv \
+      -v "$HOME/dsv41/w0/jit-cache/dg":/root/.deep_gemm -e DG_JIT_CACHE_DIR=/root/.deep_gemm \
+      --entrypoint python3 vllm/vllm-openai:v0.31.0 tests/gpu/test_dg_moe_gpu.py
+
+**Box, first light** (`--parity-levels`: L1/L2 gated as for T8; L0 static-eager vs reference-eager reported, not
+gated; extra rows "ref static-eager vs reference-eager" (gated) and "dg-masked vs ref static-eager" (first token
+divergence + mean |Δlogit|, reported); then the reps graded vs Pg61 by bench/parity.py, then the graph step cell):
+
+    docker run --rm --device nvidia.com/gpu=GPU-1c1855c8-dd10-0247-583e-3c3880ddbf55 \
+      --ipc=host --ulimit memlock=-1:-1 --cap-add IPC_LOCK \
+      -v "$W":/work -w /work -v "$W/w0":/work/w0 \
+      -v /models/DeepSeek-V4.1-Flash-1017-1bae0e1088993b9b82de08f59de5be5a34e42170:/ref:ro \
+      -v "$HOME/dsv41/w0/jit-cache/tilelang":/root/.tilelang -v "$HOME/dsv41/w0/jit-cache/triton":/root/.triton \
+      -v "$HOME/dsv41/w0/jit-cache/nv":/root/.nv \
+      -v "$HOME/dsv41/w0/jit-cache/dg":/root/.deep_gemm -e DG_JIT_CACHE_DIR=/root/.deep_gemm \
+      -e CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+      --entrypoint python3 vllm/vllm-openai:v0.31.0 \
+      bench/first_light.py --model-dir /ref --hot-per-layer 295 --mode graph --moe-impl dg-masked --parity-levels \
+        --max-pos 4095 --fixture w0/results/phase1/parity-A.jsonl --out scratch/first-light-dg.jsonl \
+        --max-new 256 --reps 2 --step-cell 512 --no-fill-uninit --json docs/first-light-dg-<date>.json
+
+`--levels-ref` x-proc rows compare runs with the same label, so point it at a report made with the same `--moe-impl`.

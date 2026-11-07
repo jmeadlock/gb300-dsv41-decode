@@ -38,6 +38,9 @@ host-side ints become device tensors and dynamic lengths become fixed lengths (c
       ascending (the reference's accumulation order) -> Triton pointer-table gather into static [k,N,K/2] staging
       (pointer tables built once per layer from runtime/expert_pool.py: hot -> HBM slot, cold -> UVA host address) ->
       k fixed reference `Expert` evaluations on the staging slots, fp32 sum in slot order -> + shared expert.
+      T9a-1: `moe_impl="dg-masked"` swaps StaticMoE for runtime/dg_moe.py `DGMaskedMoE` (same gate/sort/gather, then
+      3 DeepGEMM masked grouped GEMMs over the same staging instead of 3k fp4_gemm; not bit-identical by design).
+      `moe_impl="ref"` (default) is exactly the T8 step.
   #15 kernel.py wrapper allocations -> the graph's private pool; capture runs with fill_uninitialized_memory off
       unless `capture(fills=True)` (the L2 uninitialized-read detector records the NaN fills as kernels).
 
@@ -56,6 +59,7 @@ from torch import nn
 
 PARITIES = (0, 1)
 SUPPORTED_RATIOS = (0, 1, 2)
+MOE_IMPLS = ("ref", "dg-masked")  # T9a-1: "ref" = StaticMoE (bit-identical), "dg-masked" = runtime/dg_moe.py
 DUMMY_PROMPT = (0, 1)
 
 
@@ -246,13 +250,20 @@ class StaticStep:
     routed experts are bound to, or None (pointer tables then come from the experts' own parameters). max_pos: the
     largest decode position this step serves; it fixes W_r = (max_pos+1)//r (compressed-KV cat length, index-score
     width). marker: launch `t8_step_marker` first in every step. counters: record each layer's routed ids per step on
-    the device and accumulate cold calls (for first_light's cold-share report; does not touch the logits)."""
+    the device and accumulate cold calls (for first_light's cold-share report; does not touch the logits). moe_impl:
+    "ref" (StaticMoE, bit-identical) or "dg-masked" (runtime/dg_moe.py; dg_deterministic -> deep_gemm's
+    use_deterministic_algorithms(True))."""
 
     def __init__(self, model: nn.Module, pool=None, *, max_pos: Optional[int] = None, marker: bool = False,
-                 counters: bool = True, _allow_cpu: bool = False):
+                 counters: bool = True, moe_impl: str = "ref", dg_deterministic: bool = True,
+                 _allow_cpu: bool = False):
         R = _ref()
         from runtime import patches
 
+        if moe_impl not in MOE_IMPLS:
+            raise ValueError(f"moe_impl {moe_impl!r} not in {MOE_IMPLS}")
+        self.moe_impl, self.dg_deterministic = moe_impl, bool(dg_deterministic)
+        self.dg = None  # runtime.dg_moe.DGBuffers when moe_impl == "dg-masked"
         self.R, self.model, self.pool = R, model, pool
         self.dev = model.embed.weight.device
         if self.dev.type != "cuda" and not _allow_cpu:
@@ -329,9 +340,15 @@ class StaticStep:
                                        self.staging[(p, "scale")][j].view(torch.float8_e8m0fnu),
                                        lin0.in_features, lin0.out_features)
             self.staged_experts.append(_expert_view(R, lins["w1"], lins["w2"], lins["w3"], lim))
+        moe_cls = StaticMoE
+        if self.moe_impl == "dg-masked":  # T9a-1: same staging + pointer tables, routed GEMMs on DeepGEMM
+            from runtime.dg_moe import DGBuffers, DGMaskedMoE
+
+            self.dg = DGBuffers(self, shapes, sshapes, swiglu_limit=lim, deterministic=self.dg_deterministic)
+            moe_cls = DGMaskedMoE
         n_layers, n_exp = len(layers), moe0.n_routed_experts
         cold = torch.zeros(n_layers, n_exp, dtype=torch.long)
-        self.moes: List[StaticMoE] = []
+        self.moes: list = []  # StaticMoE (ref) or runtime.dg_moe.DGMaskedMoE (dg-masked), one per layer
         for l, layer in enumerate(layers):
             moe = layer.ffn
             if moe.n_activated_experts != k or moe.n_routed_experts != n_exp or any(e is None for e in moe.experts):
@@ -358,7 +375,7 @@ class StaticStep:
                             ptr = src.data_ptr()
                         ptrs.append(ptr)
                     ptabs[(p, kind)] = torch.tensor(ptrs, dtype=torch.int64, device=d)
-            sm = StaticMoE(self, moe, l, ptabs)
+            sm = moe_cls(self, moe, l, ptabs)
             moe._static_moe = sm
             self.moes.append(sm)
         self.cold_tab = cold.to(d)
@@ -562,6 +579,8 @@ class StaticStep:
                 s = torch.cuda.Stream(device=self.dev)
                 s.wait_stream(torch.cuda.current_stream(self.dev))
                 with torch.cuda.stream(s):
+                    if self.dg is not None:
+                        self.dg.warmup()  # DeepGEMM first-call JIT (both GEMM shapes) before anything is captured
                     for _ in range(warmup):
                         for _ in PARITIES:
                             self.forward_static(parity_of(p))
