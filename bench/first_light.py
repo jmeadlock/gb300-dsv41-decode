@@ -31,6 +31,10 @@ and one timed step cell.
     divergence + mean |delta logit| over same-context positions). The report records `generator.moe_impl`,
     `step_cell.moe_impl` and `dg_moe` (deep_gemm path, e8m0 conversion, deterministic flag). `--levels-ref` x-proc rows
     compare runs of the same label: point it at a report made with the same --moe-impl.
+(g2) T9a-2: `--moe-impl dg-inplace` reads the hot experts in place (runtime/dg_inplace.py). Parity levels as dg-masked,
+    plus one static-eager dg-masked run (same fp8/glue/attn impls) and the drift row "dg-inplace vs dg-masked (same
+    other impls)" (reported, not gated; expected 0 or the 1-ulp class). `dg_moe` in the report carries the scale-store
+    choice, the HBM it added and `hbm_after_build` (free/total/allocated after the StaticStep build).
 (h) T9b-1: `--fp8-impl gemv` (default `ref`) runs every static/graph step's fp8 Linear layers through the Triton MXFP8
     GEMV (runtime/gemv_mxfp8.py). It combines with --moe-impl: the parity levels treat any non-ref impl the same way
     (L0 reported not gated; one extra static-eager run with BOTH impls `ref` gives the gated T8 row and the drift row,
@@ -417,6 +421,14 @@ def parity_levels(gen: Generator, rows: List[dict], steps: int = 32, log=print,
             gen.set_glue_impl("ref")
             gen.set_mode("static")
             timed("static-glueref" + sfx0, lambda: _level_run(gen, prompts, steps))
+        if impl == "dg-inplace":  # T9a-2: the same static step with dg-masked (same fp8/glue/attn impls)
+            set_fill(fills_list[0])
+            if hasattr(gen, "set_glue_impl"):
+                gen.set_glue_impl(gimpl)
+            gen.set_moe_impl("dg-masked")
+            gen.set_mode("static")
+            timed("static-dgmasked" + sfx0, lambda: _level_run(gen, prompts, steps, kept.setdefault("dgmasked", {})))
+            gen.set_moe_impl(impl)
         if variant:  # the drift reference: the same static step with the bit-identical MoE and fp8 GEMMs
             set_fill(fills_list[0])
             gen.set_moe_impl("ref")
@@ -478,6 +490,15 @@ def parity_levels(gen: Generator, rows: List[dict], steps: int = 32, log=print,
         table.append((fl0, "A", "bounded attn vs ref attn (same moe/fp8/glue)", True,
                       compare_levels(runs["static" + sfx0], runs["static-attnref" + sfx0])))
     attn_drift = None
+    inplace_drift = None
+    if impl == "dg-inplace":  # T9a-2: drift vs dg-masked (expected 0 or the 1-ulp class), reported, not gated
+        fl0 = "-" if fills_list[0] is None else "off"
+        inplace_drift = logit_drift(kept[label], kept["dgmasked"], runs["static" + sfx0],
+                                    runs["static-dgmasked" + sfx0])
+        c = compare_levels(runs["static" + sfx0], runs["static-dgmasked" + sfx0])
+        c.update({k: v for k, v in inplace_drift.items() if k != "per_prompt_drift"})
+        c["per_prompt"] = {t: dict(v, **inplace_drift["per_prompt_drift"].get(t, {})) for t, v in c["per_prompt"].items()}
+        table.append((fl0, "D", "dg-inplace vs dg-masked (same other impls)", False, c))
     if attn_variant:  # T9b-3c: A3-class -> a drift row (first token divergence + mean |dlogit|), reported, not gated
         fl0 = "-" if fills_list[0] is None else "off"
         attn_drift = logit_drift(kept[label], kept["attnref"], runs["static" + sfx0], runs["static-attnref" + sfx0])
@@ -512,10 +533,15 @@ def parity_levels(gen: Generator, rows: List[dict], steps: int = 32, log=print,
             f"{attn_drift['first_token_divergence'] or 'none'}, {attn_drift['prompts_token_identical']}/{len(prompts)} "
             f"prompts token-identical, mean |dlogit| {attn_drift['mean_abs_dlogit']:.3e} (max "
             f"{attn_drift['max_abs_dlogit']:.3e}) over {attn_drift['positions_compared']} same-context positions")
+    if inplace_drift is not None:
+        log(f"drift dg-inplace vs dg-masked (same other impls): first token divergence "
+            f"{inplace_drift['first_token_divergence'] or 'none'}, {inplace_drift['prompts_token_identical']}/"
+            f"{len(prompts)} prompts token-identical, mean |dlogit| {inplace_drift['mean_abs_dlogit']:.3e} (max "
+            f"{inplace_drift['max_abs_dlogit']:.3e}) over {inplace_drift['positions_compared']} same-context positions")
     log(f"PARITY LEVELS ({steps} steps x {len(prompts)} prompts, fp32-logit sha256 per position): {verdict}")
     return {"steps": steps, "n_prompts": len(prompts), "moe_impl": impl, "fp8_impl": fimpl, "glue_impl": gimpl,
             "attn_impl": aimpl, "variant": label, "verdict": verdict, "rows": rows_out, "drift": drift,
-            "attn_drift": attn_drift, "timings_s": timings, "runs": runs}
+            "attn_drift": attn_drift, "inplace_drift": inplace_drift, "timings_s": timings, "runs": runs}
 
 
 # ------------------------------------------------------------------------------------------------ main
@@ -548,9 +574,11 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--json", default=None, help="default docs/first-light-<YYYYMMDD>.json")
     ap.add_argument("--mode", choices=["eager", "static", "graph"], default="eager",
                     help="decode step: reference forward / T8 static step eagerly / its CUDA-graph replay")
-    ap.add_argument("--moe-impl", choices=["ref", "dg-masked"], default="ref",
+    ap.add_argument("--moe-impl", choices=["ref", "dg-masked", "dg-inplace"], default="ref",
                     help="static/graph routed MoE: ref = reference fp4_gemm per expert (bit-identical, T8) / "
-                         "dg-masked = 3 DeepGEMM masked grouped GEMMs per layer (T9a-1, runtime/dg_moe.py)")
+                         "dg-masked = 3 DeepGEMM masked grouped GEMMs per layer (T9a-1, runtime/dg_moe.py) / "
+                         "dg-inplace = 3 DeepGEMM contiguous grouped GEMMs over the hot pool, cold experts staged "
+                         "into spare slots (T9a-2, runtime/dg_inplace.py; adds a drift row vs dg-masked)")
     ap.add_argument("--fp8-impl", choices=["ref", "gemv"], default="ref",
                     help="static/graph fp8 Linear layers: ref = reference fp8_gemm (bit-identical, T8) / gemv = "
                          "Triton MXFP8 GEMV at <= 8 rows (T9b-1, runtime/gemv_mxfp8.py)")

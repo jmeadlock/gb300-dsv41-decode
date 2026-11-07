@@ -73,6 +73,17 @@ class T:
 
     __hash__ = None
 
+    # T9a-2 (runtime/static_kernels.py t9a2_stage_inplace): runtime scalar branches / loop bounds on 0-d values
+    def __bool__(self):
+        assert self.a.size == 1, "truth value of a block"
+        return bool(self.a.reshape(()))
+
+    def __index__(self):
+        assert self.a.size == 1
+        return int(self.a.reshape(()))
+
+    __int__ = __index__
+
     def __getitem__(self, idx):
         return T(self.a[idx])
 
@@ -86,6 +97,8 @@ class T:
 
     def to(self, dtype, bitcast=False, fp_downcast_rounding=None):
         assert fp_downcast_rounding in (None, "rtne"), fp_downcast_rounding
+        if isinstance(dtype, pointer_type):                              # T9a-2: an address read from a table
+            return ADDRESSES.pointer(int(self), dtype.elem)
         if bitcast:
             if dtype is int32:                                           # fp32 bits as int32
                 return T(np.ascontiguousarray(self.a.astype(np.float32)).view(np.int32))
@@ -122,6 +135,43 @@ uint8, float8e4nv = _DT("uint8", np.uint8), _DT("float8e4nv", None)
 
 class constexpr:  # noqa: N801 - Triton's name; only used as an annotation
     pass
+
+
+# T9a-2: pointers read from address tables (t9a2_stage_inplace). `ADDRESSES.register(*tensors)` declares the CPU
+# tensors whose data_ptr()s the tables hold; `.to(pointer_type(dt))` on such an address gives a P over a numpy view
+# that SHARES the tensor's storage (stores land in the tensor directly, no write-back).
+class pointer_type:  # noqa: N801 - Triton's name
+    def __init__(self, elem):
+        self.elem = elem
+
+
+def multiple_of(x, n):
+    return x
+
+
+class _AddressSpace:
+    def __init__(self):
+        self.tensors = []
+
+    def register(self, *tensors):
+        self.tensors.extend(tensors)
+
+    def clear(self):
+        self.tensors = []
+
+    def pointer(self, addr: int, elem) -> "P":
+        es = np.dtype(elem.np).itemsize
+        for t in self.tensors:
+            st = t.untyped_storage()
+            base, n = st.data_ptr(), st.nbytes()
+            if base <= addr < base + n:
+                assert (addr - base) % es == 0 and n % es == 0, (hex(addr), es)
+                raw = torch.empty(0, dtype=torch.uint8).set_(st, 0, (n,), (1,))
+                return P(raw.numpy().view(elem.np), (addr - base) // es)
+        raise KeyError(f"address {addr:#x} is not in any registered tensor")
+
+
+ADDRESSES = _AddressSpace()
 
 
 # ------------------------------------------------------------------------------------------------ tl.*
@@ -333,10 +383,11 @@ def _modules():
     for name in ("T", "P", "int32", "int64", "float32", "bfloat16", "constexpr", "program_id", "arange", "zeros",
                  "where", "minimum", "maximum", "sum", "dot", "trans", "static_range", "load", "store",
                  "uint8", "float8e4nv", "max", "abs", "fma", "inline_asm_elementwise", "reshape", "split", "join",
-                 "broadcast_to"):
+                 "broadcast_to", "pointer_type", "multiple_of"):
         setattr(tl, name, globals()[name])
     tr = types.ModuleType("triton")
     tr.jit, tr.cdiv, tr.language, tr.__version__ = jit, cdiv, tl, "numpy-shim"
+    tr.next_power_of_2 = lambda n: 1 if int(n) <= 1 else 1 << (int(n) - 1).bit_length()  # (this module shadows max)
     return tr, tl
 
 

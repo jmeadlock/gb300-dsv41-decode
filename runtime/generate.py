@@ -90,7 +90,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VENDORED_ENCODING = os.path.join(REPO, "reference", "deepseek-inference", "encoding", "encoding.py")
 CUBLAS_WORKSPACE_CONFIG = ":4096:8"
 MODES = ("eager", "static", "graph")
-MOE_IMPLS = ("ref", "dg-masked")  # = runtime.static_step.MOE_IMPLS (not imported: that module needs the reference)
+MOE_IMPLS = ("ref", "dg-masked", "dg-inplace")  # = runtime.static_step.MOE_IMPLS (not imported: needs the reference)
 FP8_IMPLS = ("ref", "gemv")       # = runtime.static_step.FP8_IMPLS (T9b-1)
 GLUE_IMPLS = ("ref", "fused")     # = runtime.static_step.GLUE_IMPLS (T9b-2)
 ATTN_IMPLS = ("ref", "bounded", "flashmla")  # = runtime.static_step.ATTN_IMPLS (T9b-3a, T9b-3c)

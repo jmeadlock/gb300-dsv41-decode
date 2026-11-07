@@ -58,7 +58,7 @@ WEIGHT_BLOCK = 32    # per-32 e8m0 weight scales (fp4_block_size, model.py:28) -
 RECIPE_A = (1, ACT_BLOCK)
 RECIPE_B = (1, WEIGHT_BLOCK)
 PROJS = ("w1", "w3", "w2")
-MOE_IMPLS = ("ref", "dg-masked")
+MOE_IMPLS = ("ref", "dg-masked", "dg-inplace")  # T9a-2: "dg-inplace" = runtime/dg_inplace.py
 
 
 # ------------------------------------------------------------------------------------------------ e8m0 -> fp32
@@ -150,7 +150,9 @@ class DGBuffers:
     buffers are written only here (zeros / ones) and never again."""
 
     def __init__(self, owner, shapes: Dict[str, Tuple[int, int]], sshapes: Dict[str, Tuple[int, int]], *,
-                 swiglu_limit: float, deterministic: bool = True, dg=None):
+                 swiglu_limit: float, deterministic: bool = True, dg=None, rows: int = MAX_M, sf32: bool = True):
+        """rows / sf32: T9a-2's DGInplaceBuffers (runtime/dg_inplace.py) reuses these buffers with `rows` = its
+        contiguous-layout alignment and no fp32 weight-scale staging; dg-masked uses the defaults (unchanged)."""
         R, d, k = owner.R, owner.dev, owner.topk
         if (R.fp8_block_size, R.fp4_block_size, R.scale_fmt) != (ACT_BLOCK, WEIGHT_BLOCK, "ue8m0"):
             raise ValueError(f"dg-masked assumes per-32 ue8m0 activation and weight scales; the reference has "
@@ -172,13 +174,15 @@ class DGBuffers:
         f32, bf16, fp8 = torch.float32, torch.bfloat16, torch.float8_e4m3fn
         self.masked_m = torch.ones(k, dtype=torch.int32, device=d)
         self.expected_m = EXPECTED_M
-        # activation buffers: [k, MAX_M, K] fp8 (row 0 = the token, rows 1.. zero), [k, MAX_M, K/32] fp32 scales
-        self.xq = {1: torch.zeros(k, MAX_M, self.dim, dtype=fp8, device=d),
-                   2: torch.zeros(k, MAX_M, self.inter, dtype=fp8, device=d)}
-        self.xs = {1: torch.ones(k, MAX_M, self.dim // ACT_BLOCK, dtype=f32, device=d),
-                   2: torch.ones(k, MAX_M, self.inter // ACT_BLOCK, dtype=f32, device=d)}
-        self.sf32 = {p: torch.zeros(k, self.N[p], self.K[p] // WEIGHT_BLOCK, dtype=f32, device=d) for p in PROJS}
-        self.d = {p: torch.zeros(k, MAX_M, self.N[p], dtype=bf16, device=d) for p in PROJS}
+        self.rows = int(rows)
+        # activation buffers: [k, rows, K] fp8 (row 0 = the token, rows 1.. zero), [k, rows, K/32] fp32 scales
+        self.xq = {1: torch.zeros(k, self.rows, self.dim, dtype=fp8, device=d),
+                   2: torch.zeros(k, self.rows, self.inter, dtype=fp8, device=d)}
+        self.xs = {1: torch.ones(k, self.rows, self.dim // ACT_BLOCK, dtype=f32, device=d),
+                   2: torch.ones(k, self.rows, self.inter // ACT_BLOCK, dtype=f32, device=d)}
+        self.sf32 = ({p: torch.zeros(k, self.N[p], self.K[p] // WEIGHT_BLOCK, dtype=f32, device=d) for p in PROJS}
+                     if sf32 else {})
+        self.d = {p: torch.zeros(k, self.rows, self.N[p], dtype=bf16, device=d) for p in PROJS}
         self.n_calls = 0
 
     def _set_deterministic(self, on: bool):
@@ -225,7 +229,7 @@ class DGBuffers:
 
     def describe(self) -> dict:
         return {"impl": "dg-masked", "deep_gemm": getattr(self.dg, "__file__", None),
-                "deep_gemm_version": getattr(self.dg, "__version__", None), "max_m": MAX_M,
+                "deep_gemm_version": getattr(self.dg, "__version__", None), "max_m": self.rows,
                 "expected_m": self.expected_m, "recipe_a": list(RECIPE_A), "recipe_b": list(RECIPE_B),
                 "e8m0_to_f32": self.e8m0_method, "deterministic": self.deterministic, "k": self.k,
                 "dim": self.dim, "inter": self.inter,

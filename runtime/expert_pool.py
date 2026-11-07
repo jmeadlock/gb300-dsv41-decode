@@ -87,6 +87,11 @@ class ExpertPool:
         self.host: Optional[HostBuffer] = HostBuffer(off, "cold_experts", hugepages) if off else None
         self.counters: Optional[dict] = None
         self._hooks: List = []
+        # T9a-2 (runtime/dg_inplace.py): spare HBM slots appended after the hot slots of every layer's weight pools
+        self.spare = 0
+        self.hbm_full: Dict[int, Dict[str, torch.Tensor]] = {l: {p: self.hbm[l][p][0] for p in self.proj_nk}
+                                                              for l in range(n_layers)}
+        self.generation = 0  # bumped whenever pool storage moves (pointer tables built before are stale)
 
     # --------------------------------------------------------------- byte sizes
     @property
@@ -96,6 +101,42 @@ class ExpertPool:
     def hbm_bytes(self) -> int:
         return sum(w.numel() * w.element_size() + s.numel() * s.element_size()
                    for l in self.hbm for w, s in self.hbm[l].values())
+
+    # ------------------------------------------------------- T9a-2 spare slots
+    def add_spare_slots(self, S: int, model: nn.Module) -> int:
+        """Grow every layer's per-projection WEIGHT pool from [H, N, K/2] to [H+S, N, K/2] (hot slots unchanged, spare
+        slots H..H+S-1 zeroed): runtime/dg_inplace.py stages cold experts there so DeepGEMM's contiguous grouped GEMM
+        reads one [H+S, N, K/2] tensor per layer. Scale pools are untouched (dg-inplace keeps its scales elsewhere).
+        Layer by layer: allocate, copy, rebind that layer's hot Experts' weight params to the new storage (so the old
+        block is freed before the next layer grows; peak = one extra [H+S] block), release the cache. Idempotent for
+        S <= self.spare. Bumps `generation`: pointer tables built before are stale (StaticStep builds after this).
+        Returns the HBM bytes added."""
+        S = int(S)
+        if S <= self.spare:
+            return 0
+        added = 0
+        with torch.inference_mode(False), torch.no_grad():
+            for l in range(self.n_layers):
+                experts = model.layers[l].ffn.experts
+                for p in self.proj_nk:
+                    w, s = self.hbm[l][p]
+                    h = w.size(0)
+                    full = torch.empty(h + S, *w.shape[1:], dtype=w.dtype, device=w.device)
+                    full[:h].copy_(w)
+                    full[h:].zero_()
+                    added += (full.numel() - w.numel()) * full.element_size()
+                    self.hbm_full[l][p] = full
+                    self.hbm[l][p] = (full[:h], s)
+                    for slot, e in enumerate(self.hot[l]):
+                        lin = getattr(experts[e], p)
+                        lin.weight = nn.Parameter(full[slot].view(torch.float4_e2m1fn_x2), requires_grad=False)
+                        lin.weight.scale = lin.scale  # model.py:222
+                    del w
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+        self.spare = S
+        self.generation += 1
+        return added
 
     # ------------------------------------------------------------ destinations
     def tier(self, layer: int, expert: int) -> int:
