@@ -778,6 +778,7 @@ class FusedGlue:
                 self._off(c, f"reference act_quant codes {lo}..{hi} outside 1..253 for finite amax")
 
     # act_quant ----------------------------------------------------------------------------------------
+    @_cpu_default
     def _act_inputs(self, g, K: int) -> List[torch.Tensor]:
         allb = bf16_bits_all()
         fin = allb[torch.isfinite(allb.float())]
@@ -809,6 +810,7 @@ class FusedGlue:
                 self._off(c, "act_quant self-check mismatch vs the reference kernel")
 
     # RoPE modes ----------------------------------------------------------------------------------------
+    @_cpu_default
     def _rope_data(self, g, attn, inverse: bool):
         """[(x_bf16 [1,1,H,hd], freqs complex [1, rd/2])] at several positions; half the heads hold pairs crafted so
         the rotated component nearly cancels (where the contraction form shows)."""
@@ -876,6 +878,7 @@ class FusedGlue:
                 setattr(self, key, (pick[0], pick[1]))
 
     # hc_post mode -----------------------------------------------------------------------------------
+    @_cpu_default
     def _hc_data(self, g, D):
         """Random hc_post inputs; in half the columns copy 0 and copy 2 carry the same large value and comb's row 2
         is minus row 0, so a0 + a2 cancels exactly and the 4-term sum's ORDER shows in the result (the three
@@ -916,6 +919,7 @@ class FusedGlue:
             self._off("hc_post", f"no 4-term sum order matches Block.hc_post ({mism})")
 
     # end-to-end verifications (None = equal, else why) ---------------------------------------------
+    @_cpu_default
     def _rand_gate_up(self, g, G_, I):
         """bf16 [G, I] gate/up with clamp edges: |v| up to 64 so both clamps bind, exact +-lim, zeros."""
         v = _rand_act(g, 2 * G_, I, lo=-3, hi=7).view(2, G_, I)
@@ -1099,6 +1103,18 @@ def _jsonable(v):
     return v
 
 
+
+def _cpu_default(fn):
+    """Synthetic-input builders were written under a CPU default device; at runtime the default device is cuda.
+    Run them with a CPU default so every bare constructor (tensor/arange/zeros/rand) lands on the CPU; callers move."""
+    import functools
+    @functools.wraps(fn)
+    def w(*a, **k):
+        with torch.device("cpu"):
+            return fn(*a, **k)
+    return w
+
+@_cpu_default
 def _rand_act(g, rows: int, K: int, lo: int = -6, hi: int = 7) -> torch.Tensor:
     """bf16 [rows, K] activations: N(0,1) per 32-block scaled by 2^U[lo, hi), a few zeros, and amax values exactly at
     the scale boundaries 448 * 2^k * {1, 1 - 2^-8, 1 + 2^-7} (CPU generator; the caller moves it)."""
