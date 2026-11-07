@@ -43,6 +43,10 @@ T9b-4 (docs/HANDOFF-T9B4-RESIDUAL.md; runtime/README.md section T9b-4): `t9b4_hc
 not partitioned, so no order is re-derived), norm_row reading GEMV split partials (reduce_fold, `_t9b4_ld`), the
 wq_a || wkv pair (gemv_pair) feeding the q and kv paths, and packed DeepGEMM activation-SF stores (dg_sf_pack,
 `_t9b4_store_code`); `calibrate_r4` checks each against the path it replaces, bitwise, on the device.
+M2-T15 (docs/HANDOFF-M2-T15-ROUTER-PLAN.md, runtime/router_plan.py): $DSV41_ROUTER_IMPL=plan | plan-gemv routes `route`
+/ `route_rows` (and, at R rows, moe_rows' dedup through a _route hook) to ONE launch per layer (static_kernels
+m2_router_plan: softplus, sqrt, +bias, torch.topk's CUDA result incl. its tie order, the weights, the plan), self-checked
+at build against this cluster's own path; default `fused` = the router cluster below, unchanged.
 T9b-5 (docs/HANDOFF-T9B5-FP32-FIXED.md; section "T9b-5: fixed fp32" below): $DSV41_FP32_IMPL=fixed puts the mHC mixes'
 and the head's fp32 F.linear on runtime/static_kernels.py's fixed-order kernels (row-invariant); default cublas.
 CPU (the Mac tests, the census): the wrappers run torch mirrors; with no device to calibrate on, the statistics run
@@ -1376,6 +1380,12 @@ class R2Glue:
                 gate = sm.moe.gate
                 w = gate.weight
                 self.gate_w[id(gate)] = w if w.dtype == torch.float32 else w.detach().float().contiguous()
+        # M2-T15 (runtime/router_plan.py): $DSV41_ROUTER_IMPL plan / plan-gemv -> the router (+ the R-row plan) in one
+        # launch, self-checked at build; default "fused" = the clusters below, unchanged
+        from runtime import router_plan as RP
+
+        self.router_impl = RP.router_impl() if self.on("router") else "fused"
+        self.rplan = RP.RouterPlan(self, self.router_impl) if self.router_impl != "fused" else None
         if self.on("engram"):
             for l in layers:
                 if l.engram is not None:
@@ -1546,6 +1556,13 @@ class R2Glue:
                     self._off("mix_stat", "hc_norm is off")
             elif res.get("mismatch") and self.status.get(c) == "on":
                 self._off(c, f"self-check: {res['mismatch']:.3e} of outputs differ with an exact order")
+        rp = getattr(self, "rplan", None)
+        if rp is not None:                     # M2-T15: after the router's own check (the plan's reference)
+            if self.on("router"):
+                rp.calibrate(g)
+            else:
+                rp.off("the router cluster is off")
+            cal["router_plan"] = rp.describe()
         for c in R2_CLUSTERS:
             if self.on(c) and c not in self.numerics:
                 self.numerics[c] = {"outcome": "(i) bit-identical", "orders": {}}
@@ -2032,6 +2049,11 @@ class R2Glue:
         w [k] fp32): the mm on the cached fp32 weight, F.softplus, one kernel (sqrt, +bias), torch.topk, one kernel
         (gather, sum, +eps, /, *route_scale, sort)."""
         gate = moe.gate
+        rp = getattr(self, "rplan", None)
+        if rp is not None:                     # M2-T15 plan impl (None: not applicable here -> this path)
+            r = rp.route(moe, x, rows=False)
+            if r is not None:
+                return r
         ctx = self.ffn_pre(x)
         xf = ctx["xf"] if ctx is not None and ctx.get("xf") is not None else x.float()
         raw = F.linear(xf, self.gate_w[id(gate)])
@@ -2046,6 +2068,10 @@ class R2Glue:
         ids = torch.empty(gate.topk, dtype=torch.long, device=x.device)
         w = torch.empty(gate.topk, dtype=torch.float32, device=x.device)
         launch_router_post(idx.view(-1), sc, ids, w, ordd=self.orders["router"], eps=1e-20, rs=float(gate.route_scale))
+        if os.environ.get("DSV41_ROUTER_DUMP"):   # M2-T15 recording (router_plan.DUMP_ENV; eager calls only)
+            from runtime.router_plan import record
+
+            record(self, moe, raw, ids, w, xf)
         return ids, w
 
     def route_rows(self, moe, x):
@@ -2059,6 +2085,11 @@ class R2Glue:
         if T_ == 1:
             ids, w = self.route(moe, x)
             return ids.view(1, -1), w.view(1, -1)
+        rp = getattr(self, "rplan", None)
+        if rp is not None:                     # M2-T15 plan impl (the R-row plan itself: router_plan's _route hook)
+            r = rp.route(moe, x, rows=True)
+            if r is not None:
+                return r
         ctx = self.ffn_pre(x)
         xf = ctx["xf"] if ctx is not None and ctx.get("xf") is not None else x.float()
         raw = F.linear(xf.view(T_, D), self.gate_w[id(gate)])
@@ -2074,6 +2105,10 @@ class R2Glue:
         w = torch.empty(T_, gate.topk, dtype=torch.float32, device=x.device)
         launch_router_post(idx.contiguous(), sc, ids, w, ordd=self.orders["router"], eps=1e-20,
                            rs=float(gate.route_scale))
+        if os.environ.get("DSV41_ROUTER_DUMP"):   # M2-T15 recording (router_plan.DUMP_ENV; eager calls only)
+            from runtime.router_plan import record
+
+            record(self, moe, raw, ids, w, xf.view(T_, D))
         return ids, w
 
     def _engram_from_kv(self, eng, h, kv):
@@ -2362,7 +2397,15 @@ class R2Glue:
                 "orders": {k: v.get("name") for k, v in self.orders.items()}, "hc_pre_mode": self.hc_pre_mode,
                 "bytes": dict(getattr(self, "r2_bytes", {})), "indexer_score": INDEXER_SCORE_WHY,
                 "outcome": {c: self.numerics.get(c, {}).get("outcome") for c in R2_CLUSTERS if self.on(c)},
-                "fp32": describe_fp32()}
+                "fp32": describe_fp32(), "router_impl": self._describe_router_impl()}
+
+    def _describe_router_impl(self) -> dict:
+        rp = getattr(self, "rplan", None)
+        if rp is not None:
+            return rp.describe()
+        from runtime.router_plan import describe_default
+
+        return describe_default()
 
 
 def _jsonable(v):
