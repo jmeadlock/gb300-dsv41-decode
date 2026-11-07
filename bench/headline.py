@@ -137,11 +137,73 @@ def compare_stream(loop_ids, r1_ids, loop_sha=None, r1_sha=None, loop_rec=None, 
     return out
 
 
+def glue_orders(st) -> Optional[dict]:
+    """T9a-3: the fused glue's reduction orders of a StaticStep ({key: order name}) or None (glue ref / no orders).
+    A key whose order differs between the 1-row truth step and the 6-row verify step reduces that statistic in a
+    different fp32 order at 1 and 6 rows: the two steps' rows cannot be bit-equal through it."""
+    o = getattr(getattr(st, "glue", None), "orders", None)
+    if not o:
+        return None
+    return {str(k): (v.get("name") or str(v.get("order"))) if isinstance(v, dict) else str(v) for k, v in o.items()}
+
+
+def glue_off(st) -> Optional[List[str]]:
+    g = getattr(st, "glue", None)
+    if g is None or not hasattr(g, "status"):
+        return None
+    return sorted(c for c in g.status if not g.on(c))
+
+
+def rowmatch_record(st1) -> dict:
+    """T9a-3: the 1-row (truth) step's DG call shape and its per-row build check, plus its glue orders / off list."""
+    dg = getattr(st1, "dg", None)
+    rm = getattr(dg, "rowmatch", None)
+    chk = (rm or {}).get("check") or {}
+    return {"dg": None if rm is None else {
+                "mode": rm.get("mode"), "on": rm.get("on"), "why": rm.get("why"), "align": getattr(dg, "align", None),
+                "gemm_blocks": getattr(dg, "gemm_blocks", None), "rows_gemm": rm.get("rows_gemm"),
+                "check_equal": chk.get("equal"), "today_equal": chk.get("today_equal"),
+                "check": {p: {k_: v.get(k_) for k_ in ("build_vs_rows", "today_vs_rows", "of")}
+                          for p, v in (chk.get("projs") or {}).items()}},
+            "glue_orders_one_row": glue_orders(st1), "glue_off_one_row": glue_off(st1)}
+
+
+def orders_compare(rec: dict, st6) -> dict:
+    """rec (rowmatch_record) + the verify step's glue orders / off list -> which orders differ."""
+    a, b = rec.get("glue_orders_one_row"), glue_orders(st6)
+    rec["glue_orders_verify"] = b
+    rec["glue_off_verify"] = glue_off(st6)
+    if a is None or b is None:
+        rec["glue_orders_differ"] = None
+    else:
+        rec["glue_orders_differ"] = sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k))
+    o1, o6 = rec.get("glue_off_one_row"), rec.get("glue_off_verify")
+    rec["glue_off_only_verify"] = None if o1 is None or o6 is None else sorted(set(o6) - set(o1))
+    return rec
+
+
+def rowmatch_line(rm: dict) -> str:
+    d = rm.get("dg") or {}
+    s = (f"DG 1-row call {'ON' if d.get('on') else 'off'} ({d.get('mode')}, align {d.get('align')} x "
+         f"{d.get('gemm_blocks')} blocks; per-row build check {d.get('check_equal')}, today's call "
+         f"{d.get('today_equal')})") if d else "DG n/a"
+    diff = rm.get("glue_orders_differ")
+    if diff is not None:
+        s += f" | glue orders 1-row vs verify differ at {diff or 'none'}"
+    only = rm.get("glue_off_only_verify")
+    if only:
+        s += f" | glue off only at 6 rows: {only}"
+    return s
+
+
 def summary_lines(rep: dict) -> List[str]:
     h = rep.get("headline") or {}
     f = lambda x, d=2: "-" if x is None else f"{x:.{d}f}"  # noqa: E731
     lines = [f"HEADLINE {rep.get('date')} | {METRIC} | mode {rep.get('mode')} | impls {rep.get('impls')} | "
              f"gemv pin M1 {rep.get('gemv_pin_m1')} | max_new {rep.get('max_new')} | prompts {rep.get('n_prompts')}"]
+    rm = rep.get("rowmatch")
+    if rm:
+        lines.append(f"  rowmatch: {rowmatch_line(rm)}")
     for key in ("two_graphs", "one_graph", "eager"):
         w = h.get(key)
         if not w:
@@ -196,6 +258,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--draft-impls", choices=["same", "ref"], default="same",
                     help="M1-T11-PORT: same = the draft on the verify's impls (draft_step.draft_impls_for); ref = T11")
     ap.add_argument("--spare-slots", type=int, default=None, help="6-row dg-inplace spare slots/layer (default 8)")
+    ap.add_argument("--moe-rowmatch", choices=["on", "align", "off"], default="on",
+                    help="T9a-3: the 1-row (truth) dg-inplace routed GEMM in the 6-row step's call shape, checked per "
+                         "row at build (runtime/dg_inplace.build_one_row; sets $DSV41_MOE_ROWMATCH before any build)")
     ap.add_argument("--no-gemv-pin", action="store_true", help="do not set DSV41_GEMV_PIN_M1=1")
     ap.add_argument("--reps", type=int, default=2, help="fast (async) runs per prompt at 2 graphs")
     ap.add_argument("--parity-reps", type=int, default=2, help="parity (per-step sync) runs per prompt")
@@ -343,6 +408,7 @@ def main(argv=None) -> int:
     if not a.no_gemv_pin:
         os.environ["DSV41_GEMV_PIN_M1"] = "1"     # before any GEMV get_config (builds, warm-ups, captures)
     os.environ["DSV41_FP32_IMPL"] = a.fp32_impl   # T9b-5 (= runtime.fused_glue_r2.FP32_IMPL_ENV), before any build
+    os.environ["DSV41_MOE_ROWMATCH"] = a.moe_rowmatch   # T9a-3 (= runtime.dg_inplace.ROWMATCH_ENV), before any build
     import torch
 
     from runtime.dspark_loop import DSparkLoop
@@ -352,7 +418,8 @@ def main(argv=None) -> int:
     date = time.strftime("%Y%m%d")
     json_path = a.json or os.path.join(REPO, "docs", f"headline-{date}.json")
     graphs = [int(x) for x in a.graphs.split(",") if x.strip()]
-    impls = {"moe": a.moe_impl, "fp8": a.fp8_impl, "glue": a.glue_impl, "attn": a.attn_impl, "fp32": a.fp32_impl}
+    impls = {"moe": a.moe_impl, "fp8": a.fp8_impl, "glue": a.glue_impl, "attn": a.attn_impl, "fp32": a.fp32_impl,
+             "moe_rowmatch": a.moe_rowmatch}
     rep: Dict = {"date": time.strftime("%Y-%m-%d %H:%M:%S %Z"), "argv": sys.argv[1:] if argv is None else argv,
                  "metric": METRIC, "mode": a.mode, "impls": impls, "max_new": a.max_new,
                  "gemv_pin_m1": os.environ.get("DSV41_GEMV_PIN_M1") == "1", "errors": [], "json": json_path,
@@ -407,12 +474,15 @@ def main(argv=None) -> int:
             print(f"[r1] {r['tag']}: FAILED\n{traceback.format_exc()}", file=sys.stderr, flush=True)
 
     # 2. the loop, 2 graphs (then 1)
+    rep["rowmatch"] = rowmatch_record(getattr(gen, "static", None))   # T9a-3: before the loop resets the 1-row step
     profile = None
     if a.profile:
         t_, f_, n_ = a.profile.split(":")
         profile = (t_, int(f_), int(n_))
     loop = DSparkLoop(gen, a.max_new, poll_every=a.poll_every, draft_impls=None if a.draft_impls == "same" else "ref")
     rep["loop"] = loop.describe()
+    orders_compare(rep["rowmatch"], loop.st)
+    print(f"[rowmatch] {rowmatch_line(rep['rowmatch'])}", flush=True)
     run_graphs = graphs if a.mode == "graph" else [0]
     results = run_cells(loop, prompts, a.max_new, run_graphs, reps=a.reps, parity_reps=a.parity_reps,
                         stop_on_eos=stop, profile=profile, rep=rep)

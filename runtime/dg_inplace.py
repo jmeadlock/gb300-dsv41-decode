@@ -75,6 +75,134 @@ SF_POOL_HEADROOM_GIB = 6.0      # pool SF = hbm_plan's sf_packed_resident_B (12.
                                 # receipts had 17.1 (S 16) / 22.7 (S 8) GiB free after build: capture needs margin
 LAYOUT_CHECK_ENV = "DSV41_ROWS_LAYOUT_CHECK"         # "0": skip the build-time layout self-check
 MASKED_MAX_M = 128                                   # masked: max_m >= BLOCK_M (ABI memo)
+ROWS_GEMM_DEFAULT = "contiguous16"   # the R-row call shape (probe 2026-11-07, docs/dg-rows-spike-20261107.log)
+# T9a-3 (docs/HANDOFF-T9A3-DG-ROWMATCH.md): the 1-row step's routed GEMM in the R-row step's call shape, so that a
+# token's expert outputs are computed by the same kernel instance at 1 and at R rows (first_light / headline
+# --moe-rowmatch). "on": the R-row call's ALIGN and its A-block count R*k (the same M, N, K, G: the same kernel
+# config), the token's k blocks first, the rest tagged -1; "align": the R-row ALIGN with k blocks only (M = k*ALIGN);
+# "off": T9a-2's call (ALIGN 128, k blocks). Any mode but off is checked at build per row against the R-row call on
+# layer 0's real pool bytes (DGInplaceBuffers.check_rowmatch); a mismatch falls back to off (the record says why).
+ROWMATCH_ENV = "DSV41_MOE_ROWMATCH"
+ROWMATCH_MODES = ("on", "align", "off")
+ROWMATCH_DEFAULT = "on"
+ROWMATCH_ROWS_ENV = "DSV41_MOE_ROWMATCH_ROWS"        # R of the step the 1-row path matches
+ROWMATCH_ROWS_DEFAULT = 6                            # the DSpark verify step (k = 5 drafts + the bonus row)
+
+
+def rows_gemm_spec(req: Optional[str] = None) -> str:
+    """The R-row dg-inplace call shape in force: the build's request, else $DSV41_ROWS_MOE_GEMM, else the default."""
+    return req or os.environ.get(ROWS_GEMM_ENV) or ROWS_GEMM_DEFAULT
+
+
+def rowmatch_mode(mode: Optional[str] = None) -> str:
+    v = mode or os.environ.get(ROWMATCH_ENV) or ROWMATCH_DEFAULT
+    if v not in ROWMATCH_MODES:
+        raise ValueError(f"moe rowmatch {v!r} not in {ROWMATCH_MODES} (${ROWMATCH_ENV})")
+    return v
+
+
+def rowmatch_plan(topk: int, mode: Optional[str] = None, rows: Optional[int] = None,
+                  rows_spec: Optional[str] = None) -> dict:
+    """T9a-3: the 1-row dg-inplace build's call shape -> {"mode", "rows", "rows_gemm", "align", "blocks", "on", "why"}
+    (align / blocks None = T9a-2's ALIGN 128 x topk). Only a contiguous R-row call shape has a 1-row twin."""
+    m = rowmatch_mode(mode)
+    R_ = int(rows or os.environ.get(ROWMATCH_ROWS_ENV) or ROWMATCH_ROWS_DEFAULT)
+    spec = rows_gemm_spec(rows_spec)
+    out = {"mode": m, "rows": R_, "rows_gemm": spec, "align": None, "blocks": None, "on": False, "why": None}
+    if m == "off":
+        out["why"] = "off (requested)"
+        return out
+    layout, al = parse_rows_gemm(spec)
+    if layout != "contiguous":
+        out["why"] = f"the R-row call shape {spec!r} is not contiguous: no 1-row twin, T9a-2's call kept"
+        return out
+    al = check_align(al if al is not None else int(os.environ.get(ALIGN_ENV, MK_ALIGN)))
+    if not 1 <= R_ <= al:
+        out["why"] = f"rows {R_} outside [1, ALIGN {al}]"
+        return out
+    out.update(align=al, blocks=R_ * int(topk) if m == "on" else int(topk), on=True)
+    return out
+
+
+@contextlib.contextmanager
+def mk_alignment(dg, align: int):
+    """DeepGEMM's process-global contiguous BLOCK_M cap := align for the calls inside; restored after."""
+    f = getattr(dg, "set_mk_alignment_for_contiguous_layout", None)
+    g = getattr(dg, "get_mk_alignment_for_contiguous_layout", None)
+    prev = g() if g is not None else None
+    if f is not None:
+        f(int(align))
+    try:
+        yield
+    finally:
+        if f is not None and prev is not None and int(prev) != int(align):
+            f(int(prev))
+
+
+def contiguous_blocks_layout(blocks: Sequence[Sequence[Tuple[object, int]]], align: int, n_blocks: int
+                             ) -> Tuple[Dict[object, int], List[int]]:
+    """T9a-3: blocks[b] = [(key, group), ...] -> ({key: A row b*align + t}, m_indices [n_blocks*align]: the group on
+    every entry's row, -1 elsewhere). Blocks >= len(blocks) are unused (all -1)."""
+    if len(blocks) > n_blocks:
+        raise ValueError(f"{len(blocks)} blocks > {n_blocks}")
+    mi = [-1] * (int(n_blocks) * int(align))
+    rows: Dict[object, int] = {}
+    for b, ents in enumerate(blocks):
+        if len(ents) > align:
+            raise ValueError(f"block {b}: {len(ents)} rows > alignment {align}")
+        for t, (key, grp) in enumerate(ents):
+            if key in rows:
+                raise ValueError(f"key {key!r} twice")
+            rows[key] = b * int(align) + t
+            mi[b * int(align) + t] = int(grp)
+    return rows, mi
+
+
+def one_row_blocks(r: int, experts: Sequence[int], gmap: Dict[int, int]) -> List[List[Tuple[object, int]]]:
+    """The 1-row step's blocks for row r alone: one block per routed expert, ascending id, the token in row 0."""
+    return [[((int(r), int(e)), int(gmap[int(e)]))] for e in sorted(int(v) for v in experts)]
+
+
+def r_row_blocks(row_experts: Sequence[Sequence[int]], gmap: Dict[int, int]) -> List[List[Tuple[object, int]]]:
+    """The R-row step's blocks (runtime/moe_rows.py dedup): one block per unique expert, ascending id; in it the rows
+    routed to it, ascending (pair (r, e) at row `rank`)."""
+    uniq = sorted({int(e) for r in row_experts for e in r})
+    return [[((r, e), int(gmap[e])) for r, ex in enumerate(row_experts) if e in {int(v) for v in ex}] for e in uniq]
+
+
+def pack_act_sf_from_f32(xs: torch.Tensor) -> torch.Tensor:
+    """fp32 power-of-two activation scales [M, KS] -> the packed MN-major int32 SF DeepGEMM takes (packed_act_sf
+    layout; code = fp32 exponent bits, DeepGEMM's pack_ue8m0_to_int)."""
+    M, KS = xs.shape
+    codes = ((xs.contiguous().view(torch.int32) >> 23) & 0xFF).to(torch.uint8)
+    out = packed_act_sf(M, KS, xs.device)
+    out.copy_(codes.view(torch.int32))
+    return out
+
+
+def run_contiguous(dg, W: torch.Tensor, SF: torch.Tensor, blocks, acts: Dict[object, Tuple[torch.Tensor, torch.Tensor]],
+                   align: int, n_blocks: int, *, packed_a: bool = False) -> Dict[object, torch.Tensor]:
+    """T9a-3: ONE m_grouped_fp8_fp4_gemm_nt_contiguous call on temporary buffers in the call shape (align, n_blocks)
+    with the entries of `blocks` (contiguous_blocks_layout); acts[key] = (fp8 [K], fp32 [K/32]) on W's device.
+    -> {key: bf16 [N] output row} (clones)."""
+    dev = W.device
+    rows, mi = contiguous_blocks_layout(blocks, align, n_blocks)
+    keys = list(rows)
+    K = int(acts[keys[0]][0].numel())
+    N = int(W.size(1))
+    M = int(n_blocks) * int(align)
+    A = torch.zeros(M, K, dtype=torch.float8_e4m3fn, device=dev)
+    S = torch.ones(M, K // ACT_BLOCK, dtype=torch.float32, device=dev)
+    idx = torch.tensor([rows[k_] for k_ in keys], dtype=torch.long, device="cpu").to(dev)
+    A.view(torch.uint8).index_copy_(0, idx, torch.stack([acts[k_][0].reshape(-1).view(torch.uint8) for k_ in keys]))
+    S.index_copy_(0, idx, torch.stack([acts[k_][1].reshape(-1).float() for k_ in keys]))
+    mit = torch.tensor(mi, dtype=torch.int32, device="cpu").to(dev)
+    D = torch.zeros(M, N, dtype=torch.bfloat16, device=dev)
+    sfa = pack_act_sf_from_f32(S) if packed_a else S
+    with mk_alignment(dg, align):
+        dg.m_grouped_fp8_fp4_gemm_nt_contiguous((A, sfa), (W, SF), D, mit, recipe_a=RECIPE_A, recipe_b=RECIPE_B)
+    out = D.index_select(0, idx)
+    return {k_: out[i].clone() for i, k_ in enumerate(keys)}
 
 
 def parse_rows_gemm(spec: Optional[str]) -> Tuple[str, Optional[int]]:
@@ -130,7 +258,10 @@ def pack_sf(s: torch.Tensor) -> torch.Tensor:
 
 def unpack_sf(packed: torch.Tensor) -> torch.Tensor:
     """int32 [..., N, C] (any strides) -> uint8 e8m0 codes [..., N, 4C]."""
-    return packed.contiguous().view(torch.uint8)
+    p = packed.contiguous()
+    if p.dim() and p.stride(-1) != 1:    # C == 1: contiguous() keeps the MN-major stride of the size-1 last dim
+        p = torch.empty(p.shape, dtype=p.dtype, device=p.device).copy_(p)
+    return p.view(torch.uint8)
 
 
 def ref_pack_from_f32(sf: torch.Tensor) -> torch.Tensor:
@@ -391,11 +522,16 @@ class DGInplaceBuffers(DGBuffers):
 
     def __init__(self, owner, shapes, sshapes, *, pool, swiglu_limit: float, deterministic: bool = True, dg=None,
                  align: Optional[int] = None, sf_store: Optional[str] = None, slots: Optional[int] = None,
-                 spare_slots: Optional[int] = None, layout: str = "contiguous", expected_m: Optional[int] = None):
+                 spare_slots: Optional[int] = None, layout: str = "contiguous", expected_m: Optional[int] = None,
+                 gemm_blocks: Optional[int] = None):
         """slots: A blocks (default topk; M1-T10-FIX's R-row MoE, runtime/moe_rows.py DGInplaceMoERows, uses R*topk:
         block u holds slot u's count <= R rows). spare_slots (M1-T10-FIX2): spare pool slots per layer the cold
         experts of one step may use (default = slots: the 1-row contract, spare j for slot j; the R-row MoE passes
-        its compact-index budget S, default 8, and counts overflows). layout / expected_m: M1-T10-MOE (R rows)."""
+        its compact-index budget S, default 8, and counts overflows). layout / expected_m: M1-T10-MOE (R rows).
+        gemm_blocks (T9a-3, contiguous only): A blocks the GEMM is CALLED with (>= slots; default slots). The
+        buffers the glue / staging / combine see (xq, xs, d, mi, xsp: `slots` blocks) are prefix views of
+        gemm_blocks-block storage whose extra blocks stay zero / one / -1 forever, so the call is the R-row step's
+        (M = gemm_blocks * ALIGN) with only the token's blocks tagged."""
         if pool is None:
             raise ValueError("dg-inplace needs the ExpertPool (it reads the hot pool in place)")
         if layout not in ROWS_LAYOUTS:
@@ -418,8 +554,21 @@ class DGInplaceBuffers(DGBuffers):
             if align < rows:   # one block of ALIGN rows per used slot / group holds its <= R rows
                 raise ValueError(f"{layout} alignment {align} < {rows} rows per block")
             blocks, brows = pairs, align
+        gb = blocks if gemm_blocks is None else int(gemm_blocks)
+        if gb != blocks and (layout != "contiguous" or gb < blocks):
+            raise ValueError(f"gemm_blocks {gb}: contiguous layout only, >= the {blocks} A blocks")
         super().__init__(owner, shapes, sshapes, swiglu_limit=swiglu_limit, deterministic=deterministic, dg=dg,
-                         rows=brows, sf32=False, slots=blocks)
+                         rows=brows, sf32=False, slots=gb)
+        # T9a-3: the GEMM-call tensors (gemm_blocks blocks); the step's tensors are their first `blocks` blocks
+        self.gemm_blocks = gb
+        self._g = {"xq": self.xq, "xs": self.xs, "d": self.d}
+        if gb != blocks:
+            self.k = blocks
+            self.xq = {w: t[:blocks] for w, t in self._g["xq"].items()}
+            self.xs = {w: t[:blocks] for w, t in self._g["xs"].items()}
+            self.d = {p: t[:blocks] for p, t in self._g["d"].items()}
+            self.masked_m = self.masked_m[:blocks]
+        self.rowmatch: Optional[dict] = None    # T9a-3: set by build_one_row (the 1-row step's plan + build check)
         self.layout, self.align, self.pairs, self.G_max = layout, align, pairs, G_max
         self.rows_expected_m = rem              # masked layout: the heuristic's rows per group (handoff: R)
         self.block_rows = brows                 # A rows per block (the dedup's block_rows)
@@ -438,7 +587,8 @@ class DGInplaceBuffers(DGBuffers):
         self.fn_masked = getattr(self.dg, "m_grouped_fp8_fp4_gemm_nt_masked", None)
         self.alignment = self._set_alignment(align)
         d, k = self.dev, self.k
-        self.mi = torch.full((k * align,), -1, dtype=torch.int32, device=d) if layout == "contiguous" else None
+        self._g["mi"] = torch.full((gb * align,), -1, dtype=torch.int32, device=d) if layout == "contiguous" else None
+        self.mi = self._g["mi"][: k * align] if layout == "contiguous" else None
         self.gl = torch.zeros(G_max, dtype=torch.int32, device=d) if layout != "contiguous" else None
         # T9b-4 lever 4: packed activation SF (A [k*ALIGN, K]) for the w1/w3 input (1) and the w2 input (2); used
         # instead of the fp32 xs only once runtime/fused_glue.py's self-check turned `sf_pack` on (it owns every
@@ -447,9 +597,12 @@ class DGInplaceBuffers(DGBuffers):
         self.sf_pack = False
         self.sf_pack_why: Optional[str] = "not enabled (needs glue_impl fused: dg_act + swiglu_routed + self-check)"
         self.xsp, self.xsp_rows, self.xsp_all = {}, {}, {}
+        self._g["xsp"] = {}
         if layout != "masked":
             M = k * align
-            self.xsp = {w: packed_act_sf(M, (self.dim if w == 1 else self.inter) // ACT_BLOCK, d) for w in (1, 2)}
+            self._g["xsp"] = {w: packed_act_sf(gb * align, (self.dim if w == 1 else self.inter) // ACT_BLOCK, d)
+                              for w in (1, 2)}
+            self.xsp = {w: t[:M] for w, t in self._g["xsp"].items()}
             self.xsp_rows = {w: PackedRows(self.xsp[w], align, k) for w in (1, 2)}
             self.xsp_all = {w: PackedRows(self.xsp[w], 1, M) for w in (1, 2)}
         self.C = {p: sf_words(self.K[p] // WEIGHT_BLOCK) for p in PROJS}
@@ -604,10 +757,11 @@ class DGInplaceBuffers(DGBuffers):
         M1-T10-MOE: psum / masked layouts go through gemm_rows."""
         if self.layout != "contiguous":
             return self.gemm_rows(p, t, which)
-        M = self.k * self.align
+        Mg = self.gemm_blocks * self.align          # T9a-3: the call's M (= k * ALIGN unless padded)
+        xs = self._g["xsp"][which] if self.sf_pack else self._g["xs"][which].view(Mg, -1)
         with self._align_now():
-            self.fn((self.xq[which].view(M, -1), self._sfa(which, M)), (t["w"][p], t["sf"][p]),
-                    self.d[p].view(M, -1), self.mi, recipe_a=RECIPE_A, recipe_b=RECIPE_B)
+            self.fn((self._g["xq"][which].view(Mg, -1), xs), (t["w"][p], t["sf"][p]),
+                    self._g["d"][p].view(Mg, -1), self._g["mi"], recipe_a=RECIPE_A, recipe_b=RECIPE_B)
         self.n_calls += 1
         return self.d[p]
 
@@ -770,6 +924,95 @@ class DGInplaceBuffers(DGBuffers):
         self.layout_check = res
         return res
 
+    # ---------------------------------------------------------------- T9a-3 build-time row-match check
+    def check_rowmatch(self, rows: int, ref_align: int, ref_blocks: Optional[int] = None, seed: int = 20261107
+                       ) -> dict:
+        """T9a-3: is THIS 1-row build's routed GEMM per-row bit-equal to the R-row step's call? On layer 0's REAL pool
+        bytes: R rows each routed to k distinct hot groups (drawn from a small candidate set, so groups are shared
+        across rows as in the 6-row step), random fp8 activations with power-of-two per-32 scales (w1: one row per
+        token; w2: one row per (token, expert) pair). Reference = the R-row call (contiguous, ALIGN ref_align,
+        ref_blocks = R*k A blocks, one block per unique group with its rows ascending: runtime/moe_rows.py's layout)
+        on temporary buffers; this build = each row alone through gemm_inplace on the build's OWN buffers (padding
+        blocks included); T9a-2's call (ALIGN 128, k blocks) is measured too, for the record. Every output row
+        bitwise. Restores the build's buffers. -> {"equal": bool (this build == the R-row call on every row), ...}."""
+        pool, d = self.pool, self.dev
+        k, R_ = int(self.k), int(rows)
+        H0 = len(pool.hot[0])
+        W = {p: pool.hbm_full[0][p] for p in ("w1", "w2")}
+        G0 = W["w1"].size(0)
+        rb = int(ref_blocks or R_ * k)
+        res = {"rows": R_, "k": k, "ref": {"align": int(ref_align), "blocks": rb},
+               "build": {"align": self.align, "blocks": self.gemm_blocks}, "projs": {}}
+        if H0 < k:
+            res.update(equal=False, error=f"layer 0 has {H0} hot experts < topk {k}")
+            return res
+        g = torch.Generator(device="cpu").manual_seed(seed)
+        nc = min(H0, max(k + 1, (R_ * k) // 2))
+        cand = sorted(torch.randperm(H0, generator=g, device="cpu")[:nc].tolist())
+        rexp = [sorted(cand[i] for i in torch.randperm(nc, generator=g, device="cpu")[:k].tolist()) for _ in range(R_)]
+        gmap = {e: e for e in cand}                       # expert id := its hot slot (group) on layer 0
+        res["routing"] = rexp
+        sfp = {}
+        prev_pack = self.sf_pack
+        try:
+            with torch.inference_mode(False), torch.no_grad():
+                for p in W:
+                    t_ = packed_sf_zeros(G0, self.N[p], self.C[p], d)
+                    t_[:H0].copy_(pack_words(pool.hbm[0][p][1]))
+                    sfp[p] = t_
+            tt = {"w": W, "sf": sfp, "G": G0}
+            all_eq = True
+            for p, which in (("w1", 1), ("w2", 2)):
+                K = self.dim if which == 1 else self.inter
+                keys = [(r, e) for r in range(R_) for e in rexp[r]]
+                n_src = R_ if which == 1 else len(keys)
+                q = (torch.randn(n_src, K, generator=g, device="cpu") * 2).clamp(-448, 448).to(torch.float8_e4m3fn)
+                s = torch.exp2(torch.randint(-3, 4, (n_src, K // ACT_BLOCK), generator=g, device="cpu").float())
+                q, s = q.to(d), s.to(d)
+                acts = {kk: ((q[kk[0]], s[kk[0]]) if which == 1 else (q[i], s[i])) for i, kk in enumerate(keys)}
+                ref = run_contiguous(self.dg, W[p], sfp[p], r_row_blocks(rexp, gmap), acts, int(ref_align), rb)
+                today = {}
+                for r in range(R_):
+                    today.update(run_contiguous(self.dg, W[p], sfp[p], one_row_blocks(r, rexp[r], gmap), acts,
+                                                MK_ALIGN, k))
+                # this build, one row at a time, through its own buffers and call
+                self.sf_pack = False
+                got = {}
+                for r in range(R_):
+                    self._reset_layout()
+                    for j, e in enumerate(rexp[r]):
+                        self.xq[which][j, 0].view(torch.uint8).copy_(acts[(r, e)][0].view(torch.uint8))
+                        self.xs[which][j, 0].copy_(acts[(r, e)][1])
+                        self.mi[j * self.align] = gmap[e]
+                    out = self.gemm_inplace(p, tt, which)
+                    for j, e in enumerate(rexp[r]):
+                        got[(r, e)] = out[j, 0].clone()
+
+                def rows_eq(a, b):
+                    return sum(all(torch.equal(a[(r, e)].view(torch.int16), b[(r, e)].view(torch.int16))
+                                   for e in rexp[r]) for r in range(R_))
+
+                cat = lambda m: torch.stack([m[kk] for kk in keys])  # noqa: E731
+                rec = {"build_vs_rows": rows_eq(got, ref), "today_vs_rows": rows_eq(today, ref),
+                       "build_vs_today": rows_eq(got, today), "of": R_,
+                       "build_vs_rows_cmp": compare_bf16(cat(got), cat(ref)),
+                       "today_vs_rows_cmp": compare_bf16(cat(today), cat(ref))}
+                res["projs"][p] = rec
+                all_eq = all_eq and rec["build_vs_rows"] == R_
+            res["equal"] = all_eq
+            res["today_equal"] = all(v["today_vs_rows"] == R_ for v in res["projs"].values())
+        except Exception as e:
+            res["equal"] = False
+            res["error"] = f"{type(e).__name__}: {str(e)[:300]}"
+        finally:
+            self.sf_pack = prev_pack
+            self._reset_layout()
+            for w_ in (1, 2):
+                self._g["xq"][w_].zero_()
+                self._g["xs"][w_].fill_(1.0)
+            del sfp
+        return res
+
     def describe(self) -> dict:
         r = super().describe()
         free = None
@@ -791,6 +1034,8 @@ class DGInplaceBuffers(DGBuffers):
         r.update({"impl": "dg-inplace", "layout": self.layout, "align": self.align, "alignment": self.alignment,
                   "rows_expected_m": self.rows_expected_m if self.layout != "contiguous" else None,
                   "block_rows": self.block_rows, "a_blocks": self.k, "layout_check": self.layout_check,
+                  "gemm_blocks": self.gemm_blocks, "gemm_m": self.gemm_blocks * self.block_rows,
+                  "rowmatch": self.rowmatch,
                   "sf_store": self.sf_store, "sf_store_why": self.sf_store_why, "stage_n_work": self.stage_n_work(),
                   "act_sf_packed": self.sf_pack, "act_sf_packed_why": None if self.sf_pack else self.sf_pack_why,
                   "spare_slots": self.pool.spare, "spare_limit": self.spare_limit, "G_max": self.G_max,
@@ -804,6 +1049,36 @@ class DGInplaceBuffers(DGBuffers):
 
 
 # ------------------------------------------------------------------------------------------------ the MoE
+def build_one_row(owner, shapes, sshapes, *, pool, swiglu_limit: float, deterministic: bool = True,
+                  mode: Optional[str] = None) -> "DGInplaceBuffers":
+    """T9a-3: the 1-row dg-inplace step's buffers in the --moe-rowmatch call shape (rowmatch_plan; $DSV41_MOE_ROWMATCH,
+    default on). Unless off or $DSV41_ROWS_LAYOUT_CHECK=0, the build is checked per row against the R-row call on
+    layer 0's real bytes (check_rowmatch); a mismatch (or a failing check) builds T9a-2's call instead and says why.
+    The record is b.rowmatch (describe()["rowmatch"])."""
+    plan = rowmatch_plan(owner.topk, mode)
+    kw = dict(pool=pool, swiglu_limit=swiglu_limit, deterministic=deterministic)
+    if not plan["on"]:
+        b = DGInplaceBuffers(owner, shapes, sshapes, **kw)
+        b.rowmatch = dict(plan, check=None)
+        return b
+    b = DGInplaceBuffers(owner, shapes, sshapes, align=plan["align"], gemm_blocks=plan["blocks"], **kw)
+    rec = None
+    if os.environ.get(LAYOUT_CHECK_ENV, "1") != "0":
+        rec = b.check_rowmatch(plan["rows"], plan["align"], plan["rows"] * int(owner.topk))
+        if not rec.get("equal"):
+            why = rec.get("error") or {p: {k_: v[k_] for k_ in ("build_vs_rows", "of")}
+                                       for p, v in rec.get("projs", {}).items()}
+            print(f"[dg-inplace] moe rowmatch {plan['mode']!r} (ALIGN {plan['align']}, {plan['blocks']} blocks) failed "
+                  f"its build check ({why}); using T9a-2's call (ALIGN {MK_ALIGN}, {owner.topk} blocks)",
+                  file=sys.stderr, flush=True)
+            del b
+            b = DGInplaceBuffers(owner, shapes, sshapes, **kw)
+            b.rowmatch = dict(plan, on=False, check=rec, why=f"build check failed: {why}")
+            return b
+    b.rowmatch = dict(plan, check=rec)
+    return b
+
+
 class DGInplaceMoE(DGMaskedMoE):
     """One layer's MoE with the routed GEMMs reading the hot pool in place (module docstring). Same interface as
     StaticMoE / DGMaskedMoE; the act / SwiGLU / combine / shared sub-steps are DGMaskedMoE's."""

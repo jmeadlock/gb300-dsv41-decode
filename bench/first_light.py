@@ -341,6 +341,19 @@ def build_report(gen, label: str, report: Dict) -> Optional[dict]:
               f"{'' if dg.layout_check is None else ' check equal=' + str(dg.layout_check.get('equal'))}"
               f"{'' if not (dg.layout_check or {}).get('fallback') else ' FALLBACK ' + dg.layout_check['fallback']}",
               flush=True)
+    if getattr(dg, "rowmatch", None) is not None and getattr(st, "rows", 1) == 1:   # T9a-3: the 1-row call shape
+        rm = dg.rowmatch
+        chk = rm.get("check") or {}
+        rec["rowmatch"] = {"mode": rm.get("mode"), "on": rm.get("on"), "align": dg.align,
+                           "gemm_blocks": getattr(dg, "gemm_blocks", None), "rows_gemm": rm.get("rows_gemm"),
+                           "why": rm.get("why"), "check_equal": chk.get("equal"),
+                           "today_equal": chk.get("today_equal"),
+                           "check": {p: {k_: v.get(k_) for k_ in ("build_vs_rows", "today_vs_rows", "of")}
+                                     for p, v in (chk.get("projs") or {}).items()}}
+        print(f"[moe-rowmatch] {rm.get('mode')} -> {'ON' if rm.get('on') else 'off'}: align {dg.align} gemm_blocks "
+              f"{getattr(dg, 'gemm_blocks', None)} (R-row {rm.get('rows_gemm')}); build check equal="
+              f"{chk.get('equal')} today's call equal={chk.get('today_equal')}"
+              f"{'' if rm.get('on') or not rm.get('why') else ' (' + str(rm.get('why'))[:160] + ')'}", flush=True)
     h = rec["hbm"] or {}
     f = lambda x, d=2: "-" if x is None else f"{x:.{d}f}"  # noqa: E731
     print(f"[hbm] {label} build (moe {rec['moe_impl']}"
@@ -1042,11 +1055,17 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--rows-sf-store", default=None, choices=["step", "resident", "pool"],
                     help="M1-T10-MOE: where the R-row dg-inplace step's hot packed weight SF live (default pool: one "
                          "pre-packed copy owned by the expert pool, cold-only staging; sets $DSV41_ROWS_SF_STORE)")
+    ap.add_argument("--moe-rowmatch", default="on", choices=["on", "align", "off"],
+                    help="T9a-3: the 1-row dg-inplace routed GEMM in the R-row step's call shape (on: its ALIGN and "
+                         "its R*k A blocks, the same kernel config; align: its ALIGN, k blocks; off: T9a-2's ALIGN 128 "
+                         "x k), checked per row at build vs the R-row call on layer 0's real bytes, else off; sets "
+                         "$DSV41_MOE_ROWMATCH (R = $DSV41_MOE_ROWMATCH_ROWS, default 6)")
     return ap
 
 
 def rows_moe_env(a) -> Dict[str, str]:
-    """M1-T10-MOE: --rows-moe-gemm / --rows-sf-store -> the environment StaticStep's R-row dg-inplace build reads."""
+    """M1-T10-MOE: --rows-moe-gemm / --rows-sf-store -> the environment StaticStep's R-row dg-inplace build reads;
+    T9a-3: --moe-rowmatch -> the 1-row dg-inplace build's."""
     from runtime import dg_inplace as DI
 
     env = {}
@@ -1054,6 +1073,8 @@ def rows_moe_env(a) -> Dict[str, str]:
         env[DI.ROWS_GEMM_ENV] = a.rows_moe_gemm
     if getattr(a, "rows_sf_store", None):
         env[DI.ROWS_SF_STORE_ENV] = a.rows_sf_store
+    if getattr(a, "moe_rowmatch", None):
+        env[DI.ROWMATCH_ENV] = a.moe_rowmatch
     os.environ.update(env)
     return env
 
@@ -1255,6 +1276,13 @@ def measure(gen: Generator, a, report: Dict, *, n_layers: int, out: str, json_pa
     dg = getattr(getattr(gen, "static", None), "dg", None)
     if dg is not None and hasattr(dg, "describe"):
         report["dg_moe"] = dg.describe()  # deep_gemm path/version, e8m0 conversion, deterministic flag, buffers
+        rm = report["dg_moe"].get("rowmatch")
+        if rm is not None:                # T9a-3: the 1-row call shape in force and its per-row build check
+            chk = rm.get("check") or {}
+            print(f"[moe-rowmatch] {rm.get('mode')} -> {'ON' if rm.get('on') else 'off'}: align "
+                  f"{report['dg_moe'].get('align')} gemm_blocks {report['dg_moe'].get('gemm_blocks')} (R-row "
+                  f"{rm.get('rows_gemm')}); build check equal={chk.get('equal')} today's call "
+                  f"equal={chk.get('today_equal')}", flush=True)
     with open(json_path, "w") as f:
         json.dump(report, f, indent=1, default=str)
     for line in summary_lines(report, json_path):

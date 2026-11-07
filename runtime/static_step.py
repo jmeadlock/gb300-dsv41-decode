@@ -739,13 +739,14 @@ class StaticStep:
             self.dg = DGBuffers(self, shapes, sshapes, swiglu_limit=lim, deterministic=self.dg_deterministic)
             moe_cls = DGMaskedMoE
         elif self.moe_impl == "dg-inplace":  # T9a-2: contiguous grouped GEMM over the hot pool + spare slots
-            from runtime.dg_inplace import DGInplaceBuffers, DGInplaceMoE
+            from runtime.dg_inplace import DGInplaceMoE, build_one_row
 
             if pool is None:
                 raise ValueError("moe_impl dg-inplace needs the model's ExpertPool")
             added = pool.add_spare_slots(k, self.model)  # before the pointer tables below (storage moves)
-            self.dg = DGInplaceBuffers(self, shapes, sshapes, pool=pool, swiglu_limit=lim,
-                                       deterministic=self.dg_deterministic)
+            # T9a-3: in the R-row step's call shape ($DSV41_MOE_ROWMATCH, default on; checked per row at build)
+            self.dg = build_one_row(self, shapes, sshapes, pool=pool, swiglu_limit=lim,
+                                    deterministic=self.dg_deterministic)
             self.dg.spare_added_B = added
             moe_cls = DGInplaceMoE
         n_layers, n_exp = len(layers), moe0.n_routed_experts
@@ -803,7 +804,7 @@ class StaticStep:
         0's real pool bytes) or the build falls back to it (the record says why: describe()["layout_check"])."""
         from runtime import dg_inplace as DI
 
-        spec = self._rows_gemm_req or os.environ.get(DI.ROWS_GEMM_ENV) or "contiguous16"  # probe 2026-11-07: fastest bit-equal
+        spec = DI.rows_gemm_spec(self._rows_gemm_req)  # default contiguous16 (probe 2026-11-07: fastest bit-equal)
         layout, align = DI.parse_rows_gemm(spec)
         store = self._rows_sf_req or os.environ.get(DI.ROWS_SF_STORE_ENV) or DI.ROWS_SF_STORE_DEFAULT
         kw = dict(pool=self.pool, swiglu_limit=lim, deterministic=self.dg_deterministic, slots=ns,

@@ -47,6 +47,8 @@ def _cpu_default_device(monkeypatch):
     torch.set_default_device("cpu")
     monkeypatch.delenv(DI.ALIGN_ENV, raising=False)
     monkeypatch.delenv(DI.SF_STORE_ENV, raising=False)
+    monkeypatch.delenv(DI.ROWMATCH_ENV, raising=False)
+    monkeypatch.delenv(DI.ROWMATCH_ROWS_ENV, raising=False)
     yield
     torch.set_default_device("cpu")
 
@@ -399,7 +401,7 @@ def test_add_spare_slots_preserves_rebinds_and_is_idempotent(di_emu):
     _check(_ref_run(model, ids, 4), want, "reference forward after the re-growth")
 
 
-def _dg_inplace_vs_reference(di_emu, kind, monkeypatch, sf_store, align):
+def _dg_inplace_vs_reference(di_emu, kind, monkeypatch, sf_store, align, rowmatch="off"):
     from runtime.dg_inplace import DGInplaceMoE
     from runtime.static_step import StaticStep
 
@@ -407,10 +409,16 @@ def _dg_inplace_vs_reference(di_emu, kind, monkeypatch, sf_store, align):
         monkeypatch.setenv(DI.SF_STORE_ENV, sf_store)
     if align is not None:
         monkeypatch.setenv(DI.ALIGN_ENV, str(align))
+    monkeypatch.setenv(DI.ROWMATCH_ENV, rowmatch)   # T9a-3: "on" = the 6-row call shape (ALIGN 16, 6k blocks)
     model, pool, fk, fake = di_emu(kind)
     st = StaticStep(model, pool, max_pos=127, moe_impl="dg-inplace", _allow_cpu=True)
     b, k = st.dg, st.topk
-    a = align or 128
+    plan = DI.rowmatch_plan(k)
+    a = plan["align"] if plan["on"] else (align or 128)
+    gb = plan["blocks"] if plan["on"] else k
+    assert b.rowmatch["on"] == plan["on"] and b.gemm_blocks == gb
+    if plan["on"]:
+        assert b.rowmatch["check"]["equal"] and b.rowmatch["check"]["today_equal"], b.rowmatch
     assert st.moe_impl == "dg-inplace" and all(isinstance(m, DGInplaceMoE) for m in st.moes)
     # M1-T10-MOE: the build sets + checks its ALIGN, then leaves the process-global cap as it found it (128); each
     # of its GEMM calls runs under its own ALIGN (the fake reads BM at call time: _check below fails otherwise)
@@ -419,31 +427,39 @@ def _dg_inplace_vs_reference(di_emu, kind, monkeypatch, sf_store, align):
     assert not b.sf32 and b.mi.shape == (k * a,) and bool((b.mi == -1).all())
     d = b.describe()
     assert d["impl"] == "dg-inplace" and d["hbm_added_B"]["spare_weight_slots"] > 0 and d["spare_slots"] == k
+    assert d["gemm_blocks"] == gb and d["gemm_m"] == gb * a and d["rowmatch"]["mode"] == rowmatch
+    n_c0 = len(fake.contig_calls)
     g = torch.Generator().manual_seed(11)
     n_steps = 0
     for L in (2, 3, 16, 17):
         ids = torch.randint(2, 2000, (L,), generator=g).tolist()
         ref = _ref_run(model, ids, 10)
         got = _static_run(model, st, ids, 10)
-        _check(got, ref, (kind, "dg-inplace emulated", sf_store, align, L))
+        _check(got, ref, (kind, "dg-inplace emulated", sf_store, align, rowmatch, L))
         n_steps += 10
     n_layers = len(model.layers)
-    assert len(fake.contig_calls) == 3 * n_layers * n_steps and fake.calls == []      # masked never called
+    calls = fake.contig_calls[n_c0:]
+    assert len(calls) == 3 * n_layers * n_steps and fake.calls == []      # masked never called
     assert fk.calls["stage"] == n_layers * n_steps and fk.calls["gather"] == 0 and fk.calls["gather_tables"] == 0
     G = {len(pool.hot[l]) + k for l in range(n_layers)}
-    assert all(c[0] == k * a and c[1] in G and all(h >= 0 for h in c[4]) for c in fake.contig_calls)
-    cold_heads = sum(1 for c in fake.contig_calls for h in c[4] if h >= c[1] - k)
+    assert all(c[0] == gb * a and c[1] in G and all(h >= 0 for h in c[4][:k]) and all(h == -1 for h in c[4][k:])
+               for c in calls)
+    cold_heads = sum(1 for c in calls for h in c[4] if h >= c[1] - k)
     assert cold_heads > 0  # the mini maps route to cold experts: the spare-slot path ran
     for w in (1, 2):  # padding rows never written by a step
         assert not b.xq[w][:, 1:].view(torch.uint8).any() and torch.equal(b.xs[w][:, 1:], torch.ones_like(b.xs[w][:, 1:]))
-    assert bool((b.mi.view(k, a)[:, 1:] == -1).all())
+        assert not b._g["xq"][w][k:].view(torch.uint8).any()     # T9a-3: the padding blocks stay zero / one / -1
+        assert torch.equal(b._g["xs"][w][k:], torch.ones_like(b._g["xs"][w][k:]))
+    assert bool((b.mi.view(k, a)[:, 1:] == -1).all()) and bool((b._g["mi"][k * a:] == -1).all())
     return model, pool, st, fake
 
 
 @pytest.mark.parametrize("kind", ["mini", "mini4"])
 @pytest.mark.parametrize("sf_store,align", [(None, None), ("resident", None), ("step", 64)])
-def test_dg_inplace_static_step_equals_reference_under_emulated_gemm(di_emu, kind, monkeypatch, sf_store, align):
-    _, _, st, _ = _dg_inplace_vs_reference(di_emu, kind, monkeypatch, sf_store, align)
+@pytest.mark.parametrize("rowmatch", ["off", "on", "align"])
+def test_dg_inplace_static_step_equals_reference_under_emulated_gemm(di_emu, kind, monkeypatch, sf_store, align,
+                                                                    rowmatch):
+    _, _, st, _ = _dg_inplace_vs_reference(di_emu, kind, monkeypatch, sf_store, align, rowmatch)
     st.detach()
 
 
