@@ -11,6 +11,7 @@ torch.set_default_dtype(torch.bfloat16); torch.set_default_device("cuda")
 import deep_gemm as dg  # noqa
 import kernel as K  # noqa
 from safetensors import safe_open  # noqa
+from deep_gemm.utils.math import per_token_cast_to_fp8  # noqa
 assert not any(m == "vllm" or m.startswith("vllm.") for m in sys.modules)
 E8 = torch.float8_e8m0fnu; G = 6; DIM = 5120; INTER = 2304
 def shard_of(name):
@@ -32,31 +33,26 @@ for proj, N, Kd in (("w1", INTER, DIM), ("w2", DIM, INTER)):
     S = torch.stack([load(f"layers.0.ffn.experts.{e}.{proj}.scale").view(torch.uint8) for e in ids]).cuda()  # [G,N,K/32]
     Wfp4 = W.view(torch.float4_e2m1fn_x2); Se8 = S.view(E8)
     for M in (1, 6):
+        MAXM = 128   # DeepGEMM masked kernels need max_m >= 128 (measured: 64/8 corrupt later groups)
         x = torch.randn(G, M, Kd, dtype=torch.bfloat16)
-        # reference per expert
+        # reference per expert (per-32 e8m0 activation scales, the model's act_quant)
         ref = torch.empty(G, M, N, dtype=torch.bfloat16)
-        xq = torch.empty(G, M, Kd, dtype=torch.float8_e4m3fn); xs = torch.empty(G, M, Kd // 32, dtype=E8)
         for g in range(G):
-            q, s = K.act_quant(x[g], 32, "ue8m0", E8); xq[g] = q; xs[g] = s
-            ref[g] = K.fp4_gemm(q, s, Wfp4[g], Se8[g], E8, act_block_size=32)
-        torch.cuda.synchronize()
+            q, s = K.act_quant(x[g], 32, "ue8m0", E8); ref[g] = K.fp4_gemm(q, s, Wfp4[g], Se8[g], E8, act_block_size=32)
         def t_ref():
-            for g in range(G): K.fp4_gemm(xq[g], xs[g], Wfp4[g], Se8[g], E8, act_block_size=32)
-        # DeepGEMM: layouts. Try the documented transform on both operands' SF.
-        e2f = lambda t: torch.exp2(t.view(torch.uint8).to(torch.int32).float() - 127.0)   # e8m0 -> fp32 (exact)
-        xs_f = e2f(xs).contiguous(); S_f = e2f(S).contiguous()                              # [G,M,K/32], [G,N,K/32]
+            for g in range(G):
+                q, s = K.act_quant(x[g], 32, "ue8m0", E8); K.fp4_gemm(q, s, Wfp4[g], Se8[g], E8, act_block_size=32)
+        # DeepGEMM path: activations fp8 with per-128 ue8m0 scales (the only sm100 fp8xfp4 recipe DG tests), padded to MAXM rows
+        xq = torch.zeros(G, MAXM, Kd, dtype=torch.float8_e4m3fn); xs = torch.ones(G, MAXM, Kd // 128, dtype=torch.float32)
+        for g in range(G):
+            q, s = per_token_cast_to_fp8(x[g], use_ue8m0=True, gran_k=128); xq[g, :M] = q; xs[g, :M] = s
+        S_f = torch.exp2(S.view(torch.uint8).to(torch.int32).float() - 127.0).contiguous()   # checkpoint e8m0 -> fp32 (exact)
+        masked_m = torch.full((G,), M, dtype=torch.int32)
         def run(variant):
-            d = torch.empty(G, M, N, dtype=torch.bfloat16)
-            masked_m = torch.full((G,), M, dtype=torch.int32)
-            if variant == "fp32_sf":
-                sfa, sfb = xs_f, S_f
-            elif variant == "transform_sf":
-                sfa = dg.transform_sf_into_required_layout(xs_f, mn=M, k=Kd, recipe=(1, 1, 32), num_groups=G, is_sfa=True)
-                sfb = dg.transform_sf_into_required_layout(S_f, mn=N, k=Kd, recipe=(1, 1, 32), num_groups=G, is_sfa=False)
-            elif variant == "packed_mn_major":
-                sfa = dg.get_mn_major_tma_aligned_packed_ue8m0_tensor(xs_f); sfb = dg.get_mn_major_tma_aligned_packed_ue8m0_tensor(S_f)
-            dg.m_grouped_fp8_fp4_gemm_nt_masked((xq, sfa), (W, sfb), d, masked_m, M, recipe_a=(1, 32), recipe_b=(1, 32))   # W: int8 packed, low nibble first; DG test convention
-            torch.cuda.synchronize(); return d, (sfa.dtype, tuple(sfa.shape), sfb.dtype, tuple(sfb.shape))
+            d = torch.empty(G, MAXM, N, dtype=torch.bfloat16)
+            dg.m_grouped_fp8_fp4_gemm_nt_masked((xq, xs), (W, S_f), d, masked_m, 8, recipe_a=(1, 128), recipe_b=(1, 32))
+            torch.cuda.synchronize(); return d[:, :M], ("fp8+fp32/128", "int8+fp32/32")
+        # also: fp32 reference from the DG-quantized activations and exact-unpacked weights (isolates DG's own error)
         for variant in ("fp32_sf",):
             def probe(variant=variant):
                 d, layouts = run(variant)
