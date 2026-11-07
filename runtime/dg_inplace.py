@@ -681,8 +681,8 @@ class DGInplaceBuffers(DGBuffers):
         if U < 1:
             return {"equal": True, "skipped": "layer 0 has no hot experts"}
         g = torch.Generator(device="cpu").manual_seed(seed)
-        groups = sorted(torch.randperm(H0, generator=g)[:U].tolist())
-        counts = torch.randint(1, R_ + 1, (U,), generator=g).tolist()
+        groups = sorted(torch.randperm(H0, generator=g, device="cpu")[:U].tolist())
+        counts = torch.randint(1, R_ + 1, (U,), generator=g, device="cpu").tolist()
         sfp = {}
         with torch.inference_mode(False), torch.no_grad():
             for p in W:
@@ -695,8 +695,8 @@ class DGInplaceBuffers(DGBuffers):
             for p, which in (("w1", 1), ("w2", 2)):
                 K = self.dim if which == 1 else self.inter
                 n = sum(counts)
-                xq = (torch.randn(n, K, generator=g) * 2).clamp(-448, 448).to(torch.float8_e4m3fn).to(d)
-                xs = torch.exp2(torch.randint(-3, 4, (n, K // ACT_BLOCK), generator=g).float()).to(d)
+                xq = (torch.randn(n, K, generator=g, device="cpu") * 2).clamp(-448, 448).to(torch.float8_e4m3fn).to(d)
+                xs = torch.exp2(torch.randint(-3, 4, (n, K // ACT_BLOCK), generator=g, device="cpu").float()).to(d)
                 # reference: contiguous, ALIGN 128, U blocks
                 Ar = torch.zeros(U * MK_ALIGN, K, dtype=torch.float8_e4m3fn, device=d)
                 Sr = torch.ones(U * MK_ALIGN, K // ACT_BLOCK, dtype=torch.float32, device=d)
