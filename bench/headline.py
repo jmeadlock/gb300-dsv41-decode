@@ -23,6 +23,12 @@ to the 1-row's; (b) ms per 6-row step (steps >= --stats-from of each sequence; v
 step (accepted drafts + 1), ms per token = sum(step ms) / sum(tokens) over the window, prefill ms (reference prefill +
 draft-ring seeding + first draft, synced); (c) self-replay: fast reps, parity reps (records byte-identical, logits
 digests equal), fast == parity, 1 graph == 2 graphs (tokens + accept-length sequences); (d) HBM after the build.
+A2-2 (docs/A2-2-BOX-PLAN.md): `--residency on --residency-drain 64 [--residency-spare N ...]` puts the host-side swap
+policy (runtime/residency.py) on the loop's 6-row verify step (the 1-row truth above runs on the static map; the pool
+is grown once up front for the staging AND the residency slots). The loop calls the manager after every step; the
+report key `residency` has swaps/step, the cold-share curve (per drain and per sequence), the headroom calc and HBM, the
+manager's GPU ms per step (`ms_manager_per_step`; `ms_per_step_incl_manager` is the number to compare with the off run)
+and, with `--residency-ref <the off run's JSON>`, per prompt emitted-token / accept-length equality (an error if not).
 The C1 instrument proper (nsys cudaProfilerApi range) is M1-T13; --profile TAG:FIRST:N opens that range around N steps
 of one prompt's first fast run, for `nsys profile --capture-range=cudaProfilerApi`.
 
@@ -45,6 +51,7 @@ import sys
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 import argparse  # noqa: E402
+import hashlib  # noqa: E402
 import json  # noqa: E402
 import time  # noqa: E402
 import traceback  # noqa: E402
@@ -79,11 +86,12 @@ def _stats(xs: List[float]) -> dict:
 def window(runs: Sequence[dict], stats_from: int) -> dict:
     """Pool the live steps with index >= stats_from of every run -> ms/step (total, verify, draft), tokens/step,
     ms/token over that window; plus the same over all live steps (`all_*`)."""
-    step, ver, dra, tok, all_step, all_tok = [], [], [], [], [], []
+    step, ver, dra, tok, all_step, all_tok, mgr = [], [], [], [], [], [], []
     for r in runs:
         ms = r.get("step_ms") or []
         acc = r.get("accepts") or []
         v, d = r.get("verify_ms"), r.get("draft_ms")
+        mg = r.get("mgr_ms") or []     # A2-2: the residency manager's GPU ms after each step (not in step_ms)
         for i, m in enumerate(ms):
             all_step.append(m)
             all_tok.append(acc[i] + 1)
@@ -94,7 +102,11 @@ def window(runs: Sequence[dict], stats_from: int) -> dict:
                     ver.append(v[i])
                 if d:
                     dra.append(d[i])
+                if i < len(mg):
+                    mgr.append(mg[i])
     out = {"stats_from_step": stats_from, "steps": len(step), "ms_per_step": _stats(step),
+           "ms_manager_per_step": _stats(mgr) if mgr else None,
+           "ms_per_step_incl_manager": ((sum(step) / len(step) + sum(mgr) / len(mgr)) if step and mgr else None),
            "ms_verify_graph": _stats(ver) if ver else None, "ms_draft_graph": _stats(dra) if dra else None,
            "tokens_per_step": (sum(tok) / len(tok)) if tok else None,
            "ms_per_token": (sum(step) / sum(tok)) if tok else None,
@@ -211,7 +223,9 @@ def summary_lines(rep: dict) -> List[str]:
         ms = (w.get("ms_per_step") or {}).get("mean")
         v = (w.get("ms_verify_graph") or {}).get("mean") if w.get("ms_verify_graph") else None
         d = (w.get("ms_draft_graph") or {}).get("mean") if w.get("ms_draft_graph") else None
-        lines.append(f"  {key:10s}: {f(ms)} ms/step (verify {f(v)} + draft {f(d)}) | {f(w.get('tokens_per_step'), 3)} "
+        mg = (w.get("ms_manager_per_step") or {}).get("mean") if w.get("ms_manager_per_step") else None
+        mgs = f" [+ residency manager {f(mg, 3)} ms/step = {f(w.get('ms_per_step_incl_manager'))}]" if mg is not None else ""
+        lines.append(f"  {key:10s}: {f(ms)} ms/step{mgs} (verify {f(v)} + draft {f(d)}) | {f(w.get('tokens_per_step'), 3)} "
                      f"tok/step | {f(w.get('ms_per_token'))} ms/token | window steps >= {w.get('stats_from_step')}: "
                      f"{w.get('steps')} (all {w.get('all_steps')} steps: {f((w.get('all_ms_per_step') or {}).get('mean'))}"
                      f" ms/step, {f(w.get('all_tokens_per_step'), 3)} tok/step)")
@@ -272,6 +286,14 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--pg61-step", default=os.path.join(REPO, "w0", "results", "phase1", "step-pg61.json"))
     ap.add_argument("--reserve-host-gib", type=float, default=16.0)
     ap.add_argument("--json", default=None, help="default docs/headline-<YYYYMMDD>.json")
+    # A2-2: adaptive residency (runtime/residency.py) on the 6-row verify step; the loop calls the manager every step
+    from runtime.residency import add_cli_args
+
+    add_cli_args(ap)
+    ap.add_argument("--residency-ref", default=None,
+                    help="the residency-off run's headline JSON: per prompt tokens/accepts equal, ms/step delta")
+    ap.add_argument("--residency-audit", action="store_true",
+                    help="end of run: sha256 of every moved expert (HBM and Grace copies) vs the checkpoint shards")
     return ap
 
 
@@ -282,6 +304,27 @@ def _hbm(torch) -> Optional[dict]:
     return {"free": round(free / 2**30, 3), "total": round(total / 2**30, 3),
             "allocated": round(torch.cuda.memory_allocated() / 2**30, 3),
             "max_allocated": round(torch.cuda.max_memory_allocated() / 2**30, 3)}
+
+
+def _routed(loop) -> Optional[tuple]:
+    """(hot calls, cold calls) summed over layers since capture (StaticStep.routed_counts; syncs -- called between
+    sequences, never inside one)."""
+    try:
+        rc = loop.st.routed_counts()
+    except Exception:
+        return None
+    return None if rc is None else (sum(rc[0]), sum(rc[1]))
+
+
+def _cold_delta(res: dict, c0: Optional[tuple], c1: Optional[tuple]) -> None:
+    """A2-2: routed expert calls of one sequence and their cold share (the device counters run inside the graph, so
+    they include the loop's few predicated no-op steps; the share is a ratio, the bias is a handful of steps)."""
+    if c0 is None or c1 is None:
+        return
+    hot, cold = c1[0] - c0[0], c1[1] - c0[1]
+    res["routed_calls"] = hot + cold
+    res["cold_calls"] = cold
+    res["cold_share"] = cold / (hot + cold) if hot + cold else None
 
 
 def run_prompts(loop, prompts: Dict[str, dict], max_new: int, *, reps: int, parity_reps: int, stop_on_eos: bool,
@@ -295,10 +338,14 @@ def run_prompts(loop, prompts: Dict[str, dict], max_new: int, *, reps: int, pari
                 prof = None
                 if profile and profile[0] == tag and i == 0:
                     prof = (profile[1], profile[2])
+                c0 = _routed(loop)
                 fast.append(loop.generate(p["ids"], max_new, stop_on_eos=stop_on_eos, parity=False, profile=prof))
+                _cold_delta(fast[-1], c0, _routed(loop))
             for _ in range(parity_reps):
+                c0 = _routed(loop)
                 par.append(loop.generate(p["ids"], max_new, stop_on_eos=stop_on_eos, parity=True, tag=tag,
                                          prompt=p.get("prompt")))
+                _cold_delta(par[-1], c0, _routed(loop))
             out[tag] = {"fast": fast, "parity": par}
             r = fast[0] if fast else par[0]
             ms = r.get("step_ms") or []
@@ -371,6 +418,8 @@ def aggregate(rep: dict, prompts: Dict[str, dict], results: Dict[int, Dict[str, 
         n_replay += bool(replay)
         acc = base["accepts"]
         per[tag] = {"prompt_tokens": len(p["ids"]), "tokens": len(ids_), "steps": base["steps"],
+                    "tokens_sha256": hashlib.sha256(json.dumps([int(t) for t in ids_]).encode()).hexdigest(),
+                    "cold_share_by_rep": [x.get("cold_share") for x in fast],
                     "tokens_per_step": base["tokens_per_step"], "accept_hist": [acc.count(i) for i in range(6)],
                     "accepts": acc, "stream": s, "replay_ok": replay, "one_graph_equal": one_equal,
                     "prefill_ms": [x["prefill_ms"] for x in fast], "r1_ms_per_token": p.get("r1_ms_per_token"),
@@ -403,6 +452,97 @@ def aggregate(rep: dict, prompts: Dict[str, dict], results: Dict[int, Dict[str, 
     return rep
 
 
+def _mean(xs) -> Optional[float]:
+    xs = [x for x in xs if x is not None]
+    return sum(xs) / len(xs) if xs else None
+
+
+def residency_report(gen, a, rep: dict, results: Dict[int, Dict[str, dict]], graphs: Sequence[int]) -> dict:
+    """A2-2 (docs/A2-2-BOX-PLAN.md): the manager's budget / HBM / stats / policy telemetry, swaps per step (mean, max
+    vs the cap), the cold-share curve over the whole run -- per drain (the policy's cold picks / routed picks since
+    the previous drain) and per sequence in run order (the step's cold-call counters, `cold_share_by_seq`) -- the
+    manager's GPU ms per step, and with --residency-ref <the off run's headline JSON> per prompt: emitted tokens
+    sha256 and accept lengths equal, plus the ms/step delta. Call before loop.close() (close restores the boot map)."""
+    from runtime.residency import config_from_args
+
+    rm = getattr(gen, "residency_mgr", None)
+    out: Dict = {"config": config_from_args(a), "on": rm is not None}
+    if rm is None:
+        return out
+    try:
+        rm.flush()
+        d = rm.describe()
+        out.update({k: v for k, v in d.items() if k != "drain_log"})
+        out["drain_log"] = d["drain_log"]
+        out["cold_share_curve"] = [[r["host_steps"], r["cold_share"]] for r in d["drain_log"]]
+        cs = [r["cold_share"] for r in d["drain_log"] if r["cold_share"] is not None]
+        out["cold_share_first_drain"] = cs[0] if cs else None
+        out["cold_share_last4_drains"] = _mean(cs[-4:])
+        seq = []
+        for tag, res in (results.get(graphs[0]) or {}).items():      # chronological: fast reps, then parity reps
+            for kind in ("fast", "parity"):
+                for i, x in enumerate(res.get(kind) or []):
+                    seq.append({"tag": tag, "kind": kind, "i": i, "steps": x.get("steps"),
+                                "cold_share": x.get("cold_share"), "routed_calls": x.get("routed_calls")})
+        out["cold_share_by_seq"] = seq
+        h = rep.get("headline") or {}
+        w = h.get("two_graphs") or h.get("one_graph") or h.get("eager") or {}
+        out["ms_manager_per_step"] = (w.get("ms_manager_per_step") or {}).get("mean")
+        out["ms_per_step_incl_manager"] = w.get("ms_per_step_incl_manager")
+        out["overflow"] = rep.get("overflow")
+        if a.residency_ref:
+            with open(a.residency_ref) as f:
+                ref = json.load(f)
+            vs: Dict = {"ref": a.residency_ref, "prompts": {}}
+            for tag, p in (rep.get("prompts") or {}).items():
+                rp = (ref.get("prompts") or {}).get(tag)
+                if not rp:
+                    continue
+                vs["prompts"][tag] = {"accepts_equal": rp.get("accepts") == p.get("accepts"),
+                                      "tokens_equal": (rp.get("tokens_sha256") == p.get("tokens_sha256")
+                                                       if rp.get("tokens_sha256") else None)}
+            vs["all_accepts_equal"] = all(v["accepts_equal"] for v in vs["prompts"].values()) and bool(vs["prompts"])
+            vs["all_tokens_equal"] = (all(v["tokens_equal"] for v in vs["prompts"].values())
+                                      if vs["prompts"] and all(v["tokens_equal"] is not None
+                                                               for v in vs["prompts"].values()) else None)
+            rh = ref.get("headline") or {}
+            rw = rh.get("two_graphs") or rh.get("one_graph") or rh.get("eager") or {}
+            m0, m1 = (rw.get("ms_per_step") or {}).get("mean"), (w.get("ms_per_step") or {}).get("mean")
+            if m0 and m1:
+                vs["step_ms_off"], vs["step_ms_on"] = m0, m1
+                vs["step_ms_delta_pct"] = (m1 - m0) / m0 * 100
+                if w.get("ms_per_step_incl_manager"):
+                    vs["step_ms_on_incl_manager"] = w["ms_per_step_incl_manager"]
+                    vs["step_ms_delta_incl_manager_pct"] = (w["ms_per_step_incl_manager"] - m0) / m0 * 100
+            out["vs_off"] = vs
+            if vs["all_accepts_equal"] is False or vs["all_tokens_equal"] is False:
+                rep["errors"].append({"stage": "residency_vs_off", "traceback": f"residency on != off: {vs['prompts']}"})
+        if a.residency_audit:
+            from runtime.residency import golden_from_index
+
+            out["audit"] = rm.audit(golden=golden_from_index(gen.model.runtime_load.index))
+            if not out["audit"]["ok"]:
+                rep["errors"].append({"stage": "residency_audit", "traceback": str(out["audit"]["errors"][:8])})
+    except Exception:
+        tb = traceback.format_exc()
+        print(f"[residency] report FAILED\n{tb}", file=sys.stderr, flush=True)
+        rep["errors"].append({"stage": "residency_report", "traceback": tb})
+    return out
+
+
+def residency_line(rr: dict) -> str:
+    f = lambda x, d=4: "-" if x is None else f"{x:.{d}f}"  # noqa: E731
+    sp = rr.get("swaps_per_step") or {}
+    vo = rr.get("vs_off") or {}
+    hb = rr.get("hbm") or {}
+    return (f"  residency: {sp.get('swaps', 0)} swaps ({f(sp.get('mean'), 3)}/step, max {sp.get('max')}, cap "
+            f"{sp.get('cap')}); cold share drain1 {f(rr.get('cold_share_first_drain'))} -> last4 "
+            f"{f(rr.get('cold_share_last4_drains'))}; manager {f(rr.get('ms_manager_per_step'), 3)} ms/step; "
+            f"+{hb.get('spare_GiB')} GiB HBM, n_spare {rr.get('n_spare')}; vs off: accepts equal "
+            f"{vo.get('all_accepts_equal', '-')}, tokens equal {vo.get('all_tokens_equal', '-')}, ms/step "
+            f"{f(vo.get('step_ms_delta_pct'), 2)}%")[:400]
+
+
 def main(argv=None) -> int:
     a = build_parser().parse_args(argv)
     if not a.no_gemv_pin:
@@ -414,6 +554,7 @@ def main(argv=None) -> int:
     from runtime.dspark_loop import DSparkLoop
     from runtime.generate import Generator, set_determinism
     from runtime.loader import build_and_load
+    from runtime.residency import config_from_args
 
     date = time.strftime("%Y%m%d")
     json_path = a.json or os.path.join(REPO, "docs", f"headline-{date}.json")
@@ -438,6 +579,12 @@ def main(argv=None) -> int:
         from runtime.static_step import DEFAULT_SPARE_SLOTS_ROWS
 
         n = a.spare_slots or DEFAULT_SPARE_SLOTS_ROWS   # grow ONCE before any build (bench/draft_bench.py note)
+        if config_from_args(a) is not None:
+            # A2-2: the residency slots sit behind the staging slots; grow for both now, so the manager's later
+            # add_spare_slots is a no-op (a re-growth moves every layer's weight block; FIX2's box OOM was one)
+            from runtime.residency import ResidencyConfig
+
+            n += a.residency_spare if a.residency_spare is not None else ResidencyConfig().spare_cap
         b = gen.pool.add_spare_slots(n, model)
         print(f"[pool] pre-grown to {gen.pool.spare} spare slots/layer (+{b / 2**30:.2f} GiB)", flush=True)
     with open(a.fixture) as f:
@@ -479,6 +626,13 @@ def main(argv=None) -> int:
     if a.profile:
         t_, f_, n_ = a.profile.split(":")
         profile = (t_, int(f_), int(n_))
+    res_cfg = config_from_args(a)
+    if res_cfg is not None:
+        # A2-2: residency covers the loop's 6-row verify step only; the 1-row truth above ran on the static map. The
+        # manager grows the pool by its spare slots on top of the pre-grown staging slots (one more growth, before
+        # the verify step's tables exist -- DSparkLoop resets the static step first), then attaches to the verify step.
+        gen.set_residency(res_cfg)
+    rep["residency_config"] = res_cfg
     loop = DSparkLoop(gen, a.max_new, poll_every=a.poll_every, draft_impls=None if a.draft_impls == "same" else "ref")
     rep["loop"] = loop.describe()
     orders_compare(rep["rowmatch"], loop.st)
@@ -498,6 +652,8 @@ def main(argv=None) -> int:
 
     # 3. compare + aggregate
     aggregate(rep, prompts, results, run_graphs, a.stats_from)
+    if res_cfg is not None:
+        rep["residency"] = residency_report(gen, a, rep, results, run_graphs)   # before loop.close() restores the map
     try:
         from draft_bench import pg61_tokens_per_chunk
 
@@ -511,6 +667,8 @@ def main(argv=None) -> int:
         json.dump(slim, f, indent=1)
     for line in summary_lines(rep):
         print(line)
+    if rep.get("residency", {}).get("on"):
+        print(residency_line(rep["residency"]))
     loop.close()
     return 0 if not rep["errors"] else 2
 

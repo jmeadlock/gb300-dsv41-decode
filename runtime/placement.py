@@ -113,6 +113,8 @@ class HotMap:
             raw = json.load(f)
         if isinstance(raw, dict) and "hot" in raw and isinstance(raw["hot"], dict):
             raw = raw["hot"]
+        if isinstance(raw, dict) and isinstance(raw.get("layers"), dict):  # m3 rowmap-v0 {"layers": {l: {hot, cold}}}
+            raw = {k: v["hot"] for k, v in raw["layers"].items()}
         return cls({int(k): v for k, v in raw.items()}, cfg.n_layers, cfg.n_routed_experts, os.path.abspath(path))
 
     @classmethod

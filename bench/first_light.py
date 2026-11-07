@@ -74,6 +74,13 @@ and one timed step cell.
     both steps (M1-T10-FIX: dg-inplace runs at 6 rows too; --rows-moe-impl overrides the 6-row step's); --glue-impl
     fused at 6 rows runs the row-parallel clusters (shared SwiGLU, mHC post; `[glue]` line of the 6-row step, report
     `rows_mode.fused_glue_rows`) and the reference ops for the one-row clusters. Report key `rows_mode`.
+(m) A2-2: `--residency on` (runtime/residency.py; knobs --residency-drain/-swaps-per-drain/-hyst/-min-abs/-halflife/
+    -cap/-spare/-demote/-reserve-gib/-frozen/-force-random) runs the static/graph step under the host-side swap
+    policy: the report key `residency` has the spare-slot headroom calc and HBM, swaps per step (mean/max vs the cap),
+    the per-drain cold-share curve over the whole run, the step cell's cold share first vs last 64 steps, per-prompt
+    cold share per rep; `--residency-ref <the off run's report JSON>` adds rep 1 byte-identical to the off run (an
+    error if not), step-cell tokens equal, step-ms delta %; `--residency-audit` hashes every moved expert against
+    the shards. The 12-line summary's per-layer cold line becomes the residency line. 1-row report only.
     M1-T10-FIX2: the 6-row dg-inplace step stages cold experts into --spare-slots (default 8) spare slots per layer
     by a compact cold index; `[hbm]` lines after the 1-row and the 6-row build (HBM + the spare bytes each added;
     `rows_mode.build_1row` / `build_rows`), `[overflow]` + the summary's `overflow steps: n` (`rows_mode.overflow`:
@@ -1043,6 +1050,24 @@ def build_parser() -> argparse.ArgumentParser:
                     help="main_hidden layers: comma list, 'none', or auto (--rows > 1: the checkpoint config's "
                          "dspark_target_layer_ids, 37,38,39 on the real model -- the verify graph's T11 output)")
     ap.add_argument("--skip-census", action="store_true", help="--rows: skip the V0 census")
+    # A2-2: adaptive residency (runtime/residency.py); the 1-row report carries `residency`
+    ap.add_argument("--residency", choices=["off", "on"], default="off",
+                    help="A2-2: host-side swap policy (m3 v26 core) on the static/graph step's pointer tables")
+    ap.add_argument("--residency-drain", type=int, default=64, help="host steps between counter drains")
+    ap.add_argument("--residency-swaps-per-drain", type=int, default=2)
+    ap.add_argument("--residency-hyst", type=float, default=1.5)
+    ap.add_argument("--residency-min-abs", type=float, default=8.0)
+    ap.add_argument("--residency-halflife", type=float, default=500.0)
+    ap.add_argument("--residency-cap", type=int, default=4, help="swaps applied per step (swaps_per_barrier)")
+    ap.add_argument("--residency-spare", type=int, default=None, help="spare HBM slots/layer (default: headroom calc)")
+    ap.add_argument("--residency-demote", type=int, default=64, help="Grace demotion slots/layer")
+    ap.add_argument("--residency-reserve-gib", type=float, default=8.0, help="HBM held back in the headroom calc")
+    ap.add_argument("--residency-frozen", action="store_true", help="count + drain, never swap (frozen-map arm)")
+    ap.add_argument("--residency-force-random", type=int, default=0, help="forced random swaps per step (T-R1)")
+    ap.add_argument("--residency-ref", default=None,
+                    help="report JSON of the residency-off run: rep-1 JSONL byte compare, step-cell tokens, ms delta")
+    ap.add_argument("--residency-audit", action="store_true",
+                    help="end of run: sha256 of every moved expert (HBM and Grace copies) vs the checkpoint shards")
     ap.add_argument("--spare-slots", type=int, default=None,
                     help="--rows with dg-inplace: spare pool slots per layer for the R-row step's cold experts "
                          "(compact cold index, M1-T10-FIX2; default 8); a layer-step with more cold unique experts "
@@ -1097,6 +1122,101 @@ def hidden_layers_arg(a) -> List[int]:
         return []
 
 
+def residency_config(a) -> Optional[dict]:
+    """--residency on -> the runtime.residency.ResidencyConfig fields (None = off)."""
+    if getattr(a, "residency", "off") != "on":
+        return None
+    return {"drain_n": a.residency_drain, "swaps_per_drain": a.residency_swaps_per_drain, "hyst": a.residency_hyst,
+            "min_abs": a.residency_min_abs, "halflife": a.residency_halflife, "swaps_per_barrier": a.residency_cap,
+            "n_spare": a.residency_spare, "n_demote": a.residency_demote, "reserve_gib": a.residency_reserve_gib,
+            "frozen": bool(a.residency_frozen), "force_random": a.residency_force_random}
+
+
+def _window_mean(xs: List[float], first: bool, n: int = 64) -> Optional[float]:
+    w = xs[:n] if first else xs[-n:]
+    return sum(w) / len(w) if w else None
+
+
+def residency_report(gen: Generator, a, report: Dict) -> dict:
+    """A2-2 report: the manager's describe (budget, HBM, stats, policy telemetry, per-drain log), the cold-share curve
+    over the whole run (per drain: cold picks / routed picks over the live map), the step cell's cold share in its
+    first vs last 64 steps, per-prompt cold share of every rep (in run order), swaps/step, and -- with
+    --residency-ref <off report> -- rep 1 byte-identical to the off run, step-cell tokens, step-ms delta."""
+    rm = getattr(gen, "residency_mgr", None)
+    out: Dict = {"config": residency_config(a), "on": rm is not None}
+    if rm is None:
+        return out
+    try:
+        rm.flush()
+        d = rm.describe()
+        out.update({k: v for k, v in d.items() if k != "drain_log"})
+        out["drain_log"] = d["drain_log"]
+        out["cold_share_curve"] = [[r["host_steps"], r["cold_share"]] for r in d["drain_log"]]
+        cs = [r["cold_share"] for r in d["drain_log"] if r["cold_share"] is not None]
+        out["cold_share_first_drain"] = cs[0] if cs else None
+        out["cold_share_last4_drains"] = (sum(cs[-4:]) / len(cs[-4:])) if cs else None
+        sc = report.get("step_cell") or {}
+        c = sc.get("cold")
+        if c:
+            routed = c["routed_calls_per_step"].get("mean") or 0
+            shares = [x / routed for x in c["cold_calls_by_step"]] if routed else []
+            out["step_cell_cold_share_first64"] = _window_mean(shares, True)
+            out["step_cell_cold_share_last64"] = _window_mean(shares, False)
+        out["rep_cold_share"] = {str(rep): [[r["tag"], (r.get("cold") or {}).get("cold_share"),
+                                             (r.get("residency") or {}).get("published")]
+                                            for r in v.get("prompts", [])]
+                                 for rep, v in (report.get("reps") or {}).items()}
+        if a.residency_ref:
+            with open(a.residency_ref) as f:
+                ref = json.load(f)
+            vs: Dict = {"ref": a.residency_ref}
+            ref_rep1 = ((ref.get("reps") or {}).get("1") or {}).get("path")
+            mine = ((report.get("reps") or {}).get(1) or {}).get("path")
+            if ref_rep1 and mine and os.path.exists(ref_rep1) and os.path.exists(mine):
+                with open(ref_rep1, "rb") as f1, open(mine, "rb") as f2:
+                    vs["rep1_files_byte_identical"] = f1.read() == f2.read()
+                sr = self_replay(ref_rep1, mine, [], [])
+                vs["rep1_identical_prompts"] = sr["identical"]
+                vs["rep1_n"] = sr["n"]
+                vs["rep1_first_divergence"] = {t: v.get("first_divergence") for t, v in sr["per_prompt"].items()
+                                               if not v["identical"]}
+            rsc = ref.get("step_cell") or {}
+            if rsc.get("token_ids") and sc.get("token_ids"):
+                vs["step_cell_tokens_equal"] = rsc["token_ids"] == sc["token_ids"]
+            m0, m1 = (rsc.get("ms_per_step") or {}).get("mean"), (sc.get("ms_per_step") or {}).get("mean")
+            if m0 and m1:
+                vs["step_ms_off"], vs["step_ms_on"] = m0, m1
+                vs["step_ms_delta_pct"] = (m1 - m0) / m0 * 100
+            out["vs_off"] = vs
+        if a.residency_audit:
+            from runtime.residency import golden_from_index
+
+            out["audit"] = rm.audit(golden=golden_from_index(gen.model.runtime_load.index))
+            if not out["audit"]["ok"]:
+                report["errors"].append({"stage": "residency_audit", "traceback": str(out["audit"]["errors"][:8])})
+        vo = out.get("vs_off") or {}
+        if vo.get("rep1_files_byte_identical") is False or vo.get("step_cell_tokens_equal") is False:
+            report["errors"].append({"stage": "residency_vs_off", "traceback": f"not byte-identical: {vo}"})
+    except Exception:
+        tb = traceback.format_exc()
+        print(f"[residency] report FAILED\n{tb}", file=sys.stderr)
+        report["errors"].append({"stage": "residency_report", "traceback": tb})
+    return out
+
+
+def residency_line(rr: dict) -> str:
+    f = lambda x, d=4: "-" if x is None else f"{x:.{d}f}"  # noqa: E731
+    sp = rr.get("swaps_per_step") or {}
+    vo = rr.get("vs_off") or {}
+    hb = rr.get("hbm") or {}
+    return (f"residency: {sp.get('swaps', 0)} swaps ({f(sp.get('mean'), 3)}/step, max {sp.get('max')}, cap "
+            f"{sp.get('cap')}); cold share drain1 {f(rr.get('cold_share_first_drain'))} -> last4 "
+            f"{f(rr.get('cold_share_last4_drains'))}, cell first64 {f(rr.get('step_cell_cold_share_first64'))} -> "
+            f"last64 {f(rr.get('step_cell_cold_share_last64'))}; +{hb.get('spare_GiB')} GiB HBM, n_spare "
+            f"{rr.get('n_spare')}; vs off: rep1 identical {vo.get('rep1_files_byte_identical', '-')}, "
+            f"cell tokens {vo.get('step_cell_tokens_equal', '-')}, ms {f(vo.get('step_ms_delta_pct'), 2)}%")[:300]
+
+
 def main(argv=None) -> int:
     a = build_parser().parse_args(argv)
     if a.rows != 1 and not a.teacher_forced:
@@ -1135,13 +1255,13 @@ def main(argv=None) -> int:
     gen = Generator(model, a.tokenizer_dir or a.model_dir, mode=a.mode, max_pos=a.max_pos, marker=a.marker,
                     moe_impl=a.moe_impl, fp8_impl=a.fp8_impl, glue_impl=a.glue_impl, attn_impl=a.attn_impl,
                     glue_approx=a.glue_approx,
-                    hidden_layers=hidden_layers_arg(a), spare_slots=a.spare_slots)
+                    hidden_layers=hidden_layers_arg(a), spare_slots=a.spare_slots, residency=residency_config(a))
     report["generator"] = {"eos_ids": gen.eos_ids, "top_k": gen.top_k, "max_seq_len": gen.max_seq_len,
                            "tokenizer_dir": gen.tokenizer_dir, "mode": gen.mode, "max_pos": gen.max_pos,
                            "marker": gen.marker, "moe_impl": gen.moe_impl, "fp8_impl": gen.fp8_impl,
                            "spare_slots": gen.spare_slots,
                            "glue_impl": gen.glue_impl, "glue_approx": gen.glue_approx, "attn_impl": gen.attn_impl,
-                           "fp32_impl": a.fp32_impl}
+                           "fp32_impl": a.fp32_impl, "residency": residency_config(a)}
     if a.nvtx_layers:
         install_layer_nvtx(model)
     if a.rows != 1 and a.moe_impl == "dg-inplace" and gen.pool is not None:
@@ -1283,6 +1403,9 @@ def measure(gen: Generator, a, report: Dict, *, n_layers: int, out: str, json_pa
                   f"{report['dg_moe'].get('align')} gemm_blocks {report['dg_moe'].get('gemm_blocks')} (R-row "
                   f"{rm.get('rows_gemm')}); build check equal={chk.get('equal')} today's call "
                   f"equal={chk.get('today_equal')}", flush=True)
+    if getattr(gen, "residency", None) is not None:
+        report["residency"] = residency_report(gen, a, report)  # A2-2
+        print(residency_line(report["residency"]), flush=True)
     with open(json_path, "w") as f:
         json.dump(report, f, indent=1, default=str)
     for line in summary_lines(report, json_path):
@@ -1345,7 +1468,10 @@ def summary_lines(r: dict, json_path: str) -> List[str]:
                          f"cold calls/step mean {f(cc.get('mean'))} (routed {f(c['routed_calls_per_step'].get('mean'), 0)}/step)")
             per = c["cold_calls_per_layer"]
             top = sorted(range(len(per)), key=lambda i: -per[i])[:5]
-            lines.append("cold calls per layer (step cell), top 5: " + ", ".join(f"L{i}={per[i]}" for i in top))
+            if (r.get("residency") or {}).get("on"):  # A2-2: the residency line replaces the per-layer top 5
+                lines.append(residency_line(r["residency"]))
+            else:
+                lines.append("cold calls per layer (step cell), top 5: " + ", ".join(f"L{i}={per[i]}" for i in top))
         else:
             lines += ["cold counters: not installed", "-"]
     else:
