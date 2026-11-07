@@ -677,10 +677,11 @@ def rows_dg(emu, monkeypatch):
 def test_static6_dg_inplace_equals_dg_masked_emulated(rows_dg, kind, L):
     """Part B (1): the 6-row dg-inplace step == the 6-row dg-masked step, torch.equal on every row's fp32 logits,
     main_hidden and the caches (the GPU test's D row on the emulation), both P0 parities, ring wrapped; the
-    contiguous calls' contract: S = 6k blocks, each valid block's count rows tagged with its group (hot pool slot or
-    the spare slot H + u), padding and unused slots -1; the cold (spare-slot) path ran."""
+    contiguous calls' contract: 6k blocks, each valid block's count rows tagged with its group (hot pool slot or,
+    M1-T10-FIX2, the compact spare slot H + c, S = 8 spare slots), padding and unused slots -1; the cold
+    (spare-slot) path ran; no overflow."""
     from runtime.moe_rows import DGInplaceMoERows, DGMaskedMoERows
-    from runtime.static_step import StaticStep
+    from runtime.static_step import DEFAULT_SPARE_SLOTS_ROWS, StaticStep
 
     model, pool, fk, fake = rows_dg(kind)
     hid = (len(model.layers) - 1,)
@@ -688,18 +689,22 @@ def test_static6_dg_inplace_equals_dg_masked_emulated(rows_dg, kind, L):
     ids, toks = _tf_tokens(L, 6 * n, 23 + L)
     st = StaticStep(model, pool, max_pos=511, rows=6, hidden_layers=hid, moe_impl="dg-inplace", _allow_cpu=True)
     k = st.topk
-    S = 6 * k
+    B = 6 * k
+    S = min(DEFAULT_SPARE_SLOTS_ROWS, B)
     b = st.dg
-    assert pool.spare == S and b.k == S and all(isinstance(m, DGInplaceMoERows) for m in st.moes)
-    assert b.mi.shape == (S * b.align,) and st.describe()["moe_impl"] == "dg-inplace"
+    assert pool.spare == S == b.spare_limit == st.spare_slots and b.k == B
+    assert all(isinstance(m, DGInplaceMoERows) for m in st.moes)
+    assert b.mi.shape == (B * b.align,) and st.describe()["moe_impl"] == "dg-inplace"
     a_lg, a_h, a_s = _static_run(model, st, ids, toks, n)
     calls = list(fake.contig_calls)
     rc = st.routed_counts()
+    ov = st.overflow_counts()
     st.detach()
     n_layers = len(model.layers)
     assert len(calls) == 3 * n_layers * n and fk.calls["stage"] == n_layers * n and not fake.calls
+    assert ov["steps"] == 0 and ov["experts"] == 0 and ov["steps_counted"] == n
     Gs = {len(pool.hot[l]) + S for l in range(n_layers)}
-    assert all(c[0] == S * b.align and c[1] in Gs for c in calls)
+    assert all(c[0] == B * b.align and c[1] in Gs for c in calls)
     assert sum(1 for c in calls for h in c[4] if h >= c[1] - S) > 0      # cold experts went through spare slots
     assert any(h < 0 for c in calls for h in c[4])                        # unused slots (U < S) tagged -1
     m2 = StaticStep(model, pool, max_pos=511, rows=6, hidden_layers=hid, moe_impl="dg-masked", _allow_cpu=True)
@@ -831,14 +836,25 @@ def test_first_light_rows_accepts_dg_inplace_and_fused_glue(rows_glue, tmp_path,
     assert rc == 0 and not report["errors"], report["errors"]
     assert rm["moe_impl_rows"] == "dg-inplace" and "step_cell_r1_rows_moe" not in rm
     assert rm["static"]["moe_impl"] == "dg-inplace" and rm["static"]["glue_effective"] == "fused"
-    assert set(rm["glue_rows_on"]) == set(FG.ROWS_CLUSTERS) and rm["dg_rows"]["spare_slots"] == 6 * 4
+    assert set(rm["glue_rows_on"]) == set(FG.ROWS_CLUSTERS) and rm["dg_rows"]["spare_slots"] == 8
+    assert rm["dg_rows"]["spare_limit"] == 8 and rm["static"]["spare_slots"] == 8
+    # M1-T10-FIX2 (3): the builds' records -- the 1-row dg-inplace build grew the pool to topk = 4 spare slots, the
+    # 6-row build to 8 (4 more per layer); (2): no overflow in any 6-row step
+    b1, br = rm["build_1row"], rm["build_rows"]
+    per = sum(n_ * (k_ // 2) for n_, k_ in pool.proj_nk.values())
+    assert b1["spare_slots"] == 4 and b1["spare_added_B"] == pool.n_layers * 4 * per and b1["spare_limit"] is None
+    assert br["spare_slots"] == 8 and br["spare_added_B"] == pool.n_layers * 4 * per and br["spare_limit"] == 8
+    assert rm["overflow"]["steps"] == 0 and rm["overflow"]["spare_slots"] == 8 and rm["overflow"]["steps_counted"] > 0
     assert rm["self_replay"][2]["identical"] == rm["self_replay"][2]["n"] == 2
     assert rm["step_cell_rows"]["n_steps"] == 2 and rm["step_cell_rows"]["r6_over_r1"] > 0
     out = capsys.readouterr().out
     assert "[glue] fused: rows 6" in out
+    assert "[hbm] 1-row build (moe dg-inplace)" in out and "[hbm] 6-row build (moe dg-inplace, spare budget 8)" in out
+    assert "[overflow] 6-row dg-inplace: 0/" in out
     lines = out.strip().splitlines()
     assert lines[-12].startswith("FIRST LIGHT d | rows 6 teacher-forced | mode static | moe dg-inplace (rows: dg-inplace)")
     assert "glue fused (rows: " in lines[-12]
+    assert "| overflow steps: 0 (0 experts, spare 8/layer) |" in lines[-1] and "HBM after build: 1-row" in lines[-1]
     print("\n".join(lines[-12:]))
 
 
@@ -898,9 +914,18 @@ def test_gpu_test_d_g_rows_dry_run_on_cpu(rows_glue, monkeypatch, capsys):
     monkeypatch.setattr(G, "_need_tilelang", lambda: None)
     monkeypatch.setattr(G, "_model", model_cpu)
     monkeypatch.setattr(G, "FAST", dict(moe_impl="dg-masked", fp8_impl=None, glue_impl="fused", attn_impl=None))
+    real = sys.modules["deep_gemm"].m_grouped_fp8_fp4_gemm_nt_contiguous
+
+    def finite_skips(a, b, d, m_indices, **kw):  # the forced-overflow case: skipped blocks finite, as on the GPU
+        real(a, b, d, m_indices, **kw)
+        d.nan_to_num_(0.0)
+
     G.test_static6_dg_inplace_equals_dg_masked()
     G.test_static6_fused_glue_equals_ref_glue()
+    monkeypatch.setattr(sys.modules["deep_gemm"], "m_grouped_fp8_fp4_gemm_nt_contiguous", finite_skips)
+    G.test_static6_dg_inplace_forced_overflow_trips_counter()
     out = capsys.readouterr().out
     assert out.count("6-row dg-inplace == dg-masked") == 2 and out.count("== ref glue") == 2, out
-    assert G.COUNTS["gates"] == 4 and G.COUNTS["logit_rows"] == 4 * 24, G.COUNTS
+    assert "(budget 8)" in out and "overflow steps 0" in out and "overflow S=1: eager " in out, out
+    assert G.COUNTS["gates"] == 5 and G.COUNTS["logit_rows"] == 4 * 24, G.COUNTS
     print(out)

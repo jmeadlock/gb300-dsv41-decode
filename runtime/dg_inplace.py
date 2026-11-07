@@ -30,6 +30,9 @@ expert -- the same methods, fused or not). What changes, per layer:
           group[j] = loc slot of ids[j] if hot else H + j; cold experts' weight rows (HBM or UVA host address, the same
           pointer tables as dg-masked) are copied into pool slot H + j; scales are packed into the SF tensor (all k in
           "step", cold only in "resident"); m_indices[j*ALIGN] = group[j] (every other row stays -1); ids_step.
+          M1-T10-FIX2 (the 6-row step, runtime/moe_rows.py DGInplaceMoERows): `sidx` = a compact cold index per slot
+          (cold slot -> H + c, c < spare_slots, default 8) and a device overflow counter instead of H + j, so the
+          pool needs S spare slots, not one per A block.
   gemm    3 x m_grouped_fp8_fp4_gemm_nt_contiguous((xq [k*ALIGN, K], xs fp32), (W [H+S, N, K/2] int8, SF int32 packed),
           d [k*ALIGN, N], m_indices, recipe_a=(1,32), recipe_b=(1,32)). A block j = rows [j*ALIGN, (j+1)*ALIGN): row 0
           is the token (the masked buffers' layout with max_m = ALIGN), rows 1.. are zero and tagged -1; output row
@@ -238,30 +241,45 @@ def hbm_plan(n_layers: int, hot: Sequence[int], S: int, shapes: Dict[str, Tuple[
 
 # ------------------------------------------------------------------------------------------------ staging contract
 def stage_inplace_emulated(resolve, ptab6, ids, gtab, dtab, dsts, mi, H: int, align: int, row_w: int, sf_dims,
-                           all_scales: bool, ids_out=None) -> None:
+                           all_scales: bool, ids_out=None, *, sidx=None, spare: Optional[int] = None,
+                           ovf=None) -> None:
     """The contract of runtime/static_kernels.py `stage_inplace` (t9a2_stage_inplace) in torch, through
     `resolve(address) -> uint8 tensor of the source row` (the Mac tests' registry; the GPU test's oracle):
-    group[j] = gtab[ids[j]] if >= 0 else H + j; mi[j*align] = group[j]; cold j: weight rows of w1/w3/w2 -> slot
-    group[j] of dsts[0..2]; scales (all j if all_scales, else cold j) -> group[j] of the packed SF dsts[3..5];
-    ids_out[j] = ids[j]. Nothing else is written."""
+    spare index c[j] = j (sidx None: the 1-row step) or sidx[j] (M1-T10-FIX2: the compact cold index, -1 = skip);
+    group[j] = gtab[ids[j]] if >= 0 else H + c[j]; a cold slot is STAGED iff 0 <= c[j] < spare (spare: default k);
+    mi[j*align] = group[j] for hot and staged slots, -1 for the others; staged j: weight rows of w1/w3/w2 -> slot
+    group[j] of dsts[0..2]; scales (hot and staged j if all_scales, else staged j) -> group[j] of the packed SF
+    dsts[3..5]; ids_out[j] = ids[j]; sidx given: ovf[0] += the number of cold slots with c[j] >= spare (overflow:
+    nothing of them is written). Nothing else is written."""
     assert [int(a) for a in dtab.tolist()] == [t.data_ptr() for t in dsts] and ptab6.shape[0] == 6
     k = ids.numel()
+    if (sidx is None) != (ovf is None) or (sidx is not None and spare is None):
+        raise ValueError("stage_inplace: sidx, spare and ovf go together")
+    S = k if spare is None else int(spare)
     idl = [int(v) for v in ids.tolist()]
+    cl = list(range(k)) if sidx is None else [int(v) for v in sidx.tolist()]
+    n_over = 0
     for j, e in enumerate(idl):
         g = int(gtab[e])
         cold = g < 0
-        grp = H + j if cold else g
-        mi[j * align] = grp
+        c = cl[j]
+        staged = cold and 0 <= c < S
+        if cold and c >= S:
+            n_over += 1
+        grp = H + c if cold else g
+        mi[j * align] = grp if (not cold or staged) else -1
         for p in range(3):
-            if cold:
+            if staged:
                 src = resolve(int(ptab6[p, e]))
                 dsts[p][grp].view(torch.uint8).view(-1).copy_(src.view(-1)[:row_w])
-            if cold or all_scales:
+            if staged or (all_scales and not cold):
                 N, C = sf_dims[1] if p == 2 else sf_dims[0]
                 src = resolve(int(ptab6[3 + p, e]))
                 dsts[3 + p][grp].copy_(src.view(-1)[:N * C * SF_PACK].view(N, C * SF_PACK).view(torch.int32))
     if ids_out is not None:
         ids_out.copy_(ids)
+    if ovf is not None and n_over:
+        ovf.add_(n_over)
     assert k * align == mi.numel()
 
 
@@ -271,9 +289,12 @@ class DGInplaceBuffers(DGBuffers):
     [k*ALIGN, K]), no fp32 weight-scale staging, plus m_indices, the packed SF storage and per-layer tables."""
 
     def __init__(self, owner, shapes, sshapes, *, pool, swiglu_limit: float, deterministic: bool = True, dg=None,
-                 align: Optional[int] = None, sf_store: Optional[str] = None, slots: Optional[int] = None):
-        """slots: A blocks / spare slots (default topk; M1-T10-FIX's R-row MoE, runtime/moe_rows.py
-        DGInplaceMoERows, uses R*topk: block u holds slot u's count <= R rows)."""
+                 align: Optional[int] = None, sf_store: Optional[str] = None, slots: Optional[int] = None,
+                 spare_slots: Optional[int] = None):
+        """slots: A blocks (default topk; M1-T10-FIX's R-row MoE, runtime/moe_rows.py DGInplaceMoERows, uses R*topk:
+        block u holds slot u's count <= R rows). spare_slots (M1-T10-FIX2): spare pool slots per layer the cold
+        experts of one step may use (default = slots: the 1-row contract, spare j for slot j; the R-row MoE passes
+        its compact-index budget S, default 8, and counts overflows)."""
         align = check_align(align if align is not None else int(os.environ.get(ALIGN_ENV, MK_ALIGN)))
         if align < int(getattr(owner, "rows", 1)):
             raise ValueError(f"contiguous alignment {align} < {owner.rows} rows per block")
@@ -285,8 +306,11 @@ class DGInplaceBuffers(DGBuffers):
             raise ValueError(f"sf_store {self.sf_store!r} not in {SF_STORES} (${SF_STORE_ENV})")
         if pool is None:
             raise ValueError("dg-inplace needs the ExpertPool (it reads the hot pool in place)")
-        if pool.spare < self.k:
-            raise ValueError(f"pool has {pool.spare} spare slots per layer, dg-inplace needs topk = {self.k} "
+        self.spare_limit = self.k if spare_slots is None else int(spare_slots)
+        if not 1 <= self.spare_limit <= self.k:
+            raise ValueError(f"spare_slots {self.spare_limit} outside [1, {self.k}] (A blocks per layer)")
+        if pool.spare < self.spare_limit:
+            raise ValueError(f"pool has {pool.spare} spare slots per layer, dg-inplace needs {self.spare_limit} "
                              f"(ExpertPool.add_spare_slots, done by StaticStep before this)")
         self.pool = pool
         self.fn = getattr(self.dg, "m_grouped_fp8_fp4_gemm_nt_contiguous")
@@ -338,8 +362,8 @@ class DGInplaceBuffers(DGBuffers):
         for p in PROJS:
             if tuple(w[p].shape) != (G, self.N[p], self.K[p] // 2) or not w[p].is_contiguous():
                 raise ValueError(f"L{layer} {p}: pool {tuple(w[p].shape)} is not a contiguous [H+S, N, K/2]")
-        if G < H + self.k:
-            raise ValueError(f"L{layer}: {G} pool slots < H {H} + topk {self.k}")
+        if G < H + self.spare_limit:
+            raise ValueError(f"L{layer}: {G} pool slots < H {H} + spare slots {self.spare_limit}")
         if self.sf_store == "step":
             sf = {p: self.sf_shared[p][:G] for p in PROJS}
         else:
@@ -362,11 +386,15 @@ class DGInplaceBuffers(DGBuffers):
         return t
 
     # ---------------------------------------------------------------- per-step ops (graph-capturable)
-    def stage(self, t: dict, ids: torch.Tensor, ids_out: Optional[torch.Tensor] = None) -> None:
+    def stage(self, t: dict, ids: torch.Tensor, ids_out: Optional[torch.Tensor] = None,
+              sidx: Optional[torch.Tensor] = None, ovf: Optional[torch.Tensor] = None) -> None:
+        """sidx / ovf (M1-T10-FIX2, the R-row MoE): compact cold index per slot and the step's overflow counter;
+        the bound is spare_limit. None: the 1-row contract (cold slot j -> spare j)."""
         from runtime.static_kernels import stage_inplace
 
+        kw = {} if sidx is None else {"sidx": sidx, "spare": self.spare_limit, "ovf": ovf}
         stage_inplace(t["ptab6"], ids, t["gtab"], t["dtab"], t["dsts"], self.mi, t["H"], self.align, self.row_w,
-                      self.sf_dims, self.sf_store == "step", ids_out)
+                      self.sf_dims, self.sf_store == "step", ids_out, **kw)
 
     def gemm_inplace(self, p: str, t: dict, which: int) -> torch.Tensor:
         """d[p] [k, ALIGN, N] <- contiguous grouped GEMM of A = xq[which] as [k*ALIGN, K] (+ fp32 scales) against the
@@ -406,7 +434,8 @@ class DGInplaceBuffers(DGBuffers):
                       for l in range(pool.n_layers) for p in PROJS)
         r.update({"impl": "dg-inplace", "align": self.align, "alignment": self.alignment, "sf_store": self.sf_store,
                   "act_sf_packed": self.sf_pack, "act_sf_packed_why": None if self.sf_pack else self.sf_pack_why,
-                  "spare_slots": self.pool.spare, "G_max": self.G_max, "max_m": self.align,
+                  "spare_slots": self.pool.spare, "spare_limit": self.spare_limit, "G_max": self.G_max,
+                  "max_m": self.align,
                   "groups_per_layer": sorted({t["G"] for t in self.layers.values()}),
                   "hbm_added_B": {"spare_weight_slots": spare_b, "packed_sf": sf_b,
                                   "spare_grown_by_this_build": self.spare_added_B},

@@ -23,6 +23,9 @@ M1-T10-FIX (docs/HANDOFF-M1-T10-FIX.md):
     The final line counts the bit-equal comparisons that actually executed.
   * D row: 6-row dg-inplace == 6-row dg-masked (torch.equal: logits, main_hidden, caches; graph == eager);
   * G row: 6-row fused glue (row-parallel clusters) == 6-row ref glue on the fast impls (dg-inplace and dg-masked).
+M1-T10-FIX2 (docs/HANDOFF-M1-T10-FIX2.md): the D row at spare_slots = 8 (compact cold index, the real Triton
+  staging kernel), no overflow; forced overflow (spare_slots = 1): the device counter == the host expectation from
+  each eager step's routing, and the graph replay trips it identically.
 
 Run on the box (orchestrator), same line as tests/gpu/test_static_mini_gpu.py, repo at $W:
 
@@ -445,21 +448,25 @@ def _eq_runs(a, b, what):
 
 
 def test_static6_dg_inplace_equals_dg_masked():
-    """D row at 6 rows (M1-T10-FIX Part B 1): dg-inplace (DeepGEMM contiguous grouped GEMM over the pool in place,
-    6k spare slots) == dg-masked, torch.equal on every row's fp32 logits, main_hidden and the caches, both P0
-    parities, static-eager; dg-inplace graph == its static-eager. The dg-inplace step is built first (it grows the
+    """D row at 6 rows (M1-T10-FIX Part B 1; M1-T10-FIX2: S = 8 spare slots, compact cold index): dg-inplace
+    (DeepGEMM contiguous grouped GEMM over the pool in place) == dg-masked, torch.equal on every row's fp32 logits,
+    main_hidden and the caches, both P0 parities, static-eager; dg-inplace graph == its static-eager; no overflow
+    (mini4: at most 4 cold unique experts per layer-step < 8). The dg-inplace step is built first (it grows the
     pool; a step built before the growth refuses to run)."""
     _need_tilelang()
     with _model("mini4") as (model, pool):
         hid = (len(model.layers) - 1,)
         for L in (17, 18):
             ids, toks = _toks(L, ROWS * 4, 60 + L)
-            si = _need_step(model, pool, rows=ROWS, hidden_layers=hid, moe_impl="dg-inplace")
+            si = _need_step(model, pool, rows=ROWS, hidden_layers=hid, moe_impl="dg-inplace", spare_slots=8)
+            assert si.spare_slots == 8 and si.dg.spare_limit == 8 and pool.spare >= 8
             a = _static(model, si, ids, toks, 4)
             if DEV == "cuda":  # (the CPU dry run has no graphs)
                 si.capture()
                 ag = _static(model, si, ids, toks, 4, graph=True)
                 _assert_rows(ag[0], a[0], "6-row dg-inplace graph vs static-eager")
+            ov = si.overflow_counts()
+            assert ov["steps"] == 0 and ov["experts"] == 0, ov
             dd = si.dg.describe()
             si.detach()
             sm = _need_step(model, pool, rows=ROWS, hidden_layers=hid, moe_impl="dg-masked")
@@ -467,8 +474,47 @@ def test_static6_dg_inplace_equals_dg_masked():
             sm.detach()
             _eq_runs(a, b, f"D L={L}: 6-row dg-inplace vs dg-masked")
             print(f"  D P0 {L} (parity {L % 2}): 6-row dg-inplace == dg-masked, {len(a[0])} rows x V + main_hidden + "
-                  f"caches; graph == eager; spare slots {dd['spare_slots']}, groups/layer {dd['groups_per_layer']}, "
-                  f"HBM added {dd['hbm_added_GiB']} GiB")
+                  f"caches; graph == eager; spare slots {dd['spare_slots']} (budget {dd['spare_limit']}), groups/layer "
+                  f"{dd['groups_per_layer']}, HBM added {dd['hbm_added_GiB']} GiB; overflow steps {ov['steps']}")
+
+
+def _expected_overflow(st, S):
+    """Cold unique experts beyond S over all layers of the last EAGER step (each MoE's `last` routing)."""
+    from runtime.moe_rows import compact_cold_host
+
+    return sum(compact_cold_host(m.t["gtab"].tolist(), m.last["uniq"].tolist(), m.last["counts"].tolist(),
+                                 m.t["H"], S)["overflow"] for m in st.moes)
+
+
+def test_static6_dg_inplace_forced_overflow_trips_counter():
+    """M1-T10-FIX2 (2): spare_slots = 1 on mini4 (4 of 8 experts hot per layer): the staging kernel's device counter
+    counts exactly the cold unique experts beyond the first per layer (host expectation from each eager step's
+    routing), the steps still run, and the graph replay of the same inputs trips the counter identically (the
+    counter is graph-safe: zeroed and accumulated inside the captured step)."""
+    _need_tilelang()
+    with _model("mini4") as (model, pool):
+        ids, toks = _toks(17, ROWS * 3, 91)
+        st = _need_step(model, pool, rows=ROWS, moe_impl="dg-inplace", spare_slots=1)
+        assert st.spare_slots == 1
+        _prefill(model, ids)
+        want = []
+        with torch.inference_mode():
+            for s in range(3):
+                st.step(toks[s * ROWS:(s + 1) * ROWS], len(ids) + s * ROWS, graph=False)
+                want.append(_expected_overflow(st, 1))
+                assert int(st.ovf_step.item()) == want[-1], (s, int(st.ovf_step.item()), want[-1])
+        ov = st.overflow_counts()
+        assert sum(want) > 0 and ov["experts"] == sum(want) and ov["steps"] == sum(1 for w in want if w), (ov, want)
+        COUNTS["gates"] += 1
+        g_ov = None
+        if DEV == "cuda":
+            st.capture()
+            _static(model, st, ids, toks, 3, graph=True)
+            g_ov = st.overflow_counts()
+            assert g_ov["experts"] == sum(want) and g_ov["steps"] == ov["steps"], (g_ov, want)
+        print(f"  overflow S=1: eager {ov['steps']}/3 steps, {ov['experts']} cold experts not staged (host "
+              f"expectation {want}); graph {g_ov if g_ov is None else (g_ov['steps'], g_ov['experts'])}")
+        st.detach()
 
 
 def test_static6_fused_glue_equals_ref_glue():
@@ -583,7 +629,8 @@ def test_first_light_rows_cells_graph(mode="graph"):
 TESTS = [test_static6_equals_reference_mini_both_parities, test_static6_equals_reference_mini4_both_parities,
          test_static6_equals_reference_attn_bounded, test_static6_ring_wrapped_both_parities,
          test_static1_ring256_past_wrap_equals_reference, test_static6_graph_replay_relaunch_no_sync,
-         test_static6_dg_inplace_equals_dg_masked, test_static6_fused_glue_equals_ref_glue,
+         test_static6_dg_inplace_equals_dg_masked, test_static6_dg_inplace_forced_overflow_trips_counter,
+         test_static6_fused_glue_equals_ref_glue,
          test_static6_fast_impls_drift_graded, test_v0_census_and_step_level_table,
          test_first_light_rows_cells_graph]
 

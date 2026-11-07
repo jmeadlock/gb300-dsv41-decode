@@ -93,7 +93,8 @@ compress_lens [R, 1] (the prefill spelling, model.py:564-566); MoE through runti
 (row, expert) pairs, U <= R*k slots, per-row ascending-id combine); head on all rows -> `logits[R, V]`, `t_out[R]`;
 `main_hidden[R, len(hidden_layers) * dim]` (model.py:1267-1269) when `hidden_layers` is given. One graph (no parity).
 M1-T10-FIX: `moe_impl="dg-inplace"` at R rows = runtime/moe_rows.py DGInplaceMoERows (contiguous grouped GEMM over the
-pool in place, R*k spare slots per layer). `glue_impl="fused"` at R rows builds a FusedGlue whose row-parallel
+pool in place; M1-T10-FIX2: cold experts by a compact cold index into `spare_slots` spare slots per layer, default 8,
+overflows counted on the device -- `overflow_counts()`). `glue_impl="fused"` at R rows builds a FusedGlue whose row-parallel
 clusters (runtime/fused_glue.py ROWS_CLUSTERS: shared-expert SwiGLU, mHC post) are on and self-checked at R rows;
 every one-row cluster is n/a with its reason (`st.glue.describe()`, `glue_note`) and its call site runs the reference
 ops.
@@ -126,6 +127,7 @@ DUMMY_PROMPT = (0, 1)
 RING = 256                        # M1-T10 #20: window ring slots (>= 128 + 5, docs/M1-DSPARK-DESIGN.md 1.5)
 MAX_ROWS = 8                      # rows per step: the GEMV's M <= 8 (runtime/gemv_mxfp8.py)
 MOE_IMPLS_ROWS = ("ref", "dg-masked", "dg-inplace")  # MoE impls at rows > 1 (runtime/moe_rows.py)
+DEFAULT_SPARE_SLOTS_ROWS = 8     # M1-T10-FIX2: spare slots per layer of the R-row dg-inplace step (compact cold index)
 
 
 # ------------------------------------------------------------------------------------------------ pure index math
@@ -417,7 +419,7 @@ class StaticStep:
                  counters: bool = True, moe_impl: str = "ref", dg_deterministic: bool = True,
                  fp8_impl: str = "ref", glue_impl: str = "ref", glue_opts: Optional[dict] = None,
                  attn_impl: str = "ref", rows: int = 1, hidden_layers: Sequence[int] = (),
-                 _allow_cpu: bool = False):
+                 spare_slots: Optional[int] = None, _allow_cpu: bool = False):
         R = _ref()
         from runtime import patches
 
@@ -425,6 +427,10 @@ class StaticStep:
         if rows != 1 and not (2 <= rows <= MAX_ROWS and rows % 2 == 0):
             raise ValueError(f"rows {rows}: 1 or an even number <= {MAX_ROWS} (ratio-2 pooling needs whole groups)")
         self.rows = rows
+        if spare_slots is not None and not (rows > 1 and moe_impl == "dg-inplace"):
+            raise ValueError(f"spare_slots is the R-row dg-inplace step's budget (rows {rows}, moe_impl {moe_impl!r}: "
+                             f"the 1-row dg-inplace step always uses topk spare slots)")
+        self._spare_req = spare_slots
         if moe_impl not in MOE_IMPLS:
             raise ValueError(f"moe_impl {moe_impl!r} not in {MOE_IMPLS}")
         if rows > 1 and moe_impl not in MOE_IMPLS_ROWS:
@@ -649,6 +655,19 @@ class StaticStep:
         d, pool, k = self.dev, self.pool, self.topk
         ns = k * self.rows  # staging slots: k at 1 row; R*k at R rows (U <= R*k unique experts, runtime/moe_rows.py)
         self.n_slots = ns
+        # M1-T10-FIX2: the R-row dg-inplace step's spare-slot budget (compact cold index) and its overflow counter:
+        # ovf_step = cold unique experts that did not fit, this step (zeroed first in every step, graph-safe);
+        # ovf_steps / ovf_total accumulate steps with an overflow / overflowed experts (reset at capture)
+        self._ovf_on = False
+        self.spare_slots: Optional[int] = None
+        if self.rows > 1 and self.moe_impl == "dg-inplace":
+            s = DEFAULT_SPARE_SLOTS_ROWS if self._spare_req is None else int(self._spare_req)
+            if s < 1:
+                raise ValueError(f"spare_slots {s} < 1")
+            self.spare_slots = min(s, ns)  # more than the R*k A blocks can never be used
+        self.ovf_step = torch.zeros(1, dtype=torch.int32, device=d)
+        self.ovf_steps = torch.zeros(1, dtype=torch.long, device=d)
+        self.ovf_total = torch.zeros(1, dtype=torch.long, device=d)
         moe0 = layers[0].ffn
         ex0 = next(e for e in moe0.experts if e is not None)
         shapes = {p: tuple(getattr(ex0, p).weight.shape) for p in ("w1", "w3", "w2")}
@@ -682,15 +701,17 @@ class StaticStep:
                 self.dg = DGBuffers(self, shapes, sshapes, swiglu_limit=lim, deterministic=self.dg_deterministic,
                                     slots=ns)
                 moe_cls = moe_rows.DGMaskedMoERows
-            elif self.moe_impl == "dg-inplace":  # M1-T10-FIX: contiguous GEMM in place, R*k spare slots per layer
+            elif self.moe_impl == "dg-inplace":  # M1-T10-FIX2: contiguous GEMM in place, S spare slots per layer
                 from runtime.dg_inplace import DGInplaceBuffers
 
                 if pool is None:
                     raise ValueError("moe_impl dg-inplace needs the model's ExpertPool")
-                added = pool.add_spare_slots(ns, self.model)  # before the pointer tables below (storage moves)
+                added = pool.add_spare_slots(self.spare_slots, self.model)  # before the pointer tables (storage moves)
                 self.dg = DGInplaceBuffers(self, shapes, sshapes, pool=pool, swiglu_limit=lim,
-                                           deterministic=self.dg_deterministic, slots=ns)
+                                           deterministic=self.dg_deterministic, slots=ns,
+                                           spare_slots=self.spare_slots)
                 self.dg.spare_added_B = added
+                self._ovf_on = True
                 moe_cls = moe_rows.DGInplaceMoERows
         elif self.moe_impl == "dg-masked":  # T9a-1: same staging + pointer tables, routed GEMMs on DeepGEMM
             from runtime.dg_moe import DGBuffers, DGMaskedMoE
@@ -1001,6 +1022,8 @@ class StaticStep:
             raise ValueError("StaticStep is greedy only (model.temperature must be 0)")
         self._c = _StepScalars(self)
         self._idx_nblk = self._idx_tlen = None
+        if self._ovf_on:
+            self.ovf_step.zero_()                                             # M1-T10-FIX2: this step's overflows
         if self.marker:
             from runtime.static_kernels import step_marker
             step_marker(self.marker_ctr)
@@ -1027,6 +1050,9 @@ class StaticStep:
         else:
             self.t_out.copy_(logits.argmax(dim=-1).view(rows))                # teacher-forced: tok is the caller's
         self.pos.add_(rows)
+        if self._ovf_on:                                                      # M1-T10-FIX2 (device ops, no sync)
+            self.ovf_steps.add_((self.ovf_step > 0).long())
+            self.ovf_total.add_(self.ovf_step.long())
         if self.counters:
             if rows == 1:
                 self.cold_acc.add_(self.cold_tab.gather(1, self.ids_step).sum(-1))
@@ -1160,6 +1186,8 @@ class StaticStep:
         with torch.inference_mode():  # cold_acc is an inference tensor (built under the caller's inference_mode); in-place ops need the mode
             self.cold_acc.zero_()
             self.uniq_acc.zero_()
+            self.ovf_steps.zero_()
+            self.ovf_total.zero_()
         self.n_counted = 0
         self._dev_pos = None
         self.captured_fills = bool(fills)
@@ -1204,12 +1232,22 @@ class StaticStep:
             calls = [int(v) for v in self.uniq_acc.tolist()]
         return [a - b for a, b in zip(calls, cold)], cold
 
+    def overflow_counts(self) -> Optional[dict]:
+        """M1-T10-FIX2: the R-row dg-inplace step's spare-slot overflows since capture (or build, eager): {"steps":
+        steps in which some layer had more than `spare_slots` cold unique experts (those steps' logits are wrong),
+        "experts": cold unique experts not staged, summed over layers and steps, "steps_counted", "spare_slots"}.
+        None for any other step. Syncs."""
+        if not self._ovf_on:
+            return None
+        return {"steps": int(self.ovf_steps.item()), "experts": int(self.ovf_total.item()),
+                "steps_counted": self.n_counted, "spare_slots": self.spare_slots}
+
     def describe(self) -> dict:
         return {"rows": self.rows, "ring": self.ring, "win": self.win, "max_pos": self.max_pos,
                 "moe_impl": self.moe_impl, "fp8_impl": self.fp8_impl, "glue_impl": self.glue_impl,
                 "glue_effective": "fused" if self.glue is not None else "ref", "glue_note": self.glue_note,
                 "attn_impl": self.attn_impl, "attn_on": bool(self._attn_on or self._fm_on),
-                "hidden_layers": list(self.hidden_layers), "n_slots": self.n_slots}
+                "hidden_layers": list(self.hidden_layers), "n_slots": self.n_slots, "spare_slots": self.spare_slots}
 
     def marker_count(self) -> int:
         return int(self.marker_ctr.item())

@@ -23,9 +23,10 @@ outputs in ascending expert id (`posmat`, the reference's order). Nothing about 
     unused slots), expected_m 8 as at 1 row; w1/w3 -> the reference SwiGLU glue on the P = R*k pair rows -> act_quant
     -> w2 -> per-row ascending-id combine -> + shared.
 
-  DGInplaceMoERows (moe_impl "dg-inplace", M1-T10-FIX): the contiguous grouped GEMM over the hot pool in place, cold
-    experts staged into R*k spare pool slots (25.5 GB on the real model; a hot/cold split with fewer spare slots and
-    a masked path for the overflow would trade that HBM for launches -- not done). Same dedup, glue and combine.
+  DGInplaceMoERows (moe_impl "dg-inplace", M1-T10-FIX / FIX2): the contiguous grouped GEMM over the hot pool in
+    place, cold experts staged into S spare pool slots by a compact cold index (S = StaticStep spare_slots, default
+    8; more cold unique experts than S in a layer-step = an overflow, counted on the device, never silent). Same
+    dedup, glue and combine.
 
 The fused glue at R > 1 runs only its row-parallel clusters (runtime/fused_glue.py `ROWS_CLUSTERS`); the R-row MoEs
 take the fused shared-expert SwiGLU when it is on, their routed glue is the reference ops above.
@@ -208,15 +209,23 @@ class DGMaskedMoERows(_RowsMoEBase):
 
 
 class DGInplaceMoERows(DGMaskedMoERows):
-    """moe_impl "dg-inplace" at R rows (M1-T10-FIX): DeepGEMM's CONTIGUOUS grouped GEMM over the layer's whole pool
-    [H + S, N, K/2] (S = R*k spare slots), the same dedup as dg-masked. Slot u (expert uniq[u], ascending id) is A
-    block u = rows [u*ALIGN, u*ALIGN + counts[u]) (pair (r, e) at row u*ALIGN + rank, rows ascending), group = the
-    expert's hot pool slot, or spare slot H + u for a cold expert (staged there by the T9a-2 launch; with S = R*k
-    spare slots every slot index fits, whatever the routing). m_indices tags each block's count rows with its group
-    and everything else -1 (padding rows and unused slots u >= U): each row's k pairs reach their k groups. Combine
-    = per-row ascending expert id (posmat), the SwiGLU glue and act_quant are dg-masked's on the same pair rows, so
-    the only change is the GEMM's weight source: in place vs a staged copy (the 1-row D level measured that equal).
-    Cost: R*k spare weight slots per layer (40 x 36 x 17.7 MB = 25.5 GB on the real model)."""
+    """moe_impl "dg-inplace" at R rows (M1-T10-FIX, M1-T10-FIX2): DeepGEMM's CONTIGUOUS grouped GEMM over the layer's
+    whole pool [H + S', N, K/2] (S' >= S spare slots), the same dedup as dg-masked. Slot u (expert uniq[u], ascending
+    id) is A block u = rows [u*ALIGN, u*ALIGN + counts[u]) (pair (r, e) at row u*ALIGN + rank, rows ascending),
+    group = the expert's hot pool slot, or -- a cold expert -- spare slot H + c with the COMPACT cold index
+    c = cumsum(is_cold over the used slots in ascending-id order) - 1 (FIX2; FIX used H + u, which needed R*k = 36
+    spare slots per layer = 25.5 GB on the real model and OOMed next to the 1-row step). S = owner.spare_slots
+    (default 8; the seed map routes ~0.3 cold unique experts per layer per step). The staging launch copies cold
+    expert c into H + c; m_indices tags each block's count rows with its group and everything else -1 (padding rows
+    and unused slots u >= U): each row's k pairs reach their k groups. Combine = per-row ascending expert id
+    (posmat), the SwiGLU glue and act_quant are dg-masked's on the same pair rows, so the only change vs dg-masked
+    is the GEMM's weight source (in place vs a staged copy) and vs FIX only the spare index (same bytes, same
+    GEMM rows): bit-equal to both.
+    OVERFLOW: a layer with more than S cold unique experts in a step stages only the first S (ascending id); the
+    rest are NOT staged, their blocks are tagged -1 (the GEMM skips them: no out-of-bounds read) and the kernel adds
+    one per such expert to the step's device counter `owner.ovf_step` -- that layer's results (hence the step's
+    logits) are WRONG for that step, never silently: StaticStep.overflow_counts() / first_light's `overflow steps`.
+    Cost: S spare weight slots per layer (40 x 8 x 17.7 MB = 5.7 GB on the real model at S = 8)."""
 
     def __init__(self, owner, moe, layer: int, ptabs: Dict[Tuple[str, str], torch.Tensor]):
         super().__init__(owner, moe, layer, ptabs)
@@ -226,11 +235,11 @@ class DGInplaceMoERows(DGMaskedMoERows):
         d = owner.dev
         hot = pool.hot[layer]
         # a hot expert stands in for unused slots in the staging launch (no weight copy; its scales re-written with
-        # the same bytes); none hot -> the slot's own (duplicate) id, which still fits a spare slot
+        # the same bytes); none hot -> the slot's own (duplicate) id with compact index -1 (skipped by the launch)
         self.dummy = torch.tensor(int(hot[0]) if len(hot) else -1, dtype=torch.long, device=d)
         self.has_dummy = len(hot) > 0
-        self.ar_slots = torch.arange(b.k, dtype=torch.long, device=d)
         self.ar_rows = torch.arange(owner.rows, dtype=torch.long, device=d).view(1, -1)
+        self.S = int(b.spare_limit)
 
     def _block_rows(self) -> int:
         return self.owner.dg.align
@@ -239,11 +248,44 @@ class DGInplaceMoERows(DGMaskedMoERows):
         o, b, t = self.owner, self.owner.dg, self.t
         uniq, counts = m["uniq"], m["counts"]
         ids = torch.where(counts > 0, uniq, self.dummy) if self.has_dummy else uniq
-        b.stage(t, ids, None)                                           # 1 launch: cold rows -> H + u, packed SF
         g = t["gtab"].index_select(0, uniq).long()
-        grp = torch.where(g < 0, t["H"] + self.ar_slots, g)
-        tags = torch.where(self.ar_rows < counts.view(-1, 1), grp.view(-1, 1), -1).to(torch.int32)
-        b.mi.view(b.k, b.align)[:, : o.rows].copy_(tags)                # after the launch's head writes
+        cold, ok, grp, sidx = compact_cold(g, counts, t["H"], self.S)
+        b.stage(t, ids, None, sidx=sidx, ovf=o.ovf_step)              # 1 launch: cold c -> H + c, packed SF
+        n_ok = torch.where(ok, counts, 0)                             # an overflowing block: every row -1
+        tags = torch.where(self.ar_rows < n_ok.view(-1, 1), grp.view(-1, 1), -1)
+        b.mi.view(b.k, b.align)[:, : o.rows].copy_(tags.to(torch.int32))  # after the launch's head writes
 
     def _gemm(self, p: str, which: int) -> torch.Tensor:
         return self.owner.dg.gemm_inplace(p, self.t, which)
+
+
+def compact_cold(g: torch.Tensor, counts: torch.Tensor, H: int, S: int):
+    """M1-T10-FIX2's compact cold index, device ops only (no host sync). g [U'] = gtab[uniq] (hot pool slot or -1),
+    counts [U'] (0 = unused slot) -> (cold [U'] bool = a used slot whose expert is cold; ok [U'] bool = not an
+    overflowing cold slot; grp [U'] int64 = hot slot, or H + c for cold; sidx [U'] int64 = c for cold slots, -1
+    otherwise), c = cumsum(cold) - 1 over the slots in order (ascending expert id), cold slot staged iff c < S."""
+    cold = (g < 0) & (counts > 0)
+    c = torch.cumsum(cold, 0) - 1                       # bool cumsum -> int64
+    sidx = torch.where(cold, c, -1)
+    grp = torch.where(cold, c + int(H), g)
+    ok = sidx < int(S)                                  # sidx -1 (not cold) is always ok
+    return cold, ok, grp, sidx
+
+
+def compact_cold_host(gtab, uniq, counts, H: int, S: int) -> dict:
+    """compact_cold from plain Python (tests): {"grp": [...], "sidx": [...], "ok": [...], "overflow": n}."""
+    out = {"grp": [], "sidx": [], "ok": [], "overflow": 0}
+    c = -1
+    for e, n in zip(uniq, counts):
+        g = int(gtab[int(e)])
+        if g < 0 and n > 0:
+            c += 1
+            out["grp"].append(H + c)
+            out["sidx"].append(c)
+            out["ok"].append(c < S)
+            out["overflow"] += int(c >= S)
+        else:
+            out["grp"].append(g)  # hot slot, or -1 for an unused slot's cold duplicate (never tagged)
+            out["sidx"].append(-1)
+            out["ok"].append(True)
+    return out

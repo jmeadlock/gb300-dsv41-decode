@@ -74,6 +74,10 @@ and one timed step cell.
     both steps (M1-T10-FIX: dg-inplace runs at 6 rows too; --rows-moe-impl overrides the 6-row step's); --glue-impl
     fused at 6 rows runs the row-parallel clusters (shared SwiGLU, mHC post; `[glue]` line of the 6-row step, report
     `rows_mode.fused_glue_rows`) and the reference ops for the one-row clusters. Report key `rows_mode`.
+    M1-T10-FIX2: the 6-row dg-inplace step stages cold experts into --spare-slots (default 8) spare slots per layer
+    by a compact cold index; `[hbm]` lines after the 1-row and the 6-row build (HBM + the spare bytes each added;
+    `rows_mode.build_1row` / `build_rows`), `[overflow]` + the summary's `overflow steps: n` (`rows_mode.overflow`:
+    steps in which a layer had more cold unique experts than spare slots -- those steps' logits are wrong).
 Writes docs/first-light-<YYYYMMDD>.json (or --json) and prints a 12-line summary. One prompt failing logs its
 traceback and the run continues.
 
@@ -306,6 +310,38 @@ def _hbm(gen) -> Optional[dict]:
             "free_GiB": round(free / 2**30, 3), "total_GiB": round(total / 2**30, 3)}
 
 
+def build_report(gen, label: str, report: Dict) -> Optional[dict]:
+    """M1-T10-FIX2 (3): build the Generator's static step now (static/graph mode; eager: nothing) and record the HBM
+    right after the build (before any capture) and the spare weight slots it added: {"label", "rows", "moe_impl",
+    "spare_slots" (pool slots per layer after the build), "spare_limit" (the R-row dg-inplace budget), "spare_added_B"
+    / "_GiB" (this build's growth), "hbm"}. Prints one `[hbm]` line. A failing build (e.g. CUDA OOM) is recorded in
+    report["errors"] (stage build_<label>) and printed; the caller's later uses retry it as before."""
+    if gen.mode == "eager":
+        return None
+    try:
+        with torch.inference_mode():  # as every lazy build (Generator.step / step_rows / greedy run under it)
+            st = gen.static_step()
+    except Exception:
+        tb = traceback.format_exc()
+        print(f"[hbm] {label} build FAILED\n{tb}", file=sys.stderr, flush=True)
+        report["errors"].append({"stage": f"build_{label}", "traceback": tb})
+        return {"label": label, "failed": True, "hbm": _hbm(gen)}
+    dg = getattr(st, "dg", None)
+    pool = getattr(dg, "pool", None) or getattr(gen, "pool", None)
+    added = getattr(dg, "spare_added_B", None)
+    rec = {"label": label, "rows": getattr(st, "rows", gen.rows), "moe_impl": getattr(st, "moe_impl", gen.moe_impl),
+           "spare_slots": getattr(pool, "spare", None), "spare_limit": getattr(st, "spare_slots", None),
+           "spare_added_B": added, "spare_added_GiB": None if added is None else round(added / 2**30, 3),
+           "hbm": _hbm(gen)}
+    h = rec["hbm"] or {}
+    f = lambda x, d=2: "-" if x is None else f"{x:.{d}f}"  # noqa: E731
+    print(f"[hbm] {label} build (moe {rec['moe_impl']}"
+          f"{'' if rec['spare_limit'] is None else ', spare budget ' + str(rec['spare_limit'])}): "
+          f"{f(h.get('allocated_GiB'))} GiB alloc, {f(h.get('free_GiB'))} GiB free; pool spare slots "
+          f"{rec['spare_slots']}/layer (+{f(rec['spare_added_GiB'], 3)} GiB this build)", flush=True)
+    return rec
+
+
 @torch.inference_mode()
 def step_cell_rows(gen: Generator, ids: List[int], targets: List[int], n_steps: int, stats_from: int = 32) -> dict:
     """The R-row teacher-forced step cell (R = gen.rows): prefill, then `n_steps` R-row steps, step s feeding
@@ -421,6 +457,7 @@ def measure_rows(gen: Generator, a, report: Dict, *, out: str, json_path: str, f
 
     # phase 1: 1 row
     gen.set_rows(1)
+    rm["build_1row"] = build_report(gen, "1-row", report)  # M1-T10-FIX2 (3): HBM after the 1-row build
     p1 = f"{stem}-r1{ext or '.jsonl'}"
     t = time.time()
     res1 = run_rep(gen, rows, a.max_new, p1, 1)
@@ -463,6 +500,7 @@ def measure_rows(gen: Generator, a, report: Dict, *, out: str, json_path: str, f
     gen.reset_static()
     gen.set_moe_impl(rm["moe_impl_rows"])
     gen.set_rows(R_)
+    rm["build_rows"] = build_report(gen, f"{R_}-row", report)  # M1-T10-FIX2 (3): HBM after the R-row build
     reps: Dict[int, dict] = {}
     for rep in range(1, a.reps + 1):
         p = f"{stem}-tf{R_}{'' if rep == 1 else f'-replay{rep - 1}'}{ext or '.jsonl'}"
@@ -531,6 +569,18 @@ def measure_rows(gen: Generator, a, report: Dict, *, out: str, json_path: str, f
             print(f"[step-cell rows] FAILED\n{tb}", file=sys.stderr)
             report["errors"].append({"stage": "step_cell_rows", "traceback": tb})
     rm["hbm_rows"] = _hbm(gen)
+    # M1-T10-FIX2 (2): spare-slot overflows of the R-row dg-inplace step over everything it ran since its capture
+    # (graph) / build (static): the teacher-forced reps and the step cell
+    st = getattr(gen, "static", None)
+    if st is not None and hasattr(st, "overflow_counts"):
+        try:
+            rm["overflow"] = st.overflow_counts()
+        except Exception:
+            report["errors"].append({"stage": "overflow_counts", "traceback": traceback.format_exc()})
+    if rm.get("overflow") is not None:
+        ov = rm["overflow"]
+        print(f"[overflow] {R_}-row dg-inplace: {ov['steps']}/{ov['steps_counted']} steps overflowed the spare budget "
+              f"{ov['spare_slots']}/layer ({ov['experts']} cold experts not staged)", flush=True)
 
     # the V0 census (eager; layer-0 shapes; the GEMV with tuned vs pinned-M=1 configs)
     if not a.skip_census:
@@ -598,11 +648,18 @@ def summary_rows_lines(r: dict, json_path: str) -> List[str]:
                  f"{f(ms.get('mean'), 3)} / p50 {f(ms.get('p50'), 3)} / p90 {f(ms.get('p90'), 3)} ms per step, "
                  f"{f(sr_.get('ms_per_position_mean'), 3)} ms/position; argmax agree {sr_.get('argmax_agree', '-')}/"
                  f"{sr_.get('argmax_compared', '-')}")
-    hb = sr_.get("hbm_after_build") or {}
+    hb1 = ((rm.get("build_1row") or {}).get("hbm") or {})
+    br = rm.get("build_rows") or {}
+    hbr = br.get("hbm") or {}
+    ov = rm.get("overflow")
+    ovs = (f"{ov['steps']} ({ov['experts']} experts, spare {ov['spare_slots']}/layer)" if ov else "n/a")
     lines.append(f"R{R_}/R1 = {f(sr_.get('r6_over_r1'), 3)} (same positions; first-n {f(sr_.get('r6_over_r1_first_n'), 3)}; "
                  f"vs 1-row {rm.get('moe_impl_rows')} {f(sr_.get('r6_over_r1_same_moe'), 3)})"
-                 f" | HBM after {R_}-row build {f(hb.get('allocated_GiB'))} GiB alloc, {f(hb.get('free_GiB'))} GiB free "
-                 f"| errors: {len(r['errors'])} | report {json_path}")
+                 f" | overflow steps: {ovs}"
+                 f" | HBM after build: 1-row {f(hb1.get('allocated_GiB'))} alloc / {f(hb1.get('free_GiB'))} free, "
+                 f"{R_}-row {f(hbr.get('allocated_GiB'))} / {f(hbr.get('free_GiB'))} GiB (+"
+                 f"{f(br.get('spare_added_GiB'), 3)} GiB spare)"
+                 f" | errors: {len(r['errors'])} | report {json_path}")
     assert len(lines) == 12, len(lines)
     return lines
 
@@ -955,6 +1012,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="main_hidden layers: comma list, 'none', or auto (--rows > 1: the checkpoint config's "
                          "dspark_target_layer_ids, 37,38,39 on the real model -- the verify graph's T11 output)")
     ap.add_argument("--skip-census", action="store_true", help="--rows: skip the V0 census")
+    ap.add_argument("--spare-slots", type=int, default=None,
+                    help="--rows with dg-inplace: spare pool slots per layer for the R-row step's cold experts "
+                         "(compact cold index, M1-T10-FIX2; default 8); a layer-step with more cold unique experts "
+                         "overflows (counted: `overflow steps` in the rows summary; those steps' logits are wrong)")
     return ap
 
 
@@ -1009,10 +1070,11 @@ def main(argv=None) -> int:
     gen = Generator(model, a.tokenizer_dir or a.model_dir, mode=a.mode, max_pos=a.max_pos, marker=a.marker,
                     moe_impl=a.moe_impl, fp8_impl=a.fp8_impl, glue_impl=a.glue_impl, attn_impl=a.attn_impl,
                     glue_approx=a.glue_approx,
-                    hidden_layers=hidden_layers_arg(a))
+                    hidden_layers=hidden_layers_arg(a), spare_slots=a.spare_slots)
     report["generator"] = {"eos_ids": gen.eos_ids, "top_k": gen.top_k, "max_seq_len": gen.max_seq_len,
                            "tokenizer_dir": gen.tokenizer_dir, "mode": gen.mode, "max_pos": gen.max_pos,
                            "marker": gen.marker, "moe_impl": gen.moe_impl, "fp8_impl": gen.fp8_impl,
+                           "spare_slots": gen.spare_slots,
                            "glue_impl": gen.glue_impl, "glue_approx": gen.glue_approx, "attn_impl": gen.attn_impl}
     if a.nvtx_layers:
         install_layer_nvtx(model)

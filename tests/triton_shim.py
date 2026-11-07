@@ -318,6 +318,18 @@ STORES: list = []
 DIRTY: set = set()  # id() of the buffers a launch stored to (fp8 / uint8 / int64 ones are written back only then)
 
 
+def atomic_add(ptr, val, mask=None):
+    """M1-T10-FIX2 (t9a2_stage_inplace's overflow counter): scalar or block add at the pointer(s); returns the old
+    value(s). Programs run one after another here, so the read-modify-write is trivially atomic."""
+    off = np.atleast_1d(ptr.off)
+    m = np.ones(off.shape, bool) if mask is None else np.broadcast_to(_v(mask), off.shape)
+    assert ((off[m] >= 0) & (off[m] < ptr.buf.size)).all(), "out-of-bounds atomic"
+    old = ptr.buf[off].copy()
+    np.add.at(ptr.buf, off[m], np.broadcast_to(np.asarray(_v(val)), off.shape)[m].astype(ptr.buf.dtype))
+    DIRTY.add(id(ptr.buf))
+    return T(old.reshape(np.shape(ptr.off)))
+
+
 # ------------------------------------------------------------------------------------------------ jit + launch
 def _flat(t: torch.Tensor) -> torch.Tensor:
     """1-D view of t's storage from t's first element to the end (so a strided view's row stride indexes it the way
@@ -399,7 +411,7 @@ def _modules():
     for name in ("T", "P", "int32", "int64", "float32", "bfloat16", "constexpr", "program_id", "arange", "zeros",
                  "where", "minimum", "maximum", "sum", "dot", "trans", "static_range", "load", "store",
                  "uint8", "float8e4nv", "max", "abs", "fma", "inline_asm_elementwise", "reshape", "split", "join",
-                 "broadcast_to", "pointer_type", "multiple_of"):
+                 "broadcast_to", "pointer_type", "multiple_of", "atomic_add"):
         setattr(tl, name, globals()[name])
     tr = types.ModuleType("triton")
     tr.jit, tr.cdiv, tr.language, tr.__version__ = jit, cdiv, tl, "numpy-shim"

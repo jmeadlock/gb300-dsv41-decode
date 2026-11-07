@@ -371,6 +371,31 @@ then `tests/gpu/test_dg_inplace_gpu.py` (same line, the /ref mount optional: rea
 `--moe-impl dg-inplace --fp8-impl gemv --glue-impl fused --attn-impl bounded --map docs/maps/hot-v26ar-seed-295.json
 --mode graph --parity-levels` (the T9b-3a line with the moe impl swapped).
 
+### M1-T10-FIX2: the 6-row dg-inplace step's spare slots (compact cold index)
+
+The 6-row step (`runtime/moe_rows.py` `DGInplaceMoERows`) has R·k = 36 A blocks per layer (one per unique routed
+expert, ascending id). FIX staged a cold expert of block u into spare slot `H + u`, so every block index needed its
+own spare slot: 36 per layer = 25.5 GB, which OOMed in `add_spare_slots` next to the 218.6 GiB model on the box. FIX2
+gives each **cold** unique expert a compact index `c = cumsum(is_cold over the used blocks) − 1` (`compact_cold`,
+device ops) and stages it into `H + c`; hot experts keep their pool slot; `m_indices` tags each block's rows with that
+group. Same bytes, same GEMM rows, same combine → bit-equal to FIX and to dg-masked.
+
+- **Budget** `spare_slots` = S (StaticStep / Generator / `first_light --spare-slots`; default **8** at rows > 1,
+  clamped to R·k; the 1-row step keeps topk and the old `H + j` contract). Pool growth `40 × S × 17.7 MB`: 5.7 GB at
+  S = 8 (+1.4 GB over the 1-row step's 6). At the seed map ~0.3 cold unique experts per layer per step.
+- **Overflow is counted, never silent.** A layer-step with more than S cold unique experts stages the first S
+  (ascending id); the rest are not staged (no out-of-bounds write), their blocks are tagged −1 (the GEMM skips
+  them), and `t9a2_stage_inplace` (SIDX path) atomically adds one per such expert to the step's device counter
+  `ovf_step` — that step's logits are wrong. The step zeroes `ovf_step` first and accumulates `ovf_steps` /
+  `ovf_total` last, all inside the graph; `StaticStep.overflow_counts()` reads them (since capture or build).
+- **first_light --rows 6:** `[hbm] 1-row build …` / `[hbm] 6-row build …` lines (HBM right after each build, pool
+  spare slots, bytes this build added; `rows_mode.build_1row` / `build_rows`), `[overflow] …` and the summary's
+  `overflow steps: n` (`rows_mode.overflow`).
+- **Tests:** `tests/test_spare_compact_cpu.py` (mapping incl. ties / zero-cold / all-cold, staging contract and the
+  kernel body under the shim with sidx + counter, the 6-row step at S = 8 / 4 (boundary) / 24 == dg-masked, forced
+  overflow S = 1 counted exactly, validation, Generator/first_light plumbing); GPU: `tests/gpu/test_static_rows_gpu.py`
+  D row at S = 8 and `test_static6_dg_inplace_forced_overflow_trips_counter` (eager and graph).
+
 ## T9b-1: fp8 Linear layers on a Triton MXFP8 GEMV (`--fp8-impl gemv`, `gemv_mxfp8.py`)
 
 Spec: `docs/HANDOFF-T9B1-GEMV.md`. Every `Linear` whose weight is fp8 with 32x32 e8m0 block scales goes through

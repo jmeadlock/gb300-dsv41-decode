@@ -335,10 +335,12 @@ def _install_kernels(monkeypatch, pool):
     fk = _fake_static_kernels(reg)
     fk.calls["stage"] = 0
 
-    def stage_inplace(ptab6, ids, gtab, dtab, dsts, mi, H, align, row_w, sf_dims, all_scales, ids_out=None):
+    def stage_inplace(ptab6, ids, gtab, dtab, dsts, mi, H, align, row_w, sf_dims, all_scales, ids_out=None, **kw):
         DI.stage_inplace_emulated(reg.__getitem__, ptab6, ids, gtab, dtab, dsts, mi, H, align, row_w, sf_dims,
-                                  all_scales, ids_out)
+                                  all_scales, ids_out, **kw)
         fk.calls["stage"] += 1
+        fk.calls.setdefault("stage_sidx", 0)
+        fk.calls["stage_sidx"] += int(kw.get("sidx") is not None)
 
     fk.stage_inplace = stage_inplace
     monkeypatch.setitem(sys.modules, "runtime.static_kernels", fk)
@@ -381,6 +383,10 @@ def test_add_spare_slots_preserves_rebinds_and_is_idempotent(di_emu):
                 assert lin.weight.scale is lin.scale
     _check(_ref_run(model, ids, 4), want, "reference forward after add_spare_slots")
     assert pool.add_spare_slots(4, model) == 0 and pool.add_spare_slots(2, model) == 0 and pool.generation == gen0 + 1
+    # M1-T10-FIX2: a re-growth (1-row topk -> the 6-row budget) reports only the slots it adds
+    assert pool.add_spare_slots(6, model) == pool.n_layers * 2 * per and pool.spare == 6
+    assert all(pool.hbm_full[l][p].shape[0] == len(pool.hot[l]) + 6 for l in range(pool.n_layers) for p in pool.proj_nk)
+    _check(_ref_run(model, ids, 4), want, "reference forward after the re-growth")
 
 
 def _dg_inplace_vs_reference(di_emu, kind, monkeypatch, sf_store, align):

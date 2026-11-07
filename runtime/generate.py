@@ -292,7 +292,7 @@ class Generator:
                  mode: str = "eager", max_pos: Optional[int] = None, marker: bool = False,
                  static_counters: bool = True, static_factory: Optional[Callable] = None, moe_impl: str = "ref",
                  fp8_impl: str = "ref", glue_impl: str = "ref", attn_impl: str = "ref", glue_approx: bool = False,
-                 rows: int = 1, hidden_layers: Sequence[int] = ()):
+                 rows: int = 1, hidden_layers: Sequence[int] = (), spare_slots: Optional[int] = None):
         self.model = model
         self.tokenizer_dir = tokenizer_dir
         self.tokenizer = tokenizer if tokenizer is not None else (load_tokenizer(tokenizer_dir) if tokenizer_dir else None)
@@ -342,6 +342,10 @@ class Generator:
         self.hidden_layers = tuple(int(i) for i in hidden_layers)
         self.main_hidden: Optional[torch.Tensor] = None  # the last R-row step's main_hidden (step_rows)
         self.set_rows(rows)
+        # M1-T10-FIX2: spare slots per layer of the R-row dg-inplace step (None: StaticStep's default, 8); used only
+        # at rows > 1 with moe_impl dg-inplace (the 1-row dg-inplace step always uses topk)
+        self.spare_slots: Optional[int] = None
+        self.set_spare_slots(spare_slots)
         self.logits_sink: Optional[Callable] = None  # greedy calls sink(i, fp32 CPU logits) per position (drift rows)
         self.mode = "eager"
         self.set_mode(mode)
@@ -408,6 +412,22 @@ class Generator:
             self.reset_static()
         self.rows = rows
 
+    def _spare_kw(self) -> dict:
+        """M1-T10-FIX2: {"spare_slots": n} for the R-row dg-inplace build, {} otherwise."""
+        if self.rows > 1 and self.moe_impl == "dg-inplace" and self.spare_slots is not None:
+            return {"spare_slots": self.spare_slots}
+        return {}
+
+    def set_spare_slots(self, n: Optional[int]) -> None:
+        """M1-T10-FIX2: the R-row dg-inplace step's spare-slot budget (None = StaticStep's default). A change that
+        affects the current build drops the StaticStep."""
+        n = None if n is None else int(n)
+        if n is not None and n < 1:
+            raise ValueError(f"spare_slots {n} < 1")
+        if n != self.spare_slots and self.static is not None and self.rows > 1 and self.moe_impl == "dg-inplace":
+            self.reset_static()
+        self.spare_slots = n
+
     @property
     def max_pos(self) -> int:
         """Largest decode position this Generator can serve in its current mode."""
@@ -432,6 +452,7 @@ class Generator:
                         kw["glue_opts"] = {"approx": True}
                 if self.attn_impl != "ref":
                     kw["attn_impl"] = self.attn_impl
+                kw.update(self._spare_kw())
                 self.static = self.static_factory(self.model, **kw)
             else:
                 from runtime.static_step import StaticStep
@@ -440,7 +461,8 @@ class Generator:
                                          counters=self.static_counters, moe_impl=self.moe_impl,
                                          fp8_impl=self.fp8_impl, glue_impl=self.glue_impl,
                                          glue_opts={"approx": True} if self.glue_approx else None,
-                                         attn_impl=self.attn_impl, rows=self.rows, hidden_layers=self.hidden_layers)
+                                         attn_impl=self.attn_impl, rows=self.rows, hidden_layers=self.hidden_layers,
+                                         **self._spare_kw())
         return self.static
 
     def reset_static(self) -> None:

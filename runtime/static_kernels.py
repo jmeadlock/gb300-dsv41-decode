@@ -295,30 +295,45 @@ def _t9a2_pack_scales(ptab, dtab, e, E, p, grp, q, N13, C13, N2, C2, BN: tl.cons
 
 
 @triton.jit
-def t9a2_stage_inplace(ptab, ids, gtab, dtab, mi, ids_out, E, H, ALIGN, N13, C13, N2, C2,
+def t9a2_stage_inplace(ptab, ids, gtab, dtab, mi, ids_out, sidx, ovf, E, H, S, ALIGN, N13, C13, N2, C2,
                        ROW_W: tl.constexpr, BW: tl.constexpr, NBW: tl.constexpr, BN: tl.constexpr,
                        BC: tl.constexpr, NPROG: tl.constexpr, EVEN_W: tl.constexpr, ALL_SCALES: tl.constexpr,
-                       IDS: tl.constexpr):
+                       IDS: tl.constexpr, SIDX: tl.constexpr):
     """T9a-2: one launch per layer before its three contiguous grouped GEMMs (runtime/dg_inplace.py). Program
-    (j, q, p): e = ids[j] (sorted routed id), g = gtab[e] (its hot pool slot, or -1 = cold). group = g if hot else
-    H + j (the j-th spare slot). (j, 0, 0) writes mi[j*ALIGN] = group (the contiguous layout's group id of A block j;
-    every other mi row stays -1) and, IDS, ids_out[j] = e. Cold only: program q copies 8-KiB weight blocks
-    q, q+NPROG, ... of row ptab[p, e] (an HBM or UVA address) into slot `group` of the layer's [H+S, N, K/2] weight
-    pool at dtab[p] (int64 words, 16-B vectors as t8_gather_rows). Scales: always (ALL_SCALES, the shared packed SF
-    of sf_store "step") or cold only ("resident"): _t9a2_pack_scales. Row addresses 16-B aligned (host-checked)."""
+    (j, q, p): e = ids[j] (sorted routed id), g = gtab[e] (its hot pool slot, or -1 = cold). Spare index c = j
+    (SIDX 0, the 1-row step: k slots, S = k spares) or c = sidx[j] (SIDX 1, M1-T10-FIX2's 6-row step: the compact
+    cold index, -1 = skip this slot). group = g if hot else H + c. (j, 0, 0) writes mi[j*ALIGN] = group (-1 for a
+    skipped or overflowing cold slot; every other mi row stays -1), IDS: ids_out[j] = e, and SIDX: a cold slot with
+    c >= S (more cold experts than spare slots) adds 1 to the step's overflow counter ovf[0] (nothing of it is
+    staged: its GEMM rows are wrong, never out of bounds). Staged cold slots only (0 <= c < S): program q copies
+    8-KiB weight blocks q, q+NPROG, ... of row ptab[p, e] (an HBM or UVA address) into slot `group` of the layer's
+    [H+S', N, K/2] weight pool at dtab[p] (int64 words, 16-B vectors as t8_gather_rows). Scales: hot + staged cold
+    (ALL_SCALES, the shared packed SF of sf_store "step") or staged cold only ("resident"): _t9a2_pack_scales. Row
+    addresses 16-B aligned (host-checked)."""
     j = tl.program_id(0)
     q = tl.program_id(1)
     p = tl.program_id(2)
     e = tl.load(ids + j)
     g = tl.load(gtab + e).to(tl.int64)
     cold = g < 0
-    grp = tl.where(cold, g * 0 + j + H, g)      # int64 either way (g * 0 + ...: promotes j + H without a cast)
+    hot = g >= 0
+    if SIDX:
+        c = tl.load(sidx + j).to(tl.int64)
+    else:
+        c = g * 0 + j                            # int64 (g * 0 + ...: promotes j without a cast)
+    fits = (c >= 0) & (c < S)
+    stage = cold & fits
+    grp = tl.where(cold, c + H, g)
+    head = tl.where(hot | stage, grp, g * 0 - 1)
     if q == 0:
         if p == 0:
-            tl.store(mi + j * ALIGN, grp.to(tl.int32))
+            tl.store(mi + j * ALIGN, head.to(tl.int32))
             if IDS:
                 tl.store(ids_out + j, e)
-    if cold:
+            if SIDX:
+                if cold & (c >= S):
+                    tl.atomic_add(ovf, 1)
+    if stage:
         w_src = tl.multiple_of(tl.load(ptab + p * E + e).to(tl.pointer_type(tl.int64)), 16)
         w_dst = tl.multiple_of(tl.load(dtab + p).to(tl.pointer_type(tl.int64)), 16)
         w_row = w_dst + grp * ROW_W
@@ -332,26 +347,35 @@ def t9a2_stage_inplace(ptab, ids, gtab, dtab, mi, ids_out, E, H, ALIGN, N13, C13
                 wm_m = wm_off < ROW_W
                 tl.store(w_row + wm_off, tl.load(w_src + wm_off, mask=wm_m), mask=wm_m)
     if ALL_SCALES:
-        _t9a2_pack_scales(ptab, dtab, e, E, p, grp, q, N13, C13, N2, C2, BN, BC, NPROG)
+        if hot | stage:
+            _t9a2_pack_scales(ptab, dtab, e, E, p, grp, q, N13, C13, N2, C2, BN, BC, NPROG)
     else:
-        if cold:
+        if stage:
             _t9a2_pack_scales(ptab, dtab, e, E, p, grp, q, N13, C13, N2, C2, BN, BC, NPROG)
 
 
 def stage_inplace(ptab6: torch.Tensor, ids: torch.Tensor, gtab: torch.Tensor, dtab: torch.Tensor, dsts, mi,
                   H: int, align: int, row_w: int, sf_dims, all_scales: bool, ids_out=None,
                   block_bytes: Optional[int] = None, nprog: Optional[int] = None,
-                  num_warps: Optional[int] = None) -> None:
+                  num_warps: Optional[int] = None, *, sidx: Optional[torch.Tensor] = None,
+                  spare: Optional[int] = None, ovf: Optional[torch.Tensor] = None) -> None:
     """T9a-2 (runtime/dg_inplace.py, contract: dg_inplace.stage_inplace_emulated): ONE launch per layer.
     ptab6 int64 [6, E] source rows (w1/w3/w2 weights, then their e8m0 scales; HBM pool slot or UVA host address);
     gtab int32 [E] hot slot or -1; dtab int64 [6] = data_ptr()s of `dsts` = the layer's three [H+S, N, K/2] weight
     pools, then the three packed SF tensors (int32 [G, N, C] MN-major); mi int32 [k*align] (-1 except the block
     heads this writes); sf_dims ((N13, C13), (N2, C2)) = (rows, int32 words per row) of the w1/w3 and w2 scales.
-    `dsts` is read only for the host-side alignment check."""
+    `dsts` is read only for the host-side alignment check.
+    M1-T10-FIX2 (the 6-row step): sidx int64 [k] = each slot's compact cold index (-1: skip the slot), spare = the
+    spare slots a cold expert may use (c < spare), ovf int32 [1] = the step's overflow counter (one atomic add per
+    cold slot with c >= spare). All three or none (None: c = j, the 1-row contract; spare defaults to k there)."""
     k = ids.numel()
     (n13, c13), (n2, c2) = sf_dims
     if row_w % VEC_ALIGN or any(t.data_ptr() % VEC_ALIGN for t in dsts):
         raise ValueError(f"stage_inplace: weight row {row_w} B or a destination not {VEC_ALIGN}-B aligned")
+    use_sidx = sidx is not None
+    if use_sidx != (ovf is not None) or (use_sidx and spare is None):
+        raise ValueError("stage_inplace: sidx, spare and ovf go together")
+    S = int(spare) if spare is not None else k
     bw = _block_bytes(block_bytes) // 8
     ww = row_w // 8
     nbw = triton.cdiv(ww, bw)
@@ -359,9 +383,10 @@ def stage_inplace(ptab6: torch.Tensor, ids: torch.Tensor, gtab: torch.Tensor, dt
     bc = triton.next_power_of_2(max(int(c13), int(c2)))
     even = ww % bw == 0 and nbw % npg == 0
     t9a2_stage_inplace[(k, npg, 3)](ptab6, ids, gtab, dtab, mi, ids_out if ids_out is not None else ids,
-                                    ptab6.size(1), int(H), int(align), int(n13), int(c13), int(n2), int(c2),
+                                    sidx if use_sidx else ids, ovf if use_sidx else mi,
+                                    ptab6.size(1), int(H), S, int(align), int(n13), int(c13), int(n2), int(c2),
                                     ww, bw, nbw, STAGE_BN, bc, npg, even, bool(all_scales), ids_out is not None,
-                                    num_warps=int(num_warps or VEC_WARPS))
+                                    use_sidx, num_warps=int(num_warps or VEC_WARPS))
 
 
 def step_marker(ctr: torch.Tensor) -> None:
