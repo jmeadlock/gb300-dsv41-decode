@@ -117,7 +117,7 @@ def _model(kind: str = "mini"):
 
 def _ids(n, seed):
     g = torch.Generator().manual_seed(seed)
-    return torch.randint(2, 2000, (n,), generator=g).tolist()
+    return torch.randint(2, 2000, (n,), generator=g, device="cpu").tolist()  # default device is cuda after build_and_load
 
 
 def _run(gen, mode, ids, n=N_STEPS):
