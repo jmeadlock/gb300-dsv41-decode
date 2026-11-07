@@ -448,12 +448,12 @@ def _synthetic(N: int, K: int, M: int, copies: int, device):
     g = torch.Generator(device="cpu").manual_seed(1234 + N + 7 * K)
 
     def fp8(*shape):
-        b = torch.randint(0, 0x78, shape, generator=g, dtype=torch.int32) | (torch.randint(0, 2, shape, generator=g,
-                                                                                            dtype=torch.int32) << 7)
+        b = torch.randint(0, 0x78, shape, generator=g, dtype=torch.int32, device="cpu") | (torch.randint(
+            0, 2, shape, generator=g, dtype=torch.int32, device="cpu") << 7)   # explicit cpu: default device may be cuda
         return b.to(torch.uint8).to(device).view(FP8)
 
     def e8(*shape):
-        return torch.randint(120, 134, shape, generator=g, dtype=torch.int32).to(torch.uint8).to(device).view(E8)
+        return torch.randint(120, 134, shape, generator=g, dtype=torch.int32, device="cpu").to(torch.uint8).to(device).view(E8)
 
     xq, xs = fp8(M, K), e8(M, K // BLOCK)
     w0, s0 = fp8(N, K), e8((N + 31) // 32, K // BLOCK)
