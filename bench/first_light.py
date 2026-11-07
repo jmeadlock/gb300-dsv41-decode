@@ -1078,6 +1078,14 @@ def main(argv=None) -> int:
                            "glue_impl": gen.glue_impl, "glue_approx": gen.glue_approx, "attn_impl": gen.attn_impl}
     if a.nvtx_layers:
         install_layer_nvtx(model)
+    if a.rows != 1 and a.moe_impl == "dg-inplace" and gen.pool is not None:
+        # M1-T10-FIX2 (box round 3): grow the pool to the R-row spare budget ONCE, before any StaticStep build. The 1-row
+        # build (R1) asks for k spares and the 6-row build for `spare_slots`; a re-growth between them re-allocated every
+        # layer's weight block while the old blocks were still referenced -> +24 GiB -> OOM. Idempotent for S <= spare.
+        from runtime.static_step import DEFAULT_SPARE_SLOTS_ROWS
+        S = DEFAULT_SPARE_SLOTS_ROWS if a.spare_slots is None else int(a.spare_slots)
+        b = gen.pool.add_spare_slots(S, model)
+        print(f"[pool] pre-grown to {gen.pool.spare} spare slots/layer (+{b / 2**30:.2f} GiB) before the 1-row build", flush=True)
     if a.rows != 1:
         return measure_rows(gen, a, report, out=out, json_path=json_path, fixture2=fixture2)
     return measure(gen, a, report, n_layers=len(model.layers), out=out, json_path=json_path, fixture2=fixture2)
