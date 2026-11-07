@@ -90,8 +90,12 @@ class ResidencyConfig:
     min_abs: float = 8.0
     swaps_per_barrier: int = 4
     frozen: bool = False          # True = count and drain, never queue (the "frozen seed" arm)
-    n_spare: Optional[int] = None  # spare HBM slots per layer; None = min(spare_cap, the headroom calc)
-    spare_cap: int = 4            # design 3.1 [A] r = 4 (in-flight swaps per layer <= swaps_per_drain = 2)
+    n_spare: Optional[int] = None  # residency slots per layer; None = every free slot the pool already holds beyond
+    #                                the step's staging (new HBM is allocated only up to `spare_cap` if fewer, and only
+    #                                when free HBM - reserve allows); an int = exactly that many (pool's free ones first)
+    spare_cap: int = 4            # design 3.1 [A] r = 4: the minimum wanted (new slots are allocated to reach it)
+    stage_keep: Optional[int] = None  # slots per layer kept for the step's cold staging; None = 8 at 6 rows (the compact
+    #                                cold index budget S; min(8, R*topk)), topk at 1 row, else Generator.spare_slots
     n_demote: int = 64            # Grace demotion slots per layer (design 3.1 [A] D = 64)
     reserve_gib: float = 8.0      # HBM kept back for capture/workspaces/staging (design 2 [A]: 4.2 + ~4 GiB)
     kv_rows: int = 1              # KV reservation: rows x 150 MB x kv_ctx / 32K
@@ -144,6 +148,24 @@ def n_stage_for(moe_impl: str, rows: int, topk: int, spare_slots: Optional[int] 
     return min(int(spare_slots), int(topk) * int(rows))
 
 
+RES_STAGE_ROWS_DEFAULT = 8  # cold staging slots kept at R > 1 when residency shares the pool's pre-grown 16
+
+
+def residency_stage(cfg: Optional["ResidencyConfig"], moe_impl: str, rows: int, topk: int,
+                    spare_slots: Optional[int] = None) -> int:
+    """Staging slots per layer the step keeps when residency is on (A2-2 FIX): the pool's other spare slots are the
+    residency's. dg-inplace only (0 otherwise). 1 row: topk (cold slot j -> H + j, fixed by the kernel). R rows: the
+    compact cold index budget S = cfg.stage_keep, else the Generator's explicit `spare_slots`, else 8 (capped at
+    R*topk). A cold-unique count above S overflows (device counter, `StaticStep.overflow_counts()`: that step's
+    logits are wrong), so S trades residency slots against overflow risk -- the report carries both."""
+    if moe_impl != "dg-inplace":
+        return 0
+    if int(rows) <= 1:
+        return int(topk)
+    s = cfg.stage_keep if cfg is not None and cfg.stage_keep is not None else spare_slots
+    return min(int(RES_STAGE_ROWS_DEFAULT if s is None else s), int(topk) * int(rows))
+
+
 def sf_store_for(moe_impl: str, rows: int) -> Optional[str]:
     """Where the dg-inplace step keeps the packed scale factors of the HBM-resident experts (runtime/dg_inplace.py):
     "step" (the staging launch re-packs them every step from the pointer tables), or "pool" / "resident" (packed
@@ -169,7 +191,12 @@ def add_cli_args(ap) -> None:
     ap.add_argument("--residency-min-abs", type=float, default=8.0)
     ap.add_argument("--residency-halflife", type=float, default=500.0)
     ap.add_argument("--residency-cap", type=int, default=4, help="swaps applied per step (swaps_per_barrier)")
-    ap.add_argument("--residency-spare", type=int, default=None, help="spare HBM slots/layer (default: headroom calc)")
+    ap.add_argument("--residency-spare", type=int, default=None,
+                    help="residency slots/layer (default: every free slot of the pool beyond the staging; new HBM only "
+                         "to reach 4, and only when free HBM - reserve allows)")
+    ap.add_argument("--residency-stage", type=int, default=None,
+                    help="slots/layer kept for the 6-row step's cold staging (default: --spare-slots if given, else 8; "
+                         "1 row keeps topk). The rest of the pool's pre-grown spare slots are residency's")
     ap.add_argument("--residency-demote", type=int, default=64, help="Grace demotion slots/layer")
     ap.add_argument("--residency-reserve-gib", type=float, default=8.0, help="HBM held back in the headroom calc")
     ap.add_argument("--residency-frozen", action="store_true", help="count + drain, never swap (frozen-map arm)")
@@ -182,7 +209,7 @@ def config_from_args(a) -> Optional[dict]:
         return None
     return {"drain_n": a.residency_drain, "swaps_per_drain": a.residency_swaps_per_drain, "hyst": a.residency_hyst,
             "min_abs": a.residency_min_abs, "halflife": a.residency_halflife, "swaps_per_barrier": a.residency_cap,
-            "n_spare": a.residency_spare, "n_demote": a.residency_demote, "reserve_gib": a.residency_reserve_gib,
+            "n_spare": a.residency_spare, "stage_keep": getattr(a, "residency_stage", None), "n_demote": a.residency_demote, "reserve_gib": a.residency_reserve_gib,
             "frozen": bool(a.residency_frozen), "force_random": a.residency_force_random}
 
 
@@ -261,30 +288,42 @@ class ResidencyManager:
         self.sf_store_req = sf_store     # requested (sf_store_for); sf_store_got = what the step build ended up with
         self.sf_store_got: Optional[str] = None
         s_row = sum(n * (k // 32) for n, k in pool.proj_nk.values())  # packed SF bytes of one pool group (K/128 int32)
-        sf_group = s_row if sf_store in ("pool", "resident") else 0
+        # A2-2 FIX (box r1: "no spare HBM slot affordable" with the pool already holding 16): the residency slots are
+        # first the pool's own spare slots beyond the step's staging (`existing`, already in HBM: no cost but their
+        # e8m0 scale buffers); only a shortfall is NEW HBM, bought only when free HBM - reserve - KV allows.
+        self.existing = max(0, int(pool.spare) - self.n_stage)
+        if c.n_spare is not None:
+            want_total = int(c.n_spare)
+        else:
+            want_total = max(self.existing, int(c.spare_cap))
+        want_new = max(0, want_total - self.existing)
+        sf_group = s_row if (sf_store in ("pool", "resident") and want_new) else 0
         step_extra = 0
         if sf_group:
             from runtime import dg_inplace as DI
 
-            # the step's packed-SF copy before the residency slots (always paid: growing the pool re-keys any older
-            # copy, runtime/dg_inplace.py pool_sf_key, so it is rebuilt) + the headroom its build insists on
+            # growing the pool re-keys the step's packed-SF copy (runtime/dg_inplace.py pool_sf_key): it is rebuilt,
+            # + the headroom its build insists on. Paid only when the pool actually grows.
             groups = sum(self.H) + self.L * max(self.n_stage, int(pool.spare))
             head = float(os.environ.get(DI.SF_POOL_HEADROOM_ENV, DI.SF_POOL_HEADROOM_GIB)) * GiB
             step_extra = int(groups * s_row + head)
         self.budget = spare_budget(free, self.L, pool.expert_bytes, weight_bytes,
-                                   n_stage_new=max(0, self.n_stage - pool.spare), reserve_gib=c.reserve_gib,
+                                   n_stage_new=max(0, self.n_stage - int(pool.spare)), reserve_gib=c.reserve_gib,
                                    kv_rows=c.kv_rows, kv_ctx=c.kv_ctx, step_extra_bytes=step_extra,
-                                   sf_group_bytes=sf_group,
-                                   prepaid_bytes=max(0, int(pool.spare) - self.n_stage) * self.L * weight_bytes)
-        aff = self.budget["affordable_per_layer"]
-        if c.n_spare is not None:
-            self.n_spare = int(c.n_spare)
-            if aff is not None and self.n_spare > aff:
-                self.log(f"[residency] WARNING n_spare {self.n_spare} > affordable {aff} per layer (headroom calc)")
-        else:
-            self.n_spare = int(c.spare_cap) if aff is None else int(min(c.spare_cap, aff))
+                                   sf_group_bytes=sf_group)
+        aff = self.budget["affordable_per_layer"]   # NEW slots per layer the free HBM allows
+        new = want_new
+        if aff is not None and new > aff:
+            self.log(f"[residency] WARNING wants {want_new} new HBM slots/layer, only {aff} affordable "
+                     f"(free HBM - reserve {c.reserve_gib} GiB - KV); using {aff} (pool already holds {self.existing} "
+                     f"free beyond the {self.n_stage} staging slots)")
+            new = int(aff)
+        self.n_spare = self.existing + new if c.n_spare is None else min(int(c.n_spare), self.existing + new)
+        self.budget.update({"pool_spare": int(pool.spare), "stage_keep": self.n_stage, "existing_free_per_layer": self.existing,
+                            "want_new_per_layer": want_new, "new_per_layer": new})
         if self.n_spare < 1:
-            raise RuntimeError(f"residency: no spare HBM slot affordable ({self.budget})")
+            raise RuntimeError(f"residency: no residency slot: the pool holds {pool.spare} spare slots/layer, "
+                               f"{self.n_stage} kept for staging, and no new HBM slot is affordable ({self.budget})")
         # weights: the pool grows to H + n_stage + n_spare (before the StaticStep build: storage moves)
         self.spare_added_B = pool.add_spare_slots(self.n_stage + self.n_spare, model)
         self.base = [self.H[l] + self.n_stage for l in range(self.L)]  # first residency slot per layer
@@ -1027,8 +1066,10 @@ class ResidencyManager:
         b = self.budget
         hb = self.hbm_bytes()
         return (f"[residency] HBM free {b['free_GiB']} GiB - KV {b['kv_GiB']} - new staging {b['stage_new_GiB']} - "
-                f"reserve {b['reserve_GiB']} -> affordable {b['affordable_per_layer']} spare slots/layer "
-                f"({b['per_spare_slot_all_layers_GiB']} GiB each over {self.L} layers); n_spare {self.n_spare} "
+                f"reserve {b['reserve_GiB']} -> affordable {b['affordable_per_layer']} NEW slots/layer "
+                f"({b['per_spare_slot_all_layers_GiB']} GiB each over {self.L} layers); pool holds {b['pool_spare']} "
+                f"spare/layer, {b['stage_keep']} kept for staging, {b['existing_free_per_layer']} free in place + "
+                f"{b['new_per_layer']} new; n_spare {self.n_spare} "
                 f"(+{hb['spare_GiB']} GiB HBM), n_stage {self.n_stage}, demotion pool {self.D}/layer = "
                 f"{hb['demotion_pool_GiB']} GiB Grace; drain_n {self.params.drain_n} swaps/drain "
                 f"{self.params.swaps_per_drain} cap/step {self.params.swaps_per_barrier} hyst {self.params.hyst} "
@@ -1066,7 +1107,12 @@ def golden_from_index(index) -> Callable[[int, int], str]:
     def g(l: int, e: int) -> str:
         h = hashlib.sha256()
         for p, kind in ORDER6:
-            t = index.read_tensor(f"layers.{l}.ffn.experts.{e}.{p}.{kind}")
+            name = f"layers.{l}.ffn.experts.{e}.{p}.{kind}"
+            ent = index.entries[name]
+            # explicit device="cpu": the box runtime sets a cuda default device, and ShardIndex.read_tensor allocates
+            # without one (A2-2 box r1: 'read target must be host memory, got cuda:0')
+            t = torch.empty(ent.shape, dtype=ent.dtype, device="cpu")
+            index.read_into(name, t)
             h.update(t.contiguous().view(torch.uint8).numpy().tobytes())
         return h.hexdigest()
     return g

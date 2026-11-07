@@ -54,7 +54,10 @@ COMBOS = (("ref", "ref"), ("ref", "fused"), ("dg-inplace", "ref"))
 def _cfg(**kw):
     from runtime.residency import ResidencyConfig
 
-    base = dict(drain_n=8, min_abs=1.0, hyst=1.0, halflife=100.0, n_spare=2, n_demote=4, reserve_gib=0.0)
+    # stage_keep 16 = the off run's compact-cold-index budget (a smaller S could overflow in one arm only; the
+    # no-growth / S = 8 path has its own test below)
+    base = dict(drain_n=8, min_abs=1.0, hyst=1.0, halflife=100.0, n_spare=2, n_demote=4, reserve_gib=0.0,
+                stage_keep=16)
     base.update(kw)
     return ResidencyConfig(**base)
 
@@ -379,6 +382,50 @@ def test_residency_rows6_on_equals_off_dg_inplace_fused_glue():
     _rows_combo("dg-inplace", "pool", glue_impl="fused")
 
 
+def test_residency_rows6_promotes_into_the_pools_spare_slots_without_growing():
+    """A2-2 FIX (box r1: 'no spare HBM slot affordable' with the pool already holding 16): the step stages into 8, the
+    manager promotes into the other 8 the pool already holds -- no growth, no new HBM (free HBM given as 0)."""
+    _need_tilelang()
+    _need_impl("dg-inplace")
+    from runtime.residency import golden_from_index
+
+    with _model("mini4") as (model, tokdir):
+        gen = _gen_rows(model, tokdir, "dg-inplace")
+        ids = _ids(16, 35)
+        toks = torch.tensor(_ids(ROWS * N_ROW_STEPS, 36), dtype=torch.long, device="cpu").to("cuda")
+        off, routed = _rows_steps(gen, ids, toks, N_ROW_STEPS)
+        pool = gen.pool
+        gen0, spare0, hbm0 = pool.generation, pool.spare, pool.hbm_bytes()
+        gen.set_residency(_cfg(stage_keep=8, n_spare=None, hbm_free_bytes=0))
+        rng = np.random.default_rng(6)
+
+        def before(k):
+            rm = gen.residency_mgr
+            rm.inject_counts(_hot_cold_bias(rm, rng))
+            if 6 <= k < 18 and k + 1 < N_ROW_STEPS:
+                rm.force_swaps(_routed_swaps(rm, _used_ids(routed[k + 1]), demote_routed=k % 2 == 1))
+
+        on, _ = _rows_steps(gen, ids, toks, N_ROW_STEPS, before)
+        rm = gen.residency_mgr
+        assert rm.n_stage == gen.static.spare_slots == 8 and rm.n_spare == spare0 - 8, (rm.n_stage, rm.n_spare, spare0)
+        assert rm.spare_added_B == 0 and rm.budget["new_per_layer"] == 0, rm.budget
+        assert pool.generation == gen0 and pool.spare == spare0 and pool.hbm_bytes() == hbm0
+        assert all(b == len(pool.hot[l]) + 8 for l, b in enumerate(rm.base))
+        ov = gen.static.overflow_counts()
+        if ov["steps"] == 0:   # an overflowing step's logits are wrong (S = 8 holds fewer cold experts than 16)
+            _assert_equal(on, off, "6-row stage 8 + pool spare slots: residency on vs S=16 off")
+        else:
+            print(f"  NOTE: S = 8 overflowed on mini4 ({ov}); equality with the S = 16 off arm not asserted")
+        assert rm.stats["published"] > 0, rm.stats
+        rm.flush()
+        a = rm.audit(golden=golden_from_index(model.runtime_load.index))
+        assert a["ok"], a["errors"][:6]
+        print(f"  6-row stage 8 / pool spare {spare0}: {rm.n_spare} residency slots/layer, no growth; "
+              f"{rm.stats['published']} swaps; overflow {ov}")
+        gen.reset_static()
+        del gen
+
+
 def _rows_event_ordering_run(gen, ids, toks, routed, mutation=None):
     gen.set_residency(_cfg(n_spare=1, frozen=True, drain_n=1 << 20))
     gen.static_step()
@@ -437,7 +484,8 @@ TESTS = [test_residency_on_equals_off_ref, test_residency_on_equals_off_fused_gl
          test_residency_after_step_has_no_host_sync, test_residency_step_time_report,
          test_residency_rows6_on_equals_off_ref, test_residency_rows6_on_equals_off_dg_inplace_pool_sf,
          test_residency_rows6_on_equals_off_dg_inplace_step_sf, test_residency_rows6_on_equals_off_dg_inplace_fused_glue,
-         test_residency_rows6_swaps_while_replays_queued_event_ordering]
+         test_residency_rows6_swaps_while_replays_queued_event_ordering,
+         test_residency_rows6_promotes_into_the_pools_spare_slots_without_growing]
 
 if __name__ == "__main__":
     import traceback

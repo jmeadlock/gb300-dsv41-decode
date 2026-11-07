@@ -383,6 +383,81 @@ def test_spare_budget_on_the_real_model_numbers():
         ResidencyConfig.from_any({"drain": 8})
 
 
+def test_residency_stage_rule():
+    """A2-2 FIX: the step keeps 8 cold-staging slots at 6 rows (topk at 1 row); the pool's other spare slots are residency's."""
+    from runtime.residency import residency_stage
+    c = ResidencyConfig()
+    assert residency_stage(c, "dg-inplace", 6, 6) == 8 and residency_stage(c, "dg-inplace", 1, 6) == 6
+    assert residency_stage(c, "dg-inplace", 6, 6, spare_slots=12) == 12      # an explicit --spare-slots is the staging
+    assert residency_stage(ResidencyConfig(stage_keep=10), "dg-inplace", 6, 6, spare_slots=12) == 10
+    assert residency_stage(c, "dg-inplace", 2, 6) == 8 and residency_stage(c, "dg-inplace", 1, 6, 16) == 6
+    assert residency_stage(ResidencyConfig(stage_keep=40), "dg-inplace", 2, 6) == 12   # capped at R * topk
+    assert residency_stage(c, "ref", 6, 6) == 0 and residency_stage(c, "dg-masked", 6, 6) == 0
+
+
+def test_manager_promotes_into_the_pools_free_spare_slots_without_growing(emu):
+    """Box r1: pool pre-grown to 16, free HBM below the reserve -> 'no spare HBM slot affordable'. Now the 16 - 8
+    slots the pool already holds are the residency slots: no growth, no new HBM, whatever the free HBM."""
+    model, pool, _ = emu("mini4")
+    pool.add_spare_slots(16, model)
+    gen0, spare0 = pool.generation, pool.spare
+    # the box numbers: 8.6 GiB free, reserve 8 GiB -> nothing new is affordable
+    rm = ResidencyManager(pool, model, ResidencyConfig(n_demote=2, hbm_free_bytes=int(8.646 * 2 ** 30)), n_stage=8)
+    assert rm.n_spare == 8 and rm.existing == 8 and rm.budget["new_per_layer"] == 0
+    assert rm.spare_added_B == 0 and pool.generation == gen0 and pool.spare == spare0
+    assert rm.base == [len(pool.hot[l]) + 8 for l in range(pool.n_layers)]
+    for l in range(rm.L):   # residency slots sit behind the 8 staging slots, inside the pool's existing block
+        assert all(rm.base[l] + i < pool.hbm_full[l]["w1"].size(0) for i in range(rm.n_spare))
+    rm.close()
+    # an explicit smaller n_spare uses the first free slots; a larger one than the pool + budget holds is capped
+    rm = ResidencyManager(pool, model, ResidencyConfig(n_spare=3, n_demote=2, hbm_free_bytes=0), n_stage=8)
+    assert rm.n_spare == 3 and rm.spare_added_B == 0
+    rm.close()
+    rm = ResidencyManager(pool, model, ResidencyConfig(n_spare=12, n_demote=2, hbm_free_bytes=0), n_stage=8)
+    assert rm.n_spare == 8 and pool.spare == spare0       # wants 4 new, none affordable: capped, warned, not grown
+    rm.close()
+    # more free HBM: the shortfall is allocated (one growth), never more than asked
+    rm = ResidencyManager(pool, model, ResidencyConfig(n_spare=12, n_demote=2, reserve_gib=0.0,
+                                                       hbm_free_bytes=1 << 40), n_stage=8)
+    assert rm.n_spare == 12 and rm.budget["new_per_layer"] == 4 and pool.spare == 20 and rm.spare_added_B > 0
+    rm.close()
+    # default (n_spare None): all free slots; with none free in place -> spare_cap new ones, only if affordable
+    model, pool, _ = emu("mini4")
+    with pytest.raises(RuntimeError, match="no residency slot"):
+        ResidencyManager(pool, model, ResidencyConfig(n_demote=2, hbm_free_bytes=0), n_stage=6)
+    rm = ResidencyManager(pool, model, ResidencyConfig(n_demote=2, reserve_gib=0.0, hbm_free_bytes=1 << 40), n_stage=6)
+    assert rm.n_spare == ResidencyConfig().spare_cap and pool.spare == 6 + rm.n_spare
+    rm.close()
+
+
+def test_host_tensors_carry_device_cpu_explicitly(emu):
+    """Box r1: 'read target must be host memory, got cuda:0' -- a host buffer made under the runtime's cuda default
+    device. Every torch factory call in residency.py names its device, and the golden-digest read does not depend on
+    the default device (a meta default device stands in for cuda here)."""
+    import ast
+    import inspect
+    from runtime import residency as R
+
+    fac = {"zeros", "ones", "empty", "full", "tensor", "arange", "as_tensor", "zeros_like", "empty_like", "from_numpy",
+           "linspace", "randn", "rand", "randint", "randperm"}
+    bad = []
+    for n in ast.walk(ast.parse(inspect.getsource(R))):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Name) \
+                and n.func.value.id == "torch" and n.func.attr in fac and n.func.attr != "from_numpy":
+            if not any(k.arg == "device" for k in n.keywords):
+                bad.append(n.lineno)
+    assert not bad, f"torch factory calls without device= in residency.py lines {bad}"
+    model, pool, _ = emu("mini4")
+    assert pool.loc_cpu.device.type == "cpu"
+    g = golden_from_index(model.runtime_load.index)
+    want = g(0, pool.hot[0][0])
+    try:
+        torch.set_default_device("meta")
+        assert g(0, pool.hot[0][0]) == want
+    finally:
+        torch.set_default_device("cpu")
+
+
 # ================================================================================================ mechanism (emulated)
 class _Reg(dict):
     """Address -> uint8 bytes for the emulated gather / staging: the pool's slots and cold pool, plus everything

@@ -50,7 +50,7 @@ class ExpertPool:
         self.hot: Dict[int, Tuple[int, ...]] = {l: hot_map.hot_ids(l) for l in range(n_layers)}
         self.cold: Dict[int, Tuple[int, ...]] = {l: hot_map.cold_ids(l) for l in range(n_layers)}
         self.slot: Dict[Tuple[int, int], Tuple[int, int]] = {}
-        loc = torch.empty(n_layers, n_experts, 2, dtype=torch.int32)
+        loc = torch.empty(n_layers, n_experts, 2, dtype=torch.int32, device="cpu")  # host mirror: explicit (cuda default device)
         for l in range(n_layers):
             for s, e in enumerate(self.hot[l]):
                 self.slot[(l, e)] = (TIER_HBM, s)

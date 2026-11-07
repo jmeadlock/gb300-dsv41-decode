@@ -80,8 +80,9 @@ runtime/residency.py ResidencyManager on the static step: built before the Stati
 after (it owns the pointer tables), `after_step()` after every static/graph step (hit counter, publish, drain every
 drain_n steps, one swap barrier) -- all between replays, outside the graph; `reset_static` restores the boot placement
 and closes it. The logits do not depend on it (bytes are the checkpoint's wherever they live); `last_meta["residency"]`
-counts a greedy call's swaps. At R rows (dg-inplace) the manager is sized from the step's compact-cold-index budget
-(`spare_slots`, default 16) and its headroom calc follows the rows; `step_rows` / `teacher_forced` call `after_step()`
+counts a greedy call's swaps. At R rows (dg-inplace) the step stages into `ResidencyConfig.stage_keep` slots (else `spare_slots`,
+else 8) and the manager promotes into the rest of the pool's pre-grown spare slots (new HBM only if too few and
+affordable); `step_rows` / `teacher_forced` call `after_step()`
 and runtime/dspark_loop.py calls it after every loop step (see docs/A2-2-BOX-PLAN.md).
 """
 from __future__ import annotations
@@ -443,7 +444,7 @@ class Generator:
 
     def _residency_build(self):
         """The ResidencyManager for the step about to be built (grows the pool's weight storage first)."""
-        from runtime.residency import ResidencyManager, n_stage_for, sf_store_for
+        from runtime.residency import ResidencyManager, residency_stage, sf_store_for
 
         if self.pool is None:
             raise ValueError("residency needs the model's ExpertPool (model.runtime_load.pool)")
@@ -452,18 +453,26 @@ class Generator:
             old.close()
         topk = int(self.model.layers[0].ffn.n_activated_experts)
         # R-row dg-inplace: the step's staging slots are its compact-cold-index budget S (M1-T10-FIX2), not R*topk
-        spare = self.spare_slots if (self.rows > 1 and self.moe_impl == "dg-inplace") else None
         cfg = self.residency
+        # A2-2 FIX: residency keeps `n_stage` of the pool's spare slots for the step's cold staging (the step is built
+        # with that budget, `_spare_kw`) and promotes into the rest; new HBM only if the pool holds too few
+        n_stage = residency_stage(cfg, self.moe_impl, self.rows, topk, self.spare_slots)
         if cfg.kv_rows < self.rows:   # the KV reservation of the headroom calc follows the step's rows (~150 MB each)
             cfg = dataclasses.replace(cfg, kv_rows=self.rows)
         return ResidencyManager(self.pool, self.model, cfg,
-                                n_stage=n_stage_for(self.moe_impl, self.rows, topk, spare),
+                                n_stage=n_stage,
                                 sf_store=sf_store_for(self.moe_impl, self.rows))
 
     def _spare_kw(self) -> dict:
         """M1-T10-FIX2: {"spare_slots": n} for the R-row dg-inplace build, {} otherwise."""
-        if self.rows > 1 and self.moe_impl == "dg-inplace" and self.spare_slots is not None:
-            return {"spare_slots": self.spare_slots}
+        if self.rows > 1 and self.moe_impl == "dg-inplace":
+            if self.residency is not None:   # A2-2 FIX: the step stages into the slots residency kept for it
+                from runtime.residency import residency_stage
+
+                topk = int(self.model.layers[0].ffn.n_activated_experts)
+                return {"spare_slots": residency_stage(self.residency, self.moe_impl, self.rows, topk, self.spare_slots)}
+            if self.spare_slots is not None:
+                return {"spare_slots": self.spare_slots}
         return {}
 
     def set_spare_slots(self, n: Optional[int]) -> None:
