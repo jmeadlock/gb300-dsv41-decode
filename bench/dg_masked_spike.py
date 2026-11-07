@@ -35,6 +35,8 @@ for proj, N, Kd in (("w1", INTER, DIM), ("w2", DIM, INTER)):
     for M in (1, 6):
         MAXM = 128   # DeepGEMM masked kernels need max_m >= 128 (measured: 64/8 corrupt later groups)
         x = torch.randn(G, M, Kd, dtype=torch.bfloat16)
+        if os.environ.get("VARY_BLOCKS", "1") == "1":   # per-32 block magnitudes spanning 2^-6..2^6 so per-32 and per-128 scales differ
+            x = (x.view(G, M, Kd // 32, 32) * torch.exp2(torch.randint(-6, 7, (G, M, Kd // 32, 1)).float())).view(G, M, Kd).to(torch.bfloat16)
         # reference per expert (per-32 e8m0 activation scales, the model's act_quant)
         ref = torch.empty(G, M, N, dtype=torch.bfloat16)
         for g in range(G):
