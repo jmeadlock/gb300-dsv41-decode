@@ -65,26 +65,27 @@ def t9b2_gather_tables(ptab, ids, dtab, ids_out, E, row_w, row_s, NBW, BLOCK: tl
     blk = tl.program_id(1)
     p = tl.program_id(2)
     e = tl.load(ids + j)
+    # Triton unifies same-named variables across if/else arms (types must match): each arm uses its own names.
     if blk < NBW:
-        src = tl.load(ptab + p * E + e).to(tl.pointer_type(tl.uint8))
-        dst = tl.load(dtab + p).to(tl.pointer_type(tl.uint8))
-        off = blk * BLOCK + tl.arange(0, BLOCK)
-        m = off < row_w
-        tl.store(dst + j * row_w + off, tl.load(src + off, mask=m), mask=m)
+        src_w = tl.load(ptab + p * E + e).to(tl.pointer_type(tl.uint8))
+        dst_w = tl.load(dtab + p).to(tl.pointer_type(tl.uint8))
+        off_w = blk * BLOCK + tl.arange(0, BLOCK)
+        m_w = off_w < row_w
+        tl.store(dst_w + j * row_w + off_w, tl.load(src_w + off_w, mask=m_w), mask=m_w)
     else:
-        src = tl.load(ptab + (3 + p) * E + e).to(tl.pointer_type(tl.uint8))
-        off = (blk - NBW) * BLOCK + tl.arange(0, BLOCK)
-        m = off < row_s
-        c = tl.load(src + off, mask=m, other=127)
+        src_s = tl.load(ptab + (3 + p) * E + e).to(tl.pointer_type(tl.uint8))
+        off_s = (blk - NBW) * BLOCK + tl.arange(0, BLOCK)
+        m_s = off_s < row_s
+        c = tl.load(src_s + off_s, mask=m_s, other=127)
         if SCALE_F32:
             ci = c.to(tl.int32)
             bits = tl.where(ci == 0, 0x400000, ci << 23)
             bits = tl.where(ci == 255, 0x7FC00000, bits)
-            dst = tl.load(dtab + 3 + p).to(tl.pointer_type(tl.float32))
-            tl.store(dst + j * row_s + off, bits.to(tl.float32, bitcast=True), mask=m)
+            dst_f = tl.load(dtab + 3 + p).to(tl.pointer_type(tl.float32))
+            tl.store(dst_f + j * row_s + off_s, bits.to(tl.float32, bitcast=True), mask=m_s)
         else:
-            dst = tl.load(dtab + 3 + p).to(tl.pointer_type(tl.uint8))
-            tl.store(dst + j * row_s + off, c, mask=m)
+            dst_u = tl.load(dtab + 3 + p).to(tl.pointer_type(tl.uint8))
+            tl.store(dst_u + j * row_s + off_s, c, mask=m_s)
     if IDS:
         if blk == 0:
             if p == 0:

@@ -158,7 +158,7 @@ def test_swiglu_kernels_vs_reference_real_shapes():
             gb = torch.zeros(G_, 8, INTER, dtype=BF, device="cuda")
             ub = torch.zeros_like(gb)
             gb[:, 0], ub[:, 0] = gate, up
-            w = (torch.rand(G_, generator=g) * 2).float().cuda() if with_w else None
+            w = (torch.rand(G_, generator=g, device="cpu") * 2).float().cuda() if with_w else None
             h = _ref_glue(gate, up, w, LIM)
             q_ref, s_ref = R.act_quant(h, 32, R.scale_fmt, R.scale_dtype)
             q = torch.zeros(G_, 8, INTER, dtype=FP8, device="cuda")
@@ -190,10 +190,10 @@ def test_combine_and_hc_post_kernels():
     for _ in range(6):
         x = _act(g, 1, DIM).view(1, 1, DIM)
         res = _act(g, HC, DIM).view(1, 1, HC, DIM)
-        post = (torch.rand(1, 1, HC, generator=g) * 2).cuda()
-        comb = (torch.randn(1, 1, HC, HC, generator=g) * torch.exp2(torch.randint(-4, 5, (1, 1, HC, HC),
-                                                                                   generator=g).float())).cuda()
-        big = (torch.randn(DIM, generator=g) * torch.exp2(torch.randint(10, 17, (DIM,), generator=g).float())).to(BF)
+        post = (torch.rand(1, 1, HC, generator=g, device="cpu") * 2).cuda()
+        comb = (torch.randn(1, 1, HC, HC, generator=g, device="cpu") * torch.exp2(torch.randint(-4, 5, (1, 1, HC, HC),
+                                                                                   generator=g, device="cpu").float())).cuda()
+        big = (torch.randn(DIM, generator=g, device="cpu") * torch.exp2(torch.randint(10, 17, (DIM,), generator=g, device="cpu").float())).to(BF)
         cols = (torch.arange(DIM) % 2 == 0).cuda()
         res[0, 0, 0, cols] = big.cuda()[cols]
         res[0, 0, 2, cols] = big.cuda()[cols]
