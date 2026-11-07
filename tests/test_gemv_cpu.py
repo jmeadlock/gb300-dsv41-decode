@@ -7,8 +7,13 @@ What a CPU can check, and does:
   * block indexing: output row n reads weight scale s[n // 32, k] (no expansion), K block k reads activation scale
     xs[m, k]; N not a multiple of 32 (the last, partial scale row);
   * the GEMV algorithm (`gemv_torch`, the kernel's arithmetic in torch) == a block-faithful emulation of the reference
-    fp8_gemm (per-32 block partial, `acc += C * sa * sb` in K order) bit for bit, and within bf16 rounding of the exact
-    float64 product; rows independent for M = 1..8; the operand contract; configs/cache plumbing;
+    fp8_gemm (per-32 block partial, `acc += C * sa * sb` in K order) bit for bit at split 1, and within bf16 rounding
+    of the exact float64 product; rows independent for M = 1..8; the operand contract; configs/cache plumbing (old
+    round-1 cache entries ignored);
+  * split-K (fix round): the kernel's scale expression pow2(sa) * pow2(sb) == pair_scale on all code pairs; the split
+    partition (no empty split, K not a multiple of the split), auto split for >= 2 x SM programs capped at >= 4 K
+    blocks; the torch mirror of the split order == an independent spelling, bit for bit, and within 1 ulp / <= 0.5 %
+    of the single chain; the candidate grid covers the handoff's search space; the launch plan (grid, EVEN, BLOCK_M);
   * the model.linear patch: routed only inside the scope and only for fp8/e8m0 weights at <= 8 rows (x.numel() // K,
     not x.size(0)); fallthrough reasons; the whole `fp8_impl="gemv"` StaticStep == the reference forward on the mini
     checkpoints when both sides use the same block-faithful GEMM math (pins the act_quant call, shapes, dtypes and
@@ -168,15 +173,17 @@ def test_block_indexing_scale_rows_and_k_blocks():
     assert len({float(got[0, n]) for n in (0, 32, 64)}) == 3  # the three scale rows differ
 
 
-def test_rows_independent_m1_to_8():
-    xq, xs, w, s = _operands(8, 48, 192, seed=9)
-    full = G.mxfp8_gemv(xq, xs, w, s, torch.empty(8, 48, dtype=torch.bfloat16))
+@pytest.mark.parametrize("cfg", [None, G.GemvConfig(32, 4, 4, 2, 5, 1)])
+def test_rows_independent_m1_to_8(cfg):
+    xq, xs, w, s = _operands(8, 48, 640, seed=9)
+    full = G.mxfp8_gemv(xq, xs, w, s, torch.empty(8, 48, dtype=torch.bfloat16), config=cfg)
     for M in range(1, 9):
-        part = G.mxfp8_gemv(xq[:M].contiguous(), xs[:M].contiguous(), w, s, torch.empty(M, 48, dtype=torch.bfloat16))
+        part = G.mxfp8_gemv(xq[:M].contiguous(), xs[:M].contiguous(), w, s, torch.empty(M, 48, dtype=torch.bfloat16),
+                            config=cfg)
         assert torch.equal(part, full[:M])
     for m in range(8):
         one = G.mxfp8_gemv(xq[m:m + 1].contiguous(), xs[m:m + 1].contiguous(), w, s,
-                           torch.empty(1, 48, dtype=torch.bfloat16))
+                           torch.empty(1, 48, dtype=torch.bfloat16), config=cfg)
         assert torch.equal(one, full[m:m + 1])
 
 
@@ -206,21 +213,162 @@ def test_configs_cache_roundtrip_and_no_tune(tmp_path, monkeypatch):
     monkeypatch.setenv("DSV41_GEMV_CACHE", path)
     monkeypatch.setenv("DSV41_GEMV_TUNE", "0")
     try:
-        assert G.get_config(512, 5120, 1) == G.DEFAULT_CONFIG          # tuning off -> default, remembered
-        c = G.GemvConfig(64, 4, 8, 1)
+        d0 = G.get_config(512, 5120, 1)                                  # tuning off -> default, split resolved
+        assert d0 == G.default_config(512, 5120, 1) and d0.split_k == 19  # 16 tiles of 32 -> 19 splits >= 296 progs
+        assert (d0.block_n, d0.ku, d0.num_warps, d0.num_stages, d0.mma) == (32, 4, 4, 1, 0)
+        c = G.GemvConfig(64, 4, 8, 2, 3, 1)
         G.set_config(32768, 1280, 6, c)                                 # key (N, K, block_m(6) = 8)
         assert G.get_config(32768, 1280, 7) == c and G.config_key(32768, 1280, 6) == (32768, 1280, 8)
+        G.set_config(5120, 8192, 1, G.GemvConfig(64, 4, 8, 2))          # split_k 0 (auto) is resolved when set
+        assert G.get_config(5120, 8192, 1).split_k == 4
         assert G.save_cache() == path
         data = json.load(open(path))
-        assert data["configs"]["32768x1280/m8"] == c.as_dict()
+        assert data["configs"]["32768x1280/m8"] == c.as_dict() == {"block_n": 64, "ku": 4, "num_warps": 8,
+                                                                    "num_stages": 2, "split_k": 3, "mma": 1}
+        # a round-1 entry (no split_k / mma) in the same file is ignored, not half-loaded
+        data["configs"]["1280x5120/m1"] = {"block_n": 64, "ku": 4, "num_warps": 8, "num_stages": 1}
+        json.dump(data, open(path, "w"))
         G.reset_configs()
         assert G.get_config(32768, 1280, 8) == c                        # loaded from the file on first miss
         d = G.describe()
         assert d["cache_loaded"] == path and d["configs"]["32768x1280/m8"] == c.as_dict() and d["tune"] is False
-        assert all(cfg.block_n & (cfg.block_n - 1) == 0 and cfg.ku & (cfg.ku - 1) == 0 for cfg in G.CANDIDATES)
-        assert G.DEFAULT_CONFIG in G.CANDIDATES
+        assert d["cache_ignored"] == ["1280x5120/m1"] and "1280x5120/m1" not in d["configs"]
+        assert G.get_config(1280, 5120, 1) == G.default_config(1280, 5120, 1)  # ignored entry -> default (tune off)
     finally:
         G.reset_configs()
+
+
+# ------------------------------------------------------------------------------------------------ split-K
+def test_pow2_product_equals_pair_scale_all_code_pairs():
+    """The kernel's scale expression pow2(sa) * pow2(sb) (fp32 multiply of two exact powers of two) is the exact pair
+    scale on all 65,536 code pairs: subnormal factors (code 0) and results, underflow to 0, inf, NaN."""
+    c = _codes()
+    p = G.pow2_code(c)
+    assert torch.equal(p[:255].view(torch.int32), _e8(c).float()[:255].view(torch.int32)) and torch.isnan(p[255])
+    got = G.pow2_code(c)[:, None] * G.pow2_code(c)[None, :]
+    want = G.pair_scale(c[:, None], c[None, :])
+    nan = torch.isnan(want)
+    assert torch.equal(torch.isnan(got), nan)
+    assert torch.equal(got[~nan].view(torch.int32), want[~nan].view(torch.int32))
+
+
+def test_split_plan_partitions_and_auto_split():
+    for KB in (1, 2, 9, 10, 40, 72, 160, 192, 256):
+        for sk in range(1, 70):
+            per, ns = G.split_plan(KB, sk)
+            spans = [(j * per, min((j + 1) * per, KB)) for j in range(ns)]
+            assert spans[0][0] == 0 and spans[-1][1] == KB and all(a < b for a, b in spans)       # no empty split
+            assert all(spans[j][1] == spans[j + 1][0] for j in range(ns - 1)) and ns <= min(sk, KB)
+    assert G.split_plan(40, 7) == (6, 7)      # last split 4 blocks: K not a multiple of the split
+    assert G.split_plan(9, 6) == (2, 5)       # 6 requested -> 5 non-empty splits
+    assert G.split_plan(160, 1) == (160, 1)
+    sms = 148
+    # the handoff's shapes: programs >= 2 x 148 unless capped at >= 4 K blocks per program
+    assert G.auto_split_k(512, 5120, 32, sms) == 19 and G.auto_split_k(512, 5120, 64, sms) == 37
+    assert G.auto_split_k(512, 5120, 128, sms) == 40                  # capped: 160 / 4
+    assert G.auto_split_k(32768, 1280, 64, sms) == 1 and G.auto_split_k(25600, 6144, 64, sms) == 1
+    assert G.auto_split_k(5120, 8192, 64, sms) == 4 and G.auto_split_k(7, 64, 32, sms) == 1
+    for (N, K) in [(1280, 5120), (32768, 1280), (512, 5120), (5120, 8192), (4096, 1280), (2304, 5120), (5120, 2304),
+                   (25600, 6144)]:
+        for bn in G.TUNE_BLOCK_N:
+            sk = G.auto_split_k(N, K, bn, sms)
+            per, ns = G.split_plan(K // 32, sk)
+            tiles = -(-N // bn)
+            assert per >= 4 and (tiles * sk >= 2 * sms or sk == (K // 32) // 4), (N, K, bn, sk)
+
+
+def _chunked_reference(xq, xs, w, s, split_k):
+    """Independent spelling of the split-K order: per split a left fold over its blocks from +0.0 (python reduce
+    over [M, N] slices), then a left fold over the split partials from +0.0."""
+    import functools
+
+    M, K = xq.shape
+    N, kb = w.size(0), K // 32
+    q = (xq.float().view(M, 1, kb, 32) * w.float().view(1, N, kb, 32)).sum(-1) \
+        * G.pair_scale(xs.view(torch.uint8).int().view(M, 1, kb), s.view(torch.uint8).int()[torch.arange(N) // 32]
+                       .view(1, N, kb))
+    per = -(-kb // split_k)
+    chunks = [range(j, min(j + per, kb)) for j in range(0, kb, per)]
+    parts = [functools.reduce(lambda a, k: a + q[:, :, k], ks, torch.zeros(M, N)) for ks in chunks]
+    return functools.reduce(lambda a, p: a + p, parts, torch.zeros(M, N))
+
+
+@pytest.mark.parametrize("M,N,K,split", [(1, 64, 1280, 7), (3, 96, 1280, 4), (6, 100, 320, 3), (8, 40, 5120, 19),
+                                         (1, 33, 288, 6), (2, 64, 1280, 1)])
+def test_gemv_torch_split_k_order(M, N, K, split):
+    """The CPU algorithm (and through it the CPU path of mxfp8_gemv with a config) mirrors the kernel's split-K:
+    K-order chains per split, then the partials in split order. KB not a multiple of the split included."""
+    xq, xs, w, s = _operands(M, N, K, seed=7 * M + N + split)
+    f32 = G.gemv_torch_f32(xq, xs, w, s, split_k=split)
+    assert torch.equal(f32.view(torch.int32), _chunked_reference(xq, xs, w, s, split).view(torch.int32))
+    cfg = G.GemvConfig(32, 4, 4, 2, split, 1)
+    got = G.mxfp8_gemv(xq, xs, w, s, torch.empty(M, N, dtype=torch.bfloat16), config=cfg)
+    assert torch.equal(got, f32.to(torch.bfloat16))
+    one = G.gemv_torch(xq, xs, w, s, split_k=1)
+    assert torch.equal(one, G.mxfp8_gemv(xq, xs, w, s, torch.empty(M, N, dtype=torch.bfloat16)))  # no config: 1
+    # split-K vs the single chain: equal, or one bf16 rounding of fp32 values that differ by accumulation error only
+    d = (got.double() - one.double()).abs()
+    tol = one.double().abs() * 2.0 ** -7 + _abs_sum(xq, xs, w, s).double() * 2.0 ** -17
+    assert bool((d <= tol).all()), float((d - tol).max())
+
+
+def _abs_sum(xq, xs, w, s):
+    """fp32 sum of |terms| per output (the scale of fp32 accumulation error): the algorithm on |x|, |w|."""
+    absb = lambda t: t.view(torch.uint8).bitwise_and(0x7F).view(FP8)  # noqa: E731 - e4m3 sign bit cleared
+    return G.gemv_torch_f32(absb(xq), xs, absb(w), s, 1)
+
+
+def test_split_k_changes_fp32_order_somewhere():
+    """The split is really applied (else the mirror tests above would be vacuous): on wide-range data the fp32 sums
+    of split 1 and split 8 differ in some outputs, and every difference is within fp32 accumulation error."""
+    xq, xs, w, s = _operands(4, 256, 2048, seed=5)
+    a = G.gemv_torch_f32(xq, xs, w, s, 1)
+    b = G.gemv_torch_f32(xq, xs, w, s, 8)
+    assert bool((a != b).any())
+    assert bool(((a - b).abs() <= _abs_sum(xq, xs, w, s) * 2.0 ** -17).all())
+    bf_a, bf_b = a.to(torch.bfloat16), b.to(torch.bfloat16)
+    assert float((bf_a != bf_b).float().mean()) <= 5e-3   # the 1-ulp class: rare bf16 flips (1024 outputs here)
+
+
+def test_candidates_cover_the_search_space():
+    sms = 148
+    for (N, K, M) in [(512, 5120, 1), (32768, 1280, 6), (5120, 8192, 8), (7, 64, 3)]:
+        cands = G.candidate_configs(N, K, M, sms)
+        assert len(set(cands)) == len(cands) and all(c.split_k >= 1 for c in cands)
+        assert {c.block_n for c in cands} == {32, 64, 128} and {c.ku for c in cands} == {2, 4, 8}
+        assert {c.num_warps for c in cands} == {4, 8} and {c.num_stages for c in cands} == {2, 3, 4}
+        assert {c.mma for c in cands} == {0, 1}
+        for bn in G.TUNE_BLOCK_N:
+            s0 = G.auto_split_k(N, K, bn, sms)
+            assert s0 in {c.split_k for c in cands if c.block_n == bn}
+        if G.block_m(M) >= 4:
+            assert not [c for c in cands if not c.mma and c.block_n == 128]
+    small = G.candidate_configs(512, 5120, 1, sms)
+    assert {c.split_k for c in small if c.block_n == 32} == {19, 38}  # auto and 2x auto, both >= 4 K blocks each
+    big = G.candidate_configs(32768, 1280, 1, sms)
+    assert {c.split_k for c in big if c.block_n == 64} == {1, 2}
+    c1, c2 = G.GemvConfig(64, 2, 4, 2, 19, 0), G.GemvConfig(32, 8, 8, 4, 19, 0)
+    assert G.numerics_key(c1, 512, 5120) == G.numerics_key(c2, 512, 5120) == (9, 18, 0)
+    assert G.numerics_key(replace_mma(c1), 512, 5120) == (9, 18, 1)
+    assert G.numerics_key(G.GemvConfig(64, 2, 4, 2, 20, 0), 512, 5120) == (8, 20, 0)
+
+
+def replace_mma(cfg):
+    import dataclasses
+
+    return dataclasses.replace(cfg, mma=1)
+
+
+def test_launch_plan():
+    p = G.launch_plan(G.GemvConfig(32, 4, 4, 2, 19, 0), 1, 512, 5120)
+    assert p["grid"] == (16, 18) and (p["PER"], p["NSPLIT"]) == (9, 18) and p["SPLIT"] and not p["EVEN"]
+    assert p["BLOCK_M"] == 1 and p["reduce_grid"] == (1,)
+    p = G.launch_plan(G.GemvConfig(64, 4, 8, 3, 1, 1), 6, 32768, 1280)
+    assert p["grid"] == (512, 1) and p["BLOCK_M"] == 16 and p["EVEN"] and not p["SPLIT"] and p["reduce_grid"] is None
+    p = G.launch_plan(G.GemvConfig(128, 8, 4, 2, 4, 0), 8, 5120, 8192)
+    assert p["grid"] == (40, 4) and p["PER"] == 64 and p["EVEN"] and p["BLOCK_M"] == 8 and p["reduce_grid"] == (40,)
+    p = G.launch_plan(G.GemvConfig(32, 8, 4, 2, 7, 1), 3, 40, 1280)        # KB 40, split 7: last split short
+    assert (p["PER"], p["NSPLIT"]) == (6, 7) and not p["EVEN"] and p["grid"] == (2, 7)
 
 
 def test_impl_constants():
@@ -247,6 +395,46 @@ def test_bench_enumerates_the_steps_fp8_linears(tmp_path):
     assert any(s.startswith("attn.wo_a:") for s in skipped) and any(s.startswith("engram.embed:") for s in skipped)
     assert mod.pick_layers(list(range(40)), 8) == [0, 5, 10, 15, 20, 25, 30, 35]
     assert mod.bytes_moved(1, 64, 128) == 64 * 128 + 2 * 4 + 128 + 4 + 128
+
+
+def _bench_module():
+    spec = importlib.util.spec_from_file_location("bench_gemv", os.path.join(REPO, "bench", "gemv_bench.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_bench_gates_fix_round():
+    """The fix-round gates: >= 2x at M=1 and >= 1.5x at M > 1 per shape; >= 4 TB/s for >= 16 MiB weights; <= 8 µs
+    for smaller ones; drift <= 0.5 %; per-step saving >= 12 ms; all_pass only if none of them is False."""
+    mod = _bench_module()
+
+    def rec(N, K, m1, m6, mism=1e-5):
+        per_m = {1: {"speedup": m1[0], "us_gemv": m1[1], "GBps_gemv": m1[2], "mismatch": mism,
+                     "config_invariant": True},
+                 6: {"speedup": m6, "us_gemv": 1.0, "GBps_gemv": 1.0, "mismatch": mism, "config_invariant": True}}
+        return {"shape": [N, K], "per_m": per_m, "gates": mod.shape_gates(N, K, per_m)}
+
+    big_ok = rec(25600, 6144, (2.5, 30.0, 5300.0), 1.6)
+    small_ok = rec(512, 5120, (8.0, 7.5, 360.0), 2.0)
+    g = mod.shape_gates(512, 5120, small_ok["per_m"])
+    assert g["bw_ge_4TBps_m1"] is None and g["small_le_8us_m1"] is True and g["speedup_ge_1p5x_multirow"] is True
+    g = mod.shape_gates(25600, 6144, big_ok["per_m"])
+    assert g["bw_ge_4TBps_m1"] is True and g["small_le_8us_m1"] is None
+    ok = mod.overall_gates([big_ok, small_ok], {"ms_ref": 15.8, "ms_gemv": 3.0, "saved_ms": 12.8})
+    assert ok["all_pass"] and not ok["failing"]
+    for bad, name in [(rec(512, 5120, (8.0, 8.5, 300.0), 2.0), "small_le_8us_m1"),
+                      (rec(512, 5120, (1.9, 7.0, 300.0), 2.0), "speedup_ge_2x_m1"),
+                      (rec(512, 5120, (8.0, 7.0, 300.0), 1.4), "speedup_ge_1p5x_multirow"),
+                      (rec(5120, 8192, (3.0, 12.0, 3500.0), 2.0), "bw_ge_4TBps_m1"),
+                      (rec(512, 5120, (8.0, 7.0, 300.0), 2.0, mism=6e-3), "mismatch_le_0p5pct")]:
+        r = mod.overall_gates([big_ok, bad], {"ms_ref": 15.8, "ms_gemv": 3.0, "saved_ms": 12.8})
+        assert not r["all_pass"] and r["failing"] == {name: [bad["shape"]]}, (name, r)
+    r = mod.overall_gates([big_ok, small_ok], {"ms_ref": 15.8, "ms_gemv": 4.0, "saved_ms": 11.8})
+    assert r["step_saving_ge_12ms_m1"] is False and not r["all_pass"]
+    ts = mod.tune_summary({"us": {"a": 3.0, "b": 2.0, "c": 9.0}, "errors": {"d": "E"}, "n_timed": 3, "n_failed": 1})
+    assert ts["best"] == ("b", 2.0) and ts["runner_up"] == ("a", 3.0) and ts["spread"] == 4.5
+    assert mod.tune_summary(None) == {"source": "cache"}
 
 
 # ------------------------------------------------------------------------------------------------ the model.linear patch

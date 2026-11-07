@@ -1,13 +1,18 @@
 """GPU tests of T9b-1 (runtime/gemv_mxfp8.py, `fp8_impl="gemv"`). Skipped without CUDA/tilelang/triton (Mac).
 
-  * the kernel's own e8m0 pair scale on the device == `pair_scale` (CPU) on all 65,536 code pairs, bit for bit;
+  * the kernel's own scale functions on the device (the integer pair scale AND the pow2(sa) * pow2(sb) product the
+    GEMV evaluates) == `pair_scale` (CPU) on all 65,536 code pairs, bit for bit (catches a flush-to-zero multiply);
   * GEMV vs the reference TileLang `fp8_gemm` (kernel.py:207-307, block 32, e8m0) on synthetic fp8 weights at every
     distinct fp8 Linear shape of the real model plus the mini shapes and N not a multiple of the tile (or of 32), M in
-    {1, 2, 6, 8}, activations from the reference `act_quant`: finite, bf16 mismatch <= 0.5 % of outputs (the 1-ulp
+    {1, 2, 3, 6, 8}, activations from the reference `act_quant`: finite, bf16 mismatch <= 0.5 % of outputs (the 1-ulp
     class; the max ulp distance and the float64 error of both kernels are printed);
-  * every tuning candidate gives bit-identical output (the config choice cannot change numerics -- so a relaunch or a
-    second process that tuned differently still replays the same bits); K-loop remainder (K/32 not a multiple of KU);
-  * graph capture + replay == eager, twice; no host sync after the first call; tuning refuses under capture;
+  * split-K / MMA (fix round): explicit split configs incl. K/32 not a multiple of the split and a split collapsing to
+    fewer splits, M in {1, 3, 6, 8}, both block-partial forms, vs the reference and vs the CPU mirror of the same split
+    order (<= 0.5 %); MMA=1 rejected by this Triton is reported, not failed (the tuner skips it the same way);
+  * configs with the same numerics_key (split partition, MMA) give bit-identical output (BLOCK_N / KU / warps / stages
+    never change the bits); across keys the mismatch is printed; K-loop remainder (K/32 not a multiple of KU);
+  * graph capture (incl. split-K + reduce launches) + replay == eager, twice; no host sync after the first call;
+    tuning and first-use workspace allocation both refused under capture;
   * mini checkpoints, `fp8_impl="gemv"`: static-eager self-replay equal and no host sync; graph == static-eager,
     replay #2, fills-on recapture, relaunch equal; the top-1 stream over prefill + 10 decode steps equals `ref`'s (on a
     mismatch both streams are printed and the test fails); the routed-call count per step is 7 per layer + indexer
@@ -127,11 +132,14 @@ def test_pair_scale_device_all_pairs():
     c = torch.arange(256, dtype=torch.int32)
     a, b = c.repeat_interleave(256), c.repeat(256)
     want = pair_scale(a, b)
-    got = pair_scale_device(a.to(torch.uint8).cuda(), b.to(torch.uint8).cuda()).cpu()
     nan = torch.isnan(want)
-    assert torch.equal(torch.isnan(got), nan)
-    assert torch.equal(got[~nan].view(torch.int32), want[~nan].view(torch.int32))
-    print("  device pair scale == CPU pair_scale on 65,536 code pairs")
+    # mode 0: the integer pair scale; mode 1: pow2(sa) * pow2(sb), the expression the GEMV kernel evaluates (a
+    # flush-to-zero fp32 multiply would show up here as zeros where subnormals are expected)
+    for mode in (0, 1):
+        got = pair_scale_device(a.to(torch.uint8).cuda(), b.to(torch.uint8).cuda(), mode=mode).cpu()
+        assert torch.equal(torch.isnan(got), nan), mode
+        assert torch.equal(got[~nan].view(torch.int32), want[~nan].view(torch.int32)), mode
+    print("  device pair scale (integer form and the kernel's pow2 x pow2 form) == CPU pair_scale on 65,536 pairs")
 
 
 def _vs_reference(shapes, Ms, tag, seed0):
@@ -165,42 +173,130 @@ def test_gemv_vs_reference_real_shapes():
 
 def test_gemv_vs_reference_mini_and_odd_shapes():
     _need_gemv()
-    _vs_reference(MINI_SHAPES + ODD_SHAPES, (1, 2, 6, 8), "mini/odd", 50)
+    _vs_reference(MINI_SHAPES + ODD_SHAPES, (1, 2, 3, 6, 8), "mini/odd", 50)
+
+
+# (N, K, split_k): KB not a multiple of the split (last split shorter), a requested split that collapses to fewer
+# non-empty splits, split 1, and the auto split of a real small shape
+SPLIT_CASES = [(512, 5120, 7), (1280, 1280, 6), (1000, 384, 5), (2304, 5120, 1), (512, 5120, 19), (40, 288, 4)]
+
+
+def test_gemv_split_k_and_mma_vs_reference():
+    """Explicit split-K / MMA configs at M = 1, 3, 6, 8 vs the reference fp8_gemm (<= 0.5 %, finite) and vs the CPU
+    mirror of the same split order (gemv_torch on the device: same split partition, only the intra-block order
+    differs, so also the 1-ulp class). MMA=1 (tl.dot on fp8) may be rejected by this Triton on this GPU -- then it is
+    reported and the tuner never picks it; a wrong MMA result fails."""
+    _need_gemv()
+    from runtime import gemv_mxfp8 as G
+
+    K_ = _kernel()
+    torch.set_default_dtype(torch.bfloat16)
+    bad, mma_err = [], None
+    for i, (N, K, sk) in enumerate(SPLIT_CASES):
+        w, s = _weights(N, K, 700 + i)
+        for M in (1, 3, 6, 8):
+            xq, xs = _act(M, K, 800 + 10 * i + M)
+            ref = K_.fp8_gemm(xq, xs, w, s, E8, block_size=32)
+            mirror = G.gemv_torch(xq, xs, w, s, split_k=sk)
+            for mma in (0, 1):
+                if mma and mma_err:
+                    continue
+                cfg = G.GemvConfig(32 if M > 2 or mma else 64, 4 if K // 32 % 4 else 8, 4, 2, sk, mma)
+                plan = G.launch_plan(cfg, M, N, K)
+                try:
+                    got = G.mxfp8_gemv(xq, xs, w, s, torch.empty(M, N, dtype=torch.bfloat16, device="cuda"),
+                                       config=cfg).clone()
+                    torch.cuda.synchronize()
+                except Exception as e:
+                    if not mma:
+                        raise
+                    mma_err = repr(e)[:300]
+                    print(f"  MMA=1 (tl.dot fp8) unavailable here: {mma_err}")
+                    continue
+                r, rm = compare(got, ref), compare(got, mirror)
+                print(f"  split N={N} K={K} M={M} split_k={sk} -> (PER, NSPLIT) = ({plan['PER']}, {plan['NSPLIT']}) "
+                      f"EVEN={plan['EVEN']} mma={mma}: vs ref {r['mismatch'] * 100:.3f} % (max ulp {r['max_ulp']}), "
+                      f"vs CPU mirror {rm['mismatch'] * 100:.3f} %")
+                if not r["finite"] or r["mismatch"] > MISMATCH_GATE or rm["mismatch"] > MISMATCH_GATE:
+                    bad.append((N, K, M, sk, mma, r["mismatch"], rm["mismatch"]))
+    assert not bad, f"split-K / MMA results outside the 1-ulp class: {bad}"
+
+
+def _invariance_sample(N, K, M, per_group=6):
+    """Up to `per_group` candidates per numerics_key group, spread over the group (BLOCK_N, KU, warps, stages vary)."""
+    from runtime import gemv_mxfp8 as G
+
+    groups = {}
+    for c in G.candidate_configs(N, K, M, G.num_sms()):
+        groups.setdefault(G.numerics_key(c, N, K), []).append(c)
+    out = {}
+    for k, cs in groups.items():
+        step = max(1, len(cs) // per_group)
+        out[k] = cs[::step][:per_group]
+    return out
 
 
 def test_every_candidate_config_bit_identical():
+    """Configs with the same numerics_key (split partition, MMA) give bit-identical outputs: BLOCK_N / KU / warps /
+    stages never change the bits, so a relaunch or a second process replays the same bits for a pinned split + MMA.
+    Different keys may differ by an ulp (split order / intra-block order) -- printed, not asserted."""
     _need_gemv()
-    from runtime.gemv_mxfp8 import CANDIDATES, mxfp8_gemv
+    from runtime import gemv_mxfp8 as G
 
+    n_groups = n_cfgs = 0
+    skipped = {}
     for i, (N, K) in enumerate([(1280, 5120), (512, 5120), (1000, 384), (2304, 5120)]):
         w, s = _weights(N, K, 200 + i)
         for M in (1, 6):
             xq, xs = _act(M, K, 300 + i + M)
-            outs = {}
-            for cfg in CANDIDATES:
-                outs[cfg] = mxfp8_gemv(xq, xs, w, s, torch.empty(M, N, dtype=torch.bfloat16, device="cuda"),
-                                       config=cfg).clone()
-            base = outs[CANDIDATES[0]]
-            diff = [c.as_dict() for c, o in outs.items() if not torch.equal(o, base)]
-            assert not diff, (f"N={N} K={K} M={M}: configs {diff} differ from {CANDIDATES[0].as_dict()} -- the "
-                              f"intra-block tl.sum order depends on the layout; pin configs across processes "
-                              f"(DSV41_GEMV_CACHE) before trusting x-proc L2 rows")
-    print(f"  all {len(CANDIDATES)} candidate configs bit-identical on 4 shapes x M in (1, 6)")
+            reps = {}
+            for key, cfgs in _invariance_sample(N, K, M).items():
+                outs = {}
+                for cfg in cfgs:
+                    try:
+                        outs[cfg] = G.mxfp8_gemv(xq, xs, w, s, torch.empty(M, N, dtype=torch.bfloat16, device="cuda"),
+                                                 config=cfg).clone()
+                    except Exception as e:  # MMA=1 rejected by this Triton: the tuner skips it the same way
+                        skipped[json_key(cfg)] = repr(e)[:120]
+                if not outs:
+                    continue
+                base_cfg = next(iter(outs))
+                diff = [c.as_dict() for c, o in outs.items() if not torch.equal(o, outs[base_cfg])]
+                assert not diff, (f"N={N} K={K} M={M} numerics {key}: configs {diff} differ from "
+                                  f"{base_cfg.as_dict()} -- BLOCK_N/KU/warps/stages changed the bits; pin configs "
+                                  f"across processes (DSV41_GEMV_CACHE) before trusting x-proc L2 rows")
+                reps[key] = outs[base_cfg]
+                n_groups += 1
+                n_cfgs += len(outs)
+            keys = sorted(reps)
+            cross = {f"{a}~{b}": float((reps[a] != reps[b]).float().mean()) for a, b in zip(keys, keys[1:])}
+            print(f"  N={N} K={K} M={M}: {len(keys)} numerics groups bit-identical inside; across groups mismatch "
+                  f"{cross}")
+    print(f"  {n_cfgs} configs in {n_groups} (shape, M, numerics) groups bit-identical within each group; "
+          f"{len(skipped)} configs skipped (did not compile/launch)")
+
+
+def json_key(cfg):
+    return str(sorted(cfg.as_dict().items()))
 
 
 def test_graph_capture_replay_and_no_sync():
     _need_gemv()
     from runtime import gemv_mxfp8 as G
 
-    shapes = [(1280, 5120), (512, 5120)]
+    shapes = [(1280, 5120, 1), (512, 5120, 1), (512, 5120, 6), (32768, 1280, 3)]
     bufs = []
-    for i, (N, K) in enumerate(shapes):
+    for i, (N, K, M) in enumerate(shapes):
         w, s = _weights(N, K, 400 + i)
-        xq, xs = _act(1, K, 500 + i)
-        bufs.append((xq, xs, w, s, torch.empty(1, N, dtype=torch.bfloat16, device="cuda")))
+        xq, xs = _act(M, K, 500 + i)
+        bufs.append((xq, xs, w, s, torch.empty(M, N, dtype=torch.bfloat16, device="cuda")))
     G.reset_configs()
-    for xq, xs, w, s, out in bufs:  # eager: tunes (or defaults), compiles
+    for xq, xs, w, s, out in bufs:  # eager: tunes (or defaults), compiles, allocates the split-K workspaces
         G.mxfp8_gemv(xq, xs, w, s, out)
+    plans = {G._key_str(G.config_key(b[2].size(0), b[2].size(1), b[0].size(0))):
+             G.launch_plan(G.get_config(b[2].size(0), b[2].size(1), b[0].size(0)), b[0].size(0), b[2].size(0),
+                           b[2].size(1))["NSPLIT"] for b in bufs}
+    assert any(v > 1 for v in plans.values()), plans   # the capture below includes split-K + reduce launches
     eager = [b[4].clone() for b in bufs]
     torch.cuda.synchronize()
     torch.cuda.set_sync_debug_mode("error")
@@ -247,8 +343,21 @@ def test_graph_capture_replay_and_no_sync():
         else:
             os.environ["DSV41_GEMV_TUNE"] = prev
     assert raised, "an untuned shape under capture must raise, not tune"
-    print(f"  graph replay x2 == eager; no host sync; untuned shape under capture refused; configs "
-          f"{G.describe()['configs']}")
+    # a known config whose split-K workspace was never allocated eagerly: refused under capture (no allocation there)
+    w, s = _weights(640, 5120, 602)
+    xq, xs = _act(1, 5120, 603)
+    out = torch.empty(1, 640, dtype=torch.bfloat16, device="cuda")
+    G.set_config(640, 5120, 1, G.GemvConfig(32, 4, 4, 1, 11, 0))
+    raised = False
+    g3 = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(g3):
+            G.mxfp8_gemv(xq, xs, w, s, out)
+    except RuntimeError as e:
+        raised = "capture" in str(e) and "workspace" in str(e)
+    assert raised, "a split-K workspace first needed under capture must raise, not allocate"
+    print(f"  graph replay x2 == eager (split-K plans {plans}); no host sync; untuned shape and unallocated "
+          f"workspace under capture refused; configs {G.describe()['configs']}")
 
 
 # ------------------------------------------------------------------------------------------------ mini checkpoint
@@ -360,13 +469,14 @@ def test_gemv_vs_ref_tokens_mini4():
 
 def test_gemv_capture_with_tuning_and_cache():
     """Tuning on: configs are chosen during the warm-up steps (never under capture), written to the cache file, and a
-    reset + reload gives the same configs (the cross-process path)."""
+    reset + reload gives the same configs (the cross-process path). Quick tune space (12-ish candidates per shape)."""
     _need_gemv()
     from runtime import gemv_mxfp8 as G
 
     with tempfile.TemporaryDirectory() as tmp:
-        prev = {k: os.environ.get(k) for k in ("DSV41_GEMV_TUNE", "DSV41_GEMV_CACHE")}
+        prev = {k: os.environ.get(k) for k in ("DSV41_GEMV_TUNE", "DSV41_GEMV_CACHE", "DSV41_GEMV_TUNE_SPACE")}
         os.environ["DSV41_GEMV_TUNE"] = "1"
+        os.environ["DSV41_GEMV_TUNE_SPACE"] = "quick"
         os.environ["DSV41_GEMV_CACHE"] = os.path.join(tmp, "tune.json")
         G.reset_configs()
         try:
@@ -424,7 +534,8 @@ def test_gemv_step_cell_informative():
 
 
 TESTS = [test_pair_scale_device_all_pairs, test_gemv_vs_reference_real_shapes, test_gemv_vs_reference_mini_and_odd_shapes,
-         test_every_candidate_config_bit_identical, test_graph_capture_replay_and_no_sync,
+         test_gemv_split_k_and_mma_vs_reference, test_every_candidate_config_bit_identical,
+         test_graph_capture_replay_and_no_sync,
          test_gemv_static_selfreplay_mini, test_gemv_static_selfreplay_mini4, test_gemv_graph_equals_static_mini,
          test_gemv_graph_equals_static_mini4, test_gemv_vs_ref_tokens_mini, test_gemv_vs_ref_tokens_mini4,
          test_gemv_capture_with_tuning_and_cache, test_gemv_step_cell_informative]
