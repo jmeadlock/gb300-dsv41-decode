@@ -53,6 +53,15 @@ sampling never matters.
 
 Process-global side effects: `Generator` calls `torch.set_default_device(device)` (generate.py:134: the forward builds
 index tensors on the default device).
+
+Modes (T8, docs/T8-T9A-DESIGN.md section 2): `mode="eager"` (default) is the reference call above; `"static"` runs the
+fixed-shape step of runtime/static_step.py eagerly (`StaticStep.forward_static`, graph off); `"graph"` replays its two
+parity CUDA graphs (`StaticStep.replay`). Prefill is the reference's in every mode. In `"graph"` mode the graphs are
+captured on the first prefill (capture runs its own dummy prefill + warm-ups, which the real prefill then overwrites
+from position 0). In static/graph modes `step` returns the StaticStep's static logits buffer (valid until the next
+step) and `next_token_tensor()` its static `tok`; the record format of `greedy` is unchanged, and `last_meta` gains
+`step_sha256` (one fp32-logit digest per position) and `mode`. `marker=True` launches the fixed-name Triton kernel
+`t8_step_marker` once per decode step (inside the graph in graph mode) so nsys finds step boundaries after replay.
 """
 from __future__ import annotations
 
@@ -69,6 +78,7 @@ import torch
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VENDORED_ENCODING = os.path.join(REPO, "reference", "deepseek-inference", "encoding", "encoding.py")
 CUBLAS_WORKSPACE_CONFIG = ":4096:8"
+MODES = ("eager", "static", "graph")
 RECORD_KEYS = ("tag", "prompt", "model", "finish_reason", "n_tokens", "text", "logprobs", "usage")
 
 
@@ -261,7 +271,9 @@ class Generator:
 
     def __init__(self, model, tokenizer_dir: Optional[str] = None, *, tokenizer=None,
                  eos_ids: Optional[Iterable[int]] = None, device=None, top_k: int = 20, nvtx: bool = True,
-                 model_name: str = "m0-reference-runtime", profiler=None, set_default_device: bool = True):
+                 model_name: str = "m0-reference-runtime", profiler=None, set_default_device: bool = True,
+                 mode: str = "eager", max_pos: Optional[int] = None, marker: bool = False,
+                 static_counters: bool = True, static_factory: Optional[Callable] = None):
         self.model = model
         self.tokenizer_dir = tokenizer_dir
         self.tokenizer = tokenizer if tokenizer is not None else (load_tokenizer(tokenizer_dir) if tokenizer_dir else None)
@@ -288,6 +300,67 @@ class Generator:
         self.profile: Optional[dict] = None
         self.pool = getattr(getattr(model, "runtime_load", None), "pool", None)
         self.last_meta: dict = {}
+        # T8 modes
+        self.marker = bool(marker)
+        self.static_counters = bool(static_counters)
+        self.static_factory = static_factory
+        self.static = None  # runtime.static_step.StaticStep (or the factory's stand-in), built on first use
+        self._static_max_pos = max_pos
+        self._marker_ctr = None
+        self.mode = "eager"
+        self.set_mode(mode)
+
+    # ---------------------------------------------------------------- modes (T8)
+    def set_mode(self, mode: str) -> None:
+        if mode not in MODES:
+            raise ValueError(f"mode {mode!r} not in {MODES}")
+        self.mode = mode
+
+    @property
+    def max_pos(self) -> int:
+        """Largest decode position this Generator can serve in its current mode."""
+        if self.mode == "eager":
+            return self.max_seq_len - 1
+        mp = self._static_max_pos
+        return self.max_seq_len - 1 if mp is None else int(mp)
+
+    def static_step(self):
+        """The StaticStep (built on first call: pointer tables, staging, static buffers; no capture)."""
+        if self.static is None:
+            if self.static_factory is not None:
+                self.static = self.static_factory(self.model)
+            else:
+                from runtime.static_step import StaticStep
+
+                self.static = StaticStep(self.model, self.pool, max_pos=self._static_max_pos, marker=self.marker,
+                                         counters=self.static_counters)
+        return self.static
+
+    def reset_static(self) -> None:
+        """Drop the StaticStep and its graphs (a "relaunch" of the static path; the next use rebuilds it)."""
+        if self.static is not None and hasattr(self.static, "detach"):
+            self.static.detach()
+        self.static = None
+        if self.is_cuda:
+            torch.cuda.synchronize(self.device)
+            torch.cuda.empty_cache()
+
+    def capture(self, fills: bool = False) -> dict:
+        """(Re)capture g_even/g_odd. Must run before a real prefill (it prefills a dummy prompt itself)."""
+        return self.static_step().capture(fills=fills)
+
+    def _ensure_captured(self) -> None:
+        if self.mode == "graph" and not self.static_step().captured:
+            self.capture()  # before the real prefill: capture prefills a dummy prompt and runs warm-up steps
+
+    def _marker_eager(self) -> None:
+        if not (self.marker and self.is_cuda):
+            return
+        from runtime.static_kernels import step_marker
+
+        if self._marker_ctr is None:
+            self._marker_ctr = torch.zeros(1, dtype=torch.int32, device=self.device)
+        step_marker(self._marker_ctr)
 
     # ---------------------------------------------------------------- text
     @property
@@ -342,6 +415,7 @@ class Generator:
             raise ValueError("empty prompt")
         if len(ids) > self.max_seq_len:
             raise ValueError(f"prompt {len(ids)} > max_seq_len {self.max_seq_len}")
+        self._ensure_captured()
         tokens = torch.tensor([list(ids)], dtype=torch.long, device=self.device)
         nv = _nvtx() if self.nvtx else None
         if nv:
@@ -357,19 +431,31 @@ class Generator:
     @torch.inference_mode()
     def step(self, token, pos: int) -> torch.Tensor:
         """`model(tokens[:, pos:pos+1], pos)` (generate.py:69-78): feed `token` (int, or a device tensor holding one
-        id -- no host sync) at position `pos`. NVTX "decode_step"; profiler window hooks."""
+        id -- no host sync) at position `pos`. NVTX "decode_step"; profiler window hooks. In "static"/"graph" mode the
+        StaticStep runs instead (eagerly / as a graph replay); the returned logits are then its static buffer."""
         if pos >= self.max_seq_len:
             raise ValueError(f"position {pos} >= max_seq_len {self.max_seq_len}")
-        if isinstance(token, torch.Tensor):
-            tokens = token.reshape(1, 1).to(device=self.device, dtype=torch.long)
+        static = self.mode != "eager"
+        if not static:
+            if isinstance(token, torch.Tensor):
+                tokens = token.reshape(1, 1).to(device=self.device, dtype=torch.long)
+            else:
+                tokens = torch.tensor([[int(token)]], dtype=torch.long, device=self.device)
         else:
-            tokens = torch.tensor([[int(token)]], dtype=torch.long, device=self.device)
+            st = self.static_step()
+            if self.mode == "graph" and not st.captured:
+                raise RuntimeError("graph mode: capture() must run before the prefill (prefill() does it)")
         self._profile_before()
         nv = _nvtx() if self.nvtx else None
         if nv:
             nv.range_push("decode_step")
         try:
-            out_ids, logits, _ = self.model(tokens, pos)
+            if static:
+                logits = st.step(token, pos, graph=self.mode == "graph")
+                out_ids = st.tok.view(1)
+            else:
+                self._marker_eager()
+                out_ids, logits, _ = self.model(tokens, pos)
         finally:
             if nv:
                 nv.range_pop()
@@ -384,11 +470,19 @@ class Generator:
 
     # ---------------------------------------------------------------- counters
     def cold_totals(self) -> Optional[Tuple[int, int, List[int], List[int]]]:
-        """(hot calls, cold calls, hot per layer, cold per layer) from expert_pool's counters, or None."""
+        """(hot calls, cold calls, hot per layer, cold per layer) from expert_pool's counters, or None. In static/graph
+        mode the decode steps' routed calls come from the StaticStep's device counters (the reference experts are not
+        called, so their hooks do not fire); the prefill's still come from the hooks. Reading them syncs."""
         c = getattr(self.pool, "counters", None) if self.pool is not None else None
         if not c:
             return None
-        return sum(c["hot_calls"]), sum(c["cold_calls"]), list(c["hot_calls"]), list(c["cold_calls"])
+        hot_l, cold_l = list(c["hot_calls"]), list(c["cold_calls"])
+        cc = self.static.cold_counts() if self.static is not None and hasattr(self.static, "cold_counts") else None
+        if cc is not None:
+            cold_dev, n, k = cc
+            hot_l = [h + n * k - cd for h, cd in zip(hot_l, cold_dev)]
+            cold_l = [x + cd for x, cd in zip(cold_l, cold_dev)]
+        return sum(hot_l), sum(cold_l), hot_l, cold_l
 
     # ---------------------------------------------------------------- greedy
     @torch.inference_mode()
@@ -400,8 +494,13 @@ class Generator:
         L = len(ids)
         if L + max_new > self.max_seq_len:
             raise ValueError(f"prompt {L} + max_new {max_new} > max_seq_len {self.max_seq_len}")
+        if self.mode != "eager" and L + max_new - 2 > self.max_pos:
+            raise ValueError(f"prompt {L} + max_new {max_new}: last decode position {L + max_new - 2} > max_pos "
+                             f"{self.max_pos} of the static step")
+        self._ensure_captured()
         eos = set(self.eos_ids)
         digest = hashlib.sha256()
+        step_digests: List[str] = []
         c0 = self.cold_totals()
         t0 = time.perf_counter()
         logits = self.prefill(ids)
@@ -424,6 +523,7 @@ class Generator:
             if amax != tok:
                 raise RuntimeError(f"position {pos}: model argmax {tok} != argmax of returned logits {amax}")
             digest.update(lc.numpy().tobytes())
+            step_digests.append(hashlib.sha256(lc.numpy().tobytes()).hexdigest())
             entries.append(logprob_entry(lc, tok, top_k, self.token_str))
             gen.append(tok)
             if stop_on_eos and tok in eos:
@@ -439,7 +539,7 @@ class Generator:
                           entries=entries, finish_reason=finish, text=self.decode(text_ids))
         c1 = self.cold_totals()
         meta = {"logits_sha256": digest.hexdigest(), "token_ids": gen, "prompt_tokens": L, "wall_s": wall,
-                "prefill_s": t_prefill, "n_forward": len(gen),
+                "prefill_s": t_prefill, "n_forward": len(gen), "mode": self.mode, "step_sha256": step_digests,
                 "decode_ms_per_token": (wall - t_prefill) / max(1, len(gen) - 1) * 1e3 if len(gen) > 1 else None}
         if c0 is not None and c1 is not None:
             hot, cold = c1[0] - c0[0], c1[1] - c0[1]

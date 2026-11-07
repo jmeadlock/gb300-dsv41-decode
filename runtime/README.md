@@ -1,7 +1,8 @@
 # runtime/ — M0 loader, placement, host tier, expert pools (T2+T3)
 
 Standalone: no vllm import anywhere (charter decision 3). The reference `model.py` is imported unchanged from
-`reference/deepseek-inference/` (`runtime/refmodel.py`); nothing is monkeypatched, so there is no `patches.py`.
+`reference/deepseek-inference/` (`runtime/refmodel.py`); every behavior change is a flag-gated monkeypatch in
+`patches.py` (default off) citing the model.py line it replaces.
 
 | file | what |
 |---|---|
@@ -11,7 +12,10 @@ Standalone: no vllm import anywhere (charter decision 3). The reference `model.p
 | `expert_pool.py` | hot experts in per-layer HBM slot pools `[H,N,K/2]` + `[H,N,K/32]`; cold experts in one registered host pool, same layout; `loc[L][E] = (slot, tier)` int32 on device; binds the reference `Expert`s to zero-copy views (M0a zero-copy arm); host-side cold-hit counters |
 | `loader.py` | `build_and_load(model_dir, map, device)` and a CLI: meta construction, tiered streaming load, refusal on any key/shape/dtype mismatch, `--verify` sha256 of every placed tensor |
 | `refmodel.py` | imports the reference modules; `cpu_stubs=True` (Mac tests only) stands in for tilelang/PIL; Python < 3.10 compiles them with `from __future__ import annotations` (the file is untouched) |
-| `generate.py` | T5 driver: `Generator(model, tokenizer_dir)` -- `encode`/`decode` (checkpoint `encoding.py` chat mode + `tokenizer.json`), `prefill`/`step` (generate.py's call pattern), `greedy` -> one parity JSONL record (fp32 log-softmax top-20), NVTX `decode_step`, `arm_profile` (cudaProfilerApi window), `set_determinism` |
+| `generate.py` | T5 driver: `Generator(model, tokenizer_dir)` -- `encode`/`decode` (checkpoint `encoding.py` chat mode + `tokenizer.json`), `prefill`/`step` (generate.py's call pattern), `greedy` -> one parity JSONL record (fp32 log-softmax top-20), NVTX `decode_step`, `arm_profile` (cudaProfilerApi window), `set_determinism`; T8 `mode="eager"|"static"|"graph"`, `marker=True` |
+| `static_step.py` | T8: `StaticStep(model, pool, max_pos=)` -- the fixed-shape 1-row decode step (design table 2.1 #1-#15 row by row in its docstring), `forward_static(parity)` eager, `capture()` g_even/g_odd, `replay(pos)` |
+| `static_kernels.py` | T8 Triton kernels (GPU only): the spike's pointer-table gather `t8_gather_rows`, the per-step `t8_step_marker` |
+| `patches.py` | flag-gated monkeypatches: `kv_numerics_pg61` (model.py:761), `static_moe` (model.py:891-906, design #14) |
 
 ## Value paths (bit-identity rule)
 
@@ -198,3 +202,47 @@ Options:
   [--nvtx-layers]` and wrap the command in `nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop`.
   Where nsys lives (host `/usr/local/bin/nsys` in W0) and how it is mounted into the container is not settled here;
   the hooks are tested only without nsys attached.
+
+## T8: one CUDA graph per decode step (`static_step.py`)
+
+Spec: `docs/T8-T9A-DESIGN.md` section 2. `Generator(..., mode="graph")` captures `g_even`/`g_odd` on its first
+prefill and replays them per step; `mode="static"` runs the same code eagerly; prefill is always the reference's.
+Every replacement keeps the reference arithmetic; the one known limit is design risk 6: once a ratio-1 layer can
+reach more than 512 compressed positions (pos > 512), or a candidate source more than 2,048 blocks, the selected set
+depends on score bits and topk tie order at a different width than the reference's, and is identical only when there
+is no tie at the k-th boundary (tests/test_static_cpu.py pins exactly that property). The W0 fixture (<= 310 tokens)
+never gets there; the 512-step step cell does after ~470 steps.
+
+**Mac:** `.venv/bin/python -m pytest -q tests/` -- `test_static_cpu.py` (index math vs the reference's host
+functions, padded-vs-dynamic topk with ties, parity selection, Engram hash, Generator modes, first_light's
+`--parity-levels` table) and `test_static_emulated_cpu.py` (the whole `StaticStep` vs the reference forward on the
+mini checkpoints with CPU emulations of the six kernels, `torch.equal` every position).
+
+**Box, GPU test** (mini checkpoints; static-eager == reference, graph == static-eager, no host sync, fills-on
+recapture, relaunch, marker, step cell):
+
+    W=$HOME/hermes/gb300-dsv41-decode
+    docker run --rm --device nvidia.com/gpu=GPU-1c1855c8-dd10-0247-583e-3c3880ddbf55 --ipc=host --ulimit memlock=-1:-1 \
+      -v "$W":/work -w /work -e CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+      -v "$HOME/dsv41/w0/jit-cache/tilelang":/root/.tilelang -v "$HOME/dsv41/w0/jit-cache/triton":/root/.triton \
+      -v "$HOME/dsv41/w0/jit-cache/nv":/root/.nv \
+      --entrypoint python3 vllm/vllm-openai:v0.31.0 tests/gpu/test_static_mini_gpu.py
+
+**Box, first light in graph mode** (L0/L1/L2 table first, then the reps graded by bench/parity.py, then the step cell
+in graph mode; same mounts as T6's first light):
+
+    docker run --rm --device nvidia.com/gpu=GPU-1c1855c8-dd10-0247-583e-3c3880ddbf55 \
+      --ipc=host --ulimit memlock=-1:-1 --cap-add IPC_LOCK \
+      -v "$W":/work -w /work -v "$W/w0":/work/w0 \
+      -v /models/DeepSeek-V4.1-Flash-1017-1bae0e1088993b9b82de08f59de5be5a34e42170:/ref:ro \
+      -v "$HOME/dsv41/w0/jit-cache/tilelang":/root/.tilelang -v "$HOME/dsv41/w0/jit-cache/triton":/root/.triton \
+      -v "$HOME/dsv41/w0/jit-cache/nv":/root/.nv \
+      -e CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+      --entrypoint python3 vllm/vllm-openai:v0.31.0 \
+      bench/first_light.py --model-dir /ref --hot-per-layer 295 --mode graph --parity-levels --max-pos 4095 \
+        --fixture w0/results/phase1/parity-A.jsonl --out scratch/first-light-graph.jsonl \
+        --max-new 256 --reps 2 --step-cell 512 --no-fill-uninit --json docs/first-light-graph-<date>.json
+
+`--no-fill-uninit` applies to the reps/step cell (timed runs fills off, design 1(b)); `--parity-levels` runs its own
+fills-off and fills-on passes regardless. Add `--levels-ref <earlier report>` on a second run for the cross-process
+relaunch rows; add `--marker` (+ `--skip-parity --profile`) under nsys to find step boundaries after replay.

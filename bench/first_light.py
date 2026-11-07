@@ -17,6 +17,13 @@ and one timed step cell.
     mean / p50 / p90 ms per step and tokens/s; EOS does not stop the cell (it is recorded);
 (e) expert_pool's cold-hit counters: per-layer cold calls for rep 1 and for the step cell, and the cold share of every
     decode step (cold calls / routed-expert calls; 6 routed experts x 40 layers = 240 calls per row-step).
+(f) T8 (docs/T8-T9A-DESIGN.md 2.4): `--mode eager|static|graph` selects how every decode step of (a) and (d) runs
+    (reference forward / the static step eagerly / its CUDA-graph replay); `--parity-levels` first runs the bit-identity
+    levels on --level-steps (32) decode steps x every fixture prompt, fp32-logit sha256 per position, with
+    fill_uninitialized_memory off and then on: L0 static-eager == reference-eager, L1 graph == static-eager, L2 graph
+    replay twice + a relaunch (fresh StaticStep, new capture) equal, plus fills-on == fills-off; prints the table
+    (`parity_levels` in the report). `--levels-ref <earlier report.json>` adds "this process vs that one" rows (the
+    cross-process relaunch). `--marker` launches the fixed-name `t8_step_marker` kernel once per decode step.
 Writes docs/first-light-<YYYYMMDD>.json (or --json) and prints a 12-line summary. One prompt failing logs its
 traceback and the run continues.
 
@@ -173,7 +180,12 @@ def step_cell(gen: Generator, ids: List[int], n_steps: int, stats_from: int = 32
     L = len(ids)
     if L + n_steps + 1 > gen.max_seq_len:
         raise ValueError(f"step cell needs {L + n_steps + 1} positions > max_seq_len {gen.max_seq_len}")
+    if L + n_steps - 1 > gen.max_pos:
+        raise ValueError(f"step cell's last position {L + n_steps - 1} > max_pos {gen.max_pos} ({gen.mode} mode)")
     t0 = time.perf_counter()
+    if hasattr(gen, "_ensure_captured"):
+        gen._ensure_captured()  # graph mode: capture outside the prefill timing
+        t0 = time.perf_counter()
     gen.prefill(ids)
     if cuda:
         torch.cuda.synchronize(gen.device)
@@ -225,6 +237,116 @@ def step_cell(gen: Generator, ids: List[int], n_steps: int, stats_from: int = 32
     return out
 
 
+# ------------------------------------------------------------------------------------------------ (f) parity levels
+def _det_module():
+    return getattr(torch.utils, "deterministic", None)
+
+
+def _level_run(gen: Generator, prompts, steps: int) -> Dict[str, dict]:
+    out = {}
+    for tag, ids in prompts:
+        gen.greedy(ids, steps + 1, stop_on_eos=False)
+        m = gen.last_meta
+        out[tag] = {"sha": m["logits_sha256"], "steps": list(m["step_sha256"]), "tokens": list(m["token_ids"])}
+    return out
+
+
+def compare_levels(a: Dict[str, dict], b: Dict[str, dict]) -> dict:
+    """Per prompt: whole-run digest equal; first differing position (0 = the prefill logits) when not."""
+    tags = sorted(set(a) | set(b))
+    per, first = {}, None
+    for t in tags:
+        if t not in a or t not in b:
+            per[t] = {"equal": False, "first_step": None, "missing": True}
+        else:
+            eq = a[t]["sha"] == b[t]["sha"]
+            fs = None
+            if not eq:
+                sa, sb = a[t]["steps"], b[t]["steps"]
+                fs = next((i for i in range(min(len(sa), len(sb))) if sa[i] != sb[i]), min(len(sa), len(sb)))
+            per[t] = {"equal": eq, "first_step": fs}
+        if not per[t]["equal"] and first is None:
+            first = f"{t}@{per[t]['first_step']}"
+    n_eq = sum(1 for v in per.values() if v["equal"])
+    return {"equal": n_eq, "n": len(tags), "all_equal": n_eq == len(tags) and len(tags) > 0, "first_diff": first,
+            "per_prompt": per}
+
+
+def parity_levels(gen: Generator, rows: List[dict], steps: int = 32, log=print,
+                  ref_runs: Optional[Dict[str, Dict[str, dict]]] = None) -> dict:
+    """T8 design 2.4 on `steps` decode steps x every row: L0 (static-eager vs reference-eager), L1 (graph vs
+    static-eager), L2 (graph replay #2 and a relaunch vs replay #1), each with fill_uninitialized_memory off and on,
+    plus fills-on vs fills-off. `ref_runs` (an earlier report's `parity_levels.runs`) adds cross-process rows.
+    Leaves the Generator in its original mode with fills restored and, in graph mode, graphs captured fills-off."""
+    prompts = [(r["tag"], gen.encode([{"role": "user", "content": r["prompt"]}])) for r in rows]
+    det = _det_module()
+    fill0 = getattr(det, "fill_uninitialized_memory", None) if det is not None else None
+    mode0 = gen.mode
+    runs: Dict[str, Dict[str, dict]] = {}
+    timings: Dict[str, float] = {}
+    fills_list = [False, True] if fill0 is not None else [None]
+
+    def timed(label, fn):
+        t = time.time()
+        runs[label] = fn()
+        timings[label] = round(time.time() - t, 2)
+        log(f"[levels] {label}: {timings[label]:.1f} s", flush=True)
+
+    def set_fill(f):
+        if det is not None and f is not None:
+            det.fill_uninitialized_memory = f
+
+    try:
+        for f in fills_list:
+            sfx = "" if f is None else ("/fills-on" if f else "/fills-off")
+            set_fill(f)
+            gen.set_mode("eager")
+            timed("eager" + sfx, lambda: _level_run(gen, prompts, steps))
+            gen.reset_static()
+            gen.set_mode("static")
+            timed("static" + sfx, lambda: _level_run(gen, prompts, steps))
+            gen.set_mode("graph")
+            gen.capture(fills=bool(f))
+            timed("graph1" + sfx, lambda: _level_run(gen, prompts, steps))
+            timed("graph2" + sfx, lambda: _level_run(gen, prompts, steps))
+            gen.reset_static()  # relaunch: new StaticStep (pointer tables, staging, buffers) + a new capture
+            gen.set_mode("graph")
+            gen.capture(fills=bool(f))
+            timed("relaunch" + sfx, lambda: _level_run(gen, prompts, steps))
+    finally:
+        set_fill(fill0)
+        gen.set_mode(mode0)
+        if mode0 == "graph":
+            gen.capture(fills=False)
+
+    table = []
+    for f in fills_list:
+        sfx = "" if f is None else ("/fills-on" if f else "/fills-off")
+        fl = "-" if f is None else ("on" if f else "off")
+        table += [(fl, "L0", "static-eager vs reference-eager", compare_levels(runs["static" + sfx], runs["eager" + sfx])),
+                  (fl, "L1", "graph vs static-eager", compare_levels(runs["graph1" + sfx], runs["static" + sfx])),
+                  (fl, "L2", "graph replay#2 vs replay#1", compare_levels(runs["graph2" + sfx], runs["graph1" + sfx])),
+                  (fl, "L2", "graph relaunch vs replay#1", compare_levels(runs["relaunch" + sfx], runs["graph1" + sfx]))]
+    if len(fills_list) == 2:
+        for k in ("eager", "static", "graph1"):
+            table.append(("on/off", "L2", f"{k}: fills-on vs fills-off",
+                          compare_levels(runs[k + "/fills-on"], runs[k + "/fills-off"])))
+    if ref_runs:
+        for k in sorted(set(runs) & set(ref_runs)):
+            table.append(("x-proc", "L2", f"{k}: this process vs --levels-ref", compare_levels(runs[k], ref_runs[k])))
+    rows_out = [{"fills": fl, "level": lv, "what": what, **{k: v for k, v in c.items() if k != "per_prompt"},
+                 "per_prompt": c["per_prompt"]} for fl, lv, what, c in table]
+    # the T8 gate is the bit-identity rows; "eager: fills-on vs fills-off" is the reference's own determinism
+    gate_rows = [r for r in rows_out if not r["what"].startswith("eager:")]
+    verdict = "PASS" if all(r["all_equal"] for r in gate_rows) else "FAIL"
+    log(f"{'fills':7s}{'level':6s}{'comparison':42s}{'equal':>8s}  first diff (tag@position)")
+    for r in rows_out:
+        log(f"{r['fills']:7s}{r['level']:6s}{r['what']:42s}{r['equal']:>4d}/{r['n']:<3d}  {r['first_diff'] or '-'}")
+    log(f"PARITY LEVELS ({steps} steps x {len(prompts)} prompts, fp32-logit sha256 per position): {verdict}")
+    return {"steps": steps, "n_prompts": len(prompts), "verdict": verdict, "rows": rows_out, "timings_s": timings,
+            "runs": runs}
+
+
 # ------------------------------------------------------------------------------------------------ main
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="T6 first light: parity reps, self-replay, step cell, cold hits.")
@@ -253,6 +375,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="torch.utils.deterministic.fill_uninitialized_memory = False")
     ap.add_argument("--reserve-host-gib", type=float, default=16.0)
     ap.add_argument("--json", default=None, help="default docs/first-light-<YYYYMMDD>.json")
+    ap.add_argument("--mode", choices=["eager", "static", "graph"], default="eager",
+                    help="decode step: reference forward / T8 static step eagerly / its CUDA-graph replay")
+    ap.add_argument("--max-pos", type=int, default=4095,
+                    help="static/graph: largest decode position (fixes the compressed-KV cat and index-score widths)")
+    ap.add_argument("--marker", action="store_true", help="launch t8_step_marker once per decode step (nsys)")
+    ap.add_argument("--parity-levels", action="store_true", help="T8 L0/L1/L2 bit-identity levels before (a)-(e)")
+    ap.add_argument("--level-steps", type=int, default=32, help="decode steps per prompt in --parity-levels")
+    ap.add_argument("--levels-ref", default=None, help="earlier report JSON: compare its parity_levels runs")
     return ap
 
 
@@ -284,9 +414,10 @@ def main(argv=None) -> int:
     report["env"] = {"torch": torch.__version__, "cuda": torch.version.cuda,
                      "device": torch.cuda.get_device_name() if torch.cuda.is_available() else None,
                      "capability": torch.cuda.get_device_capability() if torch.cuda.is_available() else None}
-    gen = Generator(model, a.tokenizer_dir or a.model_dir)
+    gen = Generator(model, a.tokenizer_dir or a.model_dir, mode=a.mode, max_pos=a.max_pos, marker=a.marker)
     report["generator"] = {"eos_ids": gen.eos_ids, "top_k": gen.top_k, "max_seq_len": gen.max_seq_len,
-                           "tokenizer_dir": gen.tokenizer_dir}
+                           "tokenizer_dir": gen.tokenizer_dir, "mode": gen.mode, "max_pos": gen.max_pos,
+                           "marker": gen.marker}
     if a.nvtx_layers:
         install_layer_nvtx(model)
     return measure(gen, a, report, n_layers=len(model.layers), out=out, json_path=json_path, fixture2=fixture2)
@@ -304,6 +435,21 @@ def measure(gen: Generator, a, report: Dict, *, n_layers: int, out: str, json_pa
         report.setdefault("generator", {})["encoding"] = gen.encoding_path
     except Exception:
         report["errors"].append({"stage": "encoding", "traceback": traceback.format_exc()})
+
+    # (f) T8 parity levels, before anything else touches the static step
+    if getattr(a, "parity_levels", False):
+        try:
+            ref_runs = None
+            if getattr(a, "levels_ref", None):
+                with open(a.levels_ref) as f:
+                    ref_runs = (json.load(f).get("parity_levels") or {}).get("runs")
+            report["parity_levels"] = parity_levels(gen, rows, a.level_steps, ref_runs=ref_runs)
+            if report["parity_levels"]["verdict"] != "PASS":
+                report["errors"].append({"stage": "parity_levels", "traceback": "verdict FAIL (see table)"})
+        except Exception:
+            tb = traceback.format_exc()
+            print(f"[parity-levels] FAILED\n{tb}", file=sys.stderr, flush=True)
+            report["errors"].append({"stage": "parity_levels", "traceback": tb})
 
     # (a) reps, (b) parity, (c) self-replay
     reps: Dict[int, dict] = {}
@@ -373,7 +519,10 @@ def summary_lines(r: dict, json_path: str) -> List[str]:
     """Exactly 12 lines."""
     f = lambda x, d=2: "-" if x is None else f"{x:.{d}f}"  # noqa: E731
     b = r.get("boot", {})
-    lines = [f"FIRST LIGHT {r['date']} | map {b.get('map')} | boot {f(b.get('wall_s'), 0)} s | "
+    g = r.get("generator", {})
+    pl = (r.get("parity_levels") or {}).get("verdict")
+    lines = [f"FIRST LIGHT {r['date']} | mode {g.get('mode', 'eager')}{'' if pl is None else f' levels {pl}'} | "
+             f"map {b.get('map')} | boot {f(b.get('wall_s'), 0)} s | "
              f"HBM {f(b.get('cuda_allocated_GiB'))} GiB | {r['env'].get('device')}"]
     reps = r.get("reps", {})
     p1 = reps.get(1, {}).get("prompts", [])
