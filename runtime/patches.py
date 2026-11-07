@@ -65,6 +65,18 @@ def kv_numerics_pg61(enable: bool = True) -> None:
     ref.fp4_act_quant = patched if enable else ref._orig_fp4_act_quant
 
 
+_ACTIVE = {"step": None}
+
+
+def active_static_step(step=None):
+    """Set the StaticStep whose step is running (None = none); returns the previous one. `StaticStep._active` sets
+    it, so the static-MoE patch dispatches to THAT step's MoE objects when several StaticSteps (e.g. a 1-row and a
+    6-row one, M1-T10) share one model."""
+    prev = _ACTIVE["step"]
+    _ACTIVE["step"] = step
+    return prev
+
+
 def static_moe(enable: bool = True) -> None:
     ref = sys.modules.get("model") or __import__("model")
     if not hasattr(ref.MoE, "_orig_forward"):
@@ -72,9 +84,16 @@ def static_moe(enable: bool = True) -> None:
     orig = ref.MoE._orig_forward
 
     def forward(self, x, image_mask=None):
-        st = self.__dict__.get("_static_moe")
-        if st is not None and st.active and image_mask is None and x.numel() == self.dim:
-            return st(x)  # design #14 (model.py:891-906)
+        if image_mask is None:
+            step = _ACTIVE["step"]
+            if step is not None:
+                st = (self.__dict__.get("_static_moes") or {}).get(id(step))
+                if st is not None and st.active and x.numel() == self.dim * getattr(step, "rows", 1):
+                    return st(x)  # design #14 (model.py:891-906); M1-T10: the step's R rows
+            st = self.__dict__.get("_static_moe")
+            if st is not None and st.active and x.numel() == self.dim and \
+                    getattr(getattr(st, "owner", None), "rows", 1) == 1:
+                return st(x)  # legacy single binding (a StaticStep built outside `_active` bookkeeping)
         return orig(self, x, image_mask)
 
     forward.__t8_static_moe__ = True

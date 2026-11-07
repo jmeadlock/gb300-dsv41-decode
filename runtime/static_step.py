@@ -75,15 +75,35 @@ host-side ints become device tensors and dynamic lengths become fixed lengths (c
       bf16). Build-time self-check vs the reference and an fp64 oracle (`attn_describe()`); a failing check or load
       leaves the reference in force.
 
-Not computed: `main_hiddens` (model.py:1267-1269) -- MTP-only, never feeds the logits; the loader's overlay sets
-dspark_target_layer_ids=() and `StaticStep` refuses a model that has target layers.
+  #20 M1-T10, docs/M1-DSPARK-DESIGN.md 1.5 + 2.1 -> the window ring is the step's OWN 256-slot ring per layer
+      (`RING`, indexed pos % 256, both the 1-row and the 6-row step): a write of positions P0..P0+5 then evicts only
+      positions <= P0-128, which no row reads. Row j's index list is `window_idxs_ring`: positions P0+j-127..P0+j,
+      oldest first (the reference's order, model.py:422-426), -1 before position 0, as slots p % 256. The reference's
+      own 128-ring stays the prefill's/eager decode's; a forward hook on the model copies every position a
+      reference forward wrote (the last <= 128 of them) into the 256-ring (`sync_ring`), so a prefill re-seeds it.
+      Compressed indices are offset by the kv length (256 + ...) instead of 128: the gathered values and their order
+      are unchanged; the bounded/FlashMLA counts use the 128 index slots (`self.win`), not the offset.
+
+M1-T10 `rows=6` (`rows` even, <= 8; teacher-forced verify step, design 2.1 row by row): inputs `tok[1, R]`, device P0
+(`pos`), positions P0 + arange(R); RoPE rows per position; R ring writes then attend with per-row lists [1, R, 128];
+ratio-1 latents for R rows, ratio-2 pooling in ONE graph: the R+1-row sequence [state0, r0..r(R-1)] read from offset
+o = 1 - P0 % 2 pools exactly R/2 groups, each pair with the decode expression (model.py:482), then the state commit
+(slot 0 <- last even position's row, slot 1 <- last odd's = the reference's per-token writes 478-480); per-row
+compress_lens [R, 1] (the prefill spelling, model.py:564-566); MoE through runtime/moe_rows.py (dedup of the R*k
+(row, expert) pairs, U <= R*k slots, per-row ascending-id combine); head on all rows -> `logits[R, V]`, `t_out[R]`;
+`main_hidden[R, len(hidden_layers) * dim]` (model.py:1267-1269) when `hidden_layers` is given. One graph (no parity).
+The fused glue is not ported to R > 1 (its kernels and calibrations are one-row): `glue_impl="fused"` builds no
+FusedGlue at R > 1 and the reference glue ops run (`describe()["glue_effective"]`).
+
+`main_hiddens` at rows=1: computed only when `hidden_layers` is given (MTP-only, never feeds the logits); the loader's
+overlay sets dspark_target_layer_ids=() and `StaticStep` refuses a model that has target layers.
 """
 from __future__ import annotations
 
 import contextlib
 import os
 import sys
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -100,6 +120,9 @@ ATTN_IMPLS = ("ref", "bounded", "flashmla")  # T9b-3a: "ref" = reference sparse_
 GATHER_ALIGN = 16                 # T9b-3a: the vectorized staging gather moves 16 B per lane (static_kernels.py)
 GATHER_IMPL_ENV = "DSV41_GATHER_IMPL"  # "u8" = the byte-per-lane gather of T8/T9b-2 (bisecting), default "vec"
 DUMMY_PROMPT = (0, 1)
+RING = 256                        # M1-T10 #20: window ring slots (>= 128 + 5, docs/M1-DSPARK-DESIGN.md 1.5)
+MAX_ROWS = 8                      # rows per step: the GEMV's M <= 8 (runtime/gemv_mxfp8.py)
+MOE_IMPLS_ROWS = ("ref", "dg-masked")  # MoE impls at rows > 1 (runtime/moe_rows.py)
 
 
 # ------------------------------------------------------------------------------------------------ pure index math
@@ -125,6 +148,42 @@ def window_topk_idxs_dev(pos: torch.Tensor, win: int, ar_win: torch.Tensor) -> t
     idx = torch.remainder(torch.remainder(pos, win) + 1 + ar_win, win)
     idx = torch.where(idx > pos, -1, idx)
     return idx.int().view(1, 1, win)
+
+
+def window_idxs_ring(posv: torch.Tensor, win: int, ring: int, ar_win: torch.Tensor) -> torch.Tensor:
+    """#20: per-row window lists over a `ring`-slot ring from device positions `posv` [R] int64 -> int32 [1, R, win]:
+    entry i of row j = slot (posv[j] - win + 1 + i) % ring, -1 where that position is < 0. With ring == win this is
+    `window_topk_idxs_dev` exactly (model.py:422-426: oldest = pos % win + 1, ..., -1 where slot > pos)."""
+    p = posv.view(-1, 1) - (win - 1) + ar_win.view(1, -1)
+    return torch.where(p >= 0, torch.remainder(p, ring), -1).int().view(1, posv.numel(), win)
+
+
+def ratio2_offset(p0: torch.Tensor) -> torch.Tensor:
+    """M1-T10 single-graph ratio-2 pooling: the offset o = 1 - P0 % 2 into the sequence [state0, r0, ..., r(R-1)]
+    (P0 odd: state0 holds position P0-1, the first group is (state0, r0); P0 even: the first group is (r0, r1))."""
+    return 1 - torch.remainder(p0, 2)
+
+
+def ratio2_state_rows(p0: torch.Tensor, rows: int) -> torch.Tensor:
+    """Which of the R new rows end in the ratio-2 state after the step, [slot 0, slot 1]: the reference writes slot
+    pos % 2 per token (model.py:478-480), so slot 0 holds the last even position (row R-2+P0%2), slot 1 the last odd
+    (row R-1-P0%2)."""
+    par = torch.remainder(p0, 2).view(1)
+    return torch.cat([rows - 2 + par, rows - 1 - par])
+
+
+def pool_ratio2_rows(state_kv0: torch.Tensor, state_sc0: torch.Tensor, kv: torch.Tensor, score: torch.Tensor,
+                     seq_idx: torch.Tensor) -> torch.Tensor:
+    """The R/2 completed groups of an R-row step at ratio 2 (R even): seq = [state0, r0..r(R-1)] ([1, R+1, d] fp32),
+    rows seq_idx = o + arange(R), each consecutive pair pooled with the DECODE expression of model.py:482 on its own
+    [1, 2, d] (state slot 0, slot 1) -- the same op on the same layout as the 1-row step, so the pooled values equal
+    the per-parity reference path bit for bit (the prefill spelling 473-475 on [1, G, 2, d] can differ by an fp32
+    ulp: tests/test_static_rows_cpu.py) -> [1, R/2, d] fp32 (pre-norm)."""
+    skv = torch.cat([state_kv0, kv], dim=1).index_select(1, seq_idx)
+    ssc = torch.cat([state_sc0, score], dim=1).index_select(1, seq_idx)
+    outs = [(skv[:, g:g + 2] * ssc[:, g:g + 2].softmax(dim=1)).sum(dim=1, keepdim=True)
+            for g in range(0, skv.size(1), 2)]
+    return torch.cat(outs, dim=1)
 
 
 def freqs_rows(table_real: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
@@ -157,12 +216,12 @@ def indexer_topk_static(index_score: torch.Tensor, compress_lens, k: int, offset
 
 
 def engram_hash_static(st, tok: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
-    """Design #2: NgramHashState.forward (engram.py:159-184) for one text token, batch 1, `pos` a device [1] int64.
-    The cache write `cache[:, start_pos:start_pos+1] = compressed` becomes index_copy_; `positions` = pos. The rest is
-    the reference's code (token_mask None: text only)."""
-    compressed = st.token_map[tok]                                      # engram.py:164, [1, 1]
+    """Design #2: NgramHashState.forward (engram.py:159-184) for R text tokens ([1, R], R = 1 for the 1-row step),
+    batch 1, `pos` the device positions [R] int64. The cache write `cache[:, start_pos:start_pos+R] = compressed`
+    becomes index_copy_; `positions` = pos. The rest is the reference's code (token_mask None: text only)."""
+    compressed = st.token_map[tok]                                      # engram.py:164, [1, R]
     st.cache[:1].index_copy_(1, pos, compressed)                        # engram.py:167
-    positions = pos.view(1, 1)                                          # engram.py:169
+    positions = pos.view(1, -1)                                         # engram.py:169
     tokens, blocked = [], torch.zeros_like(positions, dtype=torch.bool)
     for shift in range(st.layout.max_ngram_size):                       # engram.py:171-175
         source = st.cache[:1].gather(1, (positions - shift).clamp_min(0))
@@ -187,10 +246,12 @@ def _ref():
 
 # ------------------------------------------------------------------------------------------------ per-step scalars
 class _StepScalars:
-    """Device scalars derived from `pos` once per step (lazily, so a graph only records the ones it uses)."""
+    """Device scalars derived from `pos` (= P0, the first row's position) once per step (lazily, so a graph only
+    records the ones it uses). At rows == 1 every value is the T8 one (except the ring slot, #20)."""
 
     def __init__(self, owner: "StaticStep"):
         self.o = owner
+        self.R = owner.rows
         self.c: Dict[tuple, torch.Tensor] = {}
 
     def _get(self, key, fn):
@@ -203,38 +264,58 @@ class _StepScalars:
     def pos(self):
         return self.o.pos
 
-    def p_win(self):
-        return self._get(("p_win",), lambda: torch.remainder(self.o.pos, self.o.win))
+    def posv(self):  # the R row positions P0 + arange(R) [R] (rows == 1: pos itself)
+        if self.R == 1:
+            return self.o.pos
+        return self._get(("posv",), lambda: self.o.pos + self.o.ar_rows)
 
-    def win_idx(self):
-        return self._get(("win_idx",), lambda: window_topk_idxs_dev(self.o.pos, self.o.win, self.o.ar_win))
+    def p_win(self):  # #20: ring slots pos % 256 (model.py:719 at % 128)
+        return self._get(("p_win",), lambda: torch.remainder(self.posv(), self.o.ring))
 
-    def div(self, r):  # write index pos // r (model.py:547, 762)
-        return self._get(("div", r), lambda: torch.div(self.o.pos, r, rounding_mode="floor"))
+    def win_idx(self):  # #6/#20: [1, R, win] oldest-first lists over the 256-ring
+        return self._get(("win_idx",), lambda: window_idxs_ring(self.posv(), self.o.win, self.o.ring, self.o.ar_win))
 
-    def clen(self, r):  # compress_lens = end_pos // r (model.py:568)
-        return self._get(("clen", r), lambda: torch.div(self.o.pos + 1, r, rounding_mode="floor"))
+    def div(self, r):  # write index pos // r (model.py:547, 762); rows > 1: the latents' rows (groups) of this step
+        if self.R == 1:
+            return self._get(("div", r), lambda: torch.div(self.o.pos, r, rounding_mode="floor"))
+        if r == 1:
+            return self.posv()
+        # ratio 2: positions P0..P0+R-1 complete groups P0//2 + arange(R/2) (one per odd position)
+        return self._get(("div", r), lambda: torch.div(self.o.pos, r, rounding_mode="floor") + self.o.ar_groups)
 
-    def nblk(self, r, k, win):  # #18: ceil((win + min(k, compress_lens)) / 64), int32 [1, 1]
+    def clen(self, r):  # compress_lens = end_pos // r (model.py:568); rows > 1: per row [R, 1] (564-565's spelling)
+        if self.R == 1:
+            return self._get(("clen", r), lambda: torch.div(self.o.pos + 1, r, rounding_mode="floor"))
+        return self._get(("clen", r), lambda: torch.div(self.posv() + 1, r, rounding_mode="floor").view(-1, 1))
+
+    def nblk(self, r, k, win):  # #18: ceil((win + min(k, compress_lens)) / 64), int32 [1, R]
         from runtime.kernels.sparse_attn_bounded import nblk_static
 
-        return self._get(("nblk", r, k, win), lambda: nblk_static(self.clen(r), k, win))
+        return self._get(("nblk", r, k, win), lambda: nblk_static(self.clen(r).reshape(-1), k, win))
 
-    def tlen(self, r, k, win):  # #19: win + min(k, compress_lens), int32 [rows]
+    def tlen(self, r, k, win):  # #19: win + min(k, compress_lens), int32 [R]
         from runtime.attn_flashmla import topk_length_static
 
-        return self._get(("tlen", r, k, win), lambda: topk_length_static(self.clen(r), k, win))
+        return self._get(("tlen", r, k, win), lambda: topk_length_static(self.clen(r).reshape(-1), k, win))
 
-    def unreach(self, r):  # arange(W_r) >= compress_lens
+    def unreach(self, r):  # arange(W_r) >= compress_lens ([W] at 1 row, [R, W] at R rows; 566's mask)
         return self._get(("unreach", r), lambda: self.o.ar[r] >= self.clen(r))
 
-    def freqs(self, table):  # freqs_cis[pos : pos+1] (model.py:552, 768)
+    def freqs(self, table):  # freqs_cis[pos : pos+R] (model.py:552, 768)
         k = table.data_ptr()
-        return self._get(("f", k), lambda: freqs_rows(self.o.tables[k], self.o.pos))
+        return self._get(("f", k), lambda: freqs_rows(self.o.tables[k], self.posv()))
 
-    def freqs_lat(self, table, r):  # freqs_cis[pos + 1 - r].unsqueeze(0) (model.py:542, 757)
+    def freqs_lat(self, table, r):  # freqs_cis[pos + 1 - r].unsqueeze(0) (model.py:542, 757); rows > 1: group g -> g*r
         k = table.data_ptr()
-        return self._get(("fl", k, r), lambda: freqs_rows(self.o.tables[k], self.o.pos + (1 - r)))
+        if self.R == 1:
+            return self._get(("fl", k, r), lambda: freqs_rows(self.o.tables[k], self.o.pos + (1 - r)))
+        return self._get(("fl", k, r), lambda: freqs_rows(self.o.tables[k], self.div(r) * r))
+
+    def r2_seq(self):  # ratio-2 pooling: rows o + arange(R) of [state0, r0..] (o = 1 - P0 % 2)
+        return self._get(("r2seq",), lambda: ratio2_offset(self.o.pos) + self.o.ar_rows)
+
+    def r2_state(self):  # ratio-2 state commit: [row of slot 0, row of slot 1]
+        return self._get(("r2st",), lambda: ratio2_state_rows(self.o.pos, self.R))
 
 
 # ------------------------------------------------------------------------------------------------ static MoE (#14)
@@ -325,17 +406,26 @@ class StaticStep:
     the device and accumulate cold calls (for first_light's cold-share report; does not touch the logits). moe_impl:
     "ref" (StaticMoE, bit-identical) or "dg-masked" (runtime/dg_moe.py; dg_deterministic -> deep_gemm's
     use_deterministic_algorithms(True)). fp8_impl: "ref" (reference fp8_gemm) or "gemv" (runtime/gemv_mxfp8.py,
-    design #16)."""
+    design #16). rows (M1-T10): 1 (the T8 step) or an even R <= 8 (the teacher-forced R-row verify step; one graph).
+    hidden_layers: layer ids whose attention input's hc-mean goes to `main_hidden` (model.py:1267-1269; the M1
+    draft's input, config dspark_target_layer_ids = 37, 38, 39 on the real model); () = not computed."""
 
     def __init__(self, model: nn.Module, pool=None, *, max_pos: Optional[int] = None, marker: bool = False,
                  counters: bool = True, moe_impl: str = "ref", dg_deterministic: bool = True,
                  fp8_impl: str = "ref", glue_impl: str = "ref", glue_opts: Optional[dict] = None,
-                 attn_impl: str = "ref", _allow_cpu: bool = False):
+                 attn_impl: str = "ref", rows: int = 1, hidden_layers: Sequence[int] = (),
+                 _allow_cpu: bool = False):
         R = _ref()
         from runtime import patches
 
+        rows = int(rows)
+        if rows != 1 and not (2 <= rows <= MAX_ROWS and rows % 2 == 0):
+            raise ValueError(f"rows {rows}: 1 or an even number <= {MAX_ROWS} (ratio-2 pooling needs whole groups)")
+        self.rows = rows
         if moe_impl not in MOE_IMPLS:
             raise ValueError(f"moe_impl {moe_impl!r} not in {MOE_IMPLS}")
+        if rows > 1 and moe_impl not in MOE_IMPLS_ROWS:
+            raise ValueError(f"moe_impl {moe_impl!r} at rows={rows}: only {MOE_IMPLS_ROWS} (runtime/moe_rows.py)")
         if fp8_impl not in FP8_IMPLS:
             raise ValueError(f"fp8_impl {fp8_impl!r} not in {FP8_IMPLS}")
         if glue_impl not in GLUE_IMPLS:
@@ -384,6 +474,21 @@ class StaticStep:
         self.W = {r: (self.max_pos + 1) // r for r in self.ratios}
         self.ar = {r: torch.arange(self.W[r], **i64) for r in self.ratios}
         self.ar_win = torch.arange(self.win, **i64)
+        self.ar_rows = torch.arange(rows, **i64)
+        self.ar_groups = torch.arange(max(1, rows // 2), **i64)
+        if rows > 1 and self.max_pos < len(DUMMY_PROMPT) + 2 * rows:
+            raise ValueError(f"max_pos {self.max_pos} too small for {rows}-row warm-up steps")
+        # #20: the step's own 256-slot window rings, re-seeded from the reference's 128-ring after every reference
+        # forward (prefill or eager decode) by a forward hook
+        self.ring = RING
+        self.rings = [torch.zeros(1, RING, a.window_kv_cache.size(-1), dtype=a.window_kv_cache.dtype, device=d)
+                      for a in attns]
+        self._ring_of = {id(a): rg for a, rg in zip(attns, self.rings)}
+        self._ring_hook = None  # registered last in __init__ (a failing build leaves no hook behind)
+        self._synced = False    # no reference forward seen yet: the first set_inputs seeds from positions < P0
+        self.hidden_layers = tuple(int(i) for i in hidden_layers)
+        if any(not 0 <= i < len(layers) for i in self.hidden_layers):
+            raise ValueError(f"hidden_layers {self.hidden_layers} outside the model's {len(layers)} layers")
         self.tables: Dict[int, torch.Tensor] = {}
         for a in attns:
             self.tables.setdefault(a.freqs_cis.data_ptr(), torch.view_as_real(a.freqs_cis))
@@ -391,10 +496,14 @@ class StaticStep:
                 if a.indexer.freqs_cis is None:
                     a.indexer.freqs_cis = a.freqs_cis  # what model.py:734-735 sets at the first indexer call
                 self.tables.setdefault(a.indexer.freqs_cis.data_ptr(), torch.view_as_real(a.indexer.freqs_cis))
-        # static inputs/outputs (#1)
-        self.tok = torch.zeros(1, 1, **i64)
+        # static inputs/outputs (#1); rows > 1: tok [1, R], logits [R, V], t_out [R] (argmax per row)
+        self.tok = torch.zeros(1, rows, **i64)
         self.pos = torch.zeros(1, **i64)
-        self.logits = torch.zeros(1, model.head.weight.size(0), dtype=torch.float32, device=d)
+        self.logits = torch.zeros(rows, model.head.weight.size(0), dtype=torch.float32, device=d)
+        self.t_out = torch.zeros(rows, **i64)
+        dim = model.embed.weight.size(1)
+        self.main_hidden = (torch.zeros(rows, len(self.hidden_layers) * dim, dtype=model.embed.weight.dtype, device=d)
+                            if self.hidden_layers else None)
         self.marker_ctr = torch.zeros(1, dtype=torch.int32, device=d)
         # static MoE (#14)
         self.topk = layers[0].ffn.n_activated_experts
@@ -408,7 +517,10 @@ class StaticStep:
         self._dev_pos: Optional[int] = None
         self.n_counted = 0
         self._c: Optional[_StepScalars] = None
-        if self.glue_impl == "fused":  # #17: tables + build-time self-check (eager; syncs; before any capture)
+        self.glue_note: Optional[str] = None
+        if self.glue_impl == "fused" and rows > 1:  # M1-T10: the fused kernels/calibrations are one-row
+            self.glue_note = f"rows={rows}: fused glue not ported (one-row kernels); the reference glue ops run"
+        elif self.glue_impl == "fused":  # #17: tables + build-time self-check (eager; syncs; before any capture)
             from runtime.fused_glue import FusedGlue
 
             self.glue = FusedGlue(self, **(glue_opts or {}))
@@ -417,7 +529,40 @@ class StaticStep:
             self._attn_selfcheck(attns)
         if self.attn_impl == "flashmla":  # #19: load the ops (no vllm), then the build-time self-check (eager)
             self._flashmla_selfcheck(attns)
+        self._ring_hook = model.register_forward_hook(self._after_reference_forward, with_kwargs=True)  # #20
 
+    # ---------------------------------------------------------------- #20 ring re-seed
+    def _after_reference_forward(self, mod, args, kwargs, out) -> None:
+        """Forward hook on the reference Transformer: after `model(tokens, start_pos)` (prefill, eager decode, or the
+        multi-row oracle) copy the positions it wrote into the 256-ring. The static step never calls model.forward."""
+        ids = args[0] if args else kwargs.get("input_ids")
+        sp = args[1] if len(args) > 1 else kwargs.get("start_pos", 0)
+        if ids is None or self.active:
+            return
+        self.sync_ring(int(sp), int(ids.size(1)))
+        self._synced = True
+
+    def sync_ring(self, start: int, n: int) -> None:
+        """Positions [start, start+n) as the reference's 128-ring holds them (only the last `win` survive there,
+        model.py:709-719) -> slots p % 256 of this step's rings. Eager, host ints (prefill time, never captured)."""
+        end = int(start) + int(n)
+        lo = max(int(start), end - self.win, 0)
+        if end <= lo:
+            return
+        with torch.inference_mode():
+            p = torch.arange(lo, end, dtype=torch.long, device=self.dev)
+            src, dst = torch.remainder(p, self.win), torch.remainder(p, self.ring)
+            for layer, rg in zip(self.model.layers, self.rings):
+                rg[:1].index_copy_(1, dst, layer.attn.window_kv_cache[:1].index_select(1, src))
+
+    def ring_positions_equal(self, pos_hi: int) -> bool:
+        """Test helper: the 256-ring holds, for the last min(win, pos_hi+1) positions <= pos_hi, exactly the
+        reference 128-ring's bytes (valid right after a reference forward that ended at pos_hi). Syncs."""
+        lo = max(0, int(pos_hi) - self.win + 1)
+        p = torch.arange(lo, int(pos_hi) + 1, dtype=torch.long, device=self.dev)
+        return all(torch.equal(rg[:1].index_select(1, p % self.ring),
+                               layer.attn.window_kv_cache[:1].index_select(1, p % self.win))
+                   for layer, rg in zip(self.model.layers, self.rings))
     def _flashmla_selfcheck(self, attns) -> None:
         """#19: runtime/attn_flashmla.self_check on this model's attention shapes (heads, head_dim, softmax_scale and
         attn_sink of the first compressed layer, else layer 0; window + k index slots; window + W_max kv rows) against
@@ -497,6 +642,8 @@ class StaticStep:
         from runtime.expert_pool import TIER_HBM
 
         d, pool, k = self.dev, self.pool, self.topk
+        ns = k * self.rows  # staging slots: k at 1 row; R*k at R rows (U <= R*k unique experts, runtime/moe_rows.py)
+        self.n_slots = ns
         moe0 = layers[0].ffn
         ex0 = next(e for e in moe0.experts if e is not None)
         shapes = {p: tuple(getattr(ex0, p).weight.shape) for p in ("w1", "w3", "w2")}
@@ -505,13 +652,13 @@ class StaticStep:
         self.row_bytes: Dict[Tuple[str, str], int] = {}
         for p in ("w1", "w3", "w2"):
             n, kh = shapes[p]
-            self.staging[(p, "weight")] = torch.zeros(k, n, kh, dtype=torch.int8, device=d)
-            self.staging[(p, "scale")] = torch.zeros(k, *sshapes[p], dtype=torch.uint8, device=d)
+            self.staging[(p, "weight")] = torch.zeros(ns, n, kh, dtype=torch.int8, device=d)
+            self.staging[(p, "scale")] = torch.zeros(ns, *sshapes[p], dtype=torch.uint8, device=d)
             self.row_bytes[(p, "weight")] = n * kh
             self.row_bytes[(p, "scale")] = sshapes[p][0] * sshapes[p][1]
         lim = moe0.shared_experts.swiglu_limit
         self.staged_experts: List[nn.Module] = []
-        for j in range(k):
+        for j in range(ns):
             lins = {}
             for p in ("w1", "w3", "w2"):
                 lin0 = getattr(ex0, p)
@@ -520,7 +667,17 @@ class StaticStep:
                                        lin0.in_features, lin0.out_features)
             self.staged_experts.append(_expert_view(R, lins["w1"], lins["w2"], lins["w3"], lim))
         moe_cls = StaticMoE
-        if self.moe_impl == "dg-masked":  # T9a-1: same staging + pointer tables, routed GEMMs on DeepGEMM
+        if self.rows > 1:  # M1-T10: the R-row MoE (dedup of the R*k pairs) on the same staging/pointer tables
+            from runtime import moe_rows
+
+            moe_cls = moe_rows.StaticMoERows
+            if self.moe_impl == "dg-masked":
+                from runtime.dg_moe import DGBuffers
+
+                self.dg = DGBuffers(self, shapes, sshapes, swiglu_limit=lim, deterministic=self.dg_deterministic,
+                                    slots=ns)
+                moe_cls = moe_rows.DGMaskedMoERows
+        elif self.moe_impl == "dg-masked":  # T9a-1: same staging + pointer tables, routed GEMMs on DeepGEMM
             from runtime.dg_moe import DGBuffers, DGMaskedMoE
 
             self.dg = DGBuffers(self, shapes, sshapes, swiglu_limit=lim, deterministic=self.dg_deterministic)
@@ -574,23 +731,29 @@ class StaticStep:
                         ptrs.append(ptr)
                     ptabs[(p, kind)] = torch.tensor(ptrs, dtype=torch.int64, device=d)
             sm = moe_cls(self, moe, l, ptabs)
-            moe._static_moe = sm
+            moe._static_moe = sm  # the last StaticStep built (legacy single binding)
+            moe.__dict__.setdefault("_static_moes", {})[id(self)] = sm  # per step: several may share one model
             self.moes.append(sm)
         self.cold_tab = cold.to(d)
-        self.ids_step = torch.zeros(n_layers, k, dtype=torch.long, device=d)
+        self.ids_step = torch.zeros(n_layers, ns, dtype=torch.long, device=d)
+        self.uvalid_step = torch.ones(n_layers, ns, dtype=torch.long, device=d)  # rows > 1: 1 = a used unique slot
         self.cold_acc = torch.zeros(n_layers, dtype=torch.long, device=d)
+        self.uniq_acc = torch.zeros(n_layers, dtype=torch.long, device=d)       # routed expert calls (unique/layer)
 
     # ---------------------------------------------------------------- body
     @contextlib.contextmanager
     def _active(self):
+        from runtime import patches
         from runtime.patches import fp8_gemv_scope
 
         prev, self.active = self.active, True
+        prev_step = patches.active_static_step(self)  # the static-MoE patch dispatches to this step's MoEs
         try:
             with fp8_gemv_scope(self.fp8_impl == "gemv"):  # design #16
                 yield
         finally:
             self.active = prev
+            patches.active_static_step(prev_step)
 
     def _indexer(self, ix, x, qr, latent, offset, qq=None):
         """Indexer.forward (model.py:527-581), decode, fixed width (design #9-#11, #13). qq: act_quant(qr) when the
@@ -630,17 +793,20 @@ class StaticStep:
         ratio, rd = attn.compress_ratio, attn.rope_head_dim
         latent = None
         if attn.is_kv_source:
-            latent = attn.compressor(x, representative_pos(parity))           # #12 (model.py:748)
+            if self.rows == 1:
+                latent = attn.compressor(x, representative_pos(parity))       # #12 (model.py:748)
+            else:
+                latent = self._compressor_rows(attn.compressor, x)            # M1-T10: one graph for both parities
             sa.compress_kv = attn.compress_kv_cache
         if attn.is_index_source:                                              # model.py:726-738 (len > 0, #7)
             idxs = self._indexer(attn.indexer, x, qr, latent, offset, qq)
             sa.topk_idxs = idxs
             if self._attn_on:                                                 # #18: count where idxs are built
-                ix = attn.indexer
-                self._idx_nblk = c.nblk(ix.compress_ratio, min(ix.index_topk, self.W[ix.compress_ratio]), offset)
+                ix = attn.indexer                                             # (#20: the 128 index slots, not offset)
+                self._idx_nblk = c.nblk(ix.compress_ratio, min(ix.index_topk, self.W[ix.compress_ratio]), self.win)
             if self._fm_on:                                                   # #19: the same count, unrounded
                 ix = attn.indexer
-                self._idx_tlen = c.tlen(ix.compress_ratio, min(ix.index_topk, self.W[ix.compress_ratio]), offset)
+                self._idx_tlen = c.tlen(ix.compress_ratio, min(ix.index_topk, self.W[ix.compress_ratio]), self.win)
         else:
             idxs = sa.topk_idxs
         if latent is not None:                                                # model.py:752-762
@@ -648,6 +814,23 @@ class StaticStep:
             R.fp4_act_quant(latent, 16, True, scale_dtype=torch.float8_e4m3fn)
             attn.compress_kv_cache[:1].index_copy_(1, c.div(ratio), latent)  # #13
         return sa.compress_kv[:1, : self.W[ratio]], idxs                      # #8 stopgap: fixed length
+
+    def _compressor_rows(self, comp, x):
+        """Compressor.forward (model.py:458-485) for the R rows of one step at positions P0..P0+R-1 (R even): ratio 1
+        is the reference call (461-462, any row count); ratio 2 projects all rows (464-465), pools the R/2 completed
+        groups from [state0, r0..] at offset 1 - P0 % 2 (482's expression per pair, `pool_ratio2_rows`) and commits the
+        state as the per-token decode writes leave it (478-480), all from the device P0 -> [1, R/2, d] latents."""
+        if comp.compress_ratio == 1:
+            return comp(x, 1)                                                 # start_pos unused at ratio 1
+        c = self._c
+        dtype = x.dtype
+        xf = x.float()
+        kv, score = comp.wkv(xf), comp.wgate(xf)                              # model.py:464-465, [1, R, d]
+        pooled = pool_ratio2_rows(comp.kv_state[:1, :1], comp.score_state[:1, :1], kv, score, c.r2_seq())
+        sidx = c.r2_state()                                                   # commit after the read of state0
+        comp.kv_state[:1].copy_(kv.index_select(1, sidx))
+        comp.score_state[:1].copy_(score.index_select(1, sidx))
+        return comp.norm(pooled.to(dtype))                                    # model.py:485
 
     def _attn(self, attn, x, parity, xq=None):
         """Attention.forward (model.py:766-791), decode. xq: act_quant(x) when the fused hc_norm made it (#17 R2:
@@ -657,8 +840,8 @@ class StaticStep:
         qr, qq = self._q_path(attn, x, xq)                                    # model.py:771
         q = self._q_proj(attn, qr, freqs_cis, qq)
         self._kv_path(attn, x, xq, freqs_cis)                                 # _window_kv, model.py:706-708, 719
-        kv = attn.window_kv_cache[:1]                                         # model.py:720
-        topk_idxs = c.win_idx()                                               # #6
+        kv = self._ring_of[id(attn)][:1]                                      # #20: the 256-ring (model.py:720)
+        topk_idxs = c.win_idx()                                               # #6/#20
         nblk = tlen = None
         if attn.compress_ratio:
             compress_kv, compress_idxs = self._compress_kv(attn, x, qr, parity, kv.size(1), qq)
@@ -684,13 +867,14 @@ class StaticStep:
         """kv_norm(wkv(x)), RoPE, act_quant QDQ, the ring write at pos % win (model.py:706-708, 719; #5) (#17 R2 #3:
         everything after wkv in one launch)."""
         R, c, g = self.R, self._c, self.glue
+        ring = self._ring_of[id(attn)]                                        # #20
         if g is not None and g.on("kv_path"):
-            g.kv_path(attn, x, xq, freqs_cis, c.p_win())
+            g.kv_path(attn, x, xq, freqs_cis, c.p_win(), ring=ring)
             return
         kv = attn.kv_norm(g.linear_pre(xq, attn.wkv, x) if g is not None else attn.wkv(x))
         R.apply_rotary_emb(kv[..., -attn.rope_head_dim:], freqs_cis)
         R.act_quant(kv, R.fp8_block_size, R.scale_fmt, R.scale_dtype, True)
-        attn.window_kv_cache[:1].index_copy_(1, c.p_win(), kv)
+        ring[:1].index_copy_(1, c.p_win(), kv)
 
     def _sparse_attn(self, q, kv, attn, topk_idxs, nblk, tlen=None):
         """model.py:781 (#18: inside the bounded scope when a block count is published; #19: FlashMLA on every layer
@@ -732,7 +916,7 @@ class StaticStep:
             g.o_path(attn, o, freqs_cis)
             return o.view(1, 1, attn.n_local_groups, -1)
         R.apply_rotary_emb(o[..., -attn.rope_head_dim:], freqs_cis, True)
-        o = o.view(1, 1, attn.n_local_groups, -1)
+        o = o.view(1, self.rows, attn.n_local_groups, -1)
         R.act_quant(o, R.fp8_block_size, R.scale_fmt, R.scale_dtype, True)
         return o
 
@@ -789,10 +973,13 @@ class StaticStep:
         g, m = self.glue, self.model
         if g is not None and g.on("hc_norm") and h.is_contiguous() and pre_mix.is_contiguous():
             return g.head(layer, h, pre_mix)
+        if self.rows > 1:                                                     # M1-T10: logits for every row
+            return m.head(m.norm(layer.hc_pre(h, pre_mix)), full_logits=True)  # model.py:1010-1014, [1, R, V]
         return m.head(m.norm(layer.hc_pre(h, pre_mix)))
 
     def _body(self, parity: int) -> None:
-        """Transformer.forward (model.py:1244-1275) + sample (1288-1292) for one token at device `pos`."""
+        """Transformer.forward (model.py:1244-1275) + sample (1288-1292) for the step's rows at device `pos`
+        (rows == 1: one token, `tok` <- its argmax; rows > 1: R teacher-forced tokens, `t_out` <- the R argmaxes)."""
         R, m = self.R, self.model
         if m.temperature != 0:
             raise ValueError("StaticStep is greedy only (model.temperature must be 0)")
@@ -802,62 +989,92 @@ class StaticStep:
             from runtime.static_kernels import step_marker
             step_marker(self.marker_ctr)
         tok = self.tok
-        hashes = engram_hash_static(m.engram_hash, tok, self.pos) if m.engram_hash is not None else None  # #2
+        hashes = (engram_hash_static(m.engram_hash, tok, self._c.posv()) if m.engram_hash is not None
+                  else None)                                                  # #2
         h = m.embed(tok)
         h = h.unsqueeze(2).repeat(1, 1, m.hc_mult, 1)
         pre_mix = R.make_identity_pre_mix(h, m.hc_mult)
-        for layer in m.layers:
+        hidden = []
+        for i, layer in enumerate(m.layers):
             if layer.engram is not None:
                 h = self._engram(layer.engram, h, hashes[:, :, layer.engram.layer_hash_index, :])
+            if i in self.hidden_layers:                                       # model.py:1267-1269
+                hidden.append(h.mean(dim=2))
             h, pre_mix = self._block(layer, h, pre_mix, parity)
         logits = self._head(layer, h, pre_mix)
-        self.logits.copy_(logits)
-        self.tok.copy_(logits.argmax(dim=-1).view(1, 1))                      # model.py:1292, #1
-        self.pos.add_(1)
+        rows = self.rows
+        self.logits.copy_(logits.view(rows, -1))
+        if hidden:
+            self.main_hidden.copy_(torch.cat(hidden, dim=-1).view(rows, -1))  # model.py:1274
+        if rows == 1:
+            self.tok.copy_(logits.argmax(dim=-1).view(1, 1))                  # model.py:1292, #1
+        else:
+            self.t_out.copy_(logits.argmax(dim=-1).view(rows))                # teacher-forced: tok is the caller's
+        self.pos.add_(rows)
         if self.counters:
-            self.cold_acc.add_(self.cold_tab.gather(1, self.ids_step).sum(-1))
+            if rows == 1:
+                self.cold_acc.add_(self.cold_tab.gather(1, self.ids_step).sum(-1))
+            else:
+                self.cold_acc.add_((self.cold_tab.gather(1, self.ids_step) * self.uvalid_step).sum(-1))
+                self.uniq_acc.add_(self.uvalid_step.sum(-1))
         self._c = None
         self._idx_nblk = self._idx_tlen = None
 
     # ---------------------------------------------------------------- public
-    def forward_static(self, parity: int) -> torch.Tensor:
-        """Run the step eagerly from the static buffers (graph off). The device `pos` must have this parity."""
+    def forward_static(self, parity: int = 0) -> torch.Tensor:
+        """Run the step eagerly from the static buffers (graph off). rows == 1: the device `pos` must have this
+        parity; rows > 1: parity is ignored (one graph serves both)."""
         with torch.inference_mode(), self._active():
-            self._body(int(parity) & 1)
+            self._body(int(parity) & 1 if self.rows == 1 else 0)
         return self.logits
 
+    def _graph_key(self, pos: int) -> int:
+        return parity_of(pos) if self.rows == 1 else 0
+
     def set_inputs(self, token, pos: int) -> None:
-        """tok <- token (int, or a device tensor holding one id: no sync); pos <- pos (skipped when the device already
-        holds it, i.e. right after the previous step)."""
+        """tok <- token (rows == 1: an int or a device tensor holding one id, no sync; rows > 1: R ids as a list or a
+        tensor); pos <- pos = P0 (skipped when the device already holds it, i.e. right after the previous step).
+        Positions P0..P0+R-1 must lie in [1, max_pos]."""
         pos = int(pos)
-        if not 1 <= pos <= self.max_pos:
-            raise ValueError(f"decode position {pos} outside [1, max_pos={self.max_pos}] (design #7: pos >= 1)")
+        if not 1 <= pos <= self.max_pos - (self.rows - 1):
+            raise ValueError(f"decode position {pos} (+{self.rows - 1}) outside [1, max_pos={self.max_pos}] "
+                             f"(design #7: pos >= 1)")
+        if not self._synced:  # #20: built after the prefill -> the reference ring holds positions < pos
+            self.sync_ring(0, pos)
+            self._synced = True
         if token is not None:
             if isinstance(token, torch.Tensor):
-                self.tok.copy_(token.reshape(1, 1))
-            else:
+                self.tok.copy_(token.reshape(1, self.rows))
+            elif self.rows == 1 and not isinstance(token, (list, tuple)):
                 self.tok.fill_(int(token))
+            else:
+                ids = [int(t) for t in token]
+                if len(ids) != self.rows:
+                    raise ValueError(f"{len(ids)} tokens for a {self.rows}-row step")
+                self.tok.copy_(torch.tensor([ids], dtype=torch.long))
         if self._dev_pos != pos:
             self.pos.fill_(pos)
         self._dev_pos = pos
 
     def replay(self, pos: int, token=None) -> torch.Tensor:
-        """Replay g_even/g_odd by pos parity. Returns the static logits buffer (overwritten by the next step)."""
+        """Replay the graph for `pos` (rows == 1: g_even/g_odd by parity; rows > 1: the one graph). Returns the
+        static logits buffer (overwritten by the next step)."""
         if not self.graphs:
             raise RuntimeError("replay before capture()")
         self.set_inputs(token, pos)
-        self.graphs[parity_of(pos)].replay()
-        self._dev_pos = int(pos) + 1
+        self.graphs[self._graph_key(pos)].replay()
+        self._dev_pos = int(pos) + self.rows
         self.n_counted += 1
         return self.logits
 
     def step(self, token, pos: int, graph: bool) -> torch.Tensor:
-        """One decode step at `pos` feeding `token`: graph replay or the same code eagerly."""
+        """One decode step at `pos` (= P0) feeding `token` (R ids at rows > 1): graph replay or the same code
+        eagerly."""
         if graph:
             return self.replay(pos, token)
         self.set_inputs(token, pos)
         out = self.forward_static(parity_of(pos))
-        self._dev_pos = int(pos) + 1
+        self._dev_pos = int(pos) + self.rows
         self.n_counted += 1
         return out
 
@@ -867,10 +1084,10 @@ class StaticStep:
 
     def capture(self, fills: bool = False, warmup: int = 2) -> dict:
         """Design 2.3: dummy prefill (reference, eager), `warmup` steps per parity on a side stream (JIT compiles,
-        cuBLAS handle, allocator), then capture g_even and g_odd with one shared mempool. fill_uninitialized_memory
-        is `fills` throughout (default off: fills recorded into a graph would replay as kernels). Leaves the model's
-        caches holding the dummy sequence: the next real prefill overwrites from position 0 (runtime/generate.py
-        docstring). Returns timings."""
+        cuBLAS handle, allocator), then capture g_even and g_odd with one shared mempool (rows > 1: `warmup` steps
+        at both P0 parities, then ONE graph). fill_uninitialized_memory is `fills` throughout (default off: fills
+        recorded into a graph would replay as kernels). Leaves the model's caches holding the dummy sequence: the
+        next real prefill overwrites from position 0 (runtime/generate.py docstring). Returns timings."""
         import time
 
         det = getattr(torch.utils, "deterministic", None)
@@ -878,6 +1095,8 @@ class StaticStep:
         self.graphs = {}
         torch.cuda.synchronize(self.dev)
         t0 = time.perf_counter()
+        keys = PARITIES if self.rows == 1 else (0,)
+        n_warm = 0
         try:
             if det is not None and prev_fill is not None:
                 det.fill_uninitialized_memory = bool(fills)
@@ -885,7 +1104,7 @@ class StaticStep:
                 toks = torch.tensor([list(DUMMY_PROMPT)], dtype=torch.long, device=self.dev)
                 out_ids, _, _ = self.model(toks, 0)
                 p = len(DUMMY_PROMPT)
-                self.tok.copy_(out_ids.reshape(1, 1))
+                self.tok.copy_(out_ids.reshape(1, 1).expand(1, self.rows))
                 self.pos.fill_(p)
                 s = torch.cuda.Stream(device=self.dev)
                 s.wait_stream(torch.cuda.current_stream(self.dev))
@@ -894,17 +1113,22 @@ class StaticStep:
                         self.dg.warmup()  # DeepGEMM first-call JIT (both GEMM shapes) before anything is captured
                     for _ in range(warmup):
                         for _ in PARITIES:
+                            if self.rows > 1 and p + self.rows - 1 > self.max_pos:
+                                break
                             self.forward_static(parity_of(p))
-                            p += 1
+                            p += self.rows if self.rows == 1 else self.rows + 1  # rows > 1: alternate P0 parity
+                            if self.rows > 1:
+                                self.pos.fill_(p)
+                            n_warm += 1
                 torch.cuda.current_stream(self.dev).wait_stream(s)
                 torch.cuda.synchronize(self.dev)
                 t_warm = time.perf_counter() - t0
                 pool = torch.cuda.graph_pool_handle()
-                for parity in PARITIES:
+                for key in keys:
                     g = torch.cuda.CUDAGraph()
                     with self._active(), torch.cuda.graph(g, pool=pool):
-                        self._body(parity)
-                    self.graphs[parity] = g
+                        self._body(key)
+                    self.graphs[key] = g
                 torch.cuda.synchronize(self.dev)
         finally:
             if det is not None and prev_fill is not None:
@@ -914,28 +1138,57 @@ class StaticStep:
         sa.topk_idxs = sa.candidates = None  # in-graph tensors; the next forward re-publishes them
         with torch.inference_mode():  # cold_acc is an inference tensor (built under the caller's inference_mode); in-place ops need the mode
             self.cold_acc.zero_()
+            self.uniq_acc.zero_()
         self.n_counted = 0
         self._dev_pos = None
         self.captured_fills = bool(fills)
         return {"warmup_s": t_warm, "capture_s": time.perf_counter() - t0 - t_warm, "fills": bool(fills),
-                "warmup_steps": warmup * len(PARITIES)}
+                "warmup_steps": n_warm, "graphs": len(keys)}
 
     def release_graphs(self) -> None:
         self.graphs = {}
         self.captured_fills = None
 
     def detach(self) -> None:
-        """Unbind this StaticStep from the model (MoE `_static_moe`) and drop its graphs, so it can be freed."""
+        """Unbind this StaticStep from the model (MoE `_static_moe(s)`, the #20 ring hook) and drop its graphs, so it
+        can be freed."""
         self.release_graphs()
+        if self._ring_hook is not None:
+            self._ring_hook.remove()
+            self._ring_hook = None
         for sm in self.moes:
             if sm.moe.__dict__.get("_static_moe") is sm:
                 del sm.moe.__dict__["_static_moe"]
+            sms = sm.moe.__dict__.get("_static_moes")
+            if sms is not None and sms.get(id(self)) is sm:
+                del sms[id(self)]
 
     def cold_counts(self) -> Optional[Tuple[List[int], int, int]]:
-        """(cold calls per layer, steps counted, routed experts per row-step) since capture, or None. Syncs."""
+        """(cold calls per layer, steps counted, routed experts per row-step) since capture, or None. Syncs. At
+        rows > 1 the routed calls per step vary (unique experts): use `routed_counts`."""
         if not self.counters:
             return None
         return [int(v) for v in self.cold_acc.tolist()], self.n_counted, self.topk
+
+    def routed_counts(self) -> Optional[Tuple[List[int], List[int]]]:
+        """(hot calls per layer, cold calls per layer) of routed-expert evaluations since capture: one per (row, expert)
+        at rows == 1 (= the reference's expert calls), one per UNIQUE expert per layer per step at rows > 1 (the
+        reference MoE.forward calls each routed expert once on all its rows, model.py:897-902). Syncs."""
+        if not self.counters:
+            return None
+        cold = [int(v) for v in self.cold_acc.tolist()]
+        if self.rows == 1:
+            calls = [self.n_counted * self.topk] * len(cold)
+        else:
+            calls = [int(v) for v in self.uniq_acc.tolist()]
+        return [a - b for a, b in zip(calls, cold)], cold
+
+    def describe(self) -> dict:
+        return {"rows": self.rows, "ring": self.ring, "win": self.win, "max_pos": self.max_pos,
+                "moe_impl": self.moe_impl, "fp8_impl": self.fp8_impl, "glue_impl": self.glue_impl,
+                "glue_effective": "fused" if self.glue is not None else "ref", "glue_note": self.glue_note,
+                "attn_impl": self.attn_impl, "attn_on": bool(self._attn_on or self._fm_on),
+                "hidden_layers": list(self.hidden_layers), "n_slots": self.n_slots}
 
     def marker_count(self) -> int:
         return int(self.marker_ctr.item())

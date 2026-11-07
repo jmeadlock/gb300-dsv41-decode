@@ -403,10 +403,19 @@ def _capturing() -> bool:
     return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
 
 
+def pin_m1() -> bool:
+    """$DSV41_GEMV_PIN_M1=1 (M1-T10 V0 census): every M > 1 call uses the M = 1 call's config for its (N, K), so the
+    6-row GEMV has the 1-row step's numerics_key whenever the form allows it (read at every get_config, i.e. at eager
+    calls and captures; a captured graph keeps the config it was captured with)."""
+    return os.environ.get("DSV41_GEMV_PIN_M1", "0") not in ("0", "", "false", "off")
+
+
 def get_config(N: int, K: int, M: int, device=None) -> GemvConfig:
     """The config for (N, K, block_m(M)): this process's choice, else the cache file's, else tuned now (eager only),
     else DEFAULT_CONFIG (split resolved) when tuning is off. Inside a CUDA-graph capture an unknown shape is an error,
-    not a tune."""
+    not a tune. With pin_m1() an M > 1 call takes the M = 1 config."""
+    if M > 1 and pin_m1():
+        return get_config(N, K, 1, device)
     key = config_key(N, K, M)
     cfg = _CONFIGS.get(key)
     if cfg is not None:

@@ -291,7 +291,8 @@ class Generator:
                  model_name: str = "m0-reference-runtime", profiler=None, set_default_device: bool = True,
                  mode: str = "eager", max_pos: Optional[int] = None, marker: bool = False,
                  static_counters: bool = True, static_factory: Optional[Callable] = None, moe_impl: str = "ref",
-                 fp8_impl: str = "ref", glue_impl: str = "ref", attn_impl: str = "ref", glue_approx: bool = False):
+                 fp8_impl: str = "ref", glue_impl: str = "ref", attn_impl: str = "ref", glue_approx: bool = False,
+                 rows: int = 1, hidden_layers: Sequence[int] = ()):
         self.model = model
         self.tokenizer_dir = tokenizer_dir
         self.tokenizer = tokenizer if tokenizer is not None else (load_tokenizer(tokenizer_dir) if tokenizer_dir else None)
@@ -335,6 +336,12 @@ class Generator:
         self.set_glue_approx(glue_approx)
         self.attn_impl = "ref"
         self.set_attn_impl(attn_impl)
+        # M1-T10: rows per decode step (1 = the T8 step; 6 = the teacher-forced verify step, `teacher_forced`);
+        # hidden_layers: the static step's main_hidden layers (model.py:1267-1269; T11's input)
+        self.rows = 1
+        self.hidden_layers = tuple(int(i) for i in hidden_layers)
+        self.main_hidden: Optional[torch.Tensor] = None  # the last R-row step's main_hidden (step_rows)
+        self.set_rows(rows)
         self.logits_sink: Optional[Callable] = None  # greedy calls sink(i, fp32 CPU logits) per position (drift rows)
         self.mode = "eager"
         self.set_mode(mode)
@@ -390,6 +397,17 @@ class Generator:
             self.reset_static()
         self.attn_impl = impl
 
+    def set_rows(self, rows: int) -> None:
+        """M1-T10: the static step's rows per step (1, or even <= 8). A change drops the StaticStep (and its graphs);
+        the next static/graph use rebuilds it at the new row count. At rows > 1 `step` refuses (use `step_rows` /
+        `teacher_forced`), and eager mode is the reference's own multi-row forward (runtime/ref_multirow.py)."""
+        rows = int(rows)
+        if rows != 1 and not (2 <= rows <= 8 and rows % 2 == 0):
+            raise ValueError(f"rows {rows}: 1 or an even number <= 8")
+        if rows != self.rows and self.static is not None:
+            self.reset_static()
+        self.rows = rows
+
     @property
     def max_pos(self) -> int:
         """Largest decode position this Generator can serve in its current mode."""
@@ -404,6 +422,8 @@ class Generator:
             if self.static_factory is not None:
                 # factories predating T9a-1/T9b-1 take only the model; an impl is passed only when it is not "ref"
                 kw = {} if self.moe_impl == "ref" else {"moe_impl": self.moe_impl}
+                if self.rows != 1:  # M1-T10
+                    kw["rows"] = self.rows
                 if self.fp8_impl != "ref":
                     kw["fp8_impl"] = self.fp8_impl
                 if self.glue_impl != "ref":
@@ -420,7 +440,7 @@ class Generator:
                                          counters=self.static_counters, moe_impl=self.moe_impl,
                                          fp8_impl=self.fp8_impl, glue_impl=self.glue_impl,
                                          glue_opts={"approx": True} if self.glue_approx else None,
-                                         attn_impl=self.attn_impl)
+                                         attn_impl=self.attn_impl, rows=self.rows, hidden_layers=self.hidden_layers)
         return self.static
 
     def reset_static(self) -> None:
@@ -522,6 +542,8 @@ class Generator:
         StaticStep runs instead (eagerly / as a graph replay); the returned logits are then its static buffer."""
         if pos >= self.max_seq_len:
             raise ValueError(f"position {pos} >= max_seq_len {self.max_seq_len}")
+        if self.rows != 1:
+            raise RuntimeError(f"rows={self.rows}: use step_rows / teacher_forced (step is the 1-row step)")
         static = self.mode != "eager"
         if not static:
             if isinstance(token, torch.Tensor):
@@ -636,5 +658,134 @@ class Generator:
             hot, cold = c1[0] - c0[0], c1[1] - c0[1]
             meta["cold"] = {"hot_calls": hot, "cold_calls": cold, "cold_share": cold / (hot + cold) if hot + cold else 0.0,
                             "cold_calls_per_layer": [b - a for a, b in zip(c0[3], c1[3])]}
+        self.last_meta = meta
+        return rec
+
+
+    # ---------------------------------------------------------------- M1-T10: R rows per step, teacher-forced
+    @torch.inference_mode()
+    def step_rows(self, tokens, pos: int) -> torch.Tensor:
+        """One R-row step (R = self.rows): feed `tokens` (R ids, a list or a device tensor) at positions pos..pos+R-1
+        -> fp32 logits [R, V] (static/graph: the step's buffer; eager: the reference's multi-row forward,
+        runtime/ref_multirow.forward_rows, i.e. the oracle). `next_token_tensor()` -> the R argmaxes. NVTX
+        "decode_step"; profiler window hooks count R-row steps."""
+        R_ = self.rows
+        if pos + R_ > self.max_seq_len:
+            raise ValueError(f"positions {pos}..{pos + R_ - 1} >= max_seq_len {self.max_seq_len}")
+        static = self.mode != "eager"
+        if static:
+            st = self.static_step()
+            if self.mode == "graph" and not st.captured:
+                raise RuntimeError("graph mode: capture() must run before the prefill (prefill() does it)")
+        self._profile_before()
+        nv = _nvtx() if self.nvtx else None
+        if nv:
+            nv.range_push("decode_step")
+        try:
+            if static:
+                logits = st.step(tokens, pos, graph=self.mode == "graph")
+                out_ids = st.t_out if R_ > 1 else st.tok.view(1)
+                self.main_hidden = getattr(st, "main_hidden", None)
+            else:
+                from runtime.ref_multirow import forward_rows
+
+                if isinstance(tokens, torch.Tensor):
+                    t = tokens.reshape(1, R_).to(device=self.device, dtype=torch.long)
+                else:
+                    t = torch.tensor([list(tokens)], dtype=torch.long, device=self.device)
+                self._marker_eager()
+                out_ids, logits, self.main_hidden = forward_rows(self.model, t, pos, self.hidden_layers)
+        finally:
+            if nv:
+                nv.range_pop()
+        self.n_steps += 1
+        self._profile_after()
+        self._last_ids = out_ids
+        return logits
+
+    @torch.inference_mode()
+    def teacher_forced(self, ids: Sequence[int], targets: Sequence[int], top_k: Optional[int] = None, *,
+                       tag: Optional[str] = None, prompt: Optional[str] = None) -> dict:
+        """M1-T10 teacher-forced verify run -> a parity record in `greedy`'s format, comparable position by position
+        to the 1-row run that produced `targets` (its token_ids): entry 0 from the prefill, then R-row steps feeding
+        targets[R*s .. R*s+R-1] at positions L+R*s.. (every row "accepted", no acceptance logic); entry i records
+        targets[i] with this run's logprob. The last step is padded with targets[-1] when len(targets) - 1 is not a
+        multiple of R (its extra rows are dropped). With bit-equal logits the record is byte-identical to the 1-row
+        record. `last_meta`: digest, the model's own argmax per position, agreement with targets, ms per step."""
+        top_k = self.top_k if top_k is None else top_k
+        R_ = self.rows
+        L = len(ids)
+        targets = [int(t) for t in targets]
+        n = len(targets)
+        if n == 0:
+            raise ValueError("no targets")
+        n_steps = -(-(n - 1) // R_)
+        last_pos = L + R_ * n_steps - 1
+        if last_pos >= self.max_seq_len or (self.mode != "eager" and last_pos > self.max_pos):
+            raise ValueError(f"teacher-forced run reaches position {last_pos} (max_pos {self.max_pos}, max_seq_len "
+                             f"{self.max_seq_len})")
+        self._ensure_captured()
+        digest = hashlib.sha256()
+        step_digests: List[str] = []
+        entries: List[dict] = []
+        own: List[int] = []
+        c0 = self.cold_totals() if R_ == 1 else None
+        t0 = time.perf_counter()
+
+        def take(lc_rows, out_rows):
+            for lc, o in zip(lc_rows, out_rows):
+                i = len(entries)
+                if i >= n:
+                    return
+                if not bool(torch.isfinite(lc).all()):
+                    raise FloatingPointError(f"position {L + i - 1}: non-finite logits")
+                amax = int(torch.argmax(lc))
+                if amax != int(o):
+                    raise RuntimeError(f"entry {i}: model argmax {int(o)} != argmax of returned logits {amax}")
+                b = lc.numpy().tobytes()
+                digest.update(b)
+                step_digests.append(hashlib.sha256(b).hexdigest())
+                if self.logits_sink is not None:
+                    self.logits_sink(i, lc)
+                entries.append(logprob_entry(lc, targets[i], top_k, self.token_str))
+                own.append(amax)
+
+        rows_saved = self.rows
+        logits = self.prefill(ids)  # the prefill is the reference's (any rows)
+        t_prefill = time.perf_counter() - t0
+        take([logits.detach().to("cpu", torch.float32)], [int(self._last_ids.reshape(-1)[0])])
+        ms_steps: List[float] = []
+        pos = L
+        for s in range(n_steps):
+            feed = targets[R_ * s: R_ * s + R_]
+            feed = feed + [targets[-1]] * (R_ - len(feed))
+            tw = time.perf_counter()
+            if R_ == 1:
+                lg = self.step(feed[0], pos).reshape(1, -1)
+            else:
+                lg = self.step_rows(feed, pos)
+            lc = lg.detach().to("cpu", torch.float32)  # one D2H copy; syncs
+            ms_steps.append((time.perf_counter() - tw) * 1e3)
+            take(list(lc), self._last_ids.reshape(-1).tolist())
+            pos += R_
+        assert self.rows == rows_saved and len(entries) == n
+        wall = time.perf_counter() - t0
+        eos = set(self.eos_ids)
+        finish = "stop" if targets[-1] in eos else "length"
+        text_ids = targets[:-1] if finish == "stop" else targets
+        rec = make_record(tag=tag, prompt=prompt, model_name=self.model_name, prompt_tokens=L, gen_ids=targets,
+                          entries=entries, finish_reason=finish, text=self.decode(text_ids))
+        agree = [a == t for a, t in zip(own, targets)]
+        meta = {"logits_sha256": digest.hexdigest(), "token_ids": targets, "own_argmax": own, "prompt_tokens": L,
+                "wall_s": wall, "prefill_s": t_prefill, "n_forward": n, "mode": self.mode, "rows": R_,
+                "teacher_forced": True, "n_steps": n_steps, "step_sha256": step_digests,
+                "argmax_agree": sum(agree), "first_disagreement": next((i for i, a in enumerate(agree) if not a), None),
+                "moe_impl": self.moe_impl, "fp8_impl": self.fp8_impl, "glue_impl": self.glue_impl,
+                "glue_approx": self.glue_approx, "attn_impl": self.attn_impl,
+                "decode_ms_per_step": (sum(ms_steps) / len(ms_steps)) if ms_steps else None,
+                "decode_ms_per_token": (sum(ms_steps) / max(1, n - 1)) if ms_steps else None}
+        c1 = self.cold_totals() if R_ == 1 else None
+        if c0 is not None and c1 is not None:
+            meta["cold"] = {"hot_calls": c1[0] - c0[0], "cold_calls": c1[1] - c0[1]}
         self.last_meta = meta
         return rec
