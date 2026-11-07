@@ -65,6 +65,8 @@ step) and `next_token_tensor()` its static `tok`; the record format of `greedy` 
 T9a-1: `moe_impl="ref"|"dg-masked"` selects the static step's routed-MoE implementation (runtime/dg_moe.py; `ref` is
 the bit-identical T8 path); `last_meta["moe_impl"]` records it; `logits_sink(i, lc)` (default None) sees every
 position's fp32 CPU logits in `greedy` (first_light's dg-vs-ref drift row).
+T9b-1: `fp8_impl="ref"|"gemv"` selects the static step's fp8 Linear implementation (runtime/gemv_mxfp8.py; `ref` is
+the bit-identical reference `fp8_gemm`), with the same rebuild-on-change rule as `moe_impl`; `last_meta["fp8_impl"]`.
 """
 from __future__ import annotations
 
@@ -83,6 +85,7 @@ VENDORED_ENCODING = os.path.join(REPO, "reference", "deepseek-inference", "encod
 CUBLAS_WORKSPACE_CONFIG = ":4096:8"
 MODES = ("eager", "static", "graph")
 MOE_IMPLS = ("ref", "dg-masked")  # = runtime.static_step.MOE_IMPLS (not imported: that module needs the reference)
+FP8_IMPLS = ("ref", "gemv")       # = runtime.static_step.FP8_IMPLS (T9b-1)
 RECORD_KEYS = ("tag", "prompt", "model", "finish_reason", "n_tokens", "text", "logprobs", "usage")
 
 
@@ -277,7 +280,8 @@ class Generator:
                  eos_ids: Optional[Iterable[int]] = None, device=None, top_k: int = 20, nvtx: bool = True,
                  model_name: str = "m0-reference-runtime", profiler=None, set_default_device: bool = True,
                  mode: str = "eager", max_pos: Optional[int] = None, marker: bool = False,
-                 static_counters: bool = True, static_factory: Optional[Callable] = None, moe_impl: str = "ref"):
+                 static_counters: bool = True, static_factory: Optional[Callable] = None, moe_impl: str = "ref",
+                 fp8_impl: str = "ref"):
         self.model = model
         self.tokenizer_dir = tokenizer_dir
         self.tokenizer = tokenizer if tokenizer is not None else (load_tokenizer(tokenizer_dir) if tokenizer_dir else None)
@@ -313,6 +317,8 @@ class Generator:
         self._marker_ctr = None
         self.moe_impl = "ref"
         self.set_moe_impl(moe_impl)
+        self.fp8_impl = "ref"
+        self.set_fp8_impl(fp8_impl)
         self.logits_sink: Optional[Callable] = None  # greedy calls sink(i, fp32 CPU logits) per position (drift rows)
         self.mode = "eager"
         self.set_mode(mode)
@@ -332,6 +338,15 @@ class Generator:
             self.reset_static()
         self.moe_impl = impl
 
+    def set_fp8_impl(self, impl: str) -> None:
+        """T9b-1: the static step's fp8 Linear implementation ("ref" | "gemv"). A change drops the StaticStep (and its
+        graphs); the next static/graph use rebuilds it. Eager mode never uses it."""
+        if impl not in FP8_IMPLS:
+            raise ValueError(f"fp8_impl {impl!r} not in {FP8_IMPLS}")
+        if impl != self.fp8_impl and self.static is not None:
+            self.reset_static()
+        self.fp8_impl = impl
+
     @property
     def max_pos(self) -> int:
         """Largest decode position this Generator can serve in its current mode."""
@@ -344,14 +359,17 @@ class Generator:
         """The StaticStep (built on first call: pointer tables, staging, static buffers; no capture)."""
         if self.static is None:
             if self.static_factory is not None:
-                # factories predating T9a-1 take only the model; they are given moe_impl only when it is not "ref"
+                # factories predating T9a-1/T9b-1 take only the model; an impl is passed only when it is not "ref"
                 kw = {} if self.moe_impl == "ref" else {"moe_impl": self.moe_impl}
+                if self.fp8_impl != "ref":
+                    kw["fp8_impl"] = self.fp8_impl
                 self.static = self.static_factory(self.model, **kw)
             else:
                 from runtime.static_step import StaticStep
 
                 self.static = StaticStep(self.model, self.pool, max_pos=self._static_max_pos, marker=self.marker,
-                                         counters=self.static_counters, moe_impl=self.moe_impl)
+                                         counters=self.static_counters, moe_impl=self.moe_impl,
+                                         fp8_impl=self.fp8_impl)
         return self.static
 
     def reset_static(self) -> None:
@@ -560,7 +578,7 @@ class Generator:
         c1 = self.cold_totals()
         meta = {"logits_sha256": digest.hexdigest(), "token_ids": gen, "prompt_tokens": L, "wall_s": wall,
                 "prefill_s": t_prefill, "n_forward": len(gen), "mode": self.mode, "step_sha256": step_digests,
-                "moe_impl": self.moe_impl,
+                "moe_impl": self.moe_impl, "fp8_impl": self.fp8_impl,
                 "decode_ms_per_token": (wall - t_prefill) / max(1, len(gen) - 1) * 1e3 if len(gen) > 1 else None}
         if c0 is not None and c1 is not None:
             hot, cold = c1[0] - c0[0], c1[1] - c0[1]

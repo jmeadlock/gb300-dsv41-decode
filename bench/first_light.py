@@ -31,6 +31,11 @@ and one timed step cell.
     divergence + mean |delta logit| over same-context positions). The report records `generator.moe_impl`,
     `step_cell.moe_impl` and `dg_moe` (deep_gemm path, e8m0 conversion, deterministic flag). `--levels-ref` x-proc rows
     compare runs of the same label: point it at a report made with the same --moe-impl.
+(h) T9b-1: `--fp8-impl gemv` (default `ref`) runs every static/graph step's fp8 Linear layers through the Triton MXFP8
+    GEMV (runtime/gemv_mxfp8.py). It combines with --moe-impl: the parity levels treat any non-ref impl the same way
+    (L0 reported not gated; one extra static-eager run with BOTH impls `ref` gives the gated T8 row and the drift row,
+    labelled e.g. "dg-masked+gemv vs ref static-eager"). The report records `generator.fp8_impl`, `step_cell.fp8_impl`
+    and `fp8_gemv` (triton version, the per-shape tuned configs, their µs).
 Writes docs/first-light-<YYYYMMDD>.json (or --json) and prints a 12-line summary. One prompt failing logs its
 traceback and the run continues.
 
@@ -328,13 +333,17 @@ def parity_levels(gen: Generator, rows: List[dict], steps: int = 32, log=print,
     DeepGEMM MoE is not bit-identical by design), and one more static-eager run with moe_impl "ref" (fills off) adds
     two rows: "ref static-eager vs reference-eager" (the T8 invariant, gated) and the drift row "<impl> vs ref
     static-eager" (first token divergence + mean |delta logit| over same-context positions, `logit_drift`; reported,
-    not gated). Leaves the Generator in its original mode and moe_impl with fills restored and, in graph mode, graphs
-    captured fills-off."""
+    not gated). T9b-1: `gen.fp8_impl != "ref"` is handled the same way; the variant label joins the non-ref impls
+    ("dg-masked", "gemv", "dg-masked+gemv") and the drift reference runs with both impls "ref". Leaves the Generator
+    in its original mode and impls with fills restored and, in graph mode, graphs captured fills-off."""
     prompts = [(r["tag"], gen.encode([{"role": "user", "content": r["prompt"]}])) for r in rows]
     det = _det_module()
     fill0 = getattr(det, "fill_uninitialized_memory", None) if det is not None else None
     mode0 = gen.mode
     impl = getattr(gen, "moe_impl", "ref")
+    fimpl = getattr(gen, "fp8_impl", "ref")
+    label = "+".join(x for x in (impl, fimpl) if x != "ref") or "ref"
+    variant = label != "ref"
     runs: Dict[str, Dict[str, dict]] = {}
     timings: Dict[str, float] = {}
     fills_list = [False, True] if fill0 is not None else [None]
@@ -359,7 +368,7 @@ def parity_levels(gen: Generator, rows: List[dict], steps: int = 32, log=print,
             timed("eager" + sfx, lambda: _level_run(gen, prompts, steps))
             gen.reset_static()
             gen.set_mode("static")
-            keep = kept.setdefault(impl, {}) if impl != "ref" and sfx == sfx0 else None
+            keep = kept.setdefault(label, {}) if variant and sfx == sfx0 else None
             timed("static" + sfx, lambda: _level_run(gen, prompts, steps, keep))
             gen.set_mode("graph")
             gen.capture(fills=bool(f))
@@ -369,20 +378,24 @@ def parity_levels(gen: Generator, rows: List[dict], steps: int = 32, log=print,
             gen.set_mode("graph")
             gen.capture(fills=bool(f))
             timed("relaunch" + sfx, lambda: _level_run(gen, prompts, steps))
-        if impl != "ref":  # the drift reference: the same static step with the bit-identical MoE
+        if variant:  # the drift reference: the same static step with the bit-identical MoE and fp8 GEMMs
             set_fill(fills_list[0])
             gen.set_moe_impl("ref")
+            if hasattr(gen, "set_fp8_impl"):
+                gen.set_fp8_impl("ref")
             gen.set_mode("static")
             timed("static-ref" + sfx0, lambda: _level_run(gen, prompts, steps, kept.setdefault("ref", {})))
     finally:
         set_fill(fill0)
-        if impl != "ref":
+        if variant:
             gen.set_moe_impl(impl)
+            if hasattr(gen, "set_fp8_impl"):
+                gen.set_fp8_impl(fimpl)
         gen.set_mode(mode0)
         if mode0 == "graph":
             gen.capture(fills=False)
 
-    gated_l0 = impl == "ref"
+    gated_l0 = not variant
     table = []
     for f in fills_list:
         sfx = "" if f is None else ("/fills-on" if f else "/fills-off")
@@ -400,15 +413,15 @@ def parity_levels(gen: Generator, rows: List[dict], steps: int = 32, log=print,
             table.append(("on/off", "L2", f"{k}: fills-on vs fills-off", k != "eager",
                           compare_levels(runs[k + "/fills-on"], runs[k + "/fills-off"])))
     drift = None
-    if impl != "ref":
+    if variant:
         fl0 = "-" if fills_list[0] is None else "off"
         table.append((fl0, "L0", "ref static-eager vs reference-eager", True,
                       compare_levels(runs["static-ref" + sfx0], runs["eager" + sfx0])))
-        drift = logit_drift(kept[impl], kept["ref"], runs["static" + sfx0], runs["static-ref" + sfx0])
+        drift = logit_drift(kept[label], kept["ref"], runs["static" + sfx0], runs["static-ref" + sfx0])
         c = compare_levels(runs["static" + sfx0], runs["static-ref" + sfx0])
         c.update({k: v for k, v in drift.items() if k != "per_prompt_drift"})
         c["per_prompt"] = {t: dict(v, **drift["per_prompt_drift"].get(t, {})) for t, v in c["per_prompt"].items()}
-        table.append((fl0, "drift", f"{impl} vs ref static-eager", False, c))
+        table.append((fl0, "drift", f"{label} vs ref static-eager", False, c))
     if ref_runs:
         for k in sorted(set(runs) & set(ref_runs)):
             table.append(("x-proc", "L2", f"{k}: this process vs --levels-ref", True,
@@ -418,19 +431,20 @@ def parity_levels(gen: Generator, rows: List[dict], steps: int = 32, log=print,
                 for fl, lv, what, gate, c in table]
     gate_rows = [r for r in rows_out if r["gate"]]
     verdict = "PASS" if all(r["all_equal"] for r in gate_rows) else "FAIL"
-    log(f"moe impl {impl}" + ("" if gated_l0 else " (L0 static-eager rows and the drift row are reported, not gated)"))
+    log(f"moe impl {impl}" + ("" if fimpl == "ref" else f", fp8 impl {fimpl}")
+        + ("" if gated_l0 else " (L0 static-eager rows and the drift row are reported, not gated)"))
     log(f"{'fills':7s}{'level':6s}{'comparison':42s}{'equal':>8s}  first diff (tag@position)")
     for r in rows_out:
         log(f"{r['fills']:7s}{r['level']:6s}{r['what']:42s}{r['equal']:>4d}/{r['n']:<3d}  {r['first_diff'] or '-'}"
             + ("" if r["gate"] else "  (not gated)"))
     if drift is not None:
-        log(f"drift {impl} vs ref static-eager: first token divergence {drift['first_token_divergence'] or 'none'}, "
+        log(f"drift {label} vs ref static-eager: first token divergence {drift['first_token_divergence'] or 'none'}, "
             f"{drift['prompts_token_identical']}/{len(prompts)} prompts token-identical, mean |dlogit| "
             f"{drift['mean_abs_dlogit']:.3e} (max {drift['max_abs_dlogit']:.3e}) over {drift['positions_compared']} "
             f"same-context positions")
     log(f"PARITY LEVELS ({steps} steps x {len(prompts)} prompts, fp32-logit sha256 per position): {verdict}")
-    return {"steps": steps, "n_prompts": len(prompts), "moe_impl": impl, "verdict": verdict, "rows": rows_out,
-            "drift": drift, "timings_s": timings, "runs": runs}
+    return {"steps": steps, "n_prompts": len(prompts), "moe_impl": impl, "fp8_impl": fimpl, "variant": label,
+            "verdict": verdict, "rows": rows_out, "drift": drift, "timings_s": timings, "runs": runs}
 
 
 # ------------------------------------------------------------------------------------------------ main
@@ -466,6 +480,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--moe-impl", choices=["ref", "dg-masked"], default="ref",
                     help="static/graph routed MoE: ref = reference fp4_gemm per expert (bit-identical, T8) / "
                          "dg-masked = 3 DeepGEMM masked grouped GEMMs per layer (T9a-1, runtime/dg_moe.py)")
+    ap.add_argument("--fp8-impl", choices=["ref", "gemv"], default="ref",
+                    help="static/graph fp8 Linear layers: ref = reference fp8_gemm (bit-identical, T8) / gemv = "
+                         "Triton MXFP8 GEMV at <= 8 rows (T9b-1, runtime/gemv_mxfp8.py)")
     ap.add_argument("--max-pos", type=int, default=4095,
                     help="static/graph: largest decode position (fixes the compressed-KV cat and index-score widths)")
     ap.add_argument("--marker", action="store_true", help="launch t8_step_marker once per decode step (nsys)")
@@ -504,10 +521,10 @@ def main(argv=None) -> int:
                      "device": torch.cuda.get_device_name() if torch.cuda.is_available() else None,
                      "capability": torch.cuda.get_device_capability() if torch.cuda.is_available() else None}
     gen = Generator(model, a.tokenizer_dir or a.model_dir, mode=a.mode, max_pos=a.max_pos, marker=a.marker,
-                    moe_impl=a.moe_impl)
+                    moe_impl=a.moe_impl, fp8_impl=a.fp8_impl)
     report["generator"] = {"eos_ids": gen.eos_ids, "top_k": gen.top_k, "max_seq_len": gen.max_seq_len,
                            "tokenizer_dir": gen.tokenizer_dir, "mode": gen.mode, "max_pos": gen.max_pos,
-                           "marker": gen.marker, "moe_impl": gen.moe_impl}
+                           "marker": gen.marker, "moe_impl": gen.moe_impl, "fp8_impl": gen.fp8_impl}
     if a.nvtx_layers:
         install_layer_nvtx(model)
     return measure(gen, a, report, n_layers=len(model.layers), out=out, json_path=json_path, fixture2=fixture2)
@@ -587,6 +604,7 @@ def measure(gen: Generator, a, report: Dict, *, n_layers: int, out: str, json_pa
                 report["profile_window"] = gen.arm_profile(a.profile_warm, a.profile_steps)
             sc = step_cell(gen, ids, a.step_cell, a.stats_from)
             sc["mode"], sc["moe_impl"] = gen.mode, getattr(gen, "moe_impl", "ref")
+            sc["fp8_impl"] = getattr(gen, "fp8_impl", "ref")
             r1 = next((r for r in reps.get(1, {}).get("prompts", []) if r["tag"] == a.step_tag and "token_ids" in r), None)
             if r1 is not None:
                 n = min(len(r1["token_ids"]), len(sc["token_ids"]))
@@ -600,6 +618,14 @@ def measure(gen: Generator, a, report: Dict, *, n_layers: int, out: str, json_pa
 
     os.makedirs(os.path.dirname(os.path.abspath(json_path)), exist_ok=True)
     report.setdefault("generator", {})["moe_impl"] = getattr(gen, "moe_impl", "ref")
+    report["generator"]["fp8_impl"] = getattr(gen, "fp8_impl", "ref")
+    if report["generator"]["fp8_impl"] == "gemv":
+        try:
+            from runtime.gemv_mxfp8 import describe as gemv_describe
+
+            report["fp8_gemv"] = gemv_describe()  # triton version, per-shape configs and tuned µs
+        except Exception:
+            report["errors"].append({"stage": "fp8_gemv_describe", "traceback": traceback.format_exc()})
     dg = getattr(getattr(gen, "static", None), "dg", None)
     if dg is not None and hasattr(dg, "describe"):
         report["dg_moe"] = dg.describe()  # deep_gemm path/version, e8m0 conversion, deterministic flag, buffers
@@ -617,7 +643,9 @@ def summary_lines(r: dict, json_path: str) -> List[str]:
     g = r.get("generator", {})
     pl = (r.get("parity_levels") or {}).get("verdict")
     moe = g.get("moe_impl", "ref")
+    fp8 = g.get("fp8_impl", "ref")
     lines = [f"FIRST LIGHT {r['date']} | mode {g.get('mode', 'eager')}{'' if moe == 'ref' else f' moe {moe}'}"
+             f"{'' if fp8 == 'ref' else f' fp8 {fp8}'}"
              f"{'' if pl is None else f' levels {pl}'} | "
              f"map {b.get('map')} | boot {f(b.get('wall_s'), 0)} s | "
              f"HBM {f(b.get('cuda_allocated_GiB'))} GiB | {r['env'].get('device')}"]

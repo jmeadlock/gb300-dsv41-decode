@@ -16,7 +16,8 @@ Standalone: no vllm import anywhere (charter decision 3). The reference `model.p
 | `static_step.py` | T8: `StaticStep(model, pool, max_pos=)` -- the fixed-shape 1-row decode step (design table 2.1 #1-#15 row by row in its docstring), `forward_static(parity)` eager, `capture()` g_even/g_odd, `replay(pos)` |
 | `static_kernels.py` | T8 Triton kernels (GPU only): the spike's pointer-table gather `t8_gather_rows`, the per-step `t8_step_marker` |
 | `dg_moe.py` | T9a-1: `DGMaskedMoE` (`--moe-impl dg-masked`): the static MoE's routed GEMMs as 3 DeepGEMM masked grouped GEMMs over the same staging; `import_deep_gemm` (no vllm import); exact e8m0 → fp32 |
-| `patches.py` | flag-gated monkeypatches: `kv_numerics_pg61` (model.py:761), `static_moe` (model.py:891-906, design #14) |
+| `gemv_mxfp8.py` | T9b-1: Triton MXFP8 GEMV `mxfp8_gemv(xq, xs, w, s, out)` for the fp8 Linears at <= 8 rows (`--fp8-impl gemv`); exact e8m0 pair scale; per-(N,K,M) tuning cache; `gemv_torch` = the same algorithm in torch (CPU) |
+| `patches.py` | flag-gated monkeypatches: `kv_numerics_pg61` (model.py:761), `static_moe` (model.py:891-906, design #14), `fp8_linear_gemv` (model.py:196-205, design #16) |
 
 ## Value paths (bit-identity rule)
 
@@ -305,3 +306,81 @@ divergence + mean |Δlogit|, reported); then the reps graded vs Pg61 by bench/pa
         --max-new 256 --reps 2 --step-cell 512 --no-fill-uninit --json docs/first-light-dg-<date>.json
 
 `--levels-ref` x-proc rows compare runs with the same label, so point it at a report made with the same `--moe-impl`.
+
+## T9b-1: fp8 Linear layers on a Triton MXFP8 GEMV (`--fp8-impl gemv`, `gemv_mxfp8.py`)
+
+Spec: `docs/HANDOFF-T9B1-GEMV.md`. Every `Linear` whose weight is fp8 with 32x32 e8m0 block scales goes through
+`linear()`'s fp8 branch (model.py:196-205): `act_quant(x, 32, "ue8m0")`, then the reference `fp8_gemm` -- a 32x128 tile
+GEMM that reads weights at ~0.3 TB/s at M = 1. At 1 row that is 290 calls/step (40 x {wq_a, wq_b, wkv, wo_b, shared
+w1, w3, w2} + 8 indexer wq_b + 2 Engram wkv), ~16 ms in the eager anatomy. With `fp8_impl="gemv"` the same act_quant
+runs, then one Triton launch: each program streams BLOCK_N weight rows once (KU 32-byte K blocks per row per
+iteration), forms each 32-wide block's fp32 partial, scales it by the exact power of two 2^(sa+sb-254) built from its
+bits, and adds it into an fp32 accumulator in K-block order -- the reference's order and scales; only the sum *inside*
+one 32-wide block is ordered differently (tensor core there, `tl.sum` here), which can move a bf16 output by one ulp.
+
+Flags: `StaticStep(..., fp8_impl="gemv")` / `Generator(..., fp8_impl=...)` / `first_light.py --fp8-impl gemv`
+(combines with `--moe-impl dg-masked`). Routing is scoped: only inside the StaticStep's `_active()` (eager static
+steps, warm-ups, capture), only fp8 + e8m0 weights, only 1..8 rows (`x.numel() // K` -- not `x.size(0)`, which is 1
+for a whole prefill too), only the reference's MXFP8 globals and a bf16 default dtype; everything else (prefill,
+eager reference, routed experts, bf16/fp32 Linears) calls the original `linear`. `fp8_impl="ref"` is T8, bit-identical.
+
+Tuning: (BLOCK_N, KU, num_warps, num_stages) only, timed once per (N, K, BLOCK_M) under a CUDA graph on rotating
+synthetic weights (HBM-streamed), in the eager warm-up (never under capture: an untuned shape there is an error).
+Kept for the process (relaunch reuses it) and persisted to `$DSV41_GEMV_CACHE` when set; `DSV41_GEMV_TUNE=0` uses
+`DEFAULT_CONFIG`. The candidates do not change the per-output K order; the box test asserts they are bit-identical.
+First real-model capture with tuning on compiles ~9 configs x 8 shape keys (Triton cache mounted: once). Pre-tune with
+the bench (`--tune-cache scratch/gemv-tune.json`) and pass `-e DSV41_GEMV_CACHE=/work/scratch/gemv-tune.json`.
+
+**Mac:** `.venv/bin/python -m pytest -q tests/` -- `tests/test_gemv_cpu.py`: `pair_scale` vs the fp32 product of torch's
+e8m0 decodes on all 65,536 code pairs and vs the reference's `(C*sa)*sb`; scale-row indexing n // 32 and K-block
+pairing; the GEMV algorithm == a block-faithful emulation of the reference fp8_gemm bit for bit and within bf16
+rounding of float64; rows independent for M = 1..8; the operand contract; the tuning cache; the patch's routing
+conditions; the whole `fp8_impl="gemv"` StaticStep (alone and with dg-masked) == the reference forward under the same
+GEMM math, with exactly 7/layer + indexer + Engram calls routed and the prefill/eager reference untouched; Generator /
+first_light `--fp8-impl` plumbing and the "<impl> vs ref static-eager" drift row. Triton itself is untested on the Mac.
+
+**Box, microbench** (real weights, every distinct fp8 shape, M = 1 and 6: µs, GB/s, mismatch vs the reference, config
+invariance, gates; writes `scratch/gemv-bench.json` and the tuned configs `scratch/gemv-tune.json`):
+
+    W=$HOME/hermes/gb300-dsv41-decode
+    docker run --rm --device nvidia.com/gpu=GPU-1c1855c8-dd10-0247-583e-3c3880ddbf55 --ipc=host --ulimit memlock=-1:-1 \
+      -v "$W":/work -w /work \
+      -v /models/DeepSeek-V4.1-Flash-1017-1bae0e1088993b9b82de08f59de5be5a34e42170:/ref:ro \
+      -v "$HOME/dsv41/w0/jit-cache/tilelang":/root/.tilelang -v "$HOME/dsv41/w0/jit-cache/triton":/root/.triton \
+      -v "$HOME/dsv41/w0/jit-cache/nv":/root/.nv \
+      --entrypoint python3 vllm/vllm-openai:v0.31.0 bench/gemv_bench.py --model-dir /ref
+
+**Box, GPU test** (device pair scale on all code pairs; GEMV vs reference `fp8_gemm` on every real/mini/odd shape at
+M in {1,2,6,8}, mismatch <= 0.5 %; all candidate configs bit-identical; graph replay == eager, no host sync, untuned
+shape refused under capture; mini: gemv static self-replay + routed count + no sync, graph == static-eager / replay x2
+/ fills-on recapture / relaunch, top-1 stream == ref, tuned capture + cache reload; informative step cells):
+
+    docker run --rm --device nvidia.com/gpu=GPU-1c1855c8-dd10-0247-583e-3c3880ddbf55 --ipc=host --ulimit memlock=-1:-1 \
+      -v "$W":/work -w /work -e CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+      -v "$HOME/dsv41/w0/jit-cache/tilelang":/root/.tilelang -v "$HOME/dsv41/w0/jit-cache/triton":/root/.triton \
+      -v "$HOME/dsv41/w0/jit-cache/nv":/root/.nv \
+      -v "$HOME/dsv41/w0/jit-cache/dg":/root/.deep_gemm -e DG_JIT_CACHE_DIR=/root/.deep_gemm \
+      --entrypoint python3 vllm/vllm-openai:v0.31.0 tests/gpu/test_gemv_gpu.py
+
+**Box, first light** (gate: L1/L2 8/8, parity vs Pg61 in the A3 class, step cell <= 32 ms; the drift row is
+"dg-masked+gemv vs ref static-eager"; run the bench first so the capture reuses its tuned configs):
+
+    docker run --rm --device nvidia.com/gpu=GPU-1c1855c8-dd10-0247-583e-3c3880ddbf55 \
+      --ipc=host --ulimit memlock=-1:-1 --cap-add IPC_LOCK \
+      -v "$W":/work -w /work -v "$W/w0":/work/w0 \
+      -v /models/DeepSeek-V4.1-Flash-1017-1bae0e1088993b9b82de08f59de5be5a34e42170:/ref:ro \
+      -v "$HOME/dsv41/w0/jit-cache/tilelang":/root/.tilelang -v "$HOME/dsv41/w0/jit-cache/triton":/root/.triton \
+      -v "$HOME/dsv41/w0/jit-cache/nv":/root/.nv \
+      -v "$HOME/dsv41/w0/jit-cache/dg":/root/.deep_gemm -e DG_JIT_CACHE_DIR=/root/.deep_gemm \
+      -e CUBLAS_WORKSPACE_CONFIG=:4096:8 -e DSV41_GEMV_CACHE=/work/scratch/gemv-tune.json \
+      --entrypoint python3 vllm/vllm-openai:v0.31.0 \
+      bench/first_light.py --model-dir /ref --hot-per-layer 295 --mode graph --moe-impl dg-masked --fp8-impl gemv \
+        --parity-levels --max-pos 4095 --fixture w0/results/phase1/parity-A.jsonl --out scratch/first-light-gemv.jsonl \
+        --max-new 256 --reps 2 --step-cell 512 --no-fill-uninit --json docs/first-light-gemv-<date>.json
+
+`--levels-ref` x-proc rows compare runs with the same label: point it at a report made with the same `--moe-impl`
+and `--fp8-impl`, and keep `DSV41_GEMV_CACHE` the same so both processes use the same configs.
+
+**Glue census (Mac, CPU):** `.venv/bin/python bench/glue_census.py` -- every torch op a 1-row decode step dispatches on
+a real-structure synthetic model (40 layers, real ratios/sources/Engram), by layer type and code region, for the
+eager reference, T8 and T9a-1+T9b-1 paths (`scratch/glue-census.json`); the numbers behind `docs/GLUE-AUDIT.md`.

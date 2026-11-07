@@ -18,7 +18,22 @@ static_moe(enable):
     Takes effect only for a MoE instance a `StaticStep` has bound (`_static_moe`), only while that StaticStep is
     running a step (`active`), and only for one row with no image mask; every other call -- the prefill, the eager
     reference decode, multi-row input -- runs the original forward. `StaticStep.__init__` enables it.
+
+fp8_linear_gemv(enable):
+    T9b-1: `linear()`'s fp8 branch (model.py:196-205: `act_quant(x, 32, "ue8m0", e8m0)` then `fp8_gemm(..., block_size
+    =32)`) -> the same `act_quant` call, then runtime/gemv_mxfp8.py `linear_fp8` (Triton MXFP8 GEMV) instead of
+    `fp8_gemm`. Routed only when ALL hold: inside `fp8_gemv_scope()` (a `StaticStep(fp8_impl="gemv")` opens it while
+    it runs a step -- eagerly, in warm-up, and under capture), the weight is float8_e4m3fn with a float8_e8m0fnu
+    `weight.scale` of the reference's [ceil(N/32), K/32] shape, the reference globals are the MXFP8 ones
+    (fp8_block_size 32, scale_fmt set, scale_dtype e8m0), K % 32 == 0, the activation has 1..8 rows (rows =
+    x.numel() // K: the reference's M, kernel.py:291 -- NOT x.size(0), which is the batch and is 1 for a whole
+    prefill too), the default dtype is bf16 (the reference output dtype, kernel.py:299), and no bias (model.py:184).
+    Everything else -- prefill, the eager reference decode, fp4/bf16/fp32 weights (routed experts, wo_a, compressor,
+    indexer wk/weights_proj, gate, head, mHC) -- calls the original `linear`. Installing it is idempotent and inert
+    outside the scope; `fp8_gemv_stats()` counts routed and fallen-through calls (host side: eager calls and
+    captures, not graph replays).
 """
+import contextlib
 import sys
 
 
@@ -59,3 +74,97 @@ def static_moe(enable: bool = True) -> None:
 def static_moe_enabled() -> bool:
     ref = sys.modules.get("model")
     return ref is not None and getattr(ref.MoE.forward, "__t8_static_moe__", False)
+
+
+# ------------------------------------------------------------------------------------------------ T9b-1 fp8 GEMV
+GEMV_MAX_ROWS = 8
+_GEMV_SCOPE = {"depth": 0}
+_GEMV_STATS = {"routed": {}, "fallthrough": {}}
+
+
+@contextlib.contextmanager
+def fp8_gemv_scope(on: bool = True):
+    """While open (and `fp8_linear_gemv` is installed), eligible fp8 Linear calls run the GEMV. Nests."""
+    if not on:
+        yield
+        return
+    _GEMV_SCOPE["depth"] += 1
+    try:
+        yield
+    finally:
+        _GEMV_SCOPE["depth"] -= 1
+
+
+def fp8_gemv_active() -> bool:
+    return _GEMV_SCOPE["depth"] > 0
+
+
+def fp8_gemv_stats(reset: bool = False) -> dict:
+    """{"routed": {(N, K, rows): calls}, "fallthrough": {(reason, N, K): calls}} since the last reset (host side)."""
+    out = {k: dict(v) for k, v in _GEMV_STATS.items()}
+    if reset:
+        for v in _GEMV_STATS.values():
+            v.clear()
+    return out
+
+
+def fp8_gemv_reason(ref, x, weight, bias=None):
+    """None if `linear(x, weight, bias)` may take the GEMV (patches docstring), else why not. Metadata only."""
+    import torch
+
+    if weight.dtype != torch.float8_e4m3fn:
+        return "dtype"
+    sc = getattr(weight, "scale", None)
+    if sc is None or sc.dtype != torch.float8_e8m0fnu:
+        return "scale_dtype"
+    if bias is not None:
+        return "bias"
+    if (ref.fp8_block_size, ref.scale_dtype) != (32, torch.float8_e8m0fnu) or ref.scale_fmt is None:
+        return "ref_globals"
+    N, K = weight.shape
+    if x.size(-1) != K or K % 32:
+        return "k"
+    if tuple(sc.shape) != ((N + 31) // 32, K // 32) or not (weight.is_contiguous() and sc.is_contiguous()):
+        return "layout"
+    rows = x.numel() // K
+    if not 1 <= rows <= GEMV_MAX_ROWS:
+        return "rows"
+    if torch.get_default_dtype() != torch.bfloat16:
+        return "default_dtype"
+    return None
+
+
+def fp8_linear_gemv(enable: bool = True) -> None:
+    """Install (or restore) the model.linear wrapper (patches docstring). model.py looks `linear` up as a module
+    global at every call (Linear/ColumnParallelLinear/RowParallelLinear.forward, Gate.forward), so the wrapper is
+    what they reach."""
+    ref = sys.modules.get("model") or __import__("model")
+    import torch
+
+    fp8 = torch.float8_e4m3fn
+    if not hasattr(ref, "_orig_linear"):
+        ref._orig_linear = ref.linear
+    orig = ref._orig_linear
+
+    def linear(x, weight, bias=None):
+        if _GEMV_SCOPE["depth"] and weight.dtype == fp8:
+            why = fp8_gemv_reason(ref, x, weight, bias)
+            if why is None:
+                from runtime.gemv_mxfp8 import linear_fp8
+
+                N, K = weight.shape
+                key = (N, K, x.numel() // K)
+                _GEMV_STATS["routed"][key] = _GEMV_STATS["routed"].get(key, 0) + 1
+                xq, s = ref.act_quant(x, ref.fp8_block_size, ref.scale_fmt, ref.scale_dtype)  # model.py:197
+                return linear_fp8(xq, s, weight, weight.scale)                                  # model.py:198-205
+            key = (why, weight.size(0), weight.size(1))
+            _GEMV_STATS["fallthrough"][key] = _GEMV_STATS["fallthrough"].get(key, 0) + 1
+        return orig(x, weight, bias)
+
+    linear.__t9b_fp8_gemv__ = True
+    ref.linear = linear if enable else orig
+
+
+def fp8_linear_gemv_enabled() -> bool:
+    ref = sys.modules.get("model")
+    return ref is not None and getattr(ref.linear, "__t9b_fp8_gemv__", False)

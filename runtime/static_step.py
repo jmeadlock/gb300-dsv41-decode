@@ -43,6 +43,12 @@ host-side ints become device tensors and dynamic lengths become fixed lengths (c
       `moe_impl="ref"` (default) is exactly the T8 step.
   #15 kernel.py wrapper allocations -> the graph's private pool; capture runs with fill_uninitialized_memory off
       unless `capture(fills=True)` (the L2 uninitialized-read detector records the NaN fills as kernels).
+  #16 T9b-1, model.py:196-205 (`linear()`'s fp8 branch: act_quant + `fp8_gemm` at block 32) -> with
+      `fp8_impl="gemv"` the same act_quant, then runtime/gemv_mxfp8.py's Triton MXFP8 GEMV (installed through
+      runtime/patches.py `fp8_linear_gemv`, routed only inside this step's `_active()` scope: eager static steps,
+      warm-ups and capture; the prefill and the eager reference never see it). 290 calls/step on the real model (40 x
+      wq_a, wq_b, wkv, wo_b, shared w1/w3/w2 + 8 indexer wq_b + 2 Engram wkv). Not bit-identical by design (the
+      32-wide block sum's order; K-block order and scales are the reference's). `fp8_impl="ref"` (default) is T8.
 
 Not computed: `main_hiddens` (model.py:1267-1269) -- MTP-only, never feeds the logits; the loader's overlay sets
 dspark_target_layer_ids=() and `StaticStep` refuses a model that has target layers.
@@ -60,6 +66,7 @@ from torch import nn
 PARITIES = (0, 1)
 SUPPORTED_RATIOS = (0, 1, 2)
 MOE_IMPLS = ("ref", "dg-masked")  # T9a-1: "ref" = StaticMoE (bit-identical), "dg-masked" = runtime/dg_moe.py
+FP8_IMPLS = ("ref", "gemv")       # T9b-1: "ref" = reference fp8_gemm (bit-identical), "gemv" = runtime/gemv_mxfp8.py
 DUMMY_PROMPT = (0, 1)
 
 
@@ -252,17 +259,25 @@ class StaticStep:
     width). marker: launch `t8_step_marker` first in every step. counters: record each layer's routed ids per step on
     the device and accumulate cold calls (for first_light's cold-share report; does not touch the logits). moe_impl:
     "ref" (StaticMoE, bit-identical) or "dg-masked" (runtime/dg_moe.py; dg_deterministic -> deep_gemm's
-    use_deterministic_algorithms(True))."""
+    use_deterministic_algorithms(True)). fp8_impl: "ref" (reference fp8_gemm) or "gemv" (runtime/gemv_mxfp8.py,
+    design #16)."""
 
     def __init__(self, model: nn.Module, pool=None, *, max_pos: Optional[int] = None, marker: bool = False,
                  counters: bool = True, moe_impl: str = "ref", dg_deterministic: bool = True,
-                 _allow_cpu: bool = False):
+                 fp8_impl: str = "ref", _allow_cpu: bool = False):
         R = _ref()
         from runtime import patches
 
         if moe_impl not in MOE_IMPLS:
             raise ValueError(f"moe_impl {moe_impl!r} not in {MOE_IMPLS}")
+        if fp8_impl not in FP8_IMPLS:
+            raise ValueError(f"fp8_impl {fp8_impl!r} not in {FP8_IMPLS}")
+        if fp8_impl == "gemv" and ((R.fp8_block_size, R.scale_dtype) != (32, torch.float8_e8m0fnu)
+                                    or R.scale_fmt is None):
+            raise ValueError(f"fp8_impl gemv assumes MXFP8 (block 32, ue8m0) activations; the reference has "
+                             f"fp8_block_size={R.fp8_block_size} scale_fmt={R.scale_fmt} scale_dtype={R.scale_dtype}")
         self.moe_impl, self.dg_deterministic = moe_impl, bool(dg_deterministic)
+        self.fp8_impl = fp8_impl
         self.dg = None  # runtime.dg_moe.DGBuffers when moe_impl == "dg-masked"
         self.R, self.model, self.pool = R, model, pool
         self.dev = model.embed.weight.device
@@ -306,6 +321,8 @@ class StaticStep:
         self.topk = layers[0].ffn.n_activated_experts
         self._build_moe(R, layers)
         patches.static_moe(True)
+        if self.fp8_impl == "gemv":
+            patches.fp8_linear_gemv(True)  # design #16: inert outside this step's _active() scope
         self.active = False
         self.graphs: Dict[int, torch.cuda.CUDAGraph] = {}
         self.captured_fills: Optional[bool] = None
@@ -385,9 +402,12 @@ class StaticStep:
     # ---------------------------------------------------------------- body
     @contextlib.contextmanager
     def _active(self):
+        from runtime.patches import fp8_gemv_scope
+
         prev, self.active = self.active, True
         try:
-            yield
+            with fp8_gemv_scope(self.fp8_impl == "gemv"):  # design #16
+                yield
         finally:
             self.active = prev
 
