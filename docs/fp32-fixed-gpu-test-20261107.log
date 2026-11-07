@@ -1,0 +1,50 @@
+  mix  ours R=6 vs R=1: bit-equal 6/6 rows, 6 configs equal | cuBLAS same inputs: equal False (90.97 % of elements, max 179 ulp) | synthetic fp32 hc_fn
+  mix  replay: eager x2, fresh launch, graph replay x2 -> bit-equal
+  head ours R=6 vs R=1: bit-equal 6/6 rows, 7 configs equal | cuBLAS same inputs: equal False (85.89 % of elements, max 192512 ulp) | real head.weight (torch.bfloat16 in the checkpoint, widened to fp32 as runtime/loader.py)
+  head replay: eager x2, fresh launch, graph replay x2 -> bit-equal
+PASS test_row_invariance_gate_and_config_sweep (18.4s)
+  head fp64 oracle, 1024 rows (real head.weight (torch.bfloat16 in the checkpoint, widened to fp32 as runtime/loader.py)):
+    ours ulp max 150.49 mean 2.0305 (well-conditioned 96.5 %), u*sum|xw| max 0.270 mean 0.0255
+    cublas ulp max 1251.55 mean 9.9735 (well-conditioned 96.5 %), u*sum|xw| max 5.861 mean 0.1704
+    ours == cuBLAS bitwise on 5.24 % of elements; argmax == oracle: ours 1024/1024, cuBLAS 1024/1024; ours == cuBLAS 1024/1024
+  mix  fp64 oracle, 1024 rows (synthetic fp32 hc_fn):
+    ours ulp max 71.32 mean 2.8530 (well-conditioned 92.6 %), u*sum|xw| max 0.112 mean 0.0210
+    cublas ulp max 127.24 mean 5.6271 (well-conditioned 92.6 %), u*sum|xw| max 0.321 mean 0.0441
+    ours == cuBLAS bitwise on 9.42 % of elements
+PASS test_fp64_oracle_distance_1024_rows (3.7s)
+  head R=1 ours default (1, 32, 4, 4, 1)        446.77 us    5.93 TB/s
+  head R=1 ours (1, 64, 2, 4, 1)                462.62 us    5.72 TB/s
+  head R=1 ours (1, 32, 8, 4, 1)                446.01 us    5.94 TB/s
+  head R=1 ours (2, 32, 4, 4, 1)                476.55 us    5.56 TB/s
+  head R=1 ours (8, 32, 2, 8, 1)                883.00 us    3.00 TB/s
+  head R=1 ours (8, 8, 4, 4, 1)                 849.69 us    3.12 TB/s
+  head R=1 ours (8, 16, 4, 8, 2)               1012.98 us    2.61 TB/s
+  head R=1 ours (8, 16, 2, 4, 3)                807.72 us    3.28 TB/s
+  head R=1 cuBLAS                                420.42 us    6.30 TB/s | best ours 446.01 us ((1, 32, 8, 4, 1)) | target <= 550 us: MET
+  head R=6 ours default (8, 16, 4, 8, 1)       1015.38 us    2.61 TB/s
+  head R=6 ours (1, 64, 2, 4, 1)               2501.72 us    1.06 TB/s
+  head R=6 ours (1, 32, 8, 4, 1)               2523.77 us    1.05 TB/s
+  head R=6 ours (2, 32, 4, 4, 1)               1330.86 us    1.99 TB/s
+  head R=6 ours (8, 32, 2, 8, 1)                886.39 us    2.99 TB/s
+  head R=6 ours (8, 8, 4, 4, 1)                 853.55 us    3.10 TB/s
+  head R=6 ours (8, 16, 4, 8, 2)               1015.37 us    2.61 TB/s
+  head R=6 ours (8, 16, 2, 4, 3)                809.09 us    3.27 TB/s
+  head R=6 cuBLAS                                675.85 us    3.92 TB/s | best ours 809.09 us ((8, 16, 2, 4, 3)) | target <= 550 us: MISSED
+  mix  R=1 ours default (1, 1, 20, 16, 1)         5.27 us    0.37 TB/s
+  mix  R=1 ours (1, 1, 4, 4, 1)                  10.37 us    0.19 TB/s
+  mix  R=1 ours (1, 2, 8, 4, 1)                  11.33 us    0.17 TB/s
+  mix  R=1 ours (1, 1, 20, 8, 1)                 11.05 us    0.18 TB/s
+  mix  R=1 ours (1, 1, 40, 16, 1)                 5.24 us    0.37 TB/s
+  mix  R=1 ours (2, 1, 8, 4, 2)                  11.10 us    0.18 TB/s
+  mix  R=1 ours (8, 4, 2, 4, 1)                  22.39 us    0.09 TB/s
+  mix  R=1 cuBLAS                                  4.97 us    0.40 TB/s | best ours 5.24 us ((1, 1, 40, 16, 1))
+  mix  R=6 ours default (1, 1, 20, 16, 1)         5.41 us    0.36 TB/s
+  mix  R=6 ours (1, 1, 4, 4, 1)                  10.42 us    0.19 TB/s
+  mix  R=6 ours (1, 2, 8, 4, 1)                  11.22 us    0.18 TB/s
+  mix  R=6 ours (1, 1, 20, 8, 1)                 11.19 us    0.18 TB/s
+  mix  R=6 ours (1, 1, 40, 16, 1)                 5.39 us    0.36 TB/s
+  mix  R=6 ours (2, 1, 8, 4, 2)                  11.34 us    0.17 TB/s
+  mix  R=6 ours (8, 4, 2, 4, 1)                  26.36 us    0.07 TB/s
+  mix  R=6 cuBLAS                                 15.12 us    0.13 TB/s | best ours 5.39 us ((1, 1, 40, 16, 1))
+PASS test_timing_rows_1_and_6 (2.1s)
+3/3 not failed; 0 failed
