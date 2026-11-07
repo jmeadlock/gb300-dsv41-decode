@@ -234,6 +234,12 @@ def main(argv=None) -> int:
     hidden = list(model.runtime_mtp.target_layer_ids)
     gen = Generator(model, a.tokenizer_dir or a.model_dir, mode=a.mode, max_pos=a.max_pos, moe_impl=a.moe_impl,
                     fp8_impl=a.fp8_impl, glue_impl=a.glue_impl, attn_impl=a.attn_impl)
+    if a.moe_impl == "dg-inplace" and getattr(gen, "pool", None) is not None:
+        # grow the pool to the 6-row spare budget ONCE before any StaticStep build (re-growth after the 1-row build
+        # keeps the old blocks referenced -> +24 GiB -> OOM; see first_light rows mode)
+        from runtime.static_step import DEFAULT_SPARE_SLOTS_ROWS
+        b = gen.pool.add_spare_slots(DEFAULT_SPARE_SLOTS_ROWS, model)
+        print(f"[pool] pre-grown to {gen.pool.spare} spare slots/layer (+{b / 2**30:.2f} GiB)", flush=True)
     with open(a.fixture) as f:
         rows = [json.loads(l) for l in f if l.strip()]
     if a.only:
