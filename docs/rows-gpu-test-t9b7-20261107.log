@@ -1,0 +1,165 @@
+  preflight: sparse_attn JIT targets (none introspectable); window idx on cuda:0; direct call on cuda OK
+  mini P0 17..35 (parity 1) attn ref: 6-row static-eager == reference forward_rows, 24 rows x V, main_hidden, caches
+  preflight: sparse_attn JIT targets ['{"kind":"cuda","tag":"","keys":["cuda","gpu"],"max_num_threads":1024,"thread_warp_size":32,"arch":"sm_103a"}']; window idx on cuda:0; direct call on cuda OK
+  mini P0 18..36 (parity 0) attn ref: 6-row static-eager == reference forward_rows, 24 rows x V, main_hidden, caches
+PASS test_static6_equals_reference_mini_both_parities (5.8s)
+  preflight: sparse_attn JIT targets ['{"kind":"cuda","tag":"","keys":["cuda","gpu"],"max_num_threads":1024,"thread_warp_size":32,"arch":"sm_103a"}']; window idx on cuda:0; direct call on cuda OK
+  mini4 P0 17..35 (parity 1) attn ref: 6-row static-eager == reference forward_rows, 24 rows x V, main_hidden, caches
+  preflight: sparse_attn JIT targets ['{"kind":"cuda","tag":"","keys":["cuda","gpu"],"max_num_threads":1024,"thread_warp_size":32,"arch":"sm_103a"}']; window idx on cuda:0; direct call on cuda OK
+  mini4 P0 18..36 (parity 0) attn ref: 6-row static-eager == reference forward_rows, 24 rows x V, main_hidden, caches
+PASS test_static6_equals_reference_mini4_both_parities (1.5s)
+  preflight: sparse_attn JIT targets ['{"kind":"cuda","tag":"","keys":["cuda","gpu"],"max_num_threads":1024,"thread_warp_size":32,"arch":"sm_103a"}']; window idx on cuda:0; direct call on cuda OK
+  mini P0 18..36 (parity 0) attn bounded: 6-row static-eager == reference forward_rows, 24 rows x V, main_hidden, caches
+  preflight: sparse_attn JIT targets ['{"kind":"cuda","tag":"","keys":["cuda","gpu"],"max_num_threads":1024,"thread_warp_size":32,"arch":"sm_103a"}']; window idx on cuda:0; direct call on cuda OK
+  mini4 P0 18..36 (parity 0) attn bounded: 6-row static-eager == reference forward_rows, 24 rows x V, main_hidden, caches
+PASS test_static6_equals_reference_attn_bounded (1.4s)
+  preflight: sparse_attn JIT targets ['{"kind":"cuda","tag":"","keys":["cuda","gpu"],"max_num_threads":1024,"thread_warp_size":32,"arch":"sm_103a"}']; window idx on cuda:0; direct call on cuda OK
+  mini4w P0 300..312 (parity 0) attn ref: 6-row static-eager == reference forward_rows, 18 rows x V, main_hidden, caches
+  preflight: sparse_attn JIT targets ['{"kind":"cuda","tag":"","keys":["cuda","gpu"],"max_num_threads":1024,"thread_warp_size":32,"arch":"sm_103a"}']; window idx on cuda:0; direct call on cuda OK
+  mini4w P0 301..313 (parity 1) attn ref: 6-row static-eager == reference forward_rows, 18 rows x V, main_hidden, caches
+  preflight: sparse_attn JIT targets ['{"kind":"cuda","tag":"","keys":["cuda","gpu"],"max_num_threads":1024,"thread_warp_size":32,"arch":"sm_103a"}']; window idx on cuda:0; direct call on cuda OK
+  miniw P0 300..312 (parity 0) attn ref: 6-row static-eager == reference forward_rows, 18 rows x V, main_hidden, caches
+  preflight: sparse_attn JIT targets ['{"kind":"cuda","tag":"","keys":["cuda","gpu"],"max_num_threads":1024,"thread_warp_size":32,"arch":"sm_103a"}']; window idx on cuda:0; direct call on cuda OK
+  miniw P0 301..313 (parity 1) attn ref: 6-row static-eager == reference forward_rows, 18 rows x V, main_hidden, caches
+PASS test_static6_ring_wrapped_both_parities (2.0s)
+  preflight: sparse_attn JIT targets ['{"kind":"cuda","tag":"","keys":["cuda","gpu"],"max_num_threads":1024,"thread_warp_size":32,"arch":"sm_103a"}']; window idx on cuda:0; direct call on cuda OK
+  1-row static == reference at positions 300..311 (both rings wrapped)
+PASS test_static1_ring256_past_wrap_equals_reference (1.1s)
+/usr/local/lib/python3.12/dist-packages/torch/cuda/__init__.py:1333: UserWarning: Synchronization debug mode is a prototype feature and does not yet detect all synchronizing operations (Triggered internally at /__w/pytorch/pytorch/torch/csrc/cuda/Module.cpp:1028.)
+  torch._C._cuda_set_sync_debug_mode(debug_mode)
+  preflight: sparse_attn JIT targets ['{"kind":"cuda","tag":"","keys":["cuda","gpu"],"max_num_threads":1024,"thread_warp_size":32,"arch":"sm_103a"}']; window idx on cuda:0; direct call on cuda OK
+  6-row graph == static-eager; replay x2, fills-on recapture, relaunch equal; no host sync
+PASS test_static6_graph_replay_relaunch_no_sync (2.2s)
+  preflight: sparse_attn JIT targets ['{"kind":"cuda","tag":"","keys":["cuda","gpu"],"max_num_threads":1024,"thread_warp_size":32,"arch":"sm_103a"}']; window idx on cuda:0; direct call on cuda OK
+  D P0 17 (parity 1): 6-row dg-inplace == dg-masked, 24 rows x V + main_hidden + caches; graph == eager; spare slots 8 (budget 8), groups/layer [12], HBM added 0.003 GiB; overflow steps 0
+  D P0 18 (parity 0): 6-row dg-inplace == dg-masked, 24 rows x V + main_hidden + caches; graph == eager; spare slots 8 (budget 8), groups/layer [12], HBM added 0.003 GiB; overflow steps 0
+PASS test_static6_dg_inplace_equals_dg_masked (1.6s)
+  preflight: sparse_attn JIT targets ['{"kind":"cuda","tag":"","keys":["cuda","gpu"],"max_num_threads":1024,"thread_warp_size":32,"arch":"sm_103a"}']; window idx on cuda:0; direct call on cuda OK
+  overflow S=1: eager 3/3 steps, 34 cold experts not staged (host expectation [12, 11, 11]); graph (3, 34)
+PASS test_static6_dg_inplace_forced_overflow_trips_counter (2.3s)
+  preflight: sparse_attn JIT targets ['{"kind":"cuda","tag":"","keys":["cuda","gpu"],"max_num_threads":1024,"thread_warp_size":32,"arch":"sm_103a"}']; window idx on cuda:0; direct call on cuda OK
+  G dg-inplace: [glue] fused: rows 6 (orders of the 1-row shapes, self-checked row by row at 6 rows; not ported: concat_free); on dg_act,swiglu_routed,swiglu_shared,moe_combine,hc_post,o_rope_qdq,q_rope_epilogue,hc_norm,mix_stat,kv_path,q_path,router,engram,indexer_post,hc_split,gemv_pair,reduce_fold,dg_sf_pack,dedup; approx -; off gather,concat_free; r2 numerics hc_norm (i), mix_stat (i), kv_path (i), q_path (i)
+  G dg-inplace per-cluster self-checks at 6 rows: verify_dedup, verify_dg_act, verify_dg_sf_pack, verify_engram, verify_gemv_pair, verify_hc_norm, verify_hc_split, verify_indexer_post, verify_kv_path, verify_moe_combine, verify_o_rope_qdq, verify_q_path, verify_q_rope_epilogue, verify_reduce_fold, verify_router, verify_swiglu_routed, verify_swiglu_shared all equal
+  G dg-inplace: 6-row fused glue (dg_act,swiglu_routed,swiglu_shared,moe_combine,hc_post,o_rope_qdq,q_rope_epilogue,hc_norm,mix_stat,kv_path,q_path,router,engram,indexer_post,hc_split,gemv_pair,reduce_fold,dg_sf_pack,dedup) == ref glue, 24 rows; graph == eager
+  G dg-masked: [glue] fused: rows 6 (orders of the 1-row shapes, self-checked row by row at 6 rows; not ported: concat_free); on gather,dg_act,swiglu_routed,swiglu_shared,moe_combine,hc_post,o_rope_qdq,q_rope_epilogue,hc_norm,mix_stat,kv_path,q_path,router,engram,indexer_post,hc_split,gemv_pair,reduce_fold,dedup; approx -; off concat_free,dg_sf_pack; r2 numerics hc_norm (i), mix_stat (i), kv_path (i), q_path (i)
+  G dg-masked per-cluster self-checks at 6 rows: verify_dedup, verify_dg_act, verify_engram, verify_gather, verify_gemv_pair, verify_hc_norm, verify_hc_split, verify_indexer_post, verify_kv_path, verify_moe_combine, verify_o_rope_qdq, verify_q_path, verify_q_rope_epilogue, verify_reduce_fold, verify_router, verify_swiglu_routed, verify_swiglu_shared all equal
+  G dg-masked: 6-row fused glue (gather,dg_act,swiglu_routed,swiglu_shared,moe_combine,hc_post,o_rope_qdq,q_rope_epilogue,hc_norm,mix_stat,kv_path,q_path,router,engram,indexer_post,hc_split,gemv_pair,reduce_fold,dedup) == ref glue, 24 rows; graph == eager
+  G dg-inplace: each of 19 clusters alone off == ref glue
+PASS test_static6_fused_glue_equals_ref_glue (22.4s)
+  preflight: sparse_attn JIT targets ['{"kind":"cuda","tag":"","keys":["cuda","gpu"],"max_num_threads":1024,"thread_warp_size":32,"arch":"sm_103a"}']; window idx on cuda:0; direct call on cuda OK
+  V0 ROW-INVARIANCE CENSUS (row r at 6 rows vs the same row alone; torch.equal / max ulp)
+  family                           op                               eq   max_ulp     mism%  note
+  fused glue orders                orders + modes, 1-row vs R-row  yes         -         -  policy shape; same: {'norm_D': 'vec_T64_V4_dec|mul', 'mix': 'vec_T256_
+  fused glue hc_norm               mix_pre_norm attn+ffn           yes         0     0.000  mix_stat on, hc_split on, fp32 fixed; attn pre =, attn post =, attn co
+  fused glue mix_stat              hc_mixes statistic -> pre/post  yes         0     0.000  rides in the hc_norm launch (same probe); attn pre =, attn post =, att
+  fused glue hc_split              t9b4_hc_norm (split programs)   yes         0     0.000  rides in the hc_norm launch (same probe); attn pre =, attn post =, att
+  fused glue hc_norm               head (hc_pre + norm + head)     yes         0     0.000  logits =
+  fused glue q_path                q_norm + act_quant              yes         0     0.000  qr =, q =, s =
+  fused glue kv_path               kv_norm + RoPE + QDQ + ring wr  yes         0     0.000  ring rows =
+  fused glue router                gate mm + softplus + pre + top  yes         0     0.000  router_impl fused (gate mm cuBLAS fp32 at the call's M); ids =, w =
+  fused glue engram                gate math + sigmoid + residual  yes         0     0.000  out =
+  fused glue indexer_post          topk + sort + where             yes         0     0.000  r1 =, r2 =
+  fused glue hc_post               post*x + comb*residual sum      yes         0     0.000  out =
+  fused glue o_rope_qdq            inverse RoPE + QDQ              yes         0     0.000  o =
+  fused glue q_rope_epilogue       wq_b GEMV + RoPE epilogue       yes         0     0.000  GEMV M=1 config pinned; q =
+  fused glue gemv_pair             q path + shared expert on the   yes         0     0.000  pair on, fold on; M=1 pinned; qr =, q =, s =, shared =, kv (pair) =
+  fused glue reduce_fold           q path + shared expert on the   yes         0     0.000  pair on, fold on; M=1 pinned; qr =, q =, s =, shared =, kv (pair) =
+  fused glue swiglu_shared         SwiGLU + act_quant (shared)     yes         0     0.000  q =, s =
+  fused glue swiglu_routed         SwiGLU + act_quant (pair rows   yes         0     0.000  q =, s =
+  fused glue dg_act                act_quant into the DeepGEMM ro  yes         0     0.000  q =, s =
+  fused glue moe_combine           ascending-id combine + shared   yes         0     0.000  y =
+  fused glue dg_sf_pack            packed DeepGEMM activation SF   yes         0     0.000  packed codes =
+  fused glue dedup                 -                               n/a         -         -  n/a: R-row only (no 1-row counterpart): a permutation of the routes, =
+  fused glue gather                -                               n/a         -         -  n/a: data movement only (pointer-table copies, no arithmetic)
+  fused glue concat_free           -                               n/a         -         -  n/a: not implemented (fused_glue.CONCAT_FREE_WHY)
+  row-invariant: fused glue dg_act, fused glue dg_sf_pack, fused glue engram, fused glue gemv_pair, fused glue hc_norm, fused glue hc_post, fused glue hc_split, fused glue indexer_post, fused glue kv_path, fused glue mix_stat, fused glue moe_combine, fused glue o_rope_qdq, fused glue orders, fused glue q_path, fused glue q_rope_epilogue, fused glue reduce_fold, fused glue router, fused glue swiglu_routed, fused glue swiglu_shared
+  NOT row-invariant: -
+  T9b-7: 18 fused clusters row-invariant at 6 rows (orders policy shape; same: {'norm_D': 'vec_T64_V4_dec|mul', 'mix': 'vec_T256_V4_dec|mul', 'kv': 'vec_T32_V4_dec|mul', 'q': 'vec_T32_V4_dec|mul', 'router': 'vec_T1_V2_d)
+  T9b-7 A/B, pre-T9b-7 `rows` policy (reported): NOT row-invariant ['fused glue hc_norm', 'fused glue hc_split', 'fused glue mix_stat', 'fused glue orders']
+  T9b-7 STEP-LEVEL (shape): 6-row row j vs 1-row step at P0+j, fast dg-inplace, fp32 fixed, rowmatch on, GEMV M=1 pinned: bit-equal 24/24, max|dlogit| 0.0000e+00, argmax 24/24
+  T9b-7 STEP-LEVEL (rows): 6-row row j vs 1-row step at P0+j, fast dg-inplace, fp32 fixed, rowmatch on, GEMV M=1 pinned: bit-equal 24/24, max|dlogit| 0.0000e+00, argmax 24/24
+PASS test_t9b7_glue_clusters_row_invariant (9.7s)
+  preflight: sparse_attn JIT targets ['{"kind":"cuda","tag":"","keys":["cuda","gpu"],"max_num_threads":1024,"thread_warp_size":32,"arch":"sm_103a"}']; window idx on cuda:0; direct call on cuda OK
+  impls (6 rows)                                       bit-equal  max|dlogit|  argmax  graph==eager
+  moe dg-masked                                           23/24    5.2869e+00  24/24   yes
+  moe dg-inplace                                          23/24    5.2869e+00  24/24   yes
+  fp8 gemv                                                24/24    0.0000e+00  24/24   yes
+  attn flashmla                                            9/24    9.4961e+00  22/24   yes
+  glue fused                                              24/24    0.0000e+00  24/24   yes (rows=6: fused gather,swiglu_shared,hc_post,o_rope_qdq,hc_norm,mix_stat,kv_path,q_path,router,engram,indexer_post,hc_split,dedup (self-checked at 6 rows); reference ops for dg_act,swiglu_routed,moe_combine,q_rope_epilogue,concat_free,gemv_pair,reduce_fold,dg_sf_pack)
+  moe dg-masked+fp8 gemv+glue fused+attn flashmla          9/24    9.4961e+00  22/24   yes (rows=6: fused gather,dg_act,swiglu_routed,swiglu_shared,moe_combine,hc_post,o_rope_qdq,q_rope_epilogue,hc_norm,mix_stat,kv_path,q_path,router,engram,indexer_post,hc_split,gemv_pair,reduce_fold,dedup (self-checked at 6 rows); reference ops for concat_free,dg_sf_pack)
+  moe dg-inplace+fp8 gemv+glue fused+attn flashmla         9/24    9.4961e+00  22/24   yes (rows=6: fused dg_act,swiglu_routed,swiglu_shared,moe_combine,hc_post,o_rope_qdq,q_rope_epilogue,hc_norm,mix_stat,kv_path,q_path,router,engram,indexer_post,hc_split,gemv_pair,reduce_fold,dg_sf_pack,dedup (self-checked at 6 rows); reference ops for gather,concat_free)
+PASS test_static6_fast_impls_drift_graded (5.5s)
+  preflight: sparse_attn JIT targets ['{"kind":"cuda","tag":"","keys":["cuda","gpu"],"max_num_threads":1024,"thread_warp_size":32,"arch":"sm_103a"}']; window idx on cuda:0; direct call on cuda OK
+  V0 ROW-INVARIANCE CENSUS (row r at 6 rows vs the same row alone; torch.equal / max ulp)
+  family                           op                               eq   max_ulp     mism%  note
+  act_quant                        act_quant(x, 32, ue8m0)         yes         0     0.000  scales equal True
+  fp8 Linear (ref fp8_gemm)        L0.attn.wq_a                    yes         0     0.000  
+  fp8 Linear (ref fp8_gemm)        L0.attn.wkv                     yes         0     0.000  
+  fp8 GEMV tuned (M=6 cfg)         L0.attn.wq_a                    yes         0     0.000  numerics_key M6 (4, 2, 1) M1 (4, 2, 1); 2.74 us/call at M=6
+  fp8 GEMV M=1 cfg pinned          L0.attn.wq_a                    yes         0     0.000  numerics_key M6 (4, 2, 1) M1 (4, 2, 1); 2.74 us/call at M=6
+  fp8 GEMV tuned (M=6 cfg)         L0.attn.wq_b                    yes         0     0.000  numerics_key M6 (4, 1, 1) M1 (4, 1, 1); 1.89 us/call at M=6
+  fp8 GEMV M=1 cfg pinned          L0.attn.wq_b                    yes         0     0.000  numerics_key M6 (4, 1, 1) M1 (4, 1, 1); 1.90 us/call at M=6
+  fp8 GEMV tuned (M=6 cfg)         L0.attn.wkv                     yes         0     0.000  numerics_key M6 (4, 2, 1) M1 (4, 2, 1); 2.82 us/call at M=6
+  fp8 GEMV M=1 cfg pinned          L0.attn.wkv                     yes         0     0.000  numerics_key M6 (4, 2, 1) M1 (4, 2, 1); 2.73 us/call at M=6
+  fp8 GEMV tuned (M=6 cfg)         L0.attn.wo_b                    yes         0     0.000  numerics_key M6 (4, 2, 1) M1 (4, 2, 1); 3.13 us/call at M=6
+  fp8 GEMV M=1 cfg pinned          L0.attn.wo_b                    yes         0     0.000  numerics_key M6 (4, 2, 1) M1 (4, 2, 1); 3.14 us/call at M=6
+  fp8 GEMV tuned (M=6 cfg)         L0.shared.w1                    yes         0     0.000  numerics_key M6 (4, 2, 1) M1 (4, 2, 1); 3.12 us/call at M=6
+  fp8 GEMV M=1 cfg pinned          L0.shared.w1                    yes         0     0.000  numerics_key M6 (4, 2, 1) M1 (4, 2, 1); 3.14 us/call at M=6
+  fp8 GEMV tuned (M=6 cfg)         L0.shared.w2                    yes         0     0.000  numerics_key M6 (4, 2, 1) M1 (4, 2, 1); 3.12 us/call at M=6
+  fp8 GEMV M=1 cfg pinned          L0.shared.w2                    yes         0     0.000  numerics_key M6 (4, 2, 1) M1 (4, 2, 1); 3.14 us/call at M=6
+  fp4 expert GEMM (ref fp4_gemm)   expert.w1                       yes         0     0.000  M=2 vs M=6 rows 0-1 equal True
+  DG masked grouped GEMM           masked_m 6 vs 1                 yes         0     0.000  expected_m 8
+  sparse_attn (ref TileLang)       m=6 vs m=1                      yes         0     0.000  per-row lists (c = [64, 1, 128, 128, 65, 63])
+  sparse_attn FlashMLA             m=6 vs m=1                      yes         0     0.000  per-row lists (c = [64, 1, 128, 128, 65, 63])
+  RMSNorm (torch)                  L0.attn_norm                    yes         0     0.000  
+  cuBLAS fp32 F.linear             mHC mixes (hc_attn_fn)           NO       224    86.806  
+  cuBLAS fp32 F.linear             gate (x.float() @ W.float())    yes         0     0.000  
+  cuBLAS fp32 F.linear             head                             NO     20480    69.246  
+  cuBLAS bf16 F.linear             indexer weights_proj            yes         0     0.000  
+  einsum bf16 (cuBLAS bmm)         wo_a bsgd,grd->bsgr             yes         0     0.000  
+  einsum bf16 (cuBLAS bmm)         indexer bshd,btd->bsht          yes         0     0.000  
+  hc_split_sinkhorn (TileLang)     mixes -> pre/post/comb          yes         0     0.000  pre/post/comb equal True/True/True
+  torch.topk                       k=64 of 2048, heavy ties        yes         0     0.000  ties: index sets compared
+  T9b-5 fixed fp32                 mHC mixes (hc_attn_fn)          yes         0     0.000  replay equal True
+  cuBLAS fp32 F.linear (same input mHC mixes (hc_attn_fn)           NO       141    88.194  same inputs as the fixed row
+  T9b-5 fixed fp32                 head                            yes         0     0.000  replay equal True
+  cuBLAS fp32 F.linear (same input head                             NO      4096    70.296  same inputs as the fixed row
+  fused glue orders                orders + modes, 1-row vs R-row  yes         -         -  policy shape; same: {'norm_D': 'vec_T64_V4_dec|mul', 'mix': 'vec_T256_
+  fused glue hc_norm               mix_pre_norm attn+ffn           yes         0     0.000  mix_stat on, hc_split on, fp32 fixed; attn pre =, attn post =, attn co
+  fused glue mix_stat              hc_mixes statistic -> pre/post  yes         0     0.000  rides in the hc_norm launch (same probe); attn pre =, attn post =, att
+  fused glue hc_split              t9b4_hc_norm (split programs)   yes         0     0.000  rides in the hc_norm launch (same probe); attn pre =, attn post =, att
+  fused glue hc_norm               head (hc_pre + norm + head)     yes         0     0.000  logits =
+  fused glue q_path                q_norm + act_quant              yes         0     0.000  qr =, q =, s =
+  fused glue kv_path               kv_norm + RoPE + QDQ + ring wr  yes         0     0.000  ring rows =
+  fused glue router                gate mm + softplus + pre + top  yes         0     0.000  router_impl fused (gate mm cuBLAS fp32 at the call's M); ids =, w =
+  fused glue engram                gate math + sigmoid + residual  yes         0     0.000  out =
+  fused glue indexer_post          topk + sort + where             yes         0     0.000  r1 =, r2 =
+  fused glue hc_post               post*x + comb*residual sum      yes         0     0.000  out =
+  fused glue o_rope_qdq            inverse RoPE + QDQ              yes         0     0.000  o =
+  fused glue q_rope_epilogue       wq_b GEMV + RoPE epilogue       yes         0     0.000  GEMV M=1 config pinned; q =
+  fused glue gemv_pair             q path + shared expert on the   yes         0     0.000  pair on, fold on; M=1 pinned; qr =, q =, s =, shared =, kv (pair) =
+  fused glue reduce_fold           q path + shared expert on the   yes         0     0.000  pair on, fold on; M=1 pinned; qr =, q =, s =, shared =, kv (pair) =
+  fused glue swiglu_shared         SwiGLU + act_quant (shared)     yes         0     0.000  q =, s =
+  fused glue swiglu_routed         SwiGLU + act_quant (pair rows   yes         0     0.000  q =, s =
+  fused glue dg_act                act_quant into the DeepGEMM ro  yes         0     0.000  q =, s =
+  fused glue moe_combine           ascending-id combine + shared   yes         0     0.000  y =
+  fused glue dg_sf_pack            packed DeepGEMM activation SF   yes         0     0.000  packed codes =
+  fused glue dedup                 -                               n/a         -         -  n/a: R-row only (no 1-row counterpart): a permutation of the routes, =
+  fused glue gather                -                               n/a         -         -  n/a: data movement only (pointer-table copies, no arithmetic)
+  fused glue concat_free           -                               n/a         -         -  n/a: not implemented (fused_glue.CONCAT_FREE_WHY)
+  row-invariant: DG masked grouped GEMM, RMSNorm (torch), T9b-5 fixed fp32, act_quant, cuBLAS bf16 F.linear, cuBLAS fp32 F.linear, einsum bf16 (cuBLAS bmm), fp4 expert GEMM (ref fp4_gemm), fp8 GEMV M=1 cfg pinned, fp8 GEMV tuned (M=6 cfg), fp8 Linear (ref fp8_gemm), fused glue dg_act, fused glue dg_sf_pack, fused glue engram, fused glue gemv_pair, fused glue hc_norm, fused glue hc_post, fused glue hc_split, fused glue indexer_post, fused glue kv_path, fused glue mix_stat, fused glue moe_combine, fused glue o_rope_qdq, fused glue orders, fused glue q_path, fused glue q_rope_epilogue, fused glue reduce_fold, fused glue router, fused glue swiglu_routed, fused glue swiglu_shared, hc_split_sinkhorn (TileLang), sparse_attn (ref TileLang), sparse_attn FlashMLA, torch.topk
+  NOT row-invariant: cuBLAS fp32 F.linear, cuBLAS fp32 F.linear (same inputs)
+  STEP-LEVEL V0: 6-row step row j vs the 1-row step at P0+j, same impls, 24 positions
+  impls                                        bit-equal  max|dlogit|  argmax
+  ref                                              0/24    1.1988e+01  23/24 
+  ref, row_invariant_mode                         24/24    0.0000e+00  24/24 
+  ref, fp32 fixed (T9b-5)                         24/24    0.0000e+00  24/24 
+  fast, GEMV tuned M=6 cfg                         0/24    1.1514e+01  22/24 
+  fast, GEMV M=1 cfg pinned                        0/24    1.1514e+01  22/24 
+  fast, GEMV M=1 cfg pinned, fp32 fixed           24/24    0.0000e+00  24/24 
+PASS test_v0_census_and_step_level_table (8.7s)
+  preflight: sparse_attn JIT targets ['{"kind":"cuda","tag":"","keys":["cuda","gpu"],"max_num_threads":1024,"thread_warp_size":32,"arch":"sm_103a"}']; window idx on cuda:0; direct call on cuda OK
+  first-light cells (graph): 1-row 2.328 ms/step, 6-row 6.189 ms/step -> R6/R1 2.658 (mini); 6-row argmax vs 1-row greedy 115/120; tf replay equal
+PASS test_first_light_rows_cells_graph (3.1s)
+bit-equal comparisons executed: 34 gate runs, 1140 fp32 logit rows, 128 main_hidden, 221 cache tensors (torch.equal); 52 per-cluster 6-row self-checks equal
+13/13 not failed; 0 failed

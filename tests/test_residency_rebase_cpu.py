@@ -78,28 +78,37 @@ def test_budget_charges_the_pool_sf_copy_and_its_headroom(emu, monkeypatch):   #
     assert on.budget["per_spare_slot_all_layers_GiB"] >= round(L * (pool.expert_bytes + s_row) / 2 ** 30, 4) - 1e-4
     assert on.sf_store_req == "pool" and on.n_stage == 16
     on.close()
-    # the env knob moves the headroom
+    # A2-2 FIX: a manager that fits in the pool's own free spare slots does not grow it, so the SF copy is not re-keyed:
+    # no step_extra. pool.spare is 18 here (the managers above grew it), n_stage 16 -> 2 free in place for n_spare 2
+    m0 = ResidencyManager(pool, model, cfg, n_stage=16, sf_store="resident")
+    assert m0.budget["step_extra_GiB"] == 0 and m0.budget["existing_free_per_layer"] == 2 \
+        and m0.budget["new_per_layer"] == 0 and m0.spare_added_B == 0
+    m0.close()
+    # one that needs new slots grows the pool: the copy is re-keyed. The env knob moves the headroom
     monkeypatch.setenv(DI.SF_POOL_HEADROOM_ENV, "1.0")
-    sp = max(16, pool.spare)   # the earlier manager grew the pool to 16 + n_spare: the groups count follows pool.spare
-    m2 = ResidencyManager(pool, model, cfg, n_stage=16, sf_store="resident")
+    sp = max(16, pool.spare)   # the groups count follows pool.spare
+    m2 = ResidencyManager(pool, model, ResidencyConfig(n_spare=4, n_demote=2, reserve_gib=0.0, hbm_free_bytes=big),
+                          n_stage=16, sf_store="resident")
     assert m2.budget["step_extra_GiB"] == round(((sum(H) + L * sp) * s_row + 2 ** 30) / 2 ** 30, 3)
+    assert m2.budget["new_per_layer"] == 2 and m2.n_spare == 4
     m2.close()
-    # a caller that pre-grew the pool (bench/headline.py: staging + residency slots in ONE growth) has those weight
-    # slots already allocated: prepaid bytes are not new cost
+    # spare_budget's prepaid_bytes (weight slots already in HBM) are not new cost
     eb = pool.expert_bytes
     base_kw = dict(n_stage_new=0, reserve_gib=0.0, kv_rows=1, kv_ctx=1, step_extra_bytes=0, sf_group_bytes=0)
     free = 10 * L * eb
     a0 = spare_budget(free, L, eb, 3 * 1024, **base_kw)
     a1 = spare_budget(free, L, eb, 3 * 1024, prepaid_bytes=3 * L * eb, **base_kw)
     assert a1["affordable_per_layer"] == a0["affordable_per_layer"] + 3 and a1["prepaid_GiB"] > 0 == a0["prepaid_GiB"]
-    pre = ResidencyManager(pool, model, ResidencyConfig(n_demote=2, reserve_gib=0.0, hbm_free_bytes=big),
-                           n_stage=8, sf_store="step")   # pool.spare is 18 here (the managers above grew it)
-    assert pre.budget["prepaid_GiB"] > 0 and pre.n_stage == 8
+    # the pool's free spare slots beyond the staging are the residency slots (no new HBM, whatever the free HBM)
+    pre = ResidencyManager(pool, model, ResidencyConfig(n_demote=2, reserve_gib=0.0, hbm_free_bytes=0),
+                           n_stage=8, sf_store="step")   # pool.spare is >= 18 here: 10 free in place
+    assert pre.budget["existing_free_per_layer"] == pool.spare - 8 and pre.n_spare == pool.spare - 8 \
+        and pre.budget["new_per_layer"] == 0 and pre.spare_added_B == 0
     pre.close()
-    # too little HBM for a single spare slot -> a clear refusal, not a silent fallback
+    # nothing free in place and too little HBM for a single new slot -> a clear refusal, not a silent fallback
     tight = ResidencyConfig(n_demote=2, reserve_gib=0.0, hbm_free_bytes=(sum(H) + L * pool.spare) * s_row)
-    with pytest.raises(RuntimeError, match="no spare HBM slot affordable"):
-        ResidencyManager(pool, model, tight, n_stage=16, sf_store="pool")
+    with pytest.raises(RuntimeError, match="no residency slot"):
+        ResidencyManager(pool, model, tight, n_stage=pool.spare, sf_store="pool")
 
 
 # ================================================================================================ 6 rows, residency on == off

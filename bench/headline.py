@@ -24,8 +24,11 @@ step (accepted drafts + 1), ms per token = sum(step ms) / sum(tokens) over the w
 draft-ring seeding + first draft, synced); (c) self-replay: fast reps, parity reps (records byte-identical, logits
 digests equal), fast == parity, 1 graph == 2 graphs (tokens + accept-length sequences); (d) HBM after the build.
 A2-2 (docs/A2-2-BOX-PLAN.md): `--residency on --residency-drain 64 [--residency-spare N ...]` puts the host-side swap
-policy (runtime/residency.py) on the loop's 6-row verify step (the 1-row truth above runs on the static map; the pool
-is grown once up front for the staging AND the residency slots). The loop calls the manager after every step; the
+policy (runtime/residency.py) on the loop's 6-row verify step (the 1-row truth above runs on the static map). The pool
+is pre-grown once to 16 spare slots/layer; the step stages cold experts into `--residency-stage` of them (default 8,
+else --spare-slots) and residency promotes into the REST (8): no new HBM unless --residency-spare asks for more than the
+pool holds and free HBM - reserve allows. A cold-unique count above the staging slots overflows (wrong logits for that
+step): the `overflow` field and the residency line report it; give the off run the same `--spare-slots`/`--pool-spare`. The loop calls the manager after every step; the
 report key `residency` has swaps/step, the cold-share curve (per drain and per sequence), the headroom calc and HBM, the
 manager's GPU ms per step (`ms_manager_per_step`; `ms_per_step_incl_manager` is the number to compare with the off run)
 and, with `--residency-ref <the off run's JSON>`, per prompt emitted-token / accept-length equality (an error if not).
@@ -271,7 +274,11 @@ def build_parser() -> argparse.ArgumentParser:
                          "sets $DSV41_FP32_IMPL before any build, so the 1-row truth and the loop both use it)")
     ap.add_argument("--draft-impls", choices=["same", "ref"], default="same",
                     help="M1-T11-PORT: same = the draft on the verify's impls (draft_step.draft_impls_for); ref = T11")
-    ap.add_argument("--spare-slots", type=int, default=None, help="6-row dg-inplace spare slots/layer (default 8)")
+    ap.add_argument("--spare-slots", type=int, default=None, help="6-row dg-inplace spare slots/layer (default 16)")
+    ap.add_argument("--pool-spare", type=int, default=None,
+                    help="pre-grow the pool to at least this many spare slots/layer (default: --spare-slots or 16; with "
+                         "--residency on never below 16). Give the residency-off run the same value as the on run so "
+                         "both start from the same HBM")
     ap.add_argument("--moe-rowmatch", choices=["on", "align", "off"], default="off",
                     help="T9a-3: the 1-row (truth) dg-inplace routed GEMM in the 6-row step's call shape, checked per "
                          "row at build (runtime/dg_inplace.build_one_row; sets $DSV41_MOE_ROWMATCH before any build)")
@@ -538,7 +545,8 @@ def residency_line(rr: dict) -> str:
     return (f"  residency: {sp.get('swaps', 0)} swaps ({f(sp.get('mean'), 3)}/step, max {sp.get('max')}, cap "
             f"{sp.get('cap')}); cold share drain1 {f(rr.get('cold_share_first_drain'))} -> last4 "
             f"{f(rr.get('cold_share_last4_drains'))}; manager {f(rr.get('ms_manager_per_step'), 3)} ms/step; "
-            f"+{hb.get('spare_GiB')} GiB HBM, n_spare {rr.get('n_spare')}; vs off: accepts equal "
+            f"+{hb.get('spare_GiB')} GiB HBM, n_spare {rr.get('n_spare')} (stage {rr.get('n_stage')}, overflow steps "
+            f"{(rr.get('overflow') or {}).get('steps', '-')}); vs off: accepts equal "
             f"{vo.get('all_accepts_equal', '-')}, tokens equal {vo.get('all_tokens_equal', '-')}, ms/step "
             f"{f(vo.get('step_ms_delta_pct'), 2)}%")[:400]
 
@@ -579,12 +587,18 @@ def main(argv=None) -> int:
         from runtime.static_step import DEFAULT_SPARE_SLOTS_ROWS
 
         n = a.spare_slots or DEFAULT_SPARE_SLOTS_ROWS   # grow ONCE before any build (bench/draft_bench.py note)
+        if a.pool_spare is not None:
+            n = max(n, a.pool_spare)
         if config_from_args(a) is not None:
-            # A2-2: the residency slots sit behind the staging slots; grow for both now, so the manager's later
-            # add_spare_slots is a no-op (a re-growth moves every layer's weight block; FIX2's box OOM was one)
-            from runtime.residency import ResidencyConfig
+            # A2-2 FIX: the staging keeps `stage` of the pool's slots (--residency-stage, else --spare-slots, else 8)
+            # and residency promotes into the REST: the default pool (16) already holds 8 -- no new allocation. Only
+            # an explicit --residency-spare larger than that grows the pool (here, once, before any build: a
+            # re-growth moves every layer's weight block; FIX2's box OOM was one).
+            from runtime.residency import ResidencyConfig, residency_stage
 
-            n += a.residency_spare if a.residency_spare is not None else ResidencyConfig().spare_cap
+            topk = int(model.layers[0].ffn.n_activated_experts)
+            stage = residency_stage(ResidencyConfig(stage_keep=a.residency_stage), "dg-inplace", 6, topk, a.spare_slots)
+            n = max(n, DEFAULT_SPARE_SLOTS_ROWS, stage + (a.residency_spare or 0))
         b = gen.pool.add_spare_slots(n, model)
         print(f"[pool] pre-grown to {gen.pool.spare} spare slots/layer (+{b / 2**30:.2f} GiB)", flush=True)
     with open(a.fixture) as f:
