@@ -443,7 +443,7 @@ def _need_step(model, pool, **kw):
 
 def _eq_runs(a, b, what):
     _assert_rows(a[0], b[0], what)
-    assert all(torch.equal(x, y) for x, y in zip(a[1], b[1])), f"{what}: main_hidden"
+    assert all((x is None and y is None) or torch.equal(x, y) for x, y in zip(a[1], b[1])), f"{what}: main_hidden"
     COUNTS["main_hidden"] += len(a[1])
     for k in b[2]:
         assert torch.equal(a[2][k], b[2][k]), (what, k)
