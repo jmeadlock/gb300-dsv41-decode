@@ -273,9 +273,12 @@ class StaticMoE:
         glue = o.glue
         shape = x.size()
         x = x.view(-1, moe.dim)                                        # model.py:893
-        weights, indices = moe.gate(x, None)                           # model.py:894 (text: no image mask)
-        ids, order = torch.sort(indices[0])                            # ascending id = model.py:897 loop order
-        w = weights[0, order]
+        if glue is not None and glue.on("router"):
+            ids, w = glue.route(moe, x)                                # T9b-2 R2 #4: gate + sort, 2 launches + 3
+        else:
+            weights, indices = moe.gate(x, None)                       # model.py:894 (text: no image mask)
+            ids, order = torch.sort(indices[0])                        # ascending id = model.py:897 loop order
+            w = weights[0, order]
         if glue is not None and glue.on("gather"):
             self._gather_fused(ids)                                    # T9b-2 #11: one launch (+ ids_step)
         else:
@@ -576,9 +579,10 @@ class StaticStep:
         finally:
             self.active = prev
 
-    def _indexer(self, ix, x, qr, latent, offset):
-        """Indexer.forward (model.py:527-581), decode, fixed width (design #9-#11, #13)."""
-        R, sa, c = self.R, self.R.shared_attn, self._c
+    def _indexer(self, ix, x, qr, latent, offset, qq=None):
+        """Indexer.forward (model.py:527-581), decode, fixed width (design #9-#11, #13). qq: act_quant(qr) when the
+        fused q path made it (#17 R2: the indexer's wq_b reuses it)."""
+        R, sa, c, g = self.R, self.R.shared_attn, self._c, self.glue
         ratio, rd = ix.compress_ratio, ix.rope_head_dim
         if ix.owns_k and latent is not None:                                   # model.py:537-547
             k = ix.k_norm(ix.wk(latent))
@@ -587,7 +591,8 @@ class StaticStep:
             ix.k_cache[:1].index_copy_(1, c.div(ratio), k)
         if ix.owns_k:
             sa.index_k = ix.k_cache
-        q = ix.wq_b(qr).unflatten(-1, (ix.n_local_heads, ix.index_head_dim))  # model.py:551-553
+        qb = g.linear_pre(qq, ix.wq_b, qr) if g is not None else ix.wq_b(qr)
+        q = qb.unflatten(-1, (ix.n_local_heads, ix.index_head_dim))            # model.py:551-553
         R.apply_rotary_emb(q[..., -rd:], c.freqs(ix.freqs_cis))
         R.fp4_act_quant(q, R.fp4_block_size, True)
         W = self.W[ratio]
@@ -602,9 +607,11 @@ class StaticStep:
                                                            ix.candidate_block_size)
         elif ix.uses_candidates:
             index_score = index_score.masked_fill(~sa.candidates, -torch.inf)
+        if g is not None and g.on("indexer_post"):                            # #17 R2 #14: sort + where, 1 launch
+            return g.indexer_topk(index_score, clen, min(ix.index_topk, W), offset)
         return indexer_topk_static(index_score, clen, min(ix.index_topk, W), offset)  # #9
 
-    def _compress_kv(self, attn, x, qr, parity, offset):
+    def _compress_kv(self, attn, x, qr, parity, offset, qq=None):
         """Attention._compress_kv + _compress_topk_idxs (model.py:723-764), decode."""
         R, sa, c = self.R, self.R.shared_attn, self._c
         ratio, rd = attn.compress_ratio, attn.rope_head_dim
@@ -613,7 +620,7 @@ class StaticStep:
             latent = attn.compressor(x, representative_pos(parity))           # #12 (model.py:748)
             sa.compress_kv = attn.compress_kv_cache
         if attn.is_index_source:                                              # model.py:726-738 (len > 0, #7)
-            idxs = self._indexer(attn.indexer, x, qr, latent, offset)
+            idxs = self._indexer(attn.indexer, x, qr, latent, offset, qq)
             sa.topk_idxs = idxs
             if self._attn_on:                                                 # #18: count where idxs are built
                 ix = attn.indexer
@@ -629,22 +636,19 @@ class StaticStep:
             attn.compress_kv_cache[:1].index_copy_(1, c.div(ratio), latent)  # #13
         return sa.compress_kv[:1, : self.W[ratio]], idxs                      # #8 stopgap: fixed length
 
-    def _attn(self, attn, x, parity):
-        """Attention.forward (model.py:766-791), decode."""
-        R, c = self.R, self._c
-        rd = attn.rope_head_dim
+    def _attn(self, attn, x, parity, xq=None):
+        """Attention.forward (model.py:766-791), decode. xq: act_quant(x) when the fused hc_norm made it (#17 R2:
+        wq_a and wkv take it instead of quantizing x twice)."""
+        c = self._c
         freqs_cis = c.freqs(attn.freqs_cis)                                   # #3
-        qr = attn.q_norm(attn.wq_a(x))
-        q = self._q_proj(attn, qr, freqs_cis)
-        kv = attn.kv_norm(attn.wkv(x))                                        # _window_kv, model.py:706-708
-        R.apply_rotary_emb(kv[..., -rd:], freqs_cis)
-        R.act_quant(kv, R.fp8_block_size, R.scale_fmt, R.scale_dtype, True)
-        attn.window_kv_cache[:1].index_copy_(1, c.p_win(), kv)               # #5 (model.py:719)
+        qr, qq = self._q_path(attn, x, xq)                                    # model.py:771
+        q = self._q_proj(attn, qr, freqs_cis, qq)
+        self._kv_path(attn, x, xq, freqs_cis)                                 # _window_kv, model.py:706-708, 719
         kv = attn.window_kv_cache[:1]                                         # model.py:720
         topk_idxs = c.win_idx()                                               # #6
         nblk = tlen = None
         if attn.compress_ratio:
-            compress_kv, compress_idxs = self._compress_kv(attn, x, qr, parity, kv.size(1))
+            compress_kv, compress_idxs = self._compress_kv(attn, x, qr, parity, kv.size(1), qq)
             kv = torch.cat([kv, compress_kv], dim=1)
             topk_idxs = torch.cat([topk_idxs, compress_idxs], dim=-1)
             nblk = self._idx_nblk if self._attn_on else None                  # #18 (None: reference call)
@@ -654,6 +658,26 @@ class StaticStep:
         wo_a = attn.wo_a.weight.view(attn.n_local_groups, attn.o_lora_rank, -1)
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
         return attn.wo_b(o.flatten(2))
+
+    def _q_path(self, attn, x, xq):
+        """qr = q_norm(wq_a(x)) (model.py:771) -> (qr, act_quant(qr) or None) (#17 R2 #6: one launch for both)."""
+        g = self.glue
+        if g is not None and g.on("q_path"):
+            return g.q_path(attn, x, xq)
+        qa = g.linear_pre(xq, attn.wq_a, x) if g is not None else attn.wq_a(x)
+        return attn.q_norm(qa), None
+
+    def _kv_path(self, attn, x, xq, freqs_cis):
+        """kv_norm(wkv(x)), RoPE, act_quant QDQ, the ring write at pos % win (model.py:706-708, 719; #5) (#17 R2 #3:
+        everything after wkv in one launch)."""
+        R, c, g = self.R, self._c, self.glue
+        if g is not None and g.on("kv_path"):
+            g.kv_path(attn, x, xq, freqs_cis, c.p_win())
+            return
+        kv = attn.kv_norm(g.linear_pre(xq, attn.wkv, x) if g is not None else attn.wkv(x))
+        R.apply_rotary_emb(kv[..., -attn.rope_head_dim:], freqs_cis)
+        R.act_quant(kv, R.fp8_block_size, R.scale_fmt, R.scale_dtype, True)
+        attn.window_kv_cache[:1].index_copy_(1, c.p_win(), kv)
 
     def _sparse_attn(self, q, kv, attn, topk_idxs, nblk, tlen=None):
         """model.py:781 (#18: inside the bounded scope when a block count is published; #19: FlashMLA on every layer
@@ -673,14 +697,16 @@ class StaticStep:
         with attn_bound_scope(nblk):
             return self.R.sparse_attn(q, kv, attn.attn_sink, topk_idxs, attn.softmax_scale)
 
-    def _q_proj(self, attn, qr, freqs_cis):
-        """model.py:770-772: q = wq_b(qr) per head, RoPE on the last rope_head_dim (#17: in the GEMV's store)."""
+    def _q_proj(self, attn, qr, freqs_cis, qq=None):
+        """model.py:770-772: q = wq_b(qr) per head, RoPE on the last rope_head_dim (#17: in the GEMV's store; R2: qq
+        = act_quant(qr) from the fused q path)."""
         g = self.glue
         if g is not None and g.on("q_rope_epilogue"):
-            q = g.q_proj(attn, qr, freqs_cis)
+            q = g.q_proj(attn, qr, freqs_cis, qq)
             if q is not None:
                 return q
-        q = attn.wq_b(qr).unflatten(-1, (attn.n_local_heads, attn.head_dim))
+        qb = g.linear_pre(qq, attn.wq_b, qr) if g is not None else attn.wq_b(qr)
+        q = qb.unflatten(-1, (attn.n_local_heads, attn.head_dim))
         self.R.apply_rotary_emb(q[..., -attn.rope_head_dim:], freqs_cis)
         return q
 
@@ -708,18 +734,49 @@ class StaticStep:
         """Block.forward (model.py:970-996) with the static attention; the FFN is the module call (static MoE via
         the patch)."""
         residual = x
-        attn_pre, attn_post, attn_comb = layer.hc_mixes(x, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base)
-        x = layer.hc_pre(x, pre_mix)
-        x = layer.attn_norm(x)
-        x = self._attn(layer.attn, x, parity)
+        attn_pre, attn_post, attn_comb, x, xq = self._mix_pre_norm(layer, x, pre_mix, "attn")
+        x = self._attn(layer.attn, x, parity, xq)
         x = self._hc_post(layer, x, residual, attn_post, attn_comb)
         residual = x
-        ffn_pre, ffn_post, ffn_comb = layer.hc_mixes(x, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base)
-        x = layer.hc_pre(x, attn_pre)
-        x = layer.ffn_norm(x)
-        x = layer.ffn(x, None)
+        ffn_pre, ffn_post, ffn_comb, x, _ = self._mix_pre_norm(layer, x, attn_pre, "ffn")
+        x = self._ffn(layer, x)
         x = self._hc_post(layer, x, residual, ffn_post, ffn_comb)
         return x, ffn_pre
+
+    def _mix_pre_norm(self, layer, x, pre_mix, side):
+        """hc_mixes + hc_pre + {attn,ffn}_norm (model.py:984-986 / 991-993) -> (pre, post, comb, normed x, xq) (#17
+        R2 #1 + #5: one launch for the statistic of the mixes, hc_pre, the norm and its act_quant)."""
+        g = self.glue
+        if g is not None and g.on("hc_norm") and x.is_contiguous() and pre_mix.is_contiguous():
+            return g.mix_pre_norm(layer, x, pre_mix, side)
+        if side == "attn":
+            pre, post, comb = layer.hc_mixes(x, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base)
+            return pre, post, comb, layer.attn_norm(layer.hc_pre(x, pre_mix)), None
+        pre, post, comb = layer.hc_mixes(x, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base)
+        return pre, post, comb, layer.ffn_norm(layer.hc_pre(x, pre_mix)), None
+
+    def _ffn(self, layer, x):
+        """layer.ffn(x, None) (model.py:994; the static MoE through the patch). The fused glue's ffn-side
+        precomputation (act_quant, x.float()) lives only for this call."""
+        try:
+            return layer.ffn(x, None)
+        finally:
+            if self.glue is not None:
+                self.glue.ffn_done()
+
+    def _engram(self, eng, h, hash_ids):
+        """Engram.forward (model.py:350-365, text) (#17 R2 #15: the gate math in two launches + torch's sigmoid)."""
+        g = self.glue
+        if g is not None and g.on("engram") and h.is_contiguous():
+            return g.engram(eng, h, hash_ids)
+        return eng(h, hash_ids, None)
+
+    def _head(self, layer, h, pre_mix):
+        """hc_pre + norm + head (model.py:1273-1274) (#17 R2 #1: hc_pre + norm + x.float() in one launch)."""
+        g, m = self.glue, self.model
+        if g is not None and g.on("hc_norm") and h.is_contiguous() and pre_mix.is_contiguous():
+            return g.head(layer, h, pre_mix)
+        return m.head(m.norm(layer.hc_pre(h, pre_mix)))
 
     def _body(self, parity: int) -> None:
         """Transformer.forward (model.py:1244-1275) + sample (1288-1292) for one token at device `pos`."""
@@ -738,10 +795,9 @@ class StaticStep:
         pre_mix = R.make_identity_pre_mix(h, m.hc_mult)
         for layer in m.layers:
             if layer.engram is not None:
-                h = layer.engram(h, hashes[:, :, layer.engram.layer_hash_index, :], None)
+                h = self._engram(layer.engram, h, hashes[:, :, layer.engram.layer_hash_index, :])
             h, pre_mix = self._block(layer, h, pre_mix, parity)
-        h = layer.hc_pre(h, pre_mix)
-        logits = m.head(m.norm(h))
+        logits = self._head(layer, h, pre_mix)
         self.logits.copy_(logits)
         self.tok.copy_(logits.argmax(dim=-1).view(1, 1))                      # model.py:1292, #1
         self.pos.add_(1)

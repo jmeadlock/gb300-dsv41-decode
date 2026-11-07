@@ -735,3 +735,12 @@ def test_census_fused_path_receipt(tmp_path):
         want = 0 if cl.startswith("#16") else r["audit_predicted"]
         assert r["removed"] == want, (cl, r)
     assert t["removed_total"] == t["removed_by_clusters"] >= 1800
+    # round 2 (the same run): fused R1 -> fused R1+R2, every R2 cluster removes launches, the per-cluster regions
+    # account for the whole difference, >= 2,000 more removed (the R2 gate)
+    t2 = rep["t9b2_r2"]
+    assert all(r["removed"] > 0 for r in t2["per_cluster"].values()), t2["per_cluster"]
+    assert t2["removed_total"] == t2["removed_by_clusters"] >= 2000, t2
+    assert rep["t9b2_total"]["removed"] == t["removed_total"] + t2["removed_total"]
+    g = rep["paths"]["static-dg-gemv-fused"]["fused_glue"]
+    assert all(g["clusters"][c] == "on" for c in FG.R2_CLUSTER_NAMES)
+    assert all(v.startswith("(i)") for v in g["r2"]["outcome"].values())

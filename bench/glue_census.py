@@ -76,6 +76,26 @@ AUDIT_PREDICTED = {"#2 SwiGLU+act_quant (routed+shared)": 600, "#7 mHC post": 32
                    "#9 DG adapter copies": 320, "#10 o path inverse RoPE + QDQ": 200,
                    "#11 one gather for 6 tables": 200, "#13 q RoPE in wq_b GEMV epilogue": 120,
                    "#16 concat-free attention inputs": 76}
+# T9b-2 round 2 (runtime/fused_glue_r2.py): disjoint region sets per cluster, measured fused-R1 (the R2 clusters
+# disabled) -> fused. The act_quant of a normed row that #1 now writes is removed from the region of its CONSUMER
+# (wq_a: attn.q_path*, wkv: attn.kv_path*, shared w1/w3: expert*, DeepGEMM rows: moe.act, the gate's x.float():
+# moe.gate/route), so those rows include #1 savings; the total is exact.
+R2_CLUSTER_REGIONS = {
+    "#1 hc_pre+RMSNorm+act_quant": ("mhc.pre", "mhc.pre_norm", "mhc.pre_norm/rmsnorm", "head.pre_norm",
+                                    "head.pre_norm/rmsnorm", "head", "expert", "expert/linear", "moe.act"),
+    "#5 mHC mixes statistic": ("mhc.mixes",),
+    "#6 q path (q_norm+act_quant)": ("attn.q_path", "attn.q_path/linear", "attn.q_path/rmsnorm", "attn.q_proj",
+                                     "indexer", "indexer/linear"),
+    "#3 kv path (norm+RoPE+QDQ+ring)": ("attn.kv_path", "attn.kv_path/linear", "attn.kv_path/rmsnorm",
+                                        "attn.kv_path/rope"),
+    "#4 router (non-topk)": ("moe.gate", "moe.route", "moe"),
+    "#15 Engram gate": ("engram", "engram/linear"),
+    "#14 indexer post-topk": ("indexer.topk",),
+}
+R2_AUDIT_PREDICTED = {"#1 hc_pre+RMSNorm+act_quant": 840, "#5 mHC mixes statistic": 480,
+                      "#6 q path (q_norm+act_quant)": 320, "#3 kv path (norm+RoPE+QDQ+ring)": 520,
+                      "#4 router (non-topk)": 520, "#15 Engram gate": 120, "#14 indexer post-topk": 150}
+R2_NAMES = ("hc_norm", "mix_stat", "kv_path", "q_path", "router", "engram", "indexer_post")
 
 
 def real_structure_config():
@@ -207,6 +227,13 @@ def install(R):
                       ("launch_moe_combine", "t9b2_moe_combine"), ("launch_hc_post", "t9b2_hc_post"),
                       ("launch_o_rope_qdq", "t9b2_o_rope_qdq")):
         setattr_saved(fused_glue, fn, kernel(getattr(fused_glue, fn), kname, lambda *a, **k: []))
+    from runtime import fused_glue_r2
+
+    for fn, kname in (("launch_hc_norm", "t9b2r2_hc_norm"), ("launch_norm_row", "t9b2r2_norm_row"),
+                      ("launch_router_pre", "t9b2r2_router_pre"), ("launch_router_post", "t9b2r2_router_post"),
+                      ("launch_engram_gate", "t9b2r2_engram_gate"), ("launch_engram_out", "t9b2r2_engram_out"),
+                      ("launch_topk_post", "t9b2r2_topk_post")):
+        setattr_saved(fused_glue_r2, fn, kernel(getattr(fused_glue_r2, fn), kname, lambda *a, **k: []))
     # regions (innermost wins in the report)
     for cls, attr, name in [
         (R.Block, "hc_mixes", "mhc.mixes"), (R.Block, "hc_pre", "mhc.pre"), (R.Block, "hc_post", "mhc.post"),
@@ -234,6 +261,11 @@ def install(R):
         (static_step.StaticMoE, "_record_ids", "moe.ids"),
         (static_step.StaticStep, "_q_proj", "attn.q_proj"), (static_step.StaticStep, "_o_path", "attn.o_path"),
         (fused_glue.FusedGlue, "shared_expert", "expert"), (fused_glue.FusedGlue, "hc_post", "mhc.post"),
+        # round 2 (both glue impls run through the StaticStep methods)
+        (static_step.StaticStep, "_mix_pre_norm", "mhc.pre_norm"), (static_step.StaticStep, "_head", "head.pre_norm"),
+        (static_step.StaticStep, "_q_path", "attn.q_path"), (static_step.StaticStep, "_kv_path", "attn.kv_path"),
+        (fused_glue_r2.R2Glue, "mix_tail", "mhc.mixes"), (fused_glue_r2.R2Glue, "route", "moe.route"),
+        (fused_glue_r2.R2Glue, "engram", "engram"), (fused_glue_r2.R2Glue, "indexer_topk", "indexer.topk"),
     ]:
         setattr_saved(cls, attr, tagged(getattr(cls, attr), name))
     setattr_saved(R, "apply_rotary_emb", tagged(R.apply_rotary_emb, "rope"))
@@ -351,7 +383,9 @@ def run_path(path: str, R, model, pool, ids: List[int], steps: int) -> dict:
     st = None
     if path != "eager-ref":
         kw = {"static-ref": {}, "static-dg-gemv": {"moe_impl": "dg-masked", "fp8_impl": "gemv"},
-              "static-dg-gemv-fused": {"moe_impl": "dg-masked", "fp8_impl": "gemv", "glue_impl": "fused"}}[path]
+              "static-dg-gemv-fused": {"moe_impl": "dg-masked", "fp8_impl": "gemv", "glue_impl": "fused"},
+              "static-dg-gemv-fused-r1": {"moe_impl": "dg-masked", "fp8_impl": "gemv", "glue_impl": "fused",
+                                          "glue_opts": {"disable": list(R2_NAMES)}}}[path]
         st = StaticStep(model, pool, max_pos=127, _allow_cpu=True, **kw)  # (fused: self-check runs here, uncounted)
     import engram
 
@@ -399,6 +433,7 @@ def run_path(path: str, R, model, pool, ids: List[int], steps: int) -> dict:
     out = summarize(ev, steps, model)
     if glue is not None:
         out["fused_glue"] = {k: glue[k] for k in ("clusters", "modes")}
+        out["fused_glue"]["r2"] = {k: glue["r2"][k] for k in ("orders", "outcome")}
     return out
 
 
@@ -423,11 +458,37 @@ def t9b2_table(before: dict, after: dict) -> dict:
                                   "static-dg-gemv-fused": after["launches_per_step"]}}
 
 
+def t9b2_r2_table(r1: dict, fused: dict) -> dict:
+    """Round 2: launches removed per R2 cluster (fused with the R2 clusters disabled -> fused), vs the audit."""
+    rows = {}
+    for cl, regs in R2_CLUSTER_REGIONS.items():
+        b = sum(region_launches(r1, r) for r in regs)
+        a = sum(region_launches(fused, r) for r in regs)
+        rows[cl] = {"before": round(b, 1), "after": round(a, 1), "removed": round(b - a, 1),
+                    "audit_predicted": R2_AUDIT_PREDICTED[cl]}
+    return {"per_cluster": rows, "removed_total": round(r1["launches_per_step"] - fused["launches_per_step"], 1),
+            "removed_by_clusters": round(sum(r["removed"] for r in rows.values()), 1),
+            "audit_predicted_total": sum(R2_AUDIT_PREDICTED.values()),
+            "launches_per_step": {"static-dg-gemv-fused-r1": r1["launches_per_step"],
+                                  "static-dg-gemv-fused": fused["launches_per_step"]}}
+
+
+def _print_table(title: str, t: dict, k_before: str, k_after: str) -> None:
+    print(f"{title}: launches/step {t['launches_per_step'][k_before]:.1f} -> "
+          f"{t['launches_per_step'][k_after]:.1f}, removed {t['removed_total']:.1f} "
+          f"(audit predicted {t['audit_predicted_total']})")
+    print(f"  {'cluster':38s}{'before':>9s}{'after':>9s}{'removed':>9s}{'audit':>8s}")
+    for cl, r in t["per_cluster"].items():
+        print(f"  {cl:38s}{r['before']:9.1f}{r['after']:9.1f}{r['removed']:9.1f}{r['audit_predicted']:8d}")
+    print(f"  {'sum over clusters':38s}{'':18s}{t['removed_by_clusters']:9.1f}")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="per-step torch-op census of the decode paths (CPU)")
     ap.add_argument("--json", default=os.path.join(REPO, "scratch", "glue-census.json"))
     ap.add_argument("--steps", type=int, default=2, help="decode steps counted (2 = one per pos parity)")
-    ap.add_argument("--paths", default="eager-ref,static-ref,static-dg-gemv,static-dg-gemv-fused")
+    ap.add_argument("--paths", default="eager-ref,static-ref,static-dg-gemv,static-dg-gemv-fused-r1,"
+                                        "static-dg-gemv-fused")
     a = ap.parse_args(argv)
     import types
 
@@ -457,15 +518,22 @@ def main(argv=None) -> int:
         "n_layers", "kv_source_layers", "index_source_layers", "candidate_source_layer", "engram_layer_ids",
         "n_activated_experts", "hc_mult", "hc_sinkhorn_iters")}, "steps": a.steps, "paths": res,
         "wall_s": round(time.time() - t0, 1)}
+    if "static-dg-gemv" in res and ("static-dg-gemv-fused-r1" in res or "static-dg-gemv-fused" in res):
+        # round 1's table measures round 1 alone (ref glue -> fused with the R2 clusters off) when that path ran:
+        # R2 also removes launches inside R1's regions (moe, expert, moe.act), which are not R1's
+        r1_key = "static-dg-gemv-fused-r1" if "static-dg-gemv-fused-r1" in res else "static-dg-gemv-fused"
+        t = report["t9b2"] = t9b2_table(res["static-dg-gemv"], res[r1_key])
+        t["after_path"] = r1_key
+        _print_table(f"T9b-2 R1 (ref glue -> {r1_key})", t, "static-dg-gemv", "static-dg-gemv-fused")
     if "static-dg-gemv" in res and "static-dg-gemv-fused" in res:
-        t = report["t9b2"] = t9b2_table(res["static-dg-gemv"], res["static-dg-gemv-fused"])
-        print(f"T9b-2 fused glue: launches/step {t['launches_per_step']['static-dg-gemv']:.1f} -> "
-              f"{t['launches_per_step']['static-dg-gemv-fused']:.1f}, removed {t['removed_total']:.1f} "
-              f"(audit predicted {t['audit_predicted_total']})")
-        print(f"  {'cluster':38s}{'before':>9s}{'after':>9s}{'removed':>9s}{'audit':>8s}")
-        for cl, r in t["per_cluster"].items():
-            print(f"  {cl:38s}{r['before']:9.1f}{r['after']:9.1f}{r['removed']:9.1f}{r['audit_predicted']:8d}")
-        print(f"  {'sum over clusters':38s}{'':18s}{t['removed_by_clusters']:9.1f}")
+        report["t9b2_total"] = {"static-dg-gemv": res["static-dg-gemv"]["launches_per_step"],
+                                "static-dg-gemv-fused": res["static-dg-gemv-fused"]["launches_per_step"],
+                                "removed": round(res["static-dg-gemv"]["launches_per_step"]
+                                                 - res["static-dg-gemv-fused"]["launches_per_step"], 1)}
+        print(f"T9b-2 total (ref glue -> fused R1+R2): {report['t9b2_total']}")
+    if "static-dg-gemv-fused-r1" in res and "static-dg-gemv-fused" in res:
+        t = report["t9b2_r2"] = t9b2_r2_table(res["static-dg-gemv-fused-r1"], res["static-dg-gemv-fused"])
+        _print_table("T9b-2 R2 (fused R1 -> fused R1+R2)", t, "static-dg-gemv-fused-r1", "static-dg-gemv-fused")
     os.makedirs(os.path.dirname(os.path.abspath(a.json)), exist_ok=True)
     with open(a.json, "w") as f:
         json.dump(report, f, indent=1)

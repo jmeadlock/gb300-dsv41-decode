@@ -82,16 +82,21 @@ except ImportError:  # pragma: no cover - depends on the environment
     HAVE_TRITON = False
 
 GLUE_IMPLS = ("ref", "fused")   # --glue-impl: ref = today's static path (unchanged) / fused = this module
-CLUSTERS = ("gather", "dg_act", "swiglu_routed", "swiglu_shared", "moe_combine", "hc_post", "o_rope_qdq",
-            "q_rope_epilogue", "concat_free")
+R1_CLUSTERS = ("gather", "dg_act", "swiglu_routed", "swiglu_shared", "moe_combine", "hc_post", "o_rope_qdq",
+               "q_rope_epilogue", "concat_free")
+# T9b-2 round 2 (runtime/fused_glue_r2.py): the medium-risk clusters
+R2_CLUSTER_NAMES = ("hc_norm", "mix_stat", "kv_path", "q_path", "router", "engram", "indexer_post")
+CLUSTERS = R1_CLUSTERS + R2_CLUSTER_NAMES
 CLUSTER_AUDIT = {"gather": "#11+#9", "dg_act": "#9", "swiglu_routed": "#2+#9", "swiglu_shared": "#2",
                  "moe_combine": "#8", "hc_post": "#7", "o_rope_qdq": "#10", "q_rope_epilogue": "#13",
-                 "concat_free": "#16"}
+                 "concat_free": "#16", "hc_norm": "#1", "mix_stat": "#5", "kv_path": "#3", "q_path": "#6",
+                 "router": "#4 (non-topk)", "engram": "#15", "indexer_post": "#14 (non-topk)"}
 CONCAT_FREE_WHY = ("not implemented in round 1: the window ring is per layer while the compressed cache and the "
                    "published topk_idxs are shared by every layer of a kv/index group, so one buffer per layer "
                    "needs either per-layer copies of the compressed rows (no launch saved) or re-allocating the "
                    "model's caches into per-group pools with per-layer index offsets; deferred, 76 launches")
-ACT_CLUSTERS = ("dg_act", "swiglu_routed", "swiglu_shared", "o_rope_qdq")   # need the act_quant table parity
+ACT_CLUSTERS = ("dg_act", "swiglu_routed", "swiglu_shared", "o_rope_qdq",   # need the act_quant table parity
+                "hc_norm", "kv_path", "q_path")
 DISABLE_ENV = "DSV41_GLUE_DISABLE"
 NBF16 = 65536                   # bf16 bit patterns (table rows)
 SILU_LIM = NBF16                # silu table entry holding silu(swiglu_limit)
@@ -567,12 +572,18 @@ def rope_probe(a, b, c, d) -> torch.Tensor:
 
 
 # ------------------------------------------------------------------------------------------------ the glue object
-class FusedGlue:
+from runtime.fused_glue_r2 import R2Glue  # noqa: E402  (round 2: kernels, calibration and call-site operations)
+
+
+class FusedGlue(R2Glue):
     """Per-StaticStep fused glue: tables, modes, per-cluster status, and the call-site operations. Built by
     `StaticStep(glue_impl="fused")` after its MoE buffers; `calibrate=False` skips the self-check (the census, which
-    counts ops, not bits) and assumes every applicable cluster on with modes (0, 0) / 0."""
+    counts ops, not bits) and assumes every applicable cluster on with modes (0, 0) / 0 (round 2: torch's own
+    reduction on CPU, the predicted order on CUDA). `approx=True` (--glue-approx) also enables round-2 clusters whose
+    statistic has no bit-identical order on this device (outcome (ii), status "approx")."""
 
-    def __init__(self, owner, *, calibrate: bool = True, disable: Optional[List[str]] = None, log=None):
+    def __init__(self, owner, *, calibrate: bool = True, disable: Optional[List[str]] = None, log=None,
+                 approx: bool = False):
         self.o = owner
         self.R = owner.R
         self.dev = owner.dev
@@ -609,23 +620,30 @@ class FusedGlue:
         self._dsts: List[torch.Tensor] = []
         if self.on("gather"):
             self._build_gather(layers)
+        if not self.on("hc_norm"):
+            self.status["mix_stat"] = self.status["mix_stat"] if self.status["mix_stat"] != "on" else \
+                "off: needs hc_norm"
+        self._r2_init(layers, approx)
         if calibrate:
             self.calibrate()
         else:
             self.calib["skipped"] = True
+            self._r2_default_orders()
 
     # ---------------------------------------------------------------- status
     def on(self, c: str) -> bool:
-        return self.status.get(c) == "on"
+        return self.status.get(c) in ("on", "approx")
 
     def _off(self, c: str, why: str) -> None:
-        if self.status.get(c) == "on":
+        if self.on(c):
             self.status[c] = f"off: {why}"
             self.log(f"[fused-glue] {c} OFF: {why}")
 
     def _applicable(self, c, layers, mx) -> Optional[str]:
         o, R = self.o, self.R
         dg = o.moe_impl == "dg-masked"
+        if c in R2_CLUSTER_NAMES:
+            return self._applicable_r2(c, layers, mx)
         if c in ACT_CLUSTERS and not mx:
             return "needs the MXFP8 act_quant globals (block 32, ue8m0, e8m0 scales)"
         if c == "concat_free":
@@ -707,8 +725,14 @@ class FusedGlue:
         w3 and w2 keep their GEMM path (patches.fp8_linear_prequant routes w2 exactly as linear() would)."""
         from runtime.patches import fp8_linear_prequant
 
-        g = ex.w1(x)
-        u = ex.w3(x)
+        ctx = self.ffn_pre(x) if self.on("hc_norm") else None
+        if ctx is not None and ctx.get("q") is not None:      # round 2 #1: act_quant(x) already made by hc_norm
+            xq = (ctx["q"].view(*x.shape), ctx["s"].view(*x.shape[:-1], -1))
+            g = self.linear_pre(xq, ex.w1, x)
+            u = self.linear_pre(xq, ex.w3, x)
+        else:
+            g = ex.w1(x)
+            u = ex.w3(x)
         I = g.size(-1)
         g2, u2 = g.view(-1, I), u.view(-1, I)
         q = torch.empty(g2.shape, dtype=FP8, device=x.device)
@@ -732,9 +756,9 @@ class FusedGlue:
         launch_o_rope_qdq(o.view(-1), torch.view_as_real(freqs_cis).reshape(-1, 2), self.code_tab, attn.head_dim,
                           attn.rope_head_dim, self.rope_inv)
 
-    def q_proj(self, attn, qr: torch.Tensor, freqs_cis: torch.Tensor) -> Optional[torch.Tensor]:
+    def q_proj(self, attn, qr: torch.Tensor, freqs_cis: torch.Tensor, qq=None) -> Optional[torch.Tensor]:
         """wq_b(qr) on the GEMV with q's RoPE in its store (model.py:770-772), or None when this call would not take
-        the GEMV (then the caller runs the reference ops)."""
+        the GEMV (then the caller runs the reference ops). qq: act_quant(qr), already made by the fused q path (R2)."""
         from runtime import patches
         from runtime.gemv_mxfp8 import linear_fp8_rope
 
@@ -744,7 +768,10 @@ class FusedGlue:
         if patches.fp8_gemv_reason(R, qr, w) is not None:
             return None
         patches.count_gemv_routed(w, qr)
-        xq, s = R.act_quant(qr, R.fp8_block_size, R.scale_fmt, R.scale_dtype)       # model.py:197 (inside wq_b)
+        if qq is not None:
+            xq, s = qq
+        else:
+            xq, s = R.act_quant(qr, R.fp8_block_size, R.scale_fmt, R.scale_dtype)   # model.py:197 (inside wq_b)
         out = linear_fp8_rope(xq, s, w, w.scale, torch.view_as_real(freqs_cis).reshape(-1, 2), attn.head_dim,
                               attn.rope_head_dim, self.rope_fwd)
         return out.unflatten(-1, (attn.n_local_heads, attn.head_dim))
@@ -758,7 +785,7 @@ class FusedGlue:
             self._check_tables(cal)
             if any(self.on(c) for c in ACT_CLUSTERS):
                 self._check_act_quant(cal, g)
-            if self.on("o_rope_qdq") or self.on("q_rope_epilogue"):
+            if self.on("o_rope_qdq") or self.on("q_rope_epilogue") or self.on("kv_path"):
                 self._pick_rope(cal, g)
             if self.on("hc_post"):
                 self._pick_hc(cal, g)
@@ -771,6 +798,7 @@ class FusedGlue:
                     cal[f"verify_{c}"] = why or "equal"
                     if why:
                         self._off(c, f"self-check: {why}")
+            self.calibrate_r2(cal, g)        # round 2 (runtime/fused_glue_r2.py): orders, then end-to-end checks
         finally:
             if self.dev.type == "cuda":
                 torch.cuda.synchronize(self.dev)
@@ -855,7 +883,8 @@ class FusedGlue:
         R = self.R
         attn = self.o.model.layers[0].attn
         rd, hd = self.rope_dim, self.head_dim
-        for inverse, key, clusters in ((False, "rope_fwd", ("q_rope_epilogue",)), (True, "rope_inv", ("o_rope_qdq",))):
+        for inverse, key, clusters in ((False, "rope_fwd", ("q_rope_epilogue", "kv_path")),
+                                       (True, "rope_inv", ("o_rope_qdq",))):
             if not any(self.on(c) for c in clusters):
                 continue
             mism = {("re", m): 0 for m in ROPE_MODES}
@@ -1098,12 +1127,26 @@ class FusedGlue:
 
     # ---------------------------------------------------------------- report
     def describe(self) -> dict:
-        return {"impl": "fused", "triton": getattr(triton, "__version__", None) if HAVE_TRITON else None,
-                "clusters": dict(self.status), "audit": dict(CLUSTER_AUDIT),
-                "on": [c for c in CLUSTERS if self.on(c)],
-                "unfused": {c: s for c, s in self.status.items() if s != "on"},
-                "modes": {"rope_fwd": list(self.rope_fwd), "rope_inv": list(self.rope_inv), "hc_sum": self.hc_mode},
-                "calibration": _jsonable(self.calib), "disable_env": os.environ.get(DISABLE_ENV)}
+        d = {"impl": "fused", "triton": getattr(triton, "__version__", None) if HAVE_TRITON else None,
+             "clusters": dict(self.status), "audit": dict(CLUSTER_AUDIT),
+             "on": [c for c in CLUSTERS if self.on(c)],
+             "approx_on": [c for c in CLUSTERS if self.status.get(c) == "approx"],
+             "unfused": {c: s for c, s in self.status.items() if not self.on(c)},
+             "modes": {"rope_fwd": list(self.rope_fwd), "rope_inv": list(self.rope_inv), "hc_sum": self.hc_mode,
+                       "hc_pre_sum": self.hc_pre_mode},
+             "calibration": _jsonable(self.calib), "disable_env": os.environ.get(DISABLE_ENV)}
+        d["r2"] = self.describe_r2()
+        return d
+
+    def glue_line(self) -> str:
+        """One line for first light's `[glue]` print: clusters on (exact), approx, off, and the numerics outcome."""
+        on = [c for c in CLUSTERS if self.status.get(c) == "on"]
+        ap = [c for c in CLUSTERS if self.status.get(c) == "approx"]
+        off = [c for c in CLUSTERS if not self.on(c)]
+        out = self.describe_r2()["outcome"]
+        num = ", ".join(f"{c} {'(i)' if (v or '').startswith('(i)') else '(ii)'}" for c, v in out.items())
+        return (f"[glue] fused: on {','.join(on) or '-'}; approx {','.join(ap) or '-'}; off {','.join(off) or '-'}; "
+                f"r2 numerics {num or '-'}; orders {self.describe_r2()['orders']}")
 
 
 def _jsonable(v):

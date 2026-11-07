@@ -309,7 +309,12 @@ def _fused_vs_ref(kind, moe, fp8):
         want_on = {"gather", "swiglu_shared", "hc_post", "o_rope_qdq"} | (
             {"dg_act", "swiglu_routed", "moe_combine"} if moe != "ref" else set()) | (
             {"q_rope_epilogue"} if fp8 == "gemv" else set())
-        assert set(d["on"]) == want_on, {c: d["clusters"][c] for c in CLUSTERS if c not in d["on"]}
+        # round 2 (runtime/fused_glue_r2.py) clusters are on when their device calibration is outcome (i); their
+        # status is checked by tests/gpu/test_fused_glue_r2_gpu.py
+        from runtime.fused_glue import R2_CLUSTER_NAMES
+
+        assert want_on <= set(d["on"]) and set(d["on"]) - want_on <= set(R2_CLUSTER_NAMES), \
+            {c: d["clusters"][c] for c in CLUSTERS if c not in d["on"]}
         runs = {}
         for L, seed in ((16, 5), (17, 6)):                               # both prefill parities
             ids = _ids(L, seed)

@@ -68,7 +68,9 @@ position's fp32 CPU logits in `greedy` (first_light's dg-vs-ref drift row).
 T9b-1: `fp8_impl="ref"|"gemv"` selects the static step's fp8 Linear implementation (runtime/gemv_mxfp8.py; `ref` is
 the bit-identical reference `fp8_gemm`), with the same rebuild-on-change rule as `moe_impl`; `last_meta["fp8_impl"]`.
 T9b-2: `glue_impl="ref"|"fused"` selects the static step's glue (runtime/fused_glue.py; both bit-identical, `ref` is
-today's ops), same rebuild-on-change rule; `last_meta["glue_impl"]`.
+today's ops), same rebuild-on-change rule; `last_meta["glue_impl"]`. R2: `glue_approx=True` also enables the fused
+clusters whose reduction order could not be matched on the device (outcome (ii), not bit-identical; off by default);
+`last_meta["glue_approx"]`.
 T9b-3a: `attn_impl="ref"|"bounded"` selects the static step's compressed-layer `sparse_attn` (runtime/kernels/
 sparse_attn_bounded.py, bit-identical: the reference kernel with its block loop bounded by a device count), same
 rebuild-on-change rule; `last_meta["attn_impl"]`. T9b-3c: `attn_impl="flashmla"` runs every layer's `sparse_attn` on
@@ -289,7 +291,7 @@ class Generator:
                  model_name: str = "m0-reference-runtime", profiler=None, set_default_device: bool = True,
                  mode: str = "eager", max_pos: Optional[int] = None, marker: bool = False,
                  static_counters: bool = True, static_factory: Optional[Callable] = None, moe_impl: str = "ref",
-                 fp8_impl: str = "ref", glue_impl: str = "ref", attn_impl: str = "ref"):
+                 fp8_impl: str = "ref", glue_impl: str = "ref", attn_impl: str = "ref", glue_approx: bool = False):
         self.model = model
         self.tokenizer_dir = tokenizer_dir
         self.tokenizer = tokenizer if tokenizer is not None else (load_tokenizer(tokenizer_dir) if tokenizer_dir else None)
@@ -329,6 +331,8 @@ class Generator:
         self.set_fp8_impl(fp8_impl)
         self.glue_impl = "ref"
         self.set_glue_impl(glue_impl)
+        self.glue_approx = False
+        self.set_glue_approx(glue_approx)
         self.attn_impl = "ref"
         self.set_attn_impl(attn_impl)
         self.logits_sink: Optional[Callable] = None  # greedy calls sink(i, fp32 CPU logits) per position (drift rows)
@@ -368,6 +372,15 @@ class Generator:
             self.reset_static()
         self.glue_impl = impl
 
+    def set_glue_approx(self, flag: bool) -> None:
+        """T9b-2 R2 (--glue-approx): with glue_impl "fused", also run the round-2 clusters whose statistic has no
+        bit-identical reduction order on this device (outcome (ii), runtime/fused_glue_r2.py). A change drops the
+        StaticStep. Meaningless with glue_impl "ref"."""
+        flag = bool(flag)
+        if flag != self.glue_approx and self.static is not None:
+            self.reset_static()
+        self.glue_approx = flag
+
     def set_attn_impl(self, impl: str) -> None:
         """T9b-3a/3c: the static step's sparse_attn ("ref" | "bounded" | "flashmla"). A change drops the StaticStep
         (and its graphs); the next static/graph use rebuilds it. Eager mode never uses it."""
@@ -395,6 +408,8 @@ class Generator:
                     kw["fp8_impl"] = self.fp8_impl
                 if self.glue_impl != "ref":
                     kw["glue_impl"] = self.glue_impl
+                    if self.glue_approx:
+                        kw["glue_opts"] = {"approx": True}
                 if self.attn_impl != "ref":
                     kw["attn_impl"] = self.attn_impl
                 self.static = self.static_factory(self.model, **kw)
@@ -404,6 +419,7 @@ class Generator:
                 self.static = StaticStep(self.model, self.pool, max_pos=self._static_max_pos, marker=self.marker,
                                          counters=self.static_counters, moe_impl=self.moe_impl,
                                          fp8_impl=self.fp8_impl, glue_impl=self.glue_impl,
+                                         glue_opts={"approx": True} if self.glue_approx else None,
                                          attn_impl=self.attn_impl)
         return self.static
 
@@ -614,7 +630,7 @@ class Generator:
         meta = {"logits_sha256": digest.hexdigest(), "token_ids": gen, "prompt_tokens": L, "wall_s": wall,
                 "prefill_s": t_prefill, "n_forward": len(gen), "mode": self.mode, "step_sha256": step_digests,
                 "moe_impl": self.moe_impl, "fp8_impl": self.fp8_impl, "glue_impl": self.glue_impl,
-                "attn_impl": self.attn_impl,
+                "glue_approx": self.glue_approx, "attn_impl": self.attn_impl,
                 "decode_ms_per_token": (wall - t_prefill) / max(1, len(gen) - 1) * 1e3 if len(gen) > 1 else None}
         if c0 is not None and c1 is not None:
             hot, cold = c1[0] - c0[0], c1[1] - c0[1]

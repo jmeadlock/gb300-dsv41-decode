@@ -86,11 +86,11 @@ class T:
 
     def to(self, dtype, bitcast=False, fp_downcast_rounding=None):
         assert fp_downcast_rounding in (None, "rtne"), fp_downcast_rounding
-        if bitcast:
+        if bitcast:   # (reshape: np.ascontiguousarray makes a 0-d scalar 1-d)
             if dtype is int32:                                           # fp32 bits as int32
-                return T(np.ascontiguousarray(self.a.astype(np.float32)).view(np.int32))
+                return T(np.ascontiguousarray(self.a.astype(np.float32)).view(np.int32).reshape(self.a.shape))
             assert dtype is float32
-            return T(np.ascontiguousarray(self.a.astype(np.int32)).view(np.float32))
+            return T(np.ascontiguousarray(self.a.astype(np.int32)).view(np.float32).reshape(self.a.shape))
         if dtype is bfloat16 or dtype is float8e4nv:
             f = torch.from_numpy(np.ascontiguousarray(self.a.astype(np.float32)))
             tdt = torch.bfloat16 if dtype is bfloat16 else torch.float8_e4m3fn

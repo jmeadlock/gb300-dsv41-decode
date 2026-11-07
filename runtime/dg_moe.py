@@ -250,9 +250,12 @@ class DGMaskedMoE:
         glue = o.glue  # runtime/fused_glue.py FusedGlue (glue_impl "fused") or None
         shape = x.size()
         x = x.view(-1, moe.dim)                                        # model.py:893
-        weights, indices = moe.gate(x, None)                           # model.py:894 (text: no image mask)
-        ids, order = torch.sort(indices[0])                            # ascending id = model.py:897 loop order
-        w = weights[0, order]
+        if glue is not None and glue.on("router"):
+            ids, w = glue.route(moe, x)                                # T9b-2 R2 #4: gate + sort, 2 launches + 3
+        else:
+            weights, indices = moe.gate(x, None)                       # model.py:894 (text: no image mask)
+            ids, order = torch.sort(indices[0])                        # ascending id = model.py:897 loop order
+            w = weights[0, order]
         if glue is not None and glue.on("gather"):
             self._gather_fused(ids)                                    # T9b-2 #11+#9: 1 launch (+ids, +fp32 scales)
         else:
@@ -289,6 +292,10 @@ class DGMaskedMoE:
 
     def _act(self, x: torch.Tensor) -> None:
         o, b, R = self.owner, self.owner.dg, self.owner.R
+        if o.glue is not None and o.glue.on("hc_norm"):
+            ctx = o.glue.ffn_pre(x)
+            if ctx is not None and ctx.get("dg"):
+                return                                                            # T9b-2 R2 #1: written by hc_norm
         if o.glue is not None and o.glue.on("dg_act"):
             o.glue.dg_act(x)                                                      # T9b-2 #9: straight into row 0
             return

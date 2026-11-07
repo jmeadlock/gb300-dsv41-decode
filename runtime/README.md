@@ -19,6 +19,7 @@ Standalone: no vllm import anywhere (charter decision 3). The reference `model.p
 | `attn_flashmla.py` | T9b-3c (`--attn-impl flashmla`, A3-class): every layer's `sparse_attn` on FlashMLA's `sparse_prefill_fwd` over our bf16 caches; the op loaded from vllm's `_flashmla_C` .so with `torch.ops.load_library` (no vllm Python, asserted before and after); head / head-dim / topk padding for small shapes; per-row `topk_length`; fp64 oracle and build-time self-check |
 | `dg_moe.py` | T9a-1: `DGMaskedMoE` (`--moe-impl dg-masked`): the static MoE's routed GEMMs as 3 DeepGEMM masked grouped GEMMs over the same staging; `import_deep_gemm` (no vllm import); exact e8m0 → fp32 |
 | `fused_glue.py` | T9b-2 round 1 (`--glue-impl fused`): Triton kernels for the zero/low-risk glue clusters (gather, DG act, SwiGLU+act_quant, MoE combine, mHC post, o-path RoPE+QDQ, q RoPE in the GEMV store), table-driven act_quant/silu, build-time self-check, per-cluster switches; torch mirrors on CPU |
+| `fused_glue_r2.py` | T9b-2 round 2 (same flag; `FusedGlue` inherits `R2Glue`): hc_pre+RMSNorm+act_quant, the mHC mixes statistic, kv/q paths, router and indexer glue around torch.topk, Engram gate; the reduction-order family + device calibration (outcome (i) on / (ii) off unless `--glue-approx`) |
 | `gemv_mxfp8.py` | T9b-1: Triton MXFP8 GEMV `mxfp8_gemv(xq, xs, w, s, out)` for the fp8 Linears at <= 8 rows (`--fp8-impl gemv`); exact e8m0 pair scale; per-(N,K,M) tuning cache; `gemv_torch` = the same algorithm in torch (CPU) |
 | `patches.py` | flag-gated monkeypatches: `kv_numerics_pg61` (model.py:761), `static_moe` (model.py:891-906, design #14), `fp8_linear_gemv` (model.py:196-205, design #16), `sparse_attn_bounded` (model.py:781 / kernel.py:392-403, design #18) |
 
@@ -463,6 +464,71 @@ them to scratch first, the cache file is written back: `cp docs/gemv-tune-gb300-
     cmp scratch/first-light-fused.jsonl w0/results/first-light-cand-gemv.jsonl && echo BYTE-IDENTICAL
 
 Then check `fused_glue.clusters` in the report: any cluster "off" is named with its reason (it ran today's ops).
+
+## T9b-2 round 2: the medium-risk glue clusters (`fused_glue_r2.py`, same `--glue-impl fused`)
+
+Spec: `docs/HANDOFF-T9B2-GLUE-R2.md`. `FusedGlue` inherits `R2Glue`; seven more switches (`describe()` names), each
+with its own device calibration and end-to-end self-check, exactly round 1's pattern:
+
+| cluster | audit | replaces (per instance) -> launches | applies to |
+|---|---|---|---|
+| `hc_norm` | #1 | hc_pre (`.float`, `*`, `sum`, `.to`) + RMSNorm (8 ops) + the act_quant of the normed row for wq_a/wkv (attn side) or shared w1/w3 + the DeepGEMM rows + the gate's `x.float()` (ffn side) / the head's `x.float()` -> **1** | attn_norm, ffn_norm, final norm |
+| `mix_stat` | #5 | hc_mixes' `.float`, `square`, `mean`, `+eps`, `rsqrt` -> **0** (in the hc_norm launch; mm, `*rsqrt`, sinkhorn stay) | needs hc_norm |
+| `kv_path` | #3 | kv_norm + RoPE + act_quant QDQ + the ring `index_copy_` -> **1** (wkv stays) | every layer |
+| `q_path` | #6 | q_norm + act_quant(qr) for wq_b (and the indexer's wq_b) -> **1** | every layer |
+| `router` | #4 | `/temp` (skipped at 1.0: exact no-op), sqrt, +bias, gather, sum, +eps, `/=`, `*=`, sort, index, `x.float()`, `weight.float()` (cached) -> **2** (+ mm, softplus, `torch.topk` kept) | sqrtsoftplus, norm_topk_prob |
+| `engram` | #15 | Engram's gate math (two rsqrt statistics, the dot, abs/clamp/sqrt/copysign, the residual add) -> **2** (+ `torch.sigmoid` kept) | Engram layers |
+| `indexer_post` | #14 | sort(topk idx) + where/+offset/.int -> **1** (`torch.topk` kept) | index-source layers |
+
+**The reduction-order question.** Each statistic is a `x.square().mean(-1)` / `x.sum(-1)` that torch reduces with a
+fixed tree; the kernels implement a *family* of trees (`order_sum_torch` is its exact torch statement; Triton:
+`_r2_offs`/`_r2_finish`/`_r2_fin`): T threads x V vectorized (or unrolled) accumulators, each sequential from +0,
+folded left, then a halving tree (shared memory to 32 lanes, then the warp halving "dec" or adjacent-pair "inc"), the
+mean multiplying by RN(1/w) or dividing. At build time `pick_order` evaluates the family on 1,024 random rows (block
+scales 2^+-8, outlier channels, zeros) at each statistic's width AND row count (torch's launch configuration depends
+on both: Engram reduces 4 rows at once) on the device, torch's predicted configuration (`predicted_order`, Reduce.cuh;
+the box probe `docs/flashmla-probe-20261106.json` matched it on 100 % of rows at every normed width) first:
+- **(i) bit-identical**: a member matches every row -> the cluster is on;
+- **(ii) fused-approx**: none matches -> the best member is recorded (match fraction, max ulp of the fp32 statistic)
+  and the cluster is **off** unless `--glue-approx` (`Generator(glue_approx=True)`, `glue_opts={"approx": True}`),
+  then status `approx`. No cluster ships silently non-identical.
+rsqrt is libdevice's (== torch.rsqrt bit for bit, probe (c)); sqrt/division are `sqrt_rn`/`div_rn` (IEEE, as torch);
+softplus and sigmoid stay torch ops. The hc_pre 4-term sum order and the kv RoPE contraction form are picked as in
+round 1 on cancellation-crafted data. **topk ties:** both topk launches are kept (torch's own tie order); the kernels
+consume torch.topk's indices in its order (the weight sum runs in that order, as the reference's) and the sorts that
+follow are of distinct ids (rank = count of smaller ids), hence exact; the router check uses tie-heavy scores. The
+indexer's score glue (relu, x weights, the 32-head sum over a strided dim) is not fused: that sum's order is not pinned.
+
+`describe()["r2"]`: per-cluster numerics outcome and orders; `approx_on`; first light prints the `[glue]` line
+(clusters on / approx / off, R2 outcome (i)/(ii), picked orders). With `--glue-approx` the parity-levels G row becomes
+the ungated drift row "fused glue +approx vs ref glue (same impls)" (first token divergence, mean |dlogit|) and L0 is
+reported, not gated. Census receipt (Mac, real structure, `bench/glue_census.py`, new path `static-dg-gemv-fused-r1` =
+fused with the R2 clusters disabled): **4,645 -> 1,823 launches/step, 2,822 removed** (audit predicted 2,950: #1 1,012
+incl. the consumers' act_quants, #5 400, #6 368, #3 560, #4 400, #15 50, #14 32; per-cluster regions sum to the total
+exactly; short of the audit where torch ops stay: topk x2, softplus, sigmoid, the mixes' mm/sinkhorn, Engram's hash
+and embedding, the indexer's score glue). Ref glue -> fused R1+R2: 6,725 -> 1,823.
+
+**Mac:** `tests/test_fused_glue_r2_cpu.py` -- the family vs an independent scalar fp32 simulation; `pick_order` finding
+hidden members and reporting a non-member as (ii); the shim-executed reduction helpers == the family for every member;
+all seven kernel bodies through `tests/triton_shim.py` (now with `libdevice.rsqrt/sqrt_rn/div_rn`) == the mirrors for
+explicit orders, ragged tails, strided DeepGEMM rows, the ring slot, tie-heavy routing and topk; the mirrors == the
+model.py op sequences; each R2 cluster off alone == ref; launches per step; outcome-(ii) gating; broken kernels
+turned off by the self-check; `--glue-approx` plumbing. `FG2_SHIM_MODULE=<mutated copy>` for sensitivity checks.
+
+**Box, GPU test** (`pick_order` on the device for every statistic at real shapes printed with its outcome; each
+kernel `torch.equal` vs the unfused reference ops on 1,024 rows (512 for 4 x 5120) incl. tie-heavy routing and topk
+when (i); mini/mini4 R2 status + fused == ref static-eager, graph == static, no host sync; `--glue-approx` status):
+
+    ... (same docker line as above) ... tests/gpu/test_fused_glue_r2_gpu.py
+
+**Box, first light** (gates: G 8/8, L1/L2 8/8, output byte-identical to the current default run, step cell <= its
+step - 3.5 ms). Current default = T9b-3c, 19.87 ms (`docs/first-light-flashmla-20261106.json`, output
+`w0/results/first-light-cand-flashmla.jsonl`) -> gate <= 16.37 ms; against the bit-identical attention (T9b-3a,
+`--attn-impl bounded`, 23.80 ms) it would be <= 20.30 ms. R2 rides on `--glue-impl fused`: rerun that argv unchanged
+with `--out scratch/first-light-r2.jsonl --json docs/first-light-r2-<date>.json`, then
+`cmp scratch/first-light-r2.jsonl w0/results/first-light-cand-flashmla.jsonl`. A second run adding `--glue-approx`
+reports the drift row (it only differs from the first if some statistic was outcome (ii) on the device; the `[glue]`
+line says which).
 
 
 ## T9b-3a: `sparse_attn` bounded to its valid blocks (`--attn-impl bounded`) + the gather at HBM rate

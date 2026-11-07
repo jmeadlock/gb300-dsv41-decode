@@ -367,6 +367,7 @@ def parity_levels(gen: Generator, rows: List[dict], steps: int = 32, log=print,
     impl = getattr(gen, "moe_impl", "ref")
     fimpl = getattr(gen, "fp8_impl", "ref")
     gimpl = getattr(gen, "glue_impl", "ref")
+    gapprox = gimpl != "ref" and bool(getattr(gen, "glue_approx", False))  # T9b-2 R2: outcome-(ii) clusters may run
     aimpl = getattr(gen, "attn_impl", "ref")
     attn_variant = aimpl in ATTN_VARIANTS  # T9b-3c: an A3-class attention makes the step a variant (bounded does not)
     label = "+".join(x for x in (impl, fimpl, aimpl if attn_variant else "ref") if x != "ref") or "ref"
@@ -395,7 +396,7 @@ def parity_levels(gen: Generator, rows: List[dict], steps: int = 32, log=print,
             timed("eager" + sfx, lambda: _level_run(gen, prompts, steps))
             gen.reset_static()
             gen.set_mode("static")
-            keep = kept.setdefault(label, {}) if variant and sfx == sfx0 else None
+            keep = kept.setdefault(label, {}) if (variant or gapprox) and sfx == sfx0 else None
             timed("static" + sfx, lambda: _level_run(gen, prompts, steps, keep))
             gen.set_mode("graph")
             gen.capture(fills=bool(f))
@@ -416,7 +417,8 @@ def parity_levels(gen: Generator, rows: List[dict], steps: int = 32, log=print,
             set_fill(fills_list[0])
             gen.set_glue_impl("ref")
             gen.set_mode("static")
-            timed("static-glueref" + sfx0, lambda: _level_run(gen, prompts, steps))
+            keep = kept.setdefault("glueref", {}) if gapprox else None
+            timed("static-glueref" + sfx0, lambda: _level_run(gen, prompts, steps, keep))
         if variant:  # the drift reference: the same static step with the bit-identical MoE and fp8 GEMMs
             set_fill(fills_list[0])
             gen.set_moe_impl("ref")
@@ -442,7 +444,7 @@ def parity_levels(gen: Generator, rows: List[dict], steps: int = 32, log=print,
         if mode0 == "graph":
             gen.capture(fills=False)
 
-    gated_l0 = not variant
+    gated_l0 = not variant and not gapprox     # an outcome-(ii) glue is a variant of the reference too
     table = []
     for f in fills_list:
         sfx = "" if f is None else ("/fills-on" if f else "/fills-off")
@@ -469,10 +471,18 @@ def parity_levels(gen: Generator, rows: List[dict], steps: int = 32, log=print,
         c.update({k: v for k, v in drift.items() if k != "per_prompt_drift"})
         c["per_prompt"] = {t: dict(v, **drift["per_prompt_drift"].get(t, {})) for t, v in c["per_prompt"].items()}
         table.append((fl0, "drift", f"{label} vs ref static-eager", False, c))
-    if gimpl != "ref":
+    glue_drift = None
+    if gimpl != "ref" and not gapprox:
         fl0 = "-" if fills_list[0] is None else "off"
         table.append((fl0, "G", "fused glue vs ref glue (same moe/fp8 impl)", True,
                       compare_levels(runs["static" + sfx0], runs["static-glueref" + sfx0])))
+    elif gimpl != "ref":  # T9b-2 R2 --glue-approx: outcome-(ii) clusters may differ -> a drift row, reported, not gated
+        fl0 = "-" if fills_list[0] is None else "off"
+        glue_drift = logit_drift(kept[label], kept["glueref"], runs["static" + sfx0], runs["static-glueref" + sfx0])
+        c = compare_levels(runs["static" + sfx0], runs["static-glueref" + sfx0])
+        c.update({k: v for k, v in glue_drift.items() if k != "per_prompt_drift"})
+        c["per_prompt"] = {t: dict(v, **glue_drift["per_prompt_drift"].get(t, {})) for t, v in c["per_prompt"].items()}
+        table.append((fl0, "G", "fused glue +approx vs ref glue (same impls)", False, c))
     if aimpl != "ref" and not attn_variant:
         fl0 = "-" if fills_list[0] is None else "off"
         table.append((fl0, "A", "bounded attn vs ref attn (same moe/fp8/glue)", True,
@@ -495,7 +505,7 @@ def parity_levels(gen: Generator, rows: List[dict], steps: int = 32, log=print,
     gate_rows = [r for r in rows_out if r["gate"]]
     verdict = "PASS" if all(r["all_equal"] for r in gate_rows) else "FAIL"
     log(f"moe impl {impl}" + ("" if fimpl == "ref" else f", fp8 impl {fimpl}")
-        + ("" if gimpl == "ref" else f", glue impl {gimpl}")
+        + ("" if gimpl == "ref" else f", glue impl {gimpl}{'+approx' if gapprox else ''}")
         + ("" if aimpl == "ref" else f", attn impl {aimpl}")
         + ("" if gated_l0 else " (L0 static-eager rows and the drift row are reported, not gated)"))
     log(f"{'fills':7s}{'level':6s}{'comparison':42s}{'equal':>8s}  first diff (tag@position)")
@@ -507,6 +517,11 @@ def parity_levels(gen: Generator, rows: List[dict], steps: int = 32, log=print,
             f"{drift['prompts_token_identical']}/{len(prompts)} prompts token-identical, mean |dlogit| "
             f"{drift['mean_abs_dlogit']:.3e} (max {drift['max_abs_dlogit']:.3e}) over {drift['positions_compared']} "
             f"same-context positions")
+    if glue_drift is not None:
+        log(f"drift fused glue +approx vs ref glue: first token divergence "
+            f"{glue_drift['first_token_divergence'] or 'none'}, {glue_drift['prompts_token_identical']}/{len(prompts)} "
+            f"prompts token-identical, mean |dlogit| {glue_drift['mean_abs_dlogit']:.3e} (max "
+            f"{glue_drift['max_abs_dlogit']:.3e}) over {glue_drift['positions_compared']} same-context positions")
     if attn_drift is not None:
         log(f"drift {aimpl} vs ref attn (same other impls): first token divergence "
             f"{attn_drift['first_token_divergence'] or 'none'}, {attn_drift['prompts_token_identical']}/{len(prompts)} "
@@ -514,8 +529,8 @@ def parity_levels(gen: Generator, rows: List[dict], steps: int = 32, log=print,
             f"{attn_drift['max_abs_dlogit']:.3e}) over {attn_drift['positions_compared']} same-context positions")
     log(f"PARITY LEVELS ({steps} steps x {len(prompts)} prompts, fp32-logit sha256 per position): {verdict}")
     return {"steps": steps, "n_prompts": len(prompts), "moe_impl": impl, "fp8_impl": fimpl, "glue_impl": gimpl,
-            "attn_impl": aimpl, "variant": label, "verdict": verdict, "rows": rows_out, "drift": drift,
-            "attn_drift": attn_drift, "timings_s": timings, "runs": runs}
+            "glue_approx": gapprox, "attn_impl": aimpl, "variant": label, "verdict": verdict, "rows": rows_out,
+            "drift": drift, "glue_drift": glue_drift, "attn_drift": attn_drift, "timings_s": timings, "runs": runs}
 
 
 # ------------------------------------------------------------------------------------------------ main
@@ -557,6 +572,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--glue-impl", choices=["ref", "fused"], default="ref",
                     help="static/graph glue: ref = today's torch glue ops / fused = the zero/low-risk glue clusters "
                          "as fused kernels, bit-identical to ref (T9b-2, runtime/fused_glue.py)")
+    ap.add_argument("--glue-approx", action="store_true",
+                    help="with --glue-impl fused: also run the round-2 clusters whose reduction order has no "
+                         "bit-identical match on this device (outcome (ii), runtime/fused_glue_r2.py); the G row "
+                         "becomes a drift row (reported, not gated)")
     ap.add_argument("--attn-impl", choices=["ref", "bounded", "flashmla"], default="ref",
                     help="static/graph sparse_attn: ref = reference TileLang kernel over the fixed 640-index width / "
                          "bounded = the same kernel with its block loop bounded by a device per-row valid-block "
@@ -600,11 +619,12 @@ def main(argv=None) -> int:
                      "device": torch.cuda.get_device_name() if torch.cuda.is_available() else None,
                      "capability": torch.cuda.get_device_capability() if torch.cuda.is_available() else None}
     gen = Generator(model, a.tokenizer_dir or a.model_dir, mode=a.mode, max_pos=a.max_pos, marker=a.marker,
-                    moe_impl=a.moe_impl, fp8_impl=a.fp8_impl, glue_impl=a.glue_impl, attn_impl=a.attn_impl)
+                    moe_impl=a.moe_impl, fp8_impl=a.fp8_impl, glue_impl=a.glue_impl, attn_impl=a.attn_impl,
+                    glue_approx=a.glue_approx)
     report["generator"] = {"eos_ids": gen.eos_ids, "top_k": gen.top_k, "max_seq_len": gen.max_seq_len,
                            "tokenizer_dir": gen.tokenizer_dir, "mode": gen.mode, "max_pos": gen.max_pos,
                            "marker": gen.marker, "moe_impl": gen.moe_impl, "fp8_impl": gen.fp8_impl,
-                           "glue_impl": gen.glue_impl, "attn_impl": gen.attn_impl}
+                           "glue_impl": gen.glue_impl, "glue_approx": gen.glue_approx, "attn_impl": gen.attn_impl}
     if a.nvtx_layers:
         install_layer_nvtx(model)
     return measure(gen, a, report, n_layers=len(model.layers), out=out, json_path=json_path, fixture2=fixture2)
@@ -702,6 +722,7 @@ def measure(gen: Generator, a, report: Dict, *, n_layers: int, out: str, json_pa
     report.setdefault("generator", {})["moe_impl"] = getattr(gen, "moe_impl", "ref")
     report["generator"]["fp8_impl"] = getattr(gen, "fp8_impl", "ref")
     report["generator"]["glue_impl"] = getattr(gen, "glue_impl", "ref")
+    report["generator"]["glue_approx"] = bool(getattr(gen, "glue_approx", False))
     report["generator"]["attn_impl"] = getattr(gen, "attn_impl", "ref")
     static = getattr(gen, "static", None)
     if static is not None and hasattr(static, "attn_describe"):
@@ -716,6 +737,8 @@ def measure(gen: Generator, a, report: Dict, *, n_layers: int, out: str, json_pa
     glue = getattr(getattr(gen, "static", None), "glue", None)
     if glue is not None and hasattr(glue, "describe"):
         report["fused_glue"] = glue.describe()  # clusters on / off (and why), self-check modes and results
+        if hasattr(glue, "glue_line"):
+            print(glue.glue_line(), flush=True)  # [glue] clusters on/approx/off, R2 numerics (i)/(ii), orders
     if report["generator"]["fp8_impl"] == "gemv":
         try:
             from runtime.gemv_mxfp8 import describe as gemv_describe
@@ -742,6 +765,8 @@ def summary_lines(r: dict, json_path: str) -> List[str]:
     moe = g.get("moe_impl", "ref")
     fp8 = g.get("fp8_impl", "ref")
     glue = g.get("glue_impl", "ref")
+    if glue != "ref" and g.get("glue_approx"):
+        glue += "+approx"
     attn = g.get("attn_impl", "ref")
     if attn != "ref" and r.get("attn_bound") is not None and not r["attn_bound"].get("on"):
         attn += "(OFF)"
