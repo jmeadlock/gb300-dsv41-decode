@@ -23,8 +23,12 @@ outputs in ascending expert id (`posmat`, the reference's order). Nothing about 
     unused slots), expected_m 8 as at 1 row; w1/w3 -> the reference SwiGLU glue on the P = R*k pair rows -> act_quant
     -> w2 -> per-row ascending-id combine -> + shared.
 
-The fused glue is not used at R > 1 (StaticStep builds none). dg-inplace at R > 1 needs up to R*k cold spare slots per
-layer (27 GB at 36 on the real model) or a hot/cold split; not implemented here (StaticStep refuses it).
+  DGInplaceMoERows (moe_impl "dg-inplace", M1-T10-FIX): the contiguous grouped GEMM over the hot pool in place, cold
+    experts staged into R*k spare pool slots (25.5 GB on the real model; a hot/cold split with fewer spare slots and
+    a masked path for the overflow would trade that HBM for launches -- not done). Same dedup, glue and combine.
+
+The fused glue at R > 1 runs only its row-parallel clusters (runtime/fused_glue.py `ROWS_CLUSTERS`); the R-row MoEs
+take the fused shared-expert SwiGLU when it is on, their routed glue is the reference ops above.
 """
 from __future__ import annotations
 
@@ -115,6 +119,9 @@ class _RowsMoEBase:
             gather_rows(tab, uniq, o.staging[key], o.row_bytes[key])
 
     def _shared(self, x: torch.Tensor) -> torch.Tensor:
+        glue = self.owner.glue
+        if glue is not None and glue.on("swiglu_shared"):
+            return glue.shared_expert(self.moe.shared_experts, x)      # fused SwiGLU (row-parallel, self-checked)
         return self.moe.shared_experts(x)                              # model.py:905 at M = R
 
 
@@ -147,22 +154,17 @@ class DGMaskedMoERows(_RowsMoEBase):
     """moe_impl "dg-masked" at R rows: 3 DeepGEMM masked grouped GEMMs over R*k groups, masked_m = rows per slot."""
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        from runtime.dg_moe import e8m0_to_f32
-
         o, moe, b, R = self.owner, self.moe, self.owner.dg, self.owner.R
         shape = x.size()
         x = x.view(-1, moe.dim)                                        # model.py:893
-        S, M = b.k, b.rows
+        S, M = b.k, self._block_rows()
         m = self._route(x, M)
-        self._gather(m["uniq"])
-        for p in PROJS:                                                # e8m0 -> fp32, one op per projection
-            b.convert_scales(p, o.staging[(p, "scale")])
+        self._weights(m)
         arow, prow = m["arow"], m["prow"]
         q, s = R.act_quant(x, R.fp8_block_size, R.scale_fmt, R.scale_dtype)   # model.py:187, the R rows once
         self._load(1, q.index_select(0, prow), s.index_select(0, prow), arow)
-        b.masked_m.copy_(m["counts"].to(torch.int32))
-        gate = b.gemm("w1", o.staging[("w1", "weight")], 1).view(S * M, -1).index_select(0, arow).float()  # 845
-        up = b.gemm("w3", o.staging[("w3", "weight")], 1).view(S * M, -1).index_select(0, arow).float()    # 846
+        gate = self._gemm("w1", 1).view(S * M, -1).index_select(0, arow).float()   # model.py:845
+        up = self._gemm("w3", 1).view(S * M, -1).index_select(0, arow).float()     # model.py:846
         lim = b.swiglu_limit
         if lim > 0:                                                    # model.py:847-849
             up = torch.clamp(up, min=-lim, max=lim)
@@ -172,10 +174,26 @@ class DGMaskedMoERows(_RowsMoEBase):
         h = h.to(x.dtype)                                              # model.py:853
         q2, s2 = R.act_quant(h, R.fp8_block_size, R.scale_fmt, R.scale_dtype)  # model.py:187 inside w2
         self._load(2, q2, s2, arow)
-        out = b.gemm("w2", o.staging[("w2", "weight")], 2).view(S * M, -1)     # [S*M, D] bf16
+        out = self._gemm("w2", 2).view(S * M, -1)                     # [S*M, D] bf16
         y = combine_rows(out, m["posmat"], x)
         y += self._shared(x)
         return y.type_as(x).view(shape)
+
+    # the two places dg-masked and dg-inplace differ (DGInplaceMoERows below)
+    def _block_rows(self) -> int:
+        return self.owner.dg.rows                                      # masked: max_m rows per group
+
+    def _weights(self, m: Dict[str, torch.Tensor]) -> None:
+        """Slot u's expert m["uniq"][u] -> staging slot u (weights + e8m0 scales), scales -> fp32 (sf32)."""
+        o, b = self.owner, self.owner.dg
+        self._gather(m["uniq"])
+        for p in PROJS:                                                # e8m0 -> fp32, one op per projection
+            b.convert_scales(p, o.staging[(p, "scale")])
+        b.masked_m.copy_(m["counts"].to(torch.int32))
+
+    def _gemm(self, p: str, which: int) -> torch.Tensor:
+        o = self.owner
+        return o.dg.gemm(p, o.staging[(p, "weight")], which)
 
     def _load(self, which: int, q: torch.Tensor, s: torch.Tensor, arow: torch.Tensor) -> None:
         """A rows `arow` of xq[which] / xs[which] <- the pairs' quantized activation (fp8) and fp32 scales."""
@@ -183,7 +201,49 @@ class DGMaskedMoERows(_RowsMoEBase):
 
         b = self.owner.dg
         K = q.size(-1)
-        b.xq[which].view(-1, K).index_copy_(0, arow, q)
+        b.xq[which].view(torch.uint8).view(-1, K).index_copy_(0, arow, q.contiguous().view(torch.uint8))  # bytes
         s32 = torch.empty(s.shape, dtype=torch.float32, device=s.device)
         e8m0_to_f32(s, s32, b.e8m0_method)
         b.xs[which].view(-1, s32.size(-1)).index_copy_(0, arow, s32)
+
+
+class DGInplaceMoERows(DGMaskedMoERows):
+    """moe_impl "dg-inplace" at R rows (M1-T10-FIX): DeepGEMM's CONTIGUOUS grouped GEMM over the layer's whole pool
+    [H + S, N, K/2] (S = R*k spare slots), the same dedup as dg-masked. Slot u (expert uniq[u], ascending id) is A
+    block u = rows [u*ALIGN, u*ALIGN + counts[u]) (pair (r, e) at row u*ALIGN + rank, rows ascending), group = the
+    expert's hot pool slot, or spare slot H + u for a cold expert (staged there by the T9a-2 launch; with S = R*k
+    spare slots every slot index fits, whatever the routing). m_indices tags each block's count rows with its group
+    and everything else -1 (padding rows and unused slots u >= U): each row's k pairs reach their k groups. Combine
+    = per-row ascending expert id (posmat), the SwiGLU glue and act_quant are dg-masked's on the same pair rows, so
+    the only change is the GEMM's weight source: in place vs a staged copy (the 1-row D level measured that equal).
+    Cost: R*k spare weight slots per layer (40 x 36 x 17.7 MB = 25.5 GB on the real model)."""
+
+    def __init__(self, owner, moe, layer: int, ptabs: Dict[Tuple[str, str], torch.Tensor]):
+        super().__init__(owner, moe, layer, ptabs)
+        b = owner.dg
+        self.t = b.layer_tables(layer, ptabs)
+        pool = b.pool
+        d = owner.dev
+        hot = pool.hot[layer]
+        # a hot expert stands in for unused slots in the staging launch (no weight copy; its scales re-written with
+        # the same bytes); none hot -> the slot's own (duplicate) id, which still fits a spare slot
+        self.dummy = torch.tensor(int(hot[0]) if len(hot) else -1, dtype=torch.long, device=d)
+        self.has_dummy = len(hot) > 0
+        self.ar_slots = torch.arange(b.k, dtype=torch.long, device=d)
+        self.ar_rows = torch.arange(owner.rows, dtype=torch.long, device=d).view(1, -1)
+
+    def _block_rows(self) -> int:
+        return self.owner.dg.align
+
+    def _weights(self, m: Dict[str, torch.Tensor]) -> None:
+        o, b, t = self.owner, self.owner.dg, self.t
+        uniq, counts = m["uniq"], m["counts"]
+        ids = torch.where(counts > 0, uniq, self.dummy) if self.has_dummy else uniq
+        b.stage(t, ids, None)                                           # 1 launch: cold rows -> H + u, packed SF
+        g = t["gtab"].index_select(0, uniq).long()
+        grp = torch.where(g < 0, t["H"] + self.ar_slots, g)
+        tags = torch.where(self.ar_rows < counts.view(-1, 1), grp.view(-1, 1), -1).to(torch.int32)
+        b.mi.view(b.k, b.align)[:, : o.rows].copy_(tags)                # after the launch's head writes
+
+    def _gemm(self, p: str, which: int) -> torch.Tensor:
+        return self.owner.dg.gemm_inplace(p, self.t, which)

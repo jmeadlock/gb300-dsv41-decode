@@ -17,6 +17,7 @@ Bytecode writing is disabled while importing so nothing is written under referen
 from __future__ import annotations
 
 import __future__ as _future
+import contextlib
 import importlib.abc
 import importlib.machinery
 import importlib.util
@@ -114,6 +115,37 @@ def import_reference(cpu_stubs: bool = False, ref_dir: str = REF_DIR) -> types.M
     if not m.__file__.startswith(ref_dir):
         raise ImportError(f"imported a foreign 'model' module: {m.__file__}")
     return m
+
+
+@contextlib.contextmanager
+def reference_device(device):
+    """The reference forward's precondition, scoped: model.py builds its index tensors with bare factories on the
+    DEFAULT device (get_window_topk_idxs, model.py:418-423: `torch.arange(...)` -> the `topk_idxs` that
+    kernel.sparse_attn takes; 1027-1028 likewise), and reference generate.py:134 calls
+    `torch.set_default_device("cuda")` before any forward. A caller that runs `model(tokens, start_pos)` without that
+    (a test, the multirow oracle, StaticStep.capture's dummy prefill) hands the CUDA-targeted TileLang kernel a CPU
+    `topk_idxs` -> "sparse_attn_kernel_ input topk_idxs device_type mismatch, expected cuda" (M1-T10 round 1).
+    Inside this context the default device is `device` (innermost mode wins over a global set_default_device).
+    model.py memoizes two of those index builders with `@lru_cache(1)` (get_window_topk_idxs 409, get_dspark_topk_idxs
+    1025): an entry made under another default device would be replayed as is, so both caches are cleared on entry
+    (they hold one entry each; the reference recomputes them on its next call, the values do not change)."""
+    import sys
+
+    import torch
+
+    m = sys.modules.get("model")
+    for name in ("get_window_topk_idxs", "get_dspark_topk_idxs"):
+        fn = getattr(m, name, None) if m is not None else None
+        if hasattr(fn, "cache_clear"):
+            fn.cache_clear()
+    with torch.device(device):
+        yield
+
+
+def reference_forward(model, tokens, start_pos: int, **kw):
+    """`model(tokens, start_pos)` (the reference Transformer.forward) under `reference_device(tokens.device)`."""
+    with reference_device(tokens.device):
+        return model(tokens, start_pos, **kw)
 
 
 def import_convert(ref_dir: str = REF_DIR) -> types.ModuleType:

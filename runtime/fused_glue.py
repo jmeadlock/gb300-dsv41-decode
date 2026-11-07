@@ -108,6 +108,30 @@ CONCAT_FREE_WHY = ("not implemented in round 1: the window ring is per layer whi
 ACT_CLUSTERS = ("dg_act", "swiglu_routed", "swiglu_shared", "o_rope_qdq",   # need the act_quant table parity
                 "hc_norm", "kv_path", "q_path")
 DISABLE_ENV = "DSV41_GLUE_DISABLE"
+# M1-T10-FIX: the clusters that run at rows > 1 (the 6-row verify step). Each is row-parallel -- the fused op on row r
+# reads and writes row r only, with the one-row op's per-element arithmetic -- and is self-checked at R rows at build
+# (hc_post: the 4-term order is re-picked on R-row data against Block.hc_post at R rows). Every other cluster is n/a
+# at rows > 1 with the reason below; its call site then runs the reference ops (the T10 6-row step's glue).
+ROWS_CLUSTERS = ("swiglu_shared", "hc_post")
+ROWS_WHY = {
+    "gather": "the R-row MoEs stage R*k dedup slots themselves (runtime/moe_rows.py); the one-launch gather is not wired",
+    "dg_act": "the R-row MoEs scatter pair rows by the dedup map (arow); the kernel writes row 0 of k groups",
+    "swiglu_routed": "pair rows gathered by arow (runtime/moe_rows.py); the kernel reads row 0 of k groups",
+    "moe_combine": "per-row combine through posmat (moe_rows.combine_rows); the kernel sums k rows into one",
+    "o_rope_qdq": "one position's freqs row per launch (rows need per-row freqs)",
+    "q_rope_epilogue": "the GEMV's RoPE epilogue takes one position's freqs row",
+    "hc_norm": "one-row buffers ([1,1,D] y/xf/q/s, one mix statistic)",
+    "mix_stat": "rides in hc_norm (one row)",
+    "kv_path": "one ring slot per launch",
+    "q_path": "one-row q_norm buffers",
+    "router": "one-row gate (ids [k]); the R-row MoEs route [R, k] and dedup",
+    "engram": "one-row gate buffers ([1,1,HC])",
+    "indexer_post": "scalar compress_lens per launch; the R-row step has [R, 1]",
+    "hc_split": "needs hc_norm",
+    "gemv_pair": "its consumers (q/kv path, hc_norm's shared-expert input) are one-row (T9b-4 _rows(xq) == 1 guards)",
+    "reduce_fold": "its consumers (q/kv path, hc_norm's shared-expert input) are one-row (T9b-4 _rows(xq) == 1 guards)",
+    "dg_sf_pack": "needs the one-row dg_act + swiglu_routed writers",
+}
 NBF16 = 65536                   # bf16 bit patterns (table rows)
 SILU_LIM = NBF16                # silu table entry holding silu(swiglu_limit)
 ROPE_MODES = (0, 1, 2)
@@ -445,9 +469,16 @@ if HAVE_TRITON:
 
     @triton.jit
     def t9b2_hc_post(x, res, post, comb, out, D, HC: tl.constexpr, BLOCK_C: tl.constexpr, MODE: tl.constexpr):
-        """Program (pb, j): out[j, i] = bf16(post[j]*x[i] + sum_r comb[r, j]*res[r, i]) (sum order: MODE)."""
+        """Program (pb, j, t): out[t, j, i] = bf16(post[t, j]*x[t, i] + sum_r comb[t, r, j]*res[t, r, i]) (sum
+        order: MODE); token row t (M1-T10-FIX: grid axis 2 = rows, 1 at the one-row step) offsets every pointer."""
         pb = tl.program_id(0)
         j = tl.program_id(1)
+        t = tl.program_id(2)
+        x = x + t * D
+        res = res + t * (HC * D)
+        post = post + t * HC
+        comb = comb + t * (HC * HC)
+        out = out + t * (HC * D)
         i = pb * BLOCK_C + tl.arange(0, BLOCK_C)
         ok = i < D
         p = tl.load(post + j) * tl.load(x + i, mask=ok, other=0.0).to(tl.float32)
@@ -619,13 +650,17 @@ def launch_moe_combine(rows, shared, out):
 
 
 def launch_hc_post(x, res, post, comb, out, mode: int):
-    """x [D], res [HC, D], out [HC, D] bf16 contiguous; post [HC], comb [HC, HC] fp32 contiguous."""
-    HC, D = res.shape
+    """x [D] or [T, D], res / out [HC, D] or [T, HC, D] bf16 contiguous; post [HC] / [T, HC], comb [HC, HC] /
+    [T, HC, HC] fp32 contiguous (T token rows, one launch)."""
+    HC, D = res.shape[-2], res.shape[-1]
+    T_ = res.numel() // (HC * D)
     if _kern(x):
-        t9b2_hc_post[(triton.cdiv(D, HC_BLOCK), HC)](x, res, post, comb, out, D, HC=HC, BLOCK_C=HC_BLOCK,
-                                                     MODE=int(mode), **LAUNCH)
+        t9b2_hc_post[(triton.cdiv(D, HC_BLOCK), HC, T_)](x, res, post, comb, out, D, HC=HC, BLOCK_C=HC_BLOCK,
+                                                         MODE=int(mode), **LAUNCH)
         return out
-    return out.copy_(hc_post_torch(x, res, post, comb, mode))
+    xs, rs, ps, cs = x.reshape(T_, D), res.reshape(T_, HC, D), post.reshape(T_, HC), comb.reshape(T_, HC, HC)
+    return out.copy_(torch.stack([hc_post_torch(xs[t], rs[t], ps[t], cs[t], mode) for t in range(T_)])
+                     .view(out.shape))
 
 
 def launch_o_rope_qdq(o_row, freqs_real, code_tab, head_dim: int, rope_dim: int, modes: Tuple[int, int]):
@@ -686,8 +721,11 @@ class FusedGlue(R2Glue):
             raise ValueError(f"{DISABLE_ENV}/disable names unknown clusters {sorted(bad)}; known {CLUSTERS}")
         R = self.R
         mx = (R.fp8_block_size, R.scale_dtype) == (BLOCK, E8) and R.scale_fmt is not None
+        self.rows = int(getattr(owner, "rows", 1))
         for c in CLUSTERS:
             why = self._applicable(c, layers, mx)
+            if why is None and self.rows > 1 and c not in ROWS_CLUSTERS:  # M1-T10-FIX: one-row cluster
+                why = f"rows={self.rows}: {ROWS_WHY.get(c, 'one-row kernel')}"
             self.status[c] = "on" if why is None else f"n/a: {why}"
         for c in manual:
             if self.status[c] == "on":
@@ -847,12 +885,14 @@ class FusedGlue(R2Glue):
 
     # ---------------------------------------------------------------- mHC post (#7)
     def hc_post(self, x, residual, post, comb) -> torch.Tensor:
-        """Block.hc_post (model.py:964-968) for one row: x [1,1,D], residual [1,1,HC,D], post [1,1,HC], comb
-        [1,1,HC,HC] -> [1,1,HC,D] (dtype of x)."""
+        """Block.hc_post (model.py:964-968) for T token rows (1, or the R-row step's R): x [1,T,D], residual
+        [1,T,HC,D], post [1,T,HC], comb [1,T,HC,HC] -> [1,T,HC,D] (dtype of x), one launch."""
         HC, D = residual.size(-2), residual.size(-1)
+        T_ = residual.numel() // (HC * D)
         out = torch.empty(residual.shape, dtype=x.dtype, device=x.device)
-        launch_hc_post(x.reshape(D), residual.reshape(HC, D), post.reshape(HC).contiguous(),
-                       comb.reshape(HC, HC).contiguous(), out.view(HC, D), self.hc_mode)
+        launch_hc_post(x.reshape(T_, D).contiguous(), residual.reshape(T_, HC, D).contiguous(),
+                       post.reshape(T_, HC).contiguous(), comb.reshape(T_, HC, HC).contiguous(),
+                       out.view(T_, HC, D), self.hc_mode)
         return out
 
     # ---------------------------------------------------------------- attention (#10, #13)
@@ -1029,19 +1069,19 @@ class FusedGlue(R2Glue):
         """Random hc_post inputs; in half the columns copy 0 and copy 2 carry the same large value and comb's row 2
         is minus row 0, so a0 + a2 cancels exactly and the 4-term sum's ORDER shows in the result (the three
         HC_SUM_MODES round differently there)."""
-        HC = self.hc
-        x = _rand_act(g, 1, D).view(1, 1, D)
-        res = _rand_act(g, HC, D).view(1, 1, HC, D)
-        post = (torch.rand(1, 1, HC, generator=g, device="cpu") * 2).float()
-        comb = (torch.randn(1, 1, HC, HC, generator=g, device="cpu") * torch.exp2(torch.randint(-4, 5, (1, 1, HC, HC), generator=g, device="cpu")
+        HC, T_ = self.hc, self.rows  # T_ token rows: the step's rows (M1-T10-FIX; 1 = the draws of T9b-2)
+        x = _rand_act(g, T_, D).view(1, T_, D)
+        res = _rand_act(g, T_ * HC, D).view(1, T_, HC, D)
+        post = (torch.rand(1, T_, HC, generator=g, device="cpu") * 2).float()
+        comb = (torch.randn(1, T_, HC, HC, generator=g, device="cpu") * torch.exp2(torch.randint(-4, 5, (1, T_, HC, HC), generator=g, device="cpu")
                                                                        .float())).float()
         if HC == 4:
             big = (torch.randn(D, generator=g, device="cpu") * torch.exp2(torch.randint(10, 17, (D,), generator=g, device="cpu").float()))
             big = big.to(torch.bfloat16)
             cols = torch.arange(D, device="cpu") % 2 == 0
-            res[0, 0, 0, cols] = big[cols]
-            res[0, 0, 2, cols] = big[cols]
-            comb[0, 0, 2, :] = -comb[0, 0, 0, :]
+            res[0, :, 0, cols] = big[cols]
+            res[0, :, 2, cols] = big[cols]
+            comb[0, :, 2, :] = -comb[0, :, 0, :]
         return [t.to(self.dev) for t in (x, res, post, comb)]
 
     def _pick_hc(self, cal, g) -> None:
@@ -1110,12 +1150,13 @@ class FusedGlue(R2Glue):
         R = self.R
         ex = self.o.model.layers[0].ffn.shared_experts
         I = ex.w1.out_features
+        T_ = self.rows  # the step's rows (the kernel's grid axis 1; M1-T10-FIX)
         for _ in range(3):
-            gate, up = self._rand_gate_up(g, 1, I)
+            gate, up = self._rand_gate_up(g, T_, I)
             h = self._ref_swiglu(gate, up, None, ex.swiglu_limit, torch.bfloat16)
             q_ref, s_ref = R.act_quant(h, R.fp8_block_size, R.scale_fmt, R.scale_dtype)
-            q = torch.empty(1, I, dtype=FP8, device=self.dev)
-            s = torch.empty(1, I // BLOCK, dtype=E8, device=self.dev)
+            q = torch.empty(T_, I, dtype=FP8, device=self.dev)
+            s = torch.empty(T_, I // BLOCK, dtype=E8, device=self.dev)
             launch_swiglu_quant(gate, up, None, q, s, self.silu_tab, self.code_tab, ex.swiglu_limit)
             if not (torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
                     and torch.equal(s.view(torch.uint8), s_ref.view(torch.uint8))):
@@ -1252,7 +1293,8 @@ class FusedGlue(R2Glue):
         off = [c for c in CLUSTERS if not self.on(c)]
         out = self.describe_r2()["outcome"]
         num = ", ".join(f"{c} {'(i)' if (v or '').startswith('(i)') else '(ii)'}" for c, v in out.items())
-        return (f"[glue] fused: on {','.join(on) or '-'}; approx {','.join(ap) or '-'}; off {','.join(off) or '-'}; "
+        rows = f"rows {self.rows} (row-parallel clusters only: {','.join(ROWS_CLUSTERS)}); " if self.rows > 1 else ""
+        return (f"[glue] fused: {rows}on {','.join(on) or '-'}; approx {','.join(ap) or '-'}; off {','.join(off) or '-'}; "
                 f"r2 numerics {num or '-'}; orders {self.describe_r2()['orders']}")
 
 

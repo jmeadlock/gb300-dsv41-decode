@@ -466,8 +466,8 @@ def test_rows_validation(emu):
     for bad in (3, 5, 10):
         with pytest.raises(ValueError):
             StaticStep(model, pool, max_pos=255, rows=bad, _allow_cpu=True)
-    with pytest.raises(ValueError):
-        StaticStep(model, pool, max_pos=255, rows=6, moe_impl="dg-inplace", _allow_cpu=True)
+    with pytest.raises(ValueError, match="ExpertPool"):  # M1-T10-FIX: dg-inplace runs at 6 rows, on the pool
+        StaticStep(model, None, max_pos=255, rows=6, moe_impl="dg-inplace", _allow_cpu=True)
     st = StaticStep(model, pool, max_pos=255, rows=6, _allow_cpu=True)
     with pytest.raises(ValueError):
         st.set_inputs([1, 2, 3, 4, 5, 6], 251)  # 251 + 5 > 255
@@ -595,6 +595,253 @@ def test_first_light_rows_teacher_forced_measure(emu, tmp_path, capsys):
     print("\n".join(lines[-12:]))
 
 
+
+
+# ------------------------------------------------------------------------------------------------ M1-T10-FIX
+def test_reference_forward_independent_of_global_default_device(emu):
+    """Part A on the Mac: the box failure's mechanism and its fix. The reference builds its window indices with bare
+    factories on the DEFAULT device (model.py:418-423, memoized by @lru_cache(1)); round 1's GPU test ran the
+    reference forward with the default device still CPU while the model and the TileLang kernel were CUDA. Here the
+    global default is a foreign device ("meta") and the lru cache is seeded under it: a plain model(...) call breaks
+    (the negative control), refmodel.reference_forward / forward_rows / StaticStep.capture's path do not, and give the
+    same bits as under the matching default."""
+    from runtime.ref_multirow import forward_rows
+    from runtime.refmodel import reference_forward
+
+    model, pool, _ = emu("mini")
+    R = sys.modules["model"]
+    ids, toks = _tf_tokens(17, 6, 3)
+    with torch.inference_mode():
+        _, want, _ = reference_forward(model, torch.tensor([ids]), 0)
+        want = want.clone()
+        _, want6, _ = forward_rows(model, torch.tensor([toks]), 17)
+        want6 = want6.clone()
+    torch.set_default_device("meta")
+    try:
+        R.get_window_topk_idxs(model.layers[0].attn.window_size, 1, len(ids), 0)  # a foreign cached entry
+        with pytest.raises(Exception):
+            with torch.inference_mode():
+                model(torch.tensor([ids], device="cpu"), 0)                         # round 1's call
+        with torch.inference_mode():
+            _, got, _ = reference_forward(model, torch.tensor([ids], device="cpu"), 0)
+            _, got6, _ = forward_rows(model, torch.tensor([toks], device="cpu"), 17)
+    finally:
+        torch.set_default_device("cpu")
+    assert got.device.type == "cpu" and torch.equal(got, want) and torch.equal(got6, want6)
+
+
+def _masked_rowwise(fake):
+    """deep_gemm's masked GEMM emulated one row at a time with the contiguous fake's math (tests/test_dg_inplace_cpu
+    _fake_dg_contig): CPU matmuls are not row-invariant, the real kernels' per-row results are the GPU test's D row."""
+    from test_static_emulated_cpu import _fp4_deq
+
+    def m_grouped_fp8_fp4_gemm_nt_masked(a, b, d, masked_m, expected_m, recipe_a=None, recipe_b=None, **kw):
+        (xq, xs), (W, S) = a, b
+        G, max_m, K = xq.shape
+        assert not kw and recipe_a == (1, 32) and recipe_b == (1, 32) and expected_m == 8 and max_m >= 128
+        assert S.dtype == torch.float32 and tuple(S.shape) == (G, W.size(1), K // 32)
+        for g in range(G):
+            m = int(masked_m[g])
+            if m:
+                B = _fp4_deq(W[g]) * S[g].repeat_interleave(32, -1)
+                for r in range(m):
+                    A = (xq[g, r:r + 1].float().view(1, K // 32, 32) * xs[g, r:r + 1].view(1, -1, 1)).view(1, K)
+                    d[g, r:r + 1] = (A @ B.t()).to(torch.bfloat16)
+            d[g, m:] = float("nan")
+        fake.calls.append((G, max_m, W.size(1), K, [int(v) for v in masked_m]))
+
+    return m_grouped_fp8_fp4_gemm_nt_masked
+
+
+@pytest.fixture
+def rows_dg(emu, monkeypatch):
+    """The rows emulation + fake deep_gemm (contiguous contract fake, row-wise masked) + the registry-backed
+    static_kernels with the stage_inplace contract (re-reads the pool: dg-inplace moves its storage)."""
+    from test_dg_inplace_cpu import _fake_dg_contig, _install_kernels
+    from test_dg_moe_cpu import _faithful_act_quant
+
+    fake = _fake_dg_contig()
+    fake.m_grouped_fp8_fp4_gemm_nt_masked = _masked_rowwise(fake)
+    monkeypatch.setitem(sys.modules, "deep_gemm", fake)
+
+    def build(kind):
+        model, pool, _ = emu(kind)
+        monkeypatch.setattr(sys.modules["model"], "act_quant", _faithful_act_quant)
+        fk = _install_kernels(monkeypatch, pool)
+        return model, pool, fk, fake
+
+    return build
+
+
+@pytest.mark.parametrize("kind,L", [("mini", 17), ("mini4", 18), ("mini4w", 301)])
+def test_static6_dg_inplace_equals_dg_masked_emulated(rows_dg, kind, L):
+    """Part B (1): the 6-row dg-inplace step == the 6-row dg-masked step, torch.equal on every row's fp32 logits,
+    main_hidden and the caches (the GPU test's D row on the emulation), both P0 parities, ring wrapped; the
+    contiguous calls' contract: S = 6k blocks, each valid block's count rows tagged with its group (hot pool slot or
+    the spare slot H + u), padding and unused slots -1; the cold (spare-slot) path ran."""
+    from runtime.moe_rows import DGInplaceMoERows, DGMaskedMoERows
+    from runtime.static_step import StaticStep
+
+    model, pool, fk, fake = rows_dg(kind)
+    hid = (len(model.layers) - 1,)
+    n = 3
+    ids, toks = _tf_tokens(L, 6 * n, 23 + L)
+    st = StaticStep(model, pool, max_pos=511, rows=6, hidden_layers=hid, moe_impl="dg-inplace", _allow_cpu=True)
+    k = st.topk
+    S = 6 * k
+    b = st.dg
+    assert pool.spare == S and b.k == S and all(isinstance(m, DGInplaceMoERows) for m in st.moes)
+    assert b.mi.shape == (S * b.align,) and st.describe()["moe_impl"] == "dg-inplace"
+    a_lg, a_h, a_s = _static_run(model, st, ids, toks, n)
+    calls = list(fake.contig_calls)
+    rc = st.routed_counts()
+    st.detach()
+    n_layers = len(model.layers)
+    assert len(calls) == 3 * n_layers * n and fk.calls["stage"] == n_layers * n and not fake.calls
+    Gs = {len(pool.hot[l]) + S for l in range(n_layers)}
+    assert all(c[0] == S * b.align and c[1] in Gs for c in calls)
+    assert sum(1 for c in calls for h in c[4] if h >= c[1] - S) > 0      # cold experts went through spare slots
+    assert any(h < 0 for c in calls for h in c[4])                        # unused slots (U < S) tagged -1
+    m2 = StaticStep(model, pool, max_pos=511, rows=6, hidden_layers=hid, moe_impl="dg-masked", _allow_cpu=True)
+    assert all(type(m) is DGMaskedMoERows for m in m2.moes)
+    b_lg, b_h, b_s = _static_run(model, m2, ids, toks, n)
+    assert len(fake.calls) == 3 * n_layers * n
+    _assert_rows_equal(a_lg, b_lg, f"{kind} L={L}: 6-row dg-inplace vs dg-masked")
+    assert all(torch.equal(x, y) for x, y in zip(a_h, b_h))
+    for k_ in b_s:
+        assert torch.equal(a_s[k_], b_s[k_]), (kind, L, k_)
+    assert m2.routed_counts() == rc and sum(rc[1]) > 0                    # same unique/cold calls per layer
+    m2.detach()
+
+
+def test_dg_inplace_rows_growth_invalidates_earlier_steps(rows_dg):
+    """A step built before a dg-inplace build grew the pool holds stale pointer tables: it refuses to run."""
+    from runtime.static_step import StaticStep
+
+    model, pool, _, _ = rows_dg("mini")
+    early = StaticStep(model, pool, max_pos=255, rows=6, moe_impl="dg-masked", _allow_cpu=True)
+    late = StaticStep(model, pool, max_pos=255, rows=6, moe_impl="dg-inplace", _allow_cpu=True)
+    ids, toks = _tf_tokens(20, 6, 4)
+    _prefill(model, ids)
+    with pytest.raises(RuntimeError, match="storage moved"):
+        early.step(toks, 20, graph=False)
+    with torch.inference_mode():
+        late.step(toks, 20, graph=False)
+    early.detach()
+    late.detach()
+
+
+@pytest.fixture
+def rows_glue(rows_dg, monkeypatch):
+    """rows_dg + the e8m0 act_quant and the block-faithful fp8_gemm (row-wise) the fused glue's tables need."""
+    from test_gemv_cpu import fp8_gemm_blocks
+
+    monkeypatch.delenv("DSV41_GLUE_DISABLE", raising=False)
+
+    def build(kind):
+        out = rows_dg(kind)
+        monkeypatch.setattr(sys.modules["model"], "fp8_gemm", _rowwise(fp8_gemm_blocks))
+        return out
+
+    return build
+
+
+@pytest.mark.parametrize("moe_impl", ["ref", "dg-inplace"])
+def test_fused_glue_rows_equals_ref_glue_emulated(rows_glue, monkeypatch, moe_impl):
+    """Part B (2): glue_impl fused at 6 rows -- the row-parallel clusters on (self-checked at 6 rows), every other
+    cluster n/a with a `rows=6:` reason -- == glue_impl ref at 6 rows, torch.equal (the GPU test's G row)."""
+    from runtime import fused_glue as FG
+    from runtime.static_step import StaticStep
+
+    model, pool, _, _ = rows_glue("mini4")
+    hid = (len(model.layers) - 1,)
+    ids, toks = _tf_tokens(18, 12, 31)
+    st = StaticStep(model, pool, max_pos=255, rows=6, hidden_layers=hid, moe_impl=moe_impl, glue_impl="fused",
+                    _allow_cpu=True)
+    d = st.glue.describe()
+    assert set(d["on"]) == set(FG.ROWS_CLUSTERS), d["clusters"]
+    assert all(s.startswith("n/a") for c, s in d["clusters"].items() if c not in FG.ROWS_CLUSTERS), d["clusters"]
+    assert all(s.startswith("n/a: rows=6") for c, s in d["clusters"].items()
+               if c in ("hc_norm", "router", "o_rope_qdq", "kv_path", "q_path", "engram", "indexer_post"))
+    assert all(v == "equal" for k_, v in d["calibration"].items() if k_.startswith("verify_")), d["calibration"]
+    assert d["calibration"]["hc_post"]["picked"] is not None
+    assert st.glue_note and "swiglu_shared" in st.glue_note and "rows" in st.glue.glue_line()
+    seen = {"hc": 0, "sw": 0}
+    real_hc, real_sw = FG.launch_hc_post, FG.launch_swiglu_quant
+
+    def hc(*a, **k):
+        seen["hc"] += 1
+        return real_hc(*a, **k)
+
+    def sw(*a, **k):
+        seen["sw"] += 1
+        return real_sw(*a, **k)
+
+    monkeypatch.setattr(FG, "launch_hc_post", hc)
+    monkeypatch.setattr(FG, "launch_swiglu_quant", sw)
+    f_lg, f_h, f_s = _static_run(model, st, ids, toks, 2)
+    n_layers = len(model.layers)
+    assert seen == {"hc": 2 * 2 * n_layers, "sw": 2 * n_layers}, seen   # one launch per instance for all 6 rows
+    st.detach()
+    ref = StaticStep(model, pool, max_pos=255, rows=6, hidden_layers=hid, moe_impl=moe_impl, _allow_cpu=True)
+    r_lg, r_h, r_s = _static_run(model, ref, ids, toks, 2)
+    _assert_rows_equal(f_lg, r_lg, f"6-row fused glue vs ref glue ({moe_impl})")
+    assert all(torch.equal(x, y) for x, y in zip(f_h, r_h))
+    for k_ in r_s:
+        assert torch.equal(f_s[k_], r_s[k_]), k_
+    ref.detach()
+
+
+
+def test_first_light_rows_accepts_dg_inplace_and_fused_glue(rows_glue, tmp_path, capsys):
+    """`first_light.py --rows 6 --teacher-forced --moe-impl dg-inplace --glue-impl fused` (M1-T10-FIX): the 6-row step
+    runs dg-inplace (no dg-masked substitution) with the row-parallel fused clusters; self-replay, the cells, the
+    [glue] line of the 6-row step and the 12-line summary."""
+    import importlib.util
+    import os
+
+    from runtime import fused_glue as FG
+    from runtime.generate import Generator
+    from runtime.static_step import StaticStep
+    from tiny_tok import make_wordlevel_tokenizer
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    spec = importlib.util.spec_from_file_location("bench_first_light", os.path.join(repo, "bench", "first_light.py"))
+    fl = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fl)
+    model, pool, _, _ = rows_glue("mini4")
+    a = fl.build_parser().parse_args(["--model-dir", "x", "--mode", "static", "--rows", "6", "--teacher-forced",
+                                      "--moe-impl", "dg-inplace", "--glue-impl", "fused",
+                                      "--fixture", str(tmp_path / "fx.jsonl"), "--reps", "2", "--max-new", "9",
+                                      "--step-cell", "2", "--stats-from", "1", "--skip-parity", "--skip-census",
+                                      "--max-pos", "255", "--out", str(tmp_path / "c.jsonl"),
+                                      "--json", str(tmp_path / "r.json")])
+    assert fl.rows_moe_impl(a.moe_impl, a.rows_moe_impl) == "dg-inplace"
+    with open(tmp_path / "fx.jsonl", "w") as f:
+        for tag, text in (("prose", "w5 w9 w12 w3 w7"), ("json", "w40 w41 w42")):
+            f.write(json.dumps({"tag": tag, "prompt": text}) + "\n")
+    gen = Generator(model, tokenizer=make_wordlevel_tokenizer(2048), eos_ids=[1], device="cpu", mode="static",
+                    max_pos=255, moe_impl="dg-inplace", glue_impl="fused",
+                    static_factory=lambda m, **kw: StaticStep(m, pool, max_pos=255, _allow_cpu=True, **kw))
+    gen.encode = lambda msgs: [7, 8] + [int(w[1:]) for w in msgs[0]["content"].split()]
+    report = {"date": "d", "env": {"device": None}, "errors": [], "generator": {"mode": "static", "fp8_impl": "ref",
+                                                                                 "glue_impl": "fused", "attn_impl": "ref"}}
+    rc = fl.measure_rows(gen, a, report, out=a.out, json_path=a.json, fixture2=None)
+    rm = report["rows_mode"]
+    assert rc == 0 and not report["errors"], report["errors"]
+    assert rm["moe_impl_rows"] == "dg-inplace" and "step_cell_r1_rows_moe" not in rm
+    assert rm["static"]["moe_impl"] == "dg-inplace" and rm["static"]["glue_effective"] == "fused"
+    assert set(rm["glue_rows_on"]) == set(FG.ROWS_CLUSTERS) and rm["dg_rows"]["spare_slots"] == 6 * 4
+    assert rm["self_replay"][2]["identical"] == rm["self_replay"][2]["n"] == 2
+    assert rm["step_cell_rows"]["n_steps"] == 2 and rm["step_cell_rows"]["r6_over_r1"] > 0
+    out = capsys.readouterr().out
+    assert "[glue] fused: rows 6" in out
+    lines = out.strip().splitlines()
+    assert lines[-12].startswith("FIRST LIGHT d | rows 6 teacher-forced | mode static | moe dg-inplace (rows: dg-inplace)")
+    assert "glue fused (rows: " in lines[-12]
+    print("\n".join(lines[-12:]))
+
+
 def test_gpu_test_logic_dry_run_on_cpu(emu, monkeypatch, capsys):
     """tests/gpu/test_static_rows_gpu.py's gate / wrap / V0 functions executed on the CPU emulations (DEV "cpu"): the
     box run then only meets the real kernels, not harness bugs. (Graph capture and the fast impls are CUDA-only.)"""
@@ -625,4 +872,35 @@ def test_gpu_test_logic_dry_run_on_cpu(emu, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert out.count("== reference forward_rows") == 3 and "positions 300..311" in out
     assert "STEP-LEVEL V0" in out and "ref, row_invariant_mode" in out and "tf replay equal" in out
+    assert G.COUNTS["gates"] == 3 and G.COUNTS["logit_rows"] > 0 and G.COUNTS["caches"] > 0, G.COUNTS
+    print(out)
+
+
+def test_gpu_test_d_g_rows_dry_run_on_cpu(rows_glue, monkeypatch, capsys):
+    """M1-T10-FIX: the GPU test's D row (6-row dg-inplace == dg-masked) and G row (fused glue == ref glue at 6 rows)
+    executed on the CPU emulations (DEV "cpu"; no graphs; G on the CPU-available impls: fp8 ref, attn ref)."""
+    import contextlib
+    import importlib.util
+    import os
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    spec = importlib.util.spec_from_file_location("gpu_rows2", os.path.join(repo, "tests", "gpu", "test_static_rows_gpu.py"))
+    G = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(G)
+
+    @contextlib.contextmanager
+    def model_cpu(kind="mini"):
+        model, pool, _, _ = rows_glue(kind)
+        yield model, pool
+
+    monkeypatch.setattr(G, "DEV", "cpu")
+    monkeypatch.setattr(G, "STATIC_KW", {"_allow_cpu": True})
+    monkeypatch.setattr(G, "_need_tilelang", lambda: None)
+    monkeypatch.setattr(G, "_model", model_cpu)
+    monkeypatch.setattr(G, "FAST", dict(moe_impl="dg-masked", fp8_impl=None, glue_impl="fused", attn_impl=None))
+    G.test_static6_dg_inplace_equals_dg_masked()
+    G.test_static6_fused_glue_equals_ref_glue()
+    out = capsys.readouterr().out
+    assert out.count("6-row dg-inplace == dg-masked") == 2 and out.count("== ref glue") == 2, out
+    assert G.COUNTS["gates"] == 4 and G.COUNTS["logit_rows"] == 4 * 24, G.COUNTS
     print(out)

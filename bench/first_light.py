@@ -71,8 +71,9 @@ and one timed step cell.
     divergence), and the 6-row step cell (--step-cell steps, stats from --stats-from, CUDA events around `step_rows`
     only, the 6 tokens staged on the device) -> ms per 6-row step, ms per position, R6/R1 (over the same positions),
     HBM after the 6-row build; then the V0 row-invariance census table (runtime/row_census.py). --moe-impl applies to
-    the 1-row step; the 6-row step runs --rows-moe-impl (auto: dg-inplace -> dg-masked, the R-row MoEs being ref /
-    dg-masked); --glue-impl fused runs the reference glue at 6 rows (not ported; recorded). Report key `rows_mode`.
+    both steps (M1-T10-FIX: dg-inplace runs at 6 rows too; --rows-moe-impl overrides the 6-row step's); --glue-impl
+    fused at 6 rows runs the row-parallel clusters (shared SwiGLU, mHC post; `[glue]` line of the 6-row step, report
+    `rows_mode.fused_glue_rows`) and the reference ops for the one-row clusters. Report key `rows_mode`.
 Writes docs/first-light-<YYYYMMDD>.json (or --json) and prints a 12-line summary. One prompt failing logs its
 traceback and the run continues.
 
@@ -288,7 +289,7 @@ def step_cell(gen: Generator, ids: List[int], n_steps: int, stats_from: int = 32
 
 
 # ------------------------------------------------------------------------------------------------ (l) M1-T10 rows
-ROWS_MOE = {"dg-inplace": "dg-masked"}  # 1-row MoE impls not ported to rows > 1 -> what the R-row step runs
+ROWS_MOE: Dict[str, str] = {}  # 1-row MoE impls not ported to rows > 1 -> what the R-row step runs (M1-T10-FIX: none)
 
 
 def rows_moe_impl(moe: str, rows_moe: str = "auto") -> str:
@@ -475,6 +476,18 @@ def measure_rows(gen: Generator, a, report: Dict, *, out: str, json_path: str, f
     if st is not None:
         rm["static"] = st.describe() if hasattr(st, "describe") else None
         rm["glue_note"] = getattr(st, "glue_note", None)
+        glue = getattr(st, "glue", None)
+        if glue is not None and hasattr(glue, "describe"):  # M1-T10-FIX: the 6-row step's own clusters
+            rm["fused_glue_rows"] = glue.describe()
+            rm["glue_rows_on"] = rm["fused_glue_rows"].get("on")
+            if hasattr(glue, "glue_line"):
+                print(glue.glue_line(), flush=True)
+        dg = getattr(st, "dg", None)
+        if dg is not None and hasattr(dg, "describe"):
+            try:
+                rm["dg_rows"] = dg.describe()
+            except Exception:
+                report["errors"].append({"stage": "dg_rows_describe", "traceback": traceback.format_exc()})
     if 1 in reps and not a.skip_parity:
         rm["parity_tf"] = run_parity(reps[1]["path"], a.fixture, fixture2, reps[1]["path"] + ".parity.json")
     rm["self_replay"] = {}
@@ -548,7 +561,8 @@ def summary_rows_lines(r: dict, json_path: str) -> List[str]:
     R_ = rm.get("rows")
     lines = [f"FIRST LIGHT {r['date']} | rows {R_} teacher-forced | mode {g.get('mode')} | moe {rm.get('moe_impl_r1')}"
              f" (rows: {rm.get('moe_impl_rows')}) fp8 {g.get('fp8_impl')} glue {g.get('glue_impl')}"
-             f"{' (ref at rows>1)' if rm.get('glue_note') else ''} attn {g.get('attn_impl')} | HBM boot "
+             f"{(' (rows: ' + (','.join(rm['glue_rows_on']) or 'ref') + ')') if rm.get('glue_rows_on') is not None else ''}"
+             f" attn {g.get('attn_impl')} | HBM boot "
              f"{f(b.get('cuda_allocated_GiB'))} GiB | {(r.get('env') or {}).get('device')}"]
     p1 = (rm.get("r1") or {}).get("prompts", [])
     ok1 = [x for x in p1 if "error" not in x]
@@ -935,8 +949,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--rows", type=int, default=1, help="M1-T10: rows per decode step (6: the verify step; needs "
                                                          "--teacher-forced)")
     ap.add_argument("--teacher-forced", action="store_true", help="M1-T10: feed the 1-row records' next tokens")
-    ap.add_argument("--rows-moe-impl", choices=["auto", "ref", "dg-masked"], default="auto",
-                    help="the R-row step's MoE (auto: --moe-impl, dg-inplace -> dg-masked)")
+    ap.add_argument("--rows-moe-impl", choices=["auto", "ref", "dg-masked", "dg-inplace"], default="auto",
+                    help="the R-row step's MoE (auto: --moe-impl)")
     ap.add_argument("--hidden-layers", default="auto",
                     help="main_hidden layers: comma list, 'none', or auto (--rows > 1: the checkpoint config's "
                          "dspark_target_layer_ids, 37,38,39 on the real model -- the verify graph's T11 output)")

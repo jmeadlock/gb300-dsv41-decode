@@ -14,6 +14,16 @@ on synthetic mini checkpoints. Skipped without CUDA/tilelang (Mac). docs/HANDOFF
     V0 table -- the 6-row step's row j vs the 1-row step at P0 + j, same impls (ref; fast with the GEMV's tuned M=6
     configs; fast with the M=1 config pinned), plus the ref step under row_invariant_mode (which families remain).
 
+M1-T10-FIX (docs/HANDOFF-M1-T10-FIX.md):
+  * Part A: every reference forward here goes through runtime.refmodel.reference_forward (round 1's 8 failures:
+    this file ran `model(...)` with the global default device still CPU, so model.py:418-423's bare torch.arange
+    built a CPU `topk_idxs` for the CUDA-targeted TileLang sparse_attn; reference generate.py:134 / Generator set
+    the default to cuda, this file never did). `_preflight` (in `_model`, before any test's first forward): JIT
+    cache targets, the window indices under a CPU-seeded lru cache, one direct reference sparse_attn call on cuda.
+    The final line counts the bit-equal comparisons that actually executed.
+  * D row: 6-row dg-inplace == 6-row dg-masked (torch.equal: logits, main_hidden, caches; graph == eager);
+  * G row: 6-row fused glue (row-parallel clusters) == 6-row ref glue on the fast impls (dg-inplace and dg-masked).
+
 Run on the box (orchestrator), same line as tests/gpu/test_static_mini_gpu.py, repo at $W:
 
   W=$HOME/hermes/gb300-dsv41-decode-wt10
@@ -43,13 +53,16 @@ os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 import torch  # noqa: E402
 
-from runtime.refmodel import tilelang_available  # noqa: E402
+from runtime.refmodel import reference_device, reference_forward, tilelang_available  # noqa: E402
 
 ROWS = 6
 MAX_POS = 511
 DEV = "cuda"      # tests/test_static_rows_cpu.py dry-runs this file's logic on the CPU emulations (DEV "cpu")
 STATIC_KW = {}    # ... with {"_allow_cpu": True}
 FAST = dict(moe_impl="dg-masked", fp8_impl="gemv", glue_impl="fused", attn_impl="flashmla")
+FAST_INPLACE = dict(FAST, moe_impl="dg-inplace")  # M1-T10-FIX: the 6-row fast path
+# M1-T10-FIX: how many bit-equal comparisons actually executed (the round-1 run reached none of them)
+COUNTS = {"logit_rows": 0, "main_hidden": 0, "caches": 0, "gates": 0}
 
 
 def _need_tilelang():
@@ -101,6 +114,7 @@ def _model(kind: str = "mini"):
         model.temperature = 0.0
         res = model.runtime_load
         try:
+            _preflight(model)
             yield model, res.pool
         finally:
             torch.set_default_device("cpu")
@@ -117,7 +131,77 @@ def _toks(L, n, seed):
 
 def _prefill(model, ids):
     with torch.inference_mode():
-        model(torch.tensor([ids], device=DEV), 0)
+        reference_forward(model, torch.tensor([ids], device=DEV), 0)  # never depends on the global default device
+
+
+def _jit_cache_targets(jit_obj, depth: int = 0) -> list:
+    """str(target) of every compiled kernel object reachable from a tilelang.jit object's attribute dicts (best
+    effort, version-agnostic: it looks for values carrying a `target`; [] = nothing compiled yet or not exposed)."""
+    out, seen = [], set()
+
+    def walk(o, d):
+        if id(o) in seen or d > 3:
+            return
+        seen.add(id(o))
+        t = getattr(o, "target", None)
+        if t is not None and not callable(t) and d > 0 and hasattr(o, "torch_function"):  # a compiled JITKernel
+            out.append(str(t))
+            return
+        vals = []
+        if isinstance(o, dict):
+            vals = list(o.values())
+        elif hasattr(o, "__dict__") and not isinstance(o, type):
+            vals = [v for k, v in vars(o).items() if not k.startswith("__")]
+        for v in vals:
+            if isinstance(v, (dict,)) or hasattr(v, "target") or (hasattr(v, "__dict__") and "cache" in type(v).__name__.lower()):
+                walk(v, d + 1)
+
+    walk(jit_obj, depth)
+    return out
+
+
+def _preflight(model):
+    """M1-T10-FIX Part A guard, before any reference forward of a test. Round 1's failure: `topk_idxs` reached the
+    CUDA-targeted reference sparse_attn as a CPU tensor, because this file ran `model(...)` with the global default
+    device still CPU (model.py:418-423 builds the window indices with bare torch.arange; @lru_cache(1) can replay such
+    an entry) -- reference generate.py:134 / runtime.generate.Generator set the default to cuda, this file never did.
+    Checks: (1) every introspectable sparse_attn JIT cache entry is CUDA-targeted; (2) the window indices built
+    under refmodel.reference_device land on cuda even with the lru cache seeded under a CPU default; (3) one direct
+    reference sparse_attn call at layer 0's (heads, head_dim, scale) on CUDA tensors -- the cache entry the forward
+    uses -- runs (a CPU-targeted kernel would raise here, with this message, not inside a test)."""
+    if DEV != "cuda":
+        return
+    R = sys.modules["model"]
+    K = sys.modules["kernel"]
+    try:  # best effort: the direct call below is the check that cannot be fooled
+        targets = _jit_cache_targets(K.sparse_attn_kernel)
+    except Exception as e:  # an exotic attribute raising during introspection: report, do not fail on it
+        print(f"  preflight: JIT cache not introspectable ({type(e).__name__}: {e})")
+        targets = []
+    bad = [t for t in targets if "cuda" not in t.lower()]
+    assert not bad, f"reference sparse_attn JIT cache holds non-CUDA kernels {bad}"
+    a = model.layers[0].attn
+    prev = torch.get_default_device() if hasattr(torch, "get_default_device") else None
+    torch.set_default_device("cpu")
+    try:
+        R.get_window_topk_idxs(a.window_size, 1, 1, 5)           # seed the lru cache with a CPU entry
+        with reference_device(DEV):
+            idx = R.get_window_topk_idxs(a.window_size, 1, 1, 5)
+    finally:
+        if prev is not None:
+            torch.set_default_device(prev)
+    assert idx.device.type == "cuda", f"window indices on {idx.device} under reference_device(cuda)"
+    with torch.inference_mode():
+        q = torch.zeros(1, 1, a.n_local_heads, a.head_dim, dtype=torch.bfloat16, device=DEV)
+        kv = torch.zeros(1, a.window_size, a.head_dim, dtype=torch.bfloat16, device=DEV)
+        try:
+            o = K.sparse_attn(q, kv, a.attn_sink, idx, a.softmax_scale)
+        except RuntimeError as e:
+            raise AssertionError(f"reference sparse_attn rejects CUDA inputs (CPU-targeted JIT entry?): {e}") from e
+    torch.cuda.synchronize()
+    assert o.is_cuda and torch.isfinite(o.float()).all()
+    print(f"  preflight: sparse_attn JIT targets {sorted(set(targets)) or '(none introspectable)'}; window idx on "
+          f"{idx.device}; direct call on cuda OK")
 
 
 def _state(model):
@@ -188,6 +272,7 @@ def _assert_rows(a, b, what):
     bad = _eq_rows(a, b)
     assert len(a) == len(b) and not bad, (f"{what}: rows {bad[:12]} differ ({len(bad)}/{len(a)}); max |d| at first "
                                           f"{(a[bad[0]] - b[bad[0]]).abs().max().item() if bad else 0}")
+    COUNTS["logit_rows"] += len(a)
 
 
 def _drift(a, b):
@@ -207,9 +292,13 @@ def _gate(kind, L, attn_impl="ref", n=4):
         o_lg, o_h, o_s = _oracle(model, ids, toks, n, hid)
         s_lg, s_h, s_s = _static(model, st, ids, toks, n)
         _assert_rows(s_lg, o_lg, f"{kind} L={L} attn {attn_impl}: 6-row static-eager vs reference 6-row forward")
-        assert all(torch.equal(a, b) for a, b in zip(s_h, o_h)), "main_hidden"
+        assert len(s_h) == len(o_h) == n and all(torch.equal(a, b) for a, b in zip(s_h, o_h)), "main_hidden"
+        COUNTS["main_hidden"] += len(s_h)
         for k in o_s:
             assert torch.equal(s_s[k], o_s[k]), (kind, L, k)
+        assert set(s_s) == set(o_s) and o_s, (sorted(s_s), sorted(o_s))
+        COUNTS["caches"] += len(o_s)
+        COUNTS["gates"] += 1
         print(f"  {kind} P0 {L}..{L + ROWS * (n - 1)} (parity {L % 2}) attn {attn_impl}: 6-row static-eager == "
               f"reference forward_rows, {len(s_lg)} rows x V, main_hidden, caches")
         st.detach()
@@ -250,10 +339,10 @@ def test_static1_ring256_past_wrap_equals_reference():
         ids, _ = _toks(300, 0, 7)
         ref, toks = [], []
         with torch.inference_mode():
-            out, lg, _ = model(torch.tensor([ids], device=DEV), 0)
+            out, lg, _ = reference_forward(model, torch.tensor([ids], device=DEV), 0)
             toks.append(int(out.reshape(-1)[0]))
             for k in range(12):
-                out, lg, _ = model(torch.tensor([[toks[-1]]], device=DEV), 300 + k)
+                out, lg, _ = reference_forward(model, torch.tensor([[toks[-1]]], device=DEV), 300 + k)
                 ref.append(lg[0].float().clone())
                 toks.append(int(out.reshape(-1)[0]))
         got = _static(model, st, ids, toks, 12)[0]
@@ -320,8 +409,8 @@ def test_static6_fast_impls_drift_graded():
         ids, toks = _toks(18, ROWS * 4, 33)
         o_lg, _, _ = _oracle(model, ids, toks, 4, hid)
         print(f"  {'impls (6 rows)':52s} {'bit-equal':>9s} {'max|dlogit|':>12s} {'argmax':>7s}  graph==eager")
-        combos = [{"moe_impl": "dg-masked"}, {"fp8_impl": "gemv"}, {"attn_impl": "flashmla"}, {"glue_impl": "fused"},
-                  dict(FAST)]
+        combos = [{"moe_impl": "dg-masked"}, {"moe_impl": "dg-inplace"}, {"fp8_impl": "gemv"}, {"attn_impl": "flashmla"},
+                  {"glue_impl": "fused"}, dict(FAST), dict(FAST_INPLACE)]
         for kw in combos:
             st, why = _try_step(model, pool, rows=ROWS, hidden_layers=hid, **kw)
             label = "+".join(f"{k.split('_')[0]} {v}" for k, v in kw.items())
@@ -336,6 +425,77 @@ def test_static6_fast_impls_drift_graded():
             note = f" ({st.glue_note})" if getattr(st, "glue_note", None) else ""
             print(f"  {label:52s} {eq:>5d}/{len(o_lg):<3d} {d:12.4e} {agree:>3d}/{len(o_lg):<3d}  yes{note}")
             st.detach()
+
+
+# ------------------------------------------------------------------------------------------------ M1-T10-FIX D / G rows
+def _need_step(model, pool, **kw):
+    st, why = _try_step(model, pool, **{k: v for k, v in kw.items() if v is not None})
+    assert st is not None, f"{kw} did not build: {why}"
+    return st
+
+
+def _eq_runs(a, b, what):
+    _assert_rows(a[0], b[0], what)
+    assert all(torch.equal(x, y) for x, y in zip(a[1], b[1])), f"{what}: main_hidden"
+    COUNTS["main_hidden"] += len(a[1])
+    for k in b[2]:
+        assert torch.equal(a[2][k], b[2][k]), (what, k)
+    COUNTS["caches"] += len(b[2])
+    COUNTS["gates"] += 1
+
+
+def test_static6_dg_inplace_equals_dg_masked():
+    """D row at 6 rows (M1-T10-FIX Part B 1): dg-inplace (DeepGEMM contiguous grouped GEMM over the pool in place,
+    6k spare slots) == dg-masked, torch.equal on every row's fp32 logits, main_hidden and the caches, both P0
+    parities, static-eager; dg-inplace graph == its static-eager. The dg-inplace step is built first (it grows the
+    pool; a step built before the growth refuses to run)."""
+    _need_tilelang()
+    with _model("mini4") as (model, pool):
+        hid = (len(model.layers) - 1,)
+        for L in (17, 18):
+            ids, toks = _toks(L, ROWS * 4, 60 + L)
+            si = _need_step(model, pool, rows=ROWS, hidden_layers=hid, moe_impl="dg-inplace")
+            a = _static(model, si, ids, toks, 4)
+            if DEV == "cuda":  # (the CPU dry run has no graphs)
+                si.capture()
+                ag = _static(model, si, ids, toks, 4, graph=True)
+                _assert_rows(ag[0], a[0], "6-row dg-inplace graph vs static-eager")
+            dd = si.dg.describe()
+            si.detach()
+            sm = _need_step(model, pool, rows=ROWS, hidden_layers=hid, moe_impl="dg-masked")
+            b = _static(model, sm, ids, toks, 4)
+            sm.detach()
+            _eq_runs(a, b, f"D L={L}: 6-row dg-inplace vs dg-masked")
+            print(f"  D P0 {L} (parity {L % 2}): 6-row dg-inplace == dg-masked, {len(a[0])} rows x V + main_hidden + "
+                  f"caches; graph == eager; spare slots {dd['spare_slots']}, groups/layer {dd['groups_per_layer']}, "
+                  f"HBM added {dd['hbm_added_GiB']} GiB")
+
+
+def test_static6_fused_glue_equals_ref_glue():
+    """G row at 6 rows (M1-T10-FIX Part B 2): glue fused (row-parallel clusters on, self-checked at 6 rows; the
+    one-row clusters n/a with their reasons) == glue ref, torch.equal, on the fast impls (gemv, flashmla) with
+    dg-masked and dg-inplace; graph == static-eager."""
+    _need_tilelang()
+    with _model("mini4") as (model, pool):
+        hid = (len(model.layers) - 1,)
+        ids, toks = _toks(18, ROWS * 4, 77)
+        for moe in ("dg-inplace", "dg-masked"):
+            kw = dict(FAST, moe_impl=moe)
+            f = _need_step(model, pool, rows=ROWS, hidden_layers=hid, **kw)
+            d = f.glue.describe()
+            print(f"  G {moe}: {f.glue.glue_line()[:300]}")
+            assert d["on"], d["clusters"]
+            a = _static(model, f, ids, toks, 4)
+            if DEV == "cuda":
+                f.capture()
+                ag = _static(model, f, ids, toks, 4, graph=True)
+                _assert_rows(ag[0], a[0], f"6-row fused glue ({moe}) graph vs static-eager")
+            f.detach()
+            r = _need_step(model, pool, rows=ROWS, hidden_layers=hid, **dict(kw, glue_impl="ref"))
+            b = _static(model, r, ids, toks, 4)
+            r.detach()
+            _eq_runs(a, b, f"G {moe}: 6-row fused glue vs ref glue")
+            print(f"  G {moe}: 6-row fused glue ({','.join(d['on'])}) == ref glue, {len(a[0])} rows; graph == eager")
 
 
 # ------------------------------------------------------------------------------------------------ V0
@@ -423,6 +583,7 @@ def test_first_light_rows_cells_graph(mode="graph"):
 TESTS = [test_static6_equals_reference_mini_both_parities, test_static6_equals_reference_mini4_both_parities,
          test_static6_equals_reference_attn_bounded, test_static6_ring_wrapped_both_parities,
          test_static1_ring256_past_wrap_equals_reference, test_static6_graph_replay_relaunch_no_sync,
+         test_static6_dg_inplace_equals_dg_masked, test_static6_fused_glue_equals_ref_glue,
          test_static6_fast_impls_drift_graded, test_v0_census_and_step_level_table,
          test_first_light_rows_cells_graph]
 
@@ -442,5 +603,7 @@ if __name__ == "__main__":
             results[t.__name__] = "FAIL"
         print(f"{results[t.__name__]:4s} {t.__name__} ({time.time() - t0:.1f}s)", flush=True)
     n_fail = sum(v == "FAIL" for v in results.values())
+    print(f"bit-equal comparisons executed: {COUNTS['gates']} gate runs, {COUNTS['logit_rows']} fp32 logit rows, "
+          f"{COUNTS['main_hidden']} main_hidden, {COUNTS['caches']} cache tensors (torch.equal)")
     print(f"{len(results) - n_fail}/{len(results)} not failed; {n_fail} failed")
     sys.exit(1 if n_fail else 0)

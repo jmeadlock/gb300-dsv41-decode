@@ -385,6 +385,35 @@ def test_kernel_hc_post(K, mode):
         assert _eq(out.view(1, 1, 4, D), _hc_ref(x, res, post, comb))
 
 
+@pytest.mark.parametrize("mode", FG.HC_SUM_MODES)
+def test_kernel_hc_post_rows(K, mode):
+    """M1-T10-FIX: the hc_post kernel's token-row grid axis -- T rows in ONE launch == each row alone (the one-row
+    launch and the torch mirror), and == Block.hc_post at T rows in mode 0 (CPU torch's order)."""
+    g = torch.Generator().manual_seed(60 + mode)
+    D, T_ = 1536, 3
+    data = [_hc_data(g, D) for _ in range(T_)]
+    x = torch.cat([d[0] for d in data], 1)                      # [1, T, D]
+    res = torch.cat([d[1] for d in data], 1)                    # [1, T, 4, D]
+    post = torch.cat([d[2] for d in data], 1).contiguous()
+    comb = torch.cat([d[3] for d in data], 1).contiguous()
+    out = torch.full((T_, 4, D), float("nan"), dtype=BF)
+    n0 = len(K.t9b2_hc_post.launches) if hasattr(K.t9b2_hc_post, "launches") else None
+    K.launch_hc_post(x.view(T_, D), res.view(T_, 4, D), post.view(T_, 4), comb.view(T_, 4, 4), out, mode)
+    if n0 is not None:
+        assert len(K.t9b2_hc_post.launches) == n0 + 1
+    for t in range(T_):
+        one = torch.full((4, D), float("nan"), dtype=BF)
+        K.launch_hc_post(x[0, t].contiguous(), res[0, t].contiguous(), post[0, t].contiguous(),
+                         comb[0, t].contiguous(), one, mode)
+        assert _eq(out[t], one), t
+        assert _eq(out[t], FG.hc_post_torch(x[0, t], res[0, t], post[0, t], comb[0, t], mode)), t
+    cpu = torch.empty(T_, 4, D, dtype=BF)
+    FG.launch_hc_post(x.view(T_, D), res.view(T_, 4, D), post.view(T_, 4), comb.view(T_, 4, 4), cpu, mode)  # mirror
+    assert _eq(cpu, out)
+    if mode == 0:
+        assert _eq(out.view(1, T_, 4, D), _hc_ref(x, res, post, comb))
+
+
 @pytest.mark.parametrize("hd,rd,H", [(64, 16, 4), (512, 64, 2), (32, 0, 3), (96, 32, 3)])
 def test_kernel_o_rope_qdq(K, tabs, hd, rd, H):
     g = torch.Generator().manual_seed(50 + hd)

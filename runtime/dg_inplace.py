@@ -271,10 +271,14 @@ class DGInplaceBuffers(DGBuffers):
     [k*ALIGN, K]), no fp32 weight-scale staging, plus m_indices, the packed SF storage and per-layer tables."""
 
     def __init__(self, owner, shapes, sshapes, *, pool, swiglu_limit: float, deterministic: bool = True, dg=None,
-                 align: Optional[int] = None, sf_store: Optional[str] = None):
+                 align: Optional[int] = None, sf_store: Optional[str] = None, slots: Optional[int] = None):
+        """slots: A blocks / spare slots (default topk; M1-T10-FIX's R-row MoE, runtime/moe_rows.py
+        DGInplaceMoERows, uses R*topk: block u holds slot u's count <= R rows)."""
         align = check_align(align if align is not None else int(os.environ.get(ALIGN_ENV, MK_ALIGN)))
+        if align < int(getattr(owner, "rows", 1)):
+            raise ValueError(f"contiguous alignment {align} < {owner.rows} rows per block")
         super().__init__(owner, shapes, sshapes, swiglu_limit=swiglu_limit, deterministic=deterministic, dg=dg,
-                         rows=align, sf32=False)
+                         rows=align, sf32=False, slots=slots)
         self.align = align
         self.sf_store = sf_store or os.environ.get(SF_STORE_ENV, "step")
         if self.sf_store not in SF_STORES:

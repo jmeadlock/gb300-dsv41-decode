@@ -92,8 +92,11 @@ o = 1 - P0 % 2 pools exactly R/2 groups, each pair with the decode expression (m
 compress_lens [R, 1] (the prefill spelling, model.py:564-566); MoE through runtime/moe_rows.py (dedup of the R*k
 (row, expert) pairs, U <= R*k slots, per-row ascending-id combine); head on all rows -> `logits[R, V]`, `t_out[R]`;
 `main_hidden[R, len(hidden_layers) * dim]` (model.py:1267-1269) when `hidden_layers` is given. One graph (no parity).
-The fused glue is not ported to R > 1 (its kernels and calibrations are one-row): `glue_impl="fused"` builds no
-FusedGlue at R > 1 and the reference glue ops run (`describe()["glue_effective"]`).
+M1-T10-FIX: `moe_impl="dg-inplace"` at R rows = runtime/moe_rows.py DGInplaceMoERows (contiguous grouped GEMM over the
+pool in place, R*k spare slots per layer). `glue_impl="fused"` at R rows builds a FusedGlue whose row-parallel
+clusters (runtime/fused_glue.py ROWS_CLUSTERS: shared-expert SwiGLU, mHC post) are on and self-checked at R rows;
+every one-row cluster is n/a with its reason (`st.glue.describe()`, `glue_note`) and its call site runs the reference
+ops.
 
 `main_hiddens` at rows=1: computed only when `hidden_layers` is given (MTP-only, never feeds the logits); the loader's
 overlay sets dspark_target_layer_ids=() and `StaticStep` refuses a model that has target layers.
@@ -122,7 +125,7 @@ GATHER_IMPL_ENV = "DSV41_GATHER_IMPL"  # "u8" = the byte-per-lane gather of T8/T
 DUMMY_PROMPT = (0, 1)
 RING = 256                        # M1-T10 #20: window ring slots (>= 128 + 5, docs/M1-DSPARK-DESIGN.md 1.5)
 MAX_ROWS = 8                      # rows per step: the GEMV's M <= 8 (runtime/gemv_mxfp8.py)
-MOE_IMPLS_ROWS = ("ref", "dg-masked")  # MoE impls at rows > 1 (runtime/moe_rows.py)
+MOE_IMPLS_ROWS = ("ref", "dg-masked", "dg-inplace")  # MoE impls at rows > 1 (runtime/moe_rows.py)
 
 
 # ------------------------------------------------------------------------------------------------ pure index math
@@ -518,12 +521,14 @@ class StaticStep:
         self.n_counted = 0
         self._c: Optional[_StepScalars] = None
         self.glue_note: Optional[str] = None
-        if self.glue_impl == "fused" and rows > 1:  # M1-T10: the fused kernels/calibrations are one-row
-            self.glue_note = f"rows={rows}: fused glue not ported (one-row kernels); the reference glue ops run"
-        elif self.glue_impl == "fused":  # #17: tables + build-time self-check (eager; syncs; before any capture)
+        if self.glue_impl == "fused":  # #17: tables + build-time self-check (eager; syncs; before any capture)
             from runtime.fused_glue import FusedGlue
 
             self.glue = FusedGlue(self, **(glue_opts or {}))
+            if rows > 1:  # M1-T10-FIX: only the row-parallel clusters run at R rows (fused_glue.ROWS_CLUSTERS)
+                on = [c for c, s in self.glue.status.items() if self.glue.on(c)]
+                self.glue_note = (f"rows={rows}: fused {','.join(on) or '-'} (row-parallel, self-checked at {rows} "
+                                  f"rows); the one-row clusters run the reference ops")
         if self.attn_impl == "bounded":  # #18: install the routed wrapper, then the build-time self-check (eager)
             patches.sparse_attn_bounded(True)
             self._attn_selfcheck(attns)
@@ -677,6 +682,16 @@ class StaticStep:
                 self.dg = DGBuffers(self, shapes, sshapes, swiglu_limit=lim, deterministic=self.dg_deterministic,
                                     slots=ns)
                 moe_cls = moe_rows.DGMaskedMoERows
+            elif self.moe_impl == "dg-inplace":  # M1-T10-FIX: contiguous GEMM in place, R*k spare slots per layer
+                from runtime.dg_inplace import DGInplaceBuffers
+
+                if pool is None:
+                    raise ValueError("moe_impl dg-inplace needs the model's ExpertPool")
+                added = pool.add_spare_slots(ns, self.model)  # before the pointer tables below (storage moves)
+                self.dg = DGInplaceBuffers(self, shapes, sshapes, pool=pool, swiglu_limit=lim,
+                                           deterministic=self.dg_deterministic, slots=ns)
+                self.dg.spare_added_B = added
+                moe_cls = moe_rows.DGInplaceMoERows
         elif self.moe_impl == "dg-masked":  # T9a-1: same staging + pointer tables, routed GEMMs on DeepGEMM
             from runtime.dg_moe import DGBuffers, DGMaskedMoE
 
@@ -735,6 +750,7 @@ class StaticStep:
             moe.__dict__.setdefault("_static_moes", {})[id(self)] = sm  # per step: several may share one model
             self.moes.append(sm)
         self.cold_tab = cold.to(d)
+        self._pool_gen = getattr(pool, "generation", None)  # pointer tables are valid for this pool storage only
         self.ids_step = torch.zeros(n_layers, ns, dtype=torch.long, device=d)
         self.uvalid_step = torch.ones(n_layers, ns, dtype=torch.long, device=d)  # rows > 1: 1 = a used unique slot
         self.cold_acc = torch.zeros(n_layers, dtype=torch.long, device=d)
@@ -1036,6 +1052,9 @@ class StaticStep:
         tensor); pos <- pos = P0 (skipped when the device already holds it, i.e. right after the previous step).
         Positions P0..P0+R-1 must lie in [1, max_pos]."""
         pos = int(pos)
+        if self.pool is not None and getattr(self.pool, "generation", None) != self._pool_gen:
+            raise RuntimeError("the ExpertPool's storage moved after this StaticStep was built (add_spare_slots by a "
+                               "later dg-inplace build): its pointer tables are stale -- rebuild the step")
         if not 1 <= pos <= self.max_pos - (self.rows - 1):
             raise ValueError(f"decode position {pos} (+{self.rows - 1}) outside [1, max_pos={self.max_pos}] "
                              f"(design #7: pos >= 1)")
@@ -1101,8 +1120,10 @@ class StaticStep:
             if det is not None and prev_fill is not None:
                 det.fill_uninitialized_memory = bool(fills)
             with torch.inference_mode():
+                from runtime.refmodel import reference_forward
+
                 toks = torch.tensor([list(DUMMY_PROMPT)], dtype=torch.long, device=self.dev)
-                out_ids, _, _ = self.model(toks, 0)
+                out_ids, _, _ = reference_forward(self.model, toks, 0)  # bare factories on self.dev, not the default
                 p = len(DUMMY_PROMPT)
                 self.tok.copy_(out_ids.reshape(1, 1).expand(1, self.rows))
                 self.pos.fill_(p)

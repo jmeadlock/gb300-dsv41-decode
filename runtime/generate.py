@@ -528,7 +528,9 @@ class Generator:
         if nv:
             nv.range_push("prefill")
         try:
-            out_ids, logits, _ = self.model(tokens, 0)
+            from runtime.refmodel import reference_forward  # index tensors on tokens' device (generate.py:134)
+
+            out_ids, logits, _ = reference_forward(self.model, tokens, 0)
         finally:
             if nv:
                 nv.range_pop()
@@ -564,7 +566,9 @@ class Generator:
                 out_ids = st.tok.view(1)
             else:
                 self._marker_eager()
-                out_ids, logits, _ = self.model(tokens, pos)
+                from runtime.refmodel import reference_forward
+
+                out_ids, logits, _ = reference_forward(self.model, tokens, pos)
         finally:
             if nv:
                 nv.range_pop()

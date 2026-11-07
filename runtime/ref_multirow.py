@@ -177,11 +177,13 @@ def forward_rows(model, tokens: torch.Tensor, start_pos: int, hidden_layers: Seq
     model.target_layer_ids for this call only (model.py:1211, 1267-1269)."""
     if start_pos < 1:
         raise ValueError("forward_rows is the decode path: start_pos >= 1 (the prefill is model(tokens, 0))")
+    from runtime.refmodel import reference_forward
+
     prev = getattr(model, "target_layer_ids", ())
     model.target_layer_ids = tuple(hidden_layers)
     try:
-        with multirow_decode():
-            ids, logits, hidden = model(tokens, int(start_pos))
+        with multirow_decode():  # the reference's bare factories land on tokens' device (refmodel.reference_device)
+            ids, logits, hidden = reference_forward(model, tokens, int(start_pos))
     finally:
         model.target_layer_ids = prev
     R_ = tokens.size(1)

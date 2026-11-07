@@ -71,7 +71,11 @@ The plan (§3) says the reference build OOMs at layer 14's Engram when built und
 **Process-global side effects.**
 - `build_and_load` leaves `torch.set_default_dtype(torch.bfloat16)` set, as generate.py:118 does.
 - The driver must still call `torch.set_default_device("cuda")` before a forward (generate.py:134), because the
-  forward builds index tensors on the default device.
+  forward builds index tensors on the default device. M1-T10-FIX: `refmodel.reference_forward(model, tokens,
+  start_pos)` / `refmodel.reference_device(dev)` scope that (and clear model.py's two `@lru_cache(1)` index builders);
+  Generator's prefill/eager decode, `ref_multirow.forward_rows`, `StaticStep.capture` and the GPU tests use it.
+  (Round 1 of M1-T10: a test calling `model(...)` with the default still CPU fed the CUDA sparse_attn a CPU
+  `topk_idxs` -- "device_type mismatch, expected cuda".)
 
 ## Run it
 
