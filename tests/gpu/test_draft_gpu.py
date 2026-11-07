@@ -28,8 +28,13 @@ M1-T11-PORT (runtime/draft_step.py impl switches), per switch the verify's own s
     drafts, logits, confidences, rings -- the V2 cases above; the fused clusters must all self-check "on".
   * P2 DG MoE: each stage's DraftDGMoE (DeepGEMM contiguous over the resident stack) vs the reference eager MoE
     (model.py:891-906, the stage's own module) on the same x: bf16 ulp statistics REPORTED (the documented 1-ulp
-    class of dg_moe.py); gated: finite, the same routed experts, max ulp <= DG_MAX_ULP (a gross-error guard, not a
-    measured number). The full-impl draft vs the reference: drafts agreement and max |logit delta| REPORTED.
+    class of dg_moe.py); gated: finite, the same routed experts, and (T12-FIX2) the A3 class by `dg_moe_evidence`:
+    every routed pair's w1 / w3 / w2 GEMM within 1 bf16 ulp (+ an accumulation-error allowance) of an fp64 oracle
+    on THAT path's own quantized inputs, no scatter / SwiGLU / combine slip. An element past DG_MAX_ULP is no longer
+    a failure by itself (box r2: real stage 1 x1, 1 / 25,600 elements at 16 ulp, |d| 0.5): it is REPORTED with its
+    row / column, experts, per-expert terms, both paths' distance from the fp64 oracle of the final value and the
+    cancellation factor max|term| / |y|; a wrong expert / row / SF would put a GEMM far from its oracle and fail.
+    The full-impl draft vs the reference: drafts agreement and max |logit delta| REPORTED.
   * P3 graph: all four switches on (gemv, dg-inplace, fused, flashmla): graph == static-eager, replay x2, relaunch,
     no host sync, `describe()` printed (which clusters / attention arm are actually on).
 
@@ -66,7 +71,7 @@ DEV = "cuda"       # tests/test_draft_cpu.py dry-runs the gates on the CPU emula
 STEP_KW = {}       # ... with {"_allow_cpu": True}
 COUNTS = {"gates": 0, "drafts": 0, "logit_rows": 0, "rings": 0, "graph": 0}
 REPORT = []        # lines printed at the end (rewrite no-op check, rowwise check)
-DG_MAX_ULP = 8     # P2 gross-error guard on the DG MoE vs the reference eager MoE (reported, see module docstring)
+DG_MAX_ULP = 8     # P2: combined-output elements past this get the A3 evidence line (reported; T12-FIX2: not a gate)
 FULL = {"fp8_impl": "gemv", "moe_impl": "dg-inplace", "glue_impl": "fused", "attn_impl": "flashmla"}
 
 
@@ -272,9 +277,285 @@ def _gate_draft(kind="mini3", L=17, cs=(1, 3, 6), chain=True, rowwise=True, impl
         return ds
 
 
+# ------------------------------------------------------------------------------------------------ T12-FIX2: P2 evidence
+# The P2 gate's question for any combined-output element past the 1-ulp class: accumulation order (A3, the class of
+# the main model's DG vs TileLang MoE) or an indexing slip (a wrong expert / row / SF somewhere in the DG path)?
+# `dg_moe_evidence` answers it per routed pair with an fp64 oracle of each GEMM ON THAT PATH'S OWN quantized inputs
+# (fp8 codes x block scales, fp4 e2m1 x e8m0 weights dequantized exactly): a GEMM that read the wrong expert, row or
+# scale is far from its oracle; a GEMM that only summed in another order is within 1 bf16 ulp of it. The chain:
+#   x act_quant (A of w1/w3)  DG bytes == act_quant(x[row])                     a scatter slip shows here
+#   w1, w3                    each path within 1 ulp of its own fp64 oracle      expert / SF slip shows here
+#   w2 input                  DG bytes == act_quant(bf16(w * silu(g1) * g3)) of DG's OWN g1/g3 (SwiGLU reproduces);
+#                             equality with the reference's input REPORTED (a 1-ulp g1/g3 can flip an fp8 code)
+#   w2                        each path within 1 ulp of its own fp64 oracle
+#   combine                   each path's output == bf16(fp32 0 + its pair outputs in ascending id + shared)
+# All of it holding = the final difference is A3 (GEMM accumulation order, propagated / amplified by cancellation in
+# the fp32 combine: reported as max |term| / |y| at each element past the 1-ulp class); anything else fails the gate.
+E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
+
+
+def bf16_spacing(v: torch.Tensor) -> torch.Tensor:
+    """bf16 ulp at |v| (fp64 in, fp64 out): 2^(e - 8) for |v| = m * 2^e, m in [0.5, 1); the subnormal floor 2^-133."""
+    _, e = torch.frexp(v.abs().to(torch.float64))
+    return torch.exp2(torch.clamp(e.to(torch.float64) - 8.0, min=-133.0))
+
+
+def fp4_rows_f64(w: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    """fp4 e2m1 pairs [N, K/2] (low nibble first, tests/test_static_emulated_cpu.py `_fp4_deq`) x e8m0 scales
+    [N, K/32] -> exact fp64 [N, K]."""
+    lut = torch.tensor(E2M1_VALUES, dtype=torch.float64, device=w.device)
+    u = w.contiguous().view(torch.uint8).to(torch.long)
+    q = torch.stack([lut[u & 0xF], lut[u >> 4]], -1).flatten(-2)
+    sc = torch.exp2(s.contiguous().view(torch.uint8).to(torch.float64) - 127.0)
+    return q * sc.repeat_interleave(q.size(-1) // sc.size(-1), -1)
+
+
+def act_f64(q: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    """fp8 e4m3 codes [.., K] x per-block scales [.., K/B] (fp32 values or e8m0 codes) -> exact fp64 [.., K]."""
+    if s.dtype == torch.float8_e8m0fnu:
+        sf = torch.exp2(s.contiguous().view(torch.uint8).to(torch.float64) - 127.0)
+    else:
+        sf = s.to(torch.float64)
+    return q.float().to(torch.float64) * sf.repeat_interleave(q.size(-1) // sf.size(-1), -1)
+
+
+def _scale_f32(s: torch.Tensor) -> torch.Tensor:
+    if s.dtype == torch.float8_e8m0fnu:
+        return torch.exp2(s.contiguous().view(torch.uint8).to(torch.float32) - 127.0)
+    return s.float()
+
+
+ORACLE_TOL = 2.0 ** -12  # GEMM vs its fp64 oracle: |d| <= 1 bf16 ulp + ORACLE_TOL * sum|a*w| (accumulation error
+#                         bound, generous for fp8/fp4 MMA accumulation); a wrong expert / row / SF block is O(K^-1/2)
+
+
+def oracle_dist(got: torch.Tensor, A: torch.Tensor, W: torch.Tensor) -> dict:
+    """got [N] (bf16) vs the exact W @ A (fp64 [N, K] x [K]): max distance in bf16 ulps of the exact value, and the
+    max excess over 1 ulp normalized by sum_k |A_k W_nk| (the scale of any accumulation-order error)."""
+    exact = W @ A
+    absum = W.abs() @ A.abs()
+    d = (got.to(torch.float64) - exact).abs()
+    sp = bf16_spacing(exact)
+    ex = torch.clamp(d - sp, min=0.0) / torch.clamp(absum, min=1e-300)
+    return {"ulp": float((d / sp).max()) if d.numel() else 0.0, "excess": float(ex.max()) if d.numel() else 0.0}
+
+
+def dg_moe_evidence(R, st, x: torch.Tensor, got: torch.Tensor, want: torch.Tensor, dg: dict, swiglu_ref: bool = True,
+                    elem_ulp: int = 1, max_elems: int = 8) -> dict:
+    """The chain above for one DraftDGMoE call. st: the stage (its reference MoE modules); x [1, R, D] bf16; got /
+    want: the DG / reference outputs; dg: the DG path's buffers {"xq1", "xs1", "g1", "g3", "xq2", "xs2", "out"} (A rows)
+    and {"posmat"} [R, k] (A rows of row r's pairs, ascending id); swiglu_ref: the DG SwiGLU ran the reference ops
+    (glue off) so its w2 input must reproduce exactly. -> {"a3": bool, "why": [...], "pairs": [...], "elems": [...]}."""
+    from runtime.dg_inplace import bf16_ulp
+    from runtime.refmodel import reference_device
+
+    import torch.nn.functional as F_
+
+    moe = st.ffn
+    D = moe.dim
+    x2 = x.reshape(-1, D)
+    why, pairs, elems = [], [], []
+    with torch.inference_mode(), reference_device(x.device):
+        weights, indices = moe.gate(x2, None)                         # model.py:894
+        ref = {}
+        y = torch.zeros(x2.shape, dtype=torch.float32, device=x2.device)
+        for e in sorted({int(v) for v in indices.reshape(-1).tolist()}):   # model.py:897-902, ascending id
+            ex = moe.experts[e]
+            cap = {}
+            hooks = [ex.w1.register_forward_hook(lambda m_, a_, o_: cap.__setitem__("g1", o_.detach().clone())),
+                     ex.w3.register_forward_hook(lambda m_, a_, o_: cap.__setitem__("g3", o_.detach().clone())),
+                     ex.w2.register_forward_pre_hook(lambda m_, a_: cap.__setitem__("h", a_[0].detach().clone()))]
+            try:
+                idx, top = torch.where(indices == e)
+                out = ex(x2[idx], weights[idx, top, None])
+            finally:
+                for h_ in hooks:
+                    h_.remove()
+            y[idx] += out
+            q2, s2 = R.act_quant(cap["h"].contiguous(), R.fp8_block_size, R.scale_fmt, R.scale_dtype)
+            for t, r in enumerate(idx.tolist()):
+                ref[(r, e)] = {"w": float(weights[r, top[t]]), "g1": cap["g1"][t], "g3": cap["g3"][t], "h": cap["h"][t],
+                               "q2": q2[t], "s2": s2[t], "out": out[t]}
+        sh = moe.shared_experts(x2)                                   # model.py:905
+        y += sh
+        y_ref = y.type_as(x2)
+        replicate_ok = bool(torch.equal(y_ref.view(torch.int16), want.reshape(-1, D).view(torch.int16)))
+        if not replicate_ok:
+            why.append("the test's replication of the reference MoE != st.ffn(x)")
+        qx, sx = R.act_quant(x2.contiguous(), R.fp8_block_size, R.scale_fmt, R.scale_dtype)
+        lim = float(moe.experts[next(iter(ref))[1]].swiglu_limit) if ref else 0.0
+        posmat = dg["posmat"]
+        Rr, k = posmat.shape
+        for r in range(Rr):
+            es = sorted(int(v) for v in indices[r].tolist())
+            for j, e in enumerate(es):
+                a = int(posmat[r, j])
+                rp, ex = ref[(r, e)], moe.experts[e]
+                ev = {"row": r, "expert": e, "arow": a, "w": rp["w"]}
+                ev["x_in_equal"] = bool(torch.equal(dg["xq1"][a].view(torch.uint8), qx[r].view(torch.uint8))
+                                        and torch.equal(dg["xs1"][a].float(), _scale_f32(sx[r])))
+                ax_ref, ax_dg = act_f64(qx[r], sx[r]), act_f64(dg["xq1"][a], dg["xs1"][a])
+                for p, key in (("w1", "g1"), ("w3", "g3")):
+                    lin = getattr(ex, p)
+                    W = fp4_rows_f64(lin.weight, lin.scale)
+                    ev[f"{key}_ref_oracle"] = oracle_dist(rp[key], ax_ref, W)
+                    ev[f"{key}_dg_oracle"] = oracle_dist(dg[key][a], ax_dg, W)
+                    ev[f"{key}_dg_vs_ref_ulp"] = int(bf16_ulp(dg[key][a].contiguous(), rp[key].contiguous()).max())
+                    del W
+                ev["w2_in_equal_ref"] = bool(torch.equal(dg["xq2"][a].view(torch.uint8), rp["q2"].view(torch.uint8))
+                                             and torch.equal(dg["xs2"][a].float(), _scale_f32(rp["s2"])))
+                if not ev["w2_in_equal_ref"]:
+                    ev["w2_in_codes_differing"] = int((dg["xq2"][a].view(torch.uint8) != rp["q2"].view(torch.uint8)).sum())
+                if swiglu_ref:                                        # model.py:845-853 on the DG's own g1 / g3
+                    gt, up = dg["g1"][a].float(), dg["g3"][a].float()
+                    if lim > 0:
+                        up = torch.clamp(up, min=-lim, max=lim)
+                        gt = torch.clamp(gt, max=lim)
+                    hh = (torch.tensor(rp["w"], dtype=torch.float32, device=gt.device) * (F_.silu(gt) * up)).to(x2.dtype)
+                    q3, s3 = R.act_quant(hh.view(1, -1).contiguous(), R.fp8_block_size, R.scale_fmt, R.scale_dtype)
+                    ev["w2_in_reproduces_from_dg_g13"] = bool(
+                        torch.equal(dg["xq2"][a].view(torch.uint8), q3[0].view(torch.uint8))
+                        and torch.equal(dg["xs2"][a].float(), _scale_f32(s3[0])))
+                W2 = fp4_rows_f64(ex.w2.weight, ex.w2.scale)
+                ev["w2_ref_oracle"] = oracle_dist(rp["out"], act_f64(rp["q2"], rp["s2"]), W2)
+                ev["w2_dg_oracle"] = oracle_dist(dg["out"][a], act_f64(dg["xq2"][a], dg["xs2"][a]), W2)
+                ev["w2_dg_vs_ref_ulp"] = int(bf16_ulp(dg["out"][a].contiguous(), rp["out"].contiguous()).max())
+                del W2
+                pairs.append(ev)
+        # combine: each path's output from its own pair outputs (fp32 0 + ascending id + shared -> bf16)
+        yd = torch.zeros(x2.shape, dtype=torch.float32, device=x2.device)
+        for j in range(k):
+            yd += dg["out"].index_select(0, posmat[:, j].long()).float()
+        yd += sh
+        combine_dg_ok = bool(torch.equal(yd.type_as(x2).view(torch.int16), got.reshape(-1, D).view(torch.int16)))
+        if not combine_dg_ok:
+            why.append("DG output != its own pair outputs combined (posmat / combine slip)")
+        # elements past the 1-ulp class: fp64 oracle of the final value and the cancellation factor
+        u = bf16_ulp(got.reshape(-1).contiguous(), want.reshape(-1).contiguous())
+        bad = torch.nonzero(u > elem_ulp).reshape(-1)[:max_elems].tolist()
+        for f in bad:
+            r, c = divmod(int(f), D)
+            es = sorted(int(v) for v in indices[r].tolist())
+            terms, y64 = [], float(sh[r, c])
+            for j, e in enumerate(es):
+                a = int(posmat[r, j])
+                rp, ex = ref[(r, e)], moe.experts[e]
+                W2c = fp4_rows_f64(ex.w2.weight[c:c + 1], ex.w2.scale[c:c + 1])[0]
+                o_ref = float((act_f64(rp["q2"], rp["s2"]) * W2c).sum())
+                o_dg = float((act_f64(dg["xq2"][a], dg["xs2"][a]) * W2c).sum())
+                y64 += o_ref
+                terms.append({"expert": e, "ref": float(rp["out"][c]), "dg": float(dg["out"][a][c]), "oracle_ref": o_ref,
+                              "oracle_dg": o_dg})
+            g_, w_ = float(got.reshape(-1)[f]), float(want.reshape(-1)[f])
+            sp = float(bf16_spacing(torch.tensor(y64, dtype=torch.float64, device="cpu")))
+            big = max([abs(t["ref"]) for t in terms] + [abs(float(sh[r, c]))])
+            elems.append({"row": r, "col": c, "ulp": int(u[f]), "dg": g_, "ref": w_, "oracle": y64,
+                          "dg_oracle_ulp": abs(g_ - y64) / sp, "ref_oracle_ulp": abs(w_ - y64) / sp,
+                          "shared": float(sh[r, c]), "terms": terms, "cancellation": big / max(abs(y64), 1e-30)})
+    for ev in pairs:
+        tag = f"row {ev['row']} expert {ev['expert']}"
+        if not ev["x_in_equal"]:
+            why.append(f"{tag}: DG w1/w3 input != act_quant(x[row]) (scatter slip)")
+        for key in ("g1", "g3", "w2"):
+            for side in ("ref", "dg"):
+                o_ = ev[f"{key}_{side}_oracle"]
+                if o_["excess"] > ORACLE_TOL:
+                    why.append(f"{tag}: {side} {key} is {o_['ulp']:.2f} ulp from its fp64 oracle (excess "
+                               f"{o_['excess']:.3g} of sum|a*w| > {ORACLE_TOL:.3g})")
+        if swiglu_ref and not ev.get("w2_in_reproduces_from_dg_g13", True):
+            why.append(f"{tag}: DG w2 input does not reproduce from its own w1/w3 outputs (SwiGLU / quant slip)")
+    return {"a3": replicate_ok and not why, "why": why, "replicate_ok": replicate_ok, "combine_dg_ok": combine_dg_ok,
+            "pairs": pairs, "elems": elems,
+            "pair_max_ulp": max([p["w2_dg_vs_ref_ulp"] for p in pairs] or [0]),
+            "w2_inputs_equal": sum(p["w2_in_equal_ref"] for p in pairs), "n_pairs": len(pairs)}
+
+
+def dg_buffers_view(ds, moe) -> dict:
+    """The DraftDGMoE call's A-row buffers (runtime/draft_step.py DraftDGBuffers) for `dg_moe_evidence`."""
+    b = ds.dgm
+    return {"xq1": b.xq[1], "xs1": b.xs[1], "g1": b.d["w1"], "g3": b.d["w3"], "xq2": b.xq[2], "xs2": b.xs[2],
+            "out": b.d["w2"], "posmat": moe.last["posmat"]}
+
+
+def reference_pairs_view(R, st, x: torch.Tensor):
+    """The reference MoE's own per-pair intermediates in the DG A-row layout (moe_rows.dedup_routes, block rows = R)
+    -> (view for `dg_moe_evidence`, the combined output from them). A self-test: evidence(reference as DG) is A3 with
+    0 ulp everywhere (tests/test_dspark_loop_cpu.py, CPU emulation)."""
+    from runtime.moe_rows import dedup_routes
+    from runtime.refmodel import reference_device
+
+    moe = st.ffn
+    D = moe.dim
+    x2 = x.reshape(-1, D)
+    with torch.inference_mode(), reference_device(x.device):
+        weights, indices = moe.gate(x2, None)
+        Rr, k = indices.shape
+        m = dedup_routes(indices, weights.float(), Rr)
+        M = Rr * k * Rr
+        e0 = moe.experts[int(indices[0, 0])]
+        I_ = e0.w1.out_features
+        qx, sx = R.act_quant(x2.contiguous(), R.fp8_block_size, R.scale_fmt, R.scale_dtype)
+        dev = x.device
+        v = {"xq1": torch.zeros(M, D, dtype=qx.dtype, device=dev), "xs1": torch.ones(M, sx.size(-1), device=dev),
+             "g1": torch.zeros(M, I_, dtype=x.dtype, device=dev), "g3": torch.zeros(M, I_, dtype=x.dtype, device=dev),
+             "out": torch.zeros(M, D, dtype=x.dtype, device=dev), "posmat": m["posmat"]}
+        xq2 = xs2 = None
+        for e in sorted({int(t) for t in indices.reshape(-1).tolist()}):
+            ex = moe.experts[e]
+            cap = {}
+            hooks = [ex.w1.register_forward_hook(lambda m_, a_, o_: cap.__setitem__("g1", o_.detach().clone())),
+                     ex.w3.register_forward_hook(lambda m_, a_, o_: cap.__setitem__("g3", o_.detach().clone())),
+                     ex.w2.register_forward_pre_hook(lambda m_, a_: cap.__setitem__("h", a_[0].detach().clone()))]
+            try:
+                idx, top = torch.where(indices == e)
+                out = ex(x2[idx], weights[idx, top, None])
+            finally:
+                for h_ in hooks:
+                    h_.remove()
+            q2, s2 = R.act_quant(cap["h"].contiguous(), R.fp8_block_size, R.scale_fmt, R.scale_dtype)
+            if xq2 is None:
+                xq2 = torch.zeros(M, q2.size(-1), dtype=q2.dtype, device=dev)
+                xs2 = torch.ones(M, s2.size(-1), device=dev)
+            for t, r in enumerate(idx.tolist()):
+                j = sorted(int(u) for u in indices[r].tolist()).index(e)
+                a = int(m["posmat"][r, j])
+                v["xq1"][a], v["xs1"][a] = qx[r], _scale_f32(sx[r])
+                v["g1"][a], v["g3"][a], v["out"][a] = cap["g1"][t], cap["g3"][t], out[t]
+                xq2[a], xs2[a] = q2[t], _scale_f32(s2[t])
+        v["xq2"], v["xs2"] = xq2, xs2
+        y = torch.zeros(x2.shape, dtype=torch.float32, device=dev)
+        for j in range(k):
+            y += v["out"].index_select(0, m["posmat"][:, j]).float()
+        y += moe.shared_experts(x2)
+    return v, y.type_as(x2).view(x.shape)
+
+
+def _evidence_line(tag: str, ev: dict) -> str:
+    def mx(key, side, what):
+        return max(p[f"{key}_{side}_oracle"][what] for p in ev["pairs"]) if ev["pairs"] else 0.0
+
+    s = (f"{tag}: {'A3' if ev['a3'] else 'NOT A3'} -- {ev['n_pairs']} pairs, per-pair w2 output DG vs ref max ulp "
+         f"{ev['pair_max_ulp']}, w2 inputs bit-equal {ev['w2_inputs_equal']}/{ev['n_pairs']}; vs fp64 oracle (ref/dg) "
+         + ", ".join(f"{k_} max ulp {mx(k_, 'ref', 'ulp'):.2f}/{mx(k_, 'dg', 'ulp'):.2f} excess "
+                     f"{mx(k_, 'ref', 'excess'):.2g}/{mx(k_, 'dg', 'excess'):.2g}" for k_ in ("g1", "g3", "w2"))
+         + f"; combine reproduces {ev['combine_dg_ok']}")
+    for e in ev["elems"]:
+        s += (f"; element row {e['row']} col {e['col']}: {e['ulp']} ulp (DG {e['dg']:.6g}, ref {e['ref']:.6g}, fp64 "
+              f"oracle {e['oracle']:.9g}: DG {e['dg_oracle_ulp']:.2f} / ref {e['ref_oracle_ulp']:.2f} ulp from it; "
+              f"cancellation max|term|/|y| {e['cancellation']:.1f}; terms " + ", ".join(
+                  f"e{t['expert']} ref {t['ref']:.6g} dg {t['dg']:.6g} oracle {t['oracle_ref']:.9g}"
+                  for t in e["terms"]) + f", shared {e['shared']:.6g})")
+    if ev["why"]:
+        s += "; why not: " + " | ".join(ev["why"][:6])
+    return s
+
+
 # ------------------------------------------------------------------------------------------------ M1-T11-PORT
 def _gate_dg_moe(kind="mini3", n_x=3):
-    """P2: DraftDGMoE (DeepGEMM contiguous over the resident stack) vs the stage's reference eager MoE on the same x."""
+    """P2: DraftDGMoE (DeepGEMM contiguous over the resident stack) vs the stage's reference eager MoE on the same x.
+    T12-FIX2: an output past DG_MAX_ULP no longer fails by itself; it must be A3 by `dg_moe_evidence` (per-pair
+    GEMMs within 1 ulp of their fp64 oracles, no scatter / SwiGLU / combine slip), reported with the element, its
+    experts and both paths' oracle distances; and every pair's evidence is gated on every call."""
     from runtime.dg_inplace import compare_bf16
     from runtime.draft_step import DraftStep
     from runtime.refmodel import reference_device
@@ -283,13 +564,15 @@ def _gate_dg_moe(kind="mini3", n_x=3):
         ds = DraftStep(model, moe_impl="dg-inplace", **STEP_KW)
         D = ds.stages[0].attn_norm.dim
         g = torch.Generator(device="cpu").manual_seed(11)
-        worst, lines = 0, []
+        glue_sw = ds.glue is not None and ds.glue.on("swiglu_routed")
+        worst, lines, a3_lines = 0, [], []
         for s, (st, moe) in enumerate(zip(ds.stages, ds.moes)):
             for j in range(n_x):
                 x = (torch.randn(1, ds.block, D, generator=g, device="cpu") * (0.5 + j)).to(torch.bfloat16).to(DEV)
                 with torch.inference_mode():
                     got = moe(x).clone()
                     ids_dg = sorted(int(e) for e in moe.last["uniq"][moe.last["counts"] > 0].tolist())
+                    view = {k_: v.clone() for k_, v in dg_buffers_view(ds, moe).items()}
                     with reference_device(x.device):
                         want = st.ffn(x)                                  # model.py:891-906, eager reference
                     _, ind = st.ffn.gate(x.view(-1, D), None)
@@ -299,13 +582,22 @@ def _gate_dg_moe(kind="mini3", n_x=3):
                 assert bool(torch.isfinite(got.float()).all()), f"{kind} stage {s}: non-finite DG MoE output"
                 c = compare_bf16(got.reshape(-1), want.reshape(-1))
                 worst = max(worst, c["max_ulp"])
+                ev = dg_moe_evidence(ds.R, st, x, got, want, view, swiglu_ref=not glue_sw)
+                _sync()
                 lines.append(f"s{s}x{j}: equal {c['equal']}, mismatch {100 * c['mismatch_frac']:.3f}%, max ulp "
-                             f"{c['max_ulp']}, max |d| {c['max_abs']:.3g}")
-                assert c["max_ulp"] <= DG_MAX_ULP, f"{kind} stage {s} x{j}: DG MoE vs reference {c}"
+                             f"{c['max_ulp']}, max |d| {c['max_abs']:.3g}, per-pair max ulp {ev['pair_max_ulp']}")
+                if c["max_ulp"] > 1 or not ev["a3"]:
+                    a3_lines.append(_evidence_line(f"{kind} s{s}x{j}", ev))
+                assert ev["a3"], f"{kind} stage {s} x{j}: DG MoE vs reference is NOT the A3 class: " + \
+                    _evidence_line(f"{kind} s{s}x{j}", ev)
+                if c["max_ulp"] > DG_MAX_ULP:
+                    REPORT.append(f"{kind} stage {s} x{j}: {c['n_ulp_gt1']} element(s) past the {DG_MAX_ULP}-ulp guard,"
+                                  f" explained A3 (accumulation order, see the evidence line)")
         REPORT.append(f"{kind}: draft DG MoE vs reference eager MoE (bf16): " + "; ".join(lines))
+        REPORT.extend(f"A3 evidence {ln}" for ln in a3_lines)
         COUNTS["gates"] += 1
-        print(f"  {kind}: draft DG MoE == reference eager MoE within the 1-ulp class (max ulp {worst}; "
-              f"{ds.dgm.describe()['bytes']})")
+        print(f"  {kind}: draft DG MoE == reference eager MoE within the A3 class (max ulp {worst}, every pair's GEMMs "
+              f"within 1 ulp of their fp64 oracles; {ds.dgm.describe()['bytes']})")
 
 
 def _gate_full_graph(kind="mini3", L=17, impls=None):

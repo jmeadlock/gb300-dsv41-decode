@@ -33,6 +33,7 @@ call on the GPU (the emulation's CPU topk happens to agree). A selection change 
 mini3 (CPU control: forcing a different 6-row selection at positions 33/34 changed rows 17/18 only) -- the box log's
 signature (1/64 rows, no stream divergence). The first verify step (entry 1, position 17) matched, which rules out
 the prefill-KV / ctx_count 0 / first-row-token hypotheses. The forced runs use another prompt (seed 700+L).
+
 `_gate_stream` therefore EXPLAINS rows instead of failing on them when, and only when, all of this holds (measured
 by `_explain_rows`, static mode, the same prompt and switches): (a) the static loop differs at exactly the same
 rows; (b) at each such position the 1-row step's reachable index scores tie (or are within the largest 1-row vs
@@ -40,6 +41,21 @@ rows; (b) at each such position the 1-row step's reachable index scores tie (or 
 the 1-row step's; (d) re-running the loop with ONLY the 1-row step's selection injected at those positions makes
 every row bit-equal to the 1-row step (the selection is the whole cause). Anything else still fails. The evidence
 (score bits equal or not, gap, the two dropped groups) is REPORTed.
+
+T12-FIX2 (box log docs/loop-gpu-test-r2-20261107.log): the r2 runs refuted the tie story for row 17 -- scores AND
+selections bit-equal, the injection changed nothing -- and the cache-by-cache diff (`cache_probe`, CPU emulation of
+the same prompt and map: tests/test_dspark_loop_cpu.py test_cache_probe_free_loop_caches_equal_one_row) finds every
+cache a row reads bit-equal to the 1-row step's entering and leaving every step through position 41, the ratio-2
+compressor's two slots included: the first step does NOT mis-commit the prefill's partial group. The cause left
+is inside the step and CUDA-only (read from torch's Reduce.cuh; the census below confirms or refutes it on the box):
+the reduce kernel chooses the lanes per output from the number of outputs,
+so the 6-row step's per-token statistics (the mHC mixes norm over hc*dim, Engram's per-copy mean / sum, ...) sum in
+another order than the 1-row step's (the CPU reduces every output with one loop: the emulation never sees it), an
+fp32 ulp that the next bf16 cast nearly always absorbs -- 1 row in 64 on mini3. `row_invariant_mode(True)` now
+evaluates those reductions one row at a time too; `test_loop_reduction_row_invariance_census` measures every site
+(plain: reported; in the mode: gated equal) and `test_loop_stream_as_is_reported` reports the T12 mode
+(rowinv="linear") next to it. The tie explanation and the cache diff stay as the diagnostic of any row that still
+differs.
 
 Run on the box (orchestrator), same line as tests/gpu/test_draft_gpu.py, repo at $W:
   W=$HOME/hermes/gb300-dsv41-decode-wt12
@@ -91,9 +107,18 @@ def _sync():
 
 
 @contextlib.contextmanager
-def row_invariant_mode(enabled: bool = True):
+def row_invariant_mode(enabled=True):
     """docs/M1-DSPARK-DESIGN.md 4's row-invariant mode: F.linear and the reference's row-indexed einsums ("bs...")
-    evaluated one row at a time (M = 1 calls, as the 1-row step makes them). Debug only."""
+    evaluated one row at a time (M = 1 calls, as the 1-row step makes them). Debug only.
+
+    T12-FIX2: enabled=True also evaluates torch's float sum / mean over dims >= 2 of a [1, s > 1, ...] tensor one
+    s-row at a time (`_rowwise_reduce`): torch's CUDA reduce kernel picks its thread layout (block_width, the
+    threads cooperating on one output) from the NUMBER OF OUTPUTS (Reduce.cuh setReduceConfig / set_block_dimension),
+    so the per-token statistics of a 6-row step -- the mHC mixes norm `x.square().mean(-1)` over hc*dim
+    (model.py:955), Engram's per-copy `mean(-1)` / `sum(-1)` (model.py:357-358) -- sum in a different order than
+    the 1-row step's (mini3: hc*dim = 1024 -> 128 vs 256 lanes per output; Engram 24 vs 4 outputs -> 32 vs 64
+    lanes), an fp32 ulp that a bf16 cast usually absorbs and occasionally does not (box r2: 1 row in 64, position
+    33). enabled="linear" is the T12 mode (F.linear + einsum only), kept for the reported before/after."""
     if not enabled:
         yield
         return
@@ -116,10 +141,40 @@ def row_invariant_mode(enabled: bool = True):
         return ein0(eq, *ops)
 
     F_.linear, torch.einsum = linear, einsum
+    red = enabled is True
+    saved = {}
+    if red:
+        for owner, name in REDUCTIONS:
+            saved[(owner, name)] = (name in vars(owner), getattr(owner, name))
+            setattr(owner, name, _rowwise_reduce(getattr(owner, name)))
     try:
         yield
     finally:
         F_.linear, torch.einsum = lin0, ein0
+        for (owner, name), (own, fn) in saved.items():
+            if own:
+                setattr(owner, name, fn)
+            else:
+                delattr(owner, name)   # inherited (torch.Tensor.sum lives on torch._C.TensorBase)
+
+
+REDUCTIONS = ((torch.Tensor, "sum"), (torch.Tensor, "mean"), (torch, "sum"), (torch, "mean"))
+
+
+def _rowwise_reduce(orig):
+    """sum / mean wrapper: x float, [1, s > 1, ...], every reduced dim >= 2 -> the reduction of each [1, 1, ...]
+    s-slice (the 1-row step's exact call shape and layout), concatenated on dim 1. Anything else: the original."""
+    def f(x, *args, **kw):
+        if (isinstance(x, torch.Tensor) and x.dim() >= 3 and x.size(0) == 1 and x.size(1) > 1
+                and x.is_floating_point() and "out" not in kw):
+            dim = args[0] if args else kw.get("dim")
+            ds = tuple(dim) if isinstance(dim, (tuple, list)) else (() if dim is None else (dim,))
+            if ds and all(isinstance(d, int) and not isinstance(d, bool) for d in ds) \
+                    and min(int(d) % x.dim() for d in ds) >= 2:
+                return torch.cat([orig(x[:, i:i + 1], *args, **kw) for i in range(x.size(1))], 1)
+        return orig(x, *args, **kw)
+
+    return f
 
 
 @contextlib.contextmanager
@@ -261,26 +316,171 @@ def _sel_set(sel):
     return sorted(int(v) for v in sel.tolist() if int(v) >= 0)
 
 
+# ------------------------------------------------------------------------------------------------ T12-FIX2 census
+CENSUS_SITES = (  # (name, per-row shape from (D, hc, H, W), the reference expression)
+    ("mHC mixes norm x.square().mean(-1) [1,R,hc*D] (model.py:955)", lambda D, hc, H, W: (hc * D,),
+     lambda t: t.square().mean(-1, keepdim=True)),
+    ("RMSNorm x.square().mean(-1) [1,R,D] (model.py:291)", lambda D, hc, H, W: (D,),
+     lambda t: t.square().mean(-1, keepdim=True)),
+    ("Engram h.square().mean(-1) [1,R,hc,D] (model.py:359)", lambda D, hc, H, W: (hc, D),
+     lambda t: t.square().mean(-1)),
+    ("Engram (h*w*k).sum(-1) [1,R,hc,D] (model.py:360)", lambda D, hc, H, W: (hc, D), lambda t: t.sum(-1)),
+    ("hc_pre torch.sum(dim=2) [1,R,hc,D] (model.py:961)", lambda D, hc, H, W: (hc, D),
+     lambda t: torch.sum(t, dim=2)),
+    ("hc_post torch.sum(dim=2) [1,R,hc,hc,D] (model.py:967)", lambda D, hc, H, W: (hc, hc, D),
+     lambda t: torch.sum(t, dim=2)),
+    ("indexer .sum(dim=2) over heads [1,R,H,W] (model.py:558)", lambda D, hc, H, W: (H, W),
+     lambda t: t.sum(dim=2)),
+)
+
+
+def _reduction_census(dev, rows=6, trials=48, shapes=None):
+    """T12-FIX2: for each per-token reduction the 6-row step makes (CENSUS_SITES), row r of the R-row call vs the
+    same row computed alone as a fresh [1, 1, ...] tensor (the 1-row step's call), bitwise, plain and inside
+    row_invariant_mode(True). -> [{"site", "shape", "plain_rows_differing", "mode_rows_differing", "rows"}]."""
+    shapes = shapes or {"mini3": (256, 4, 4, 256)}
+    g = torch.Generator(device="cpu").manual_seed(12)
+    out = []
+    for tag, (D, hc, H, W) in shapes.items():
+        for name, shp, fn in CENSUS_SITES:
+            s = shp(D, hc, H, W)
+            xs = [torch.randn(1, rows, *s, generator=g, device="cpu").to(dev) for _ in range(trials)]
+            res = {}
+            for mode in ("plain", "mode"):
+                ctx = row_invariant_mode(True) if mode == "mode" else contextlib.nullcontext()
+                bad = 0
+                with ctx, torch.inference_mode():
+                    for x in xs:
+                        yr = fn(x)
+                        for r in range(rows):
+                            y1 = fn(x[:, r:r + 1].clone())
+                            bad += int(not torch.equal(yr[:, r:r + 1].reshape(-1), y1.reshape(-1)))
+                res[mode] = bad
+            out.append({"site": name, "shape": tag, "plain_rows_differing": res["plain"],
+                        "mode_rows_differing": res["mode"], "rows": rows * trials})
+    if str(dev).startswith("cuda"):
+        torch.cuda.synchronize()
+    return out
+
+
+# ------------------------------------------------------------------------------------------------ T12-FIX2 caches
+def cache_snapshot(st, p):
+    """Every cache a row at position p+1 reads, as the reference's per-token decode leaves it after position p:
+    the step's 256-ring slots 0..p (p < 256), compressed KV / index K groups < (p+1)//r, the ratio-2 compressor's
+    slots (p % 2 holds kv(p), the other kv(p-1)) and the Engram hash cache 0..p. Clones (eager, syncs)."""
+    m = st.model
+    d = {}
+    for li, layer in enumerate(m.layers):
+        a = layer.attn
+        d[f"L{li}.ring"] = st._ring_of[id(a)][0, : min(p + 1, st.ring)].clone()
+        if a.compress_ratio:
+            r = a.compress_ratio
+            g = (p + 1) // r
+            d[f"L{li}.compress_kv"] = a.compress_kv_cache[0, :g].clone()
+            ix = getattr(a, "indexer", None)
+            if ix is not None and getattr(ix, "owns_k", False):
+                d[f"L{li}.index_k"] = ix.k_cache[0, :g].clone()
+            c = a.compressor
+            if c is not None and r == 2:
+                s = p % 2
+                d[f"L{li}.kv_state[p%2]"] = c.kv_state[0, s].clone()
+                d[f"L{li}.score_state[p%2]"] = c.score_state[0, s].clone()
+                d[f"L{li}.kv_state[(p-1)%2]"] = c.kv_state[0, 1 - s].clone()
+                d[f"L{li}.score_state[(p-1)%2]"] = c.score_state[0, 1 - s].clone()
+    eh = getattr(m, "engram_hash", None)
+    if eh is not None:
+        d["engram.cache"] = eh.cache[0, : p + 1].clone()
+    return d
+
+
+def cache_diff(a, b):
+    """Names of the snapshot tensors that differ bitwise (with the first differing leading index)."""
+    out = []
+    for k in a:
+        x, y = a[k], b.get(k)
+        if y is None or x.shape != y.shape:
+            out.append(f"{k}: shape {tuple(x.shape)} vs {None if y is None else tuple(y.shape)}")
+            continue
+        xv = x.view(torch.uint8) if x.element_size() == 1 else x
+        yv = y.view(torch.uint8) if y.element_size() == 1 else y
+        if not torch.equal(xv, yv):
+            ne = (xv != yv) if not xv.is_floating_point() else ~((xv == yv) | (torch.isnan(xv) & torch.isnan(yv)))
+            idx = ne.reshape(ne.size(0), -1).any(-1).nonzero().reshape(-1).tolist() if ne.dim() > 1 else []
+            if ne.dim() <= 1 or idx:
+                out.append(f"{k}: rows {idx[:6]}" if idx else k)
+    return out
+
+
+@contextlib.contextmanager
+def cache_probe():
+    """T12-FIX2 ('dump both caches at that position, diff tensor by tensor'): static mode, syncs. rec["1row"][p] =
+    the 1-row step's caches after position p; rec["enter"][p] = the loop's caches entering the step with P0 = p+1
+    (after the previous commit AND draft); rec["after"][a] = after a live step's commit with A' = a. tag["t"] selects
+    which side records ("1row" / "loop")."""
+    from runtime.dspark_loop import DSparkLoop
+    from runtime.static_step import StaticStep
+
+    rec = {"1row": {}, "enter": {}, "after": {}}
+    tag: dict = {"t": None}
+    ob, ova = StaticStep._body, DSparkLoop._verify_accept
+
+    def capturing():
+        return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+
+    def body(self, parity):
+        if tag["t"] != "1row" or self.rows != 1 or capturing():
+            return ob(self, parity)
+        p = int(self.pos)
+        ob(self, parity)
+        rec["1row"][p] = cache_snapshot(self, p)
+
+    def va(self):
+        if tag["t"] != "loop" or capturing():
+            return ova(self)
+        p = int(self.st.pos) - 1
+        rec["enter"][p] = cache_snapshot(self.st, p)
+        ova(self)
+        if int(self.b.live):
+            a = int(self.b.a_new)
+            rec["after"][a] = cache_snapshot(self.st, a)
+
+    StaticStep._body, DSparkLoop._verify_accept = body, va
+    try:
+        yield rec, tag
+    finally:
+        StaticStep._body, DSparkLoop._verify_accept = ob, ova
+
+
 def _explain_rows(kind, L, max_new, bad, seed, pin=False, **impls):
     """T12-FIX (module docstring): rebuild, run the 1-row truth and the loop in STATIC mode (row-invariant mode, the
     same prompt / switches) under `indexer_probe`, classify every differing emitted row, then re-run the loop with the
-    1-row step's selections injected at those positions. -> evidence dict; ok = the four conditions hold."""
-    with _model(kind) as (model, pool), row_invariant_mode(True), gemv_pin_m1(pin):
+    1-row step's selections injected at those positions. -> evidence dict; ok = the four conditions hold.
+    T12-FIX2: the same runs also go through `cache_probe`; every differing row reports which caches differ from the
+    1-row step's entering its step (P0 = its position) and after that step's commit (empty = no cache state
+    difference: the row's difference is inside the step)."""
+    with _model(kind) as (model, pool), row_invariant_mode(True), gemv_pin_m1(pin), cache_probe() as (crec, ctag):
         V = model.head.weight.size(0)
         gen = _gen(model, "static", **impls)
         ids = _toks(L, seed, min(2000, V))
+        ctag["t"] = "1row"
         with indexer_probe() as rec1:
             truth, sha = _truth(gen, ids, max_new)
+        ctag["t"] = "loop"
         loop = _loop(gen, max_new)
         try:
             with indexer_probe() as rec6:
                 r = loop.generate(ids, max_new, stop_on_eos=False, parity=True)
+            ctag["t"] = None
             bad_s = [i for i, (x, y) in enumerate(zip(r["step_sha256"], sha)) if x != y]
             rows = []
             for i in bad_s:
                 p = L - 1 + i
                 a, b = rec1.get(p), rec6.get(p)
                 e = {"row": i, "pos": p}
+                c1e, c6e = crec["1row"].get(p - 1), crec["enter"].get(p - 1)
+                c1a, c6a = crec["1row"].get(p), crec["after"].get(p)
+                e["cache_enter_diff"] = cache_diff(c1e, c6e) if c1e is not None and c6e is not None else "n/a"
+                e["cache_after_diff"] = cache_diff(c1a, c6a) if c1a is not None and c6a is not None else "n/a"
                 if a is None or b is None:
                     e["probe"] = "no indexer call recorded (fused indexer_post or a layer without an indexer?)"
                     rows.append(e)
@@ -326,13 +526,14 @@ def _gate_stream(kind="mini3", L=17, max_new=64, mode="static", n_graphs=None, r
             loop.close()
         k = _first_div(r["token_ids"], truth)
         bad = [i for i, (x, y) in enumerate(zip(r["step_sha256"], sha)) if x != y]
+        mname = {True: "row-invariant", "linear": "row-invariant(T12 linear+einsum only)", False: "as-is"}[rowinv]
         tag = (f"{kind} L={L} mode={mode}{'/' + str(n_graphs) + 'g' if mode == 'graph' else ''} "
-               f"{'row-invariant' if rowinv else 'as-is'}{' gemv-pinned' if pin else ''} {impls or ''}")
+               f"{mname}{' gemv-pinned' if pin else ''} {impls or ''}")
         REPORT.append(f"{tag}: {len(r['token_ids'])} tokens, {r['steps']} steps, {r['tokens_per_step']:.3f} tok/step, "
                       f"stream {'== greedy' if k is None else f'diverges at {k}'}, logits rows differing "
-                      f"{len(bad)}/{len(sha)}")
+                      f"{len(bad)}/{len(sha)}{f' {bad[:8]}' if bad and rowinv else ''}")
         assert r2["token_ids"] == r["token_ids"] and r2["accepts"] == r["accepts"], f"{tag}: fast run != parity run"
-    if rowinv:
+    if rowinv is True:
         assert k is None, f"{tag}: stream diverges at {k}: loop {r['token_ids'][k:k + 4]} vs {truth[k:k + 4]}"
         if bad:
             ev = _explain_rows(kind, L, max_new, bad, seed, pin=pin, **impls)
@@ -340,7 +541,9 @@ def _gate_stream(kind="mini3", L=17, max_new=64, mode="static", n_graphs=None, r
                 f"row {e['row']} pos {e['pos']}: clen {e.get('clen')} > k {e.get('k')}, k-th score {e.get('kth')}, "
                 f"gap k/k+1 {e.get('gap_k_k1')}, 6-row vs 1-row scores bit-equal {e.get('score_bits_equal')} (max "
                 f"|d| {e.get('max_score_diff')}), dropped only by 6-row {e.get('only_1row')} / only by 1-row "
-                f"{e.get('only_6row')}" + (f" [{e['probe']}]" if 'probe' in e else "") for e in ev["rows"])
+                f"{e.get('only_6row')}" + (f" [{e['probe']}]" if 'probe' in e else "")
+                + f"; T12-FIX2 caches vs the 1-row step: entering the step {e.get('cache_enter_diff') or 'all equal'}, "
+                  f"after its commit {e.get('cache_after_diff') or 'all equal'}" for e in ev["rows"])
                 + f"; rows differing after injecting the 1-row selections: {ev['bad_after_injection']} (stream equal "
                   f"{ev['stream_equal_after_injection']}); static-mode rows {ev['bad_static']}")
             COUNTS["explained_rows"] = COUNTS.get("explained_rows", 0) + (len(bad) if ev["ok"] else 0)
@@ -350,9 +553,12 @@ def _gate_stream(kind="mini3", L=17, max_new=64, mode="static", n_graphs=None, r
     COUNTS["tokens"] += len(truth)
     COUNTS["logit_rows"] += len(sha)
     COUNTS["steps"] += r["steps"]
-    print(f"  {tag}: loop == 1-row greedy ({len(truth)} tokens, {r['steps']} steps"
-          f"{f'; rows {bad} = indexer top-k tie, explained (T12-FIX)' if bad else ''})" if k is None
-          else f"  {tag}: REPORTED divergence at {k}")
+    if rowinv is not True:
+        print(f"  {tag}: REPORTED -- stream {'== greedy' if k is None else f'diverges at {k}'}, logits rows differing "
+              f"{len(bad)}/{len(sha)}{f' {bad[:8]}' if bad and rowinv else ''}")
+    else:
+        print(f"  {tag}: loop == 1-row greedy ({len(truth)} tokens, {r['steps']} steps"
+              f"{f'; rows {bad} = indexer top-k tie, explained (T12-FIX)' if bad else ''})")
     return r
 
 
@@ -477,6 +683,29 @@ def test_loop_stream_equals_greedy_static():
 def test_loop_stream_as_is_reported():
     _need_tilelang()
     _gate_stream("mini3", 17, 64, mode="static", rowinv=False)
+    # T12-FIX2 before/after: the T12 mode (F.linear + einsum per row, reductions batched) on the same prompt -- the
+    # box r2 runs showed logits row 17 (position 33) differing in it; row_invariant_mode(True) is the gated mode
+    _gate_stream("mini3", 17, 64, mode="static", rowinv="linear")
+
+
+def test_loop_reduction_row_invariance_census():
+    """T12-FIX2: the step's per-token reductions (CENSUS_SITES) at 6 rows vs the same row alone, bitwise: REPORTED
+    plain (torch's CUDA reduce picks its lanes per output from the number of outputs), GATED equal inside
+    row_invariant_mode(True). mini3's shapes and real-model-shaped ones (dim 5120, the inventory's embed width;
+    hc 4; 64 index heads over W = 1024)."""
+    _need_tilelang()
+    rows = _reduction_census(DEV, shapes={"mini3": (256, 4, 4, 256), "real-shaped": (5120, 4, 64, 1024)},
+                             trials=16)
+    for r in rows:
+        REPORT.append(f"reduction census [{r['shape']}] {r['site']}: rows differing 6-row vs 1-row plain "
+                      f"{r['plain_rows_differing']}/{r['rows']}, in row_invariant_mode {r['mode_rows_differing']}"
+                      f"/{r['rows']}")
+    bad = [r for r in rows if r["mode_rows_differing"]]
+    assert not bad, f"row_invariant_mode leaves reductions row-variant: {bad}"
+    COUNTS["gates"] += 1
+    n_plain = sum(1 for r in rows if r["plain_rows_differing"])
+    print(f"  reduction census: {len(rows)} sites; plain: {n_plain} sites row-variant at 6 rows (reported); "
+          f"row_invariant_mode: all row-invariant")
 
 
 def test_loop_forced_rejections_static():
@@ -540,14 +769,32 @@ def test_loop_stream_gemv_pinned():
 
 
 def test_loop_real():
-    """Real checkpoint, fast mode (no row-invariant mode): stream vs 1-row REPORTED; replay x2 gated."""
+    """Real checkpoint, fast mode (no row-invariant mode): stream vs 1-row REPORTED; replay x2 gated.
+
+    T12-FIX2 (box r2: the 1-row `_truth` hit a device-side `index out of bounds` in its capture warm-up): the fixture
+    is now bench/headline.py's build line for line -- DSV41_GEMV_PIN_M1 before the build, the same map
+    (`_model("real")`), set_determinism(0), the Generator on the headline impls (dg-inplace / gemv / fused / flashmla,
+    spare slots DEFAULT_SPARE_SLOTS_ROWS) and the ExpertPool pre-grown to that spare budget BEFORE any StaticStep is
+    built (the 1-row truth's own dg-inplace build is then a no-op growth, and the 6-row VerifyStep's pointer tables
+    are built on the same storage). The r2 fixture ran every impl at "ref" -- the 1-row reference-MoE graph path on
+    the real checkpoint, which nothing has run since T8 (first-light-graph-20261106, before load_mtp); the headline
+    has never exercised it. DSV41_LOOP_REAL_IMPLS=ref keeps that configuration reachable for the diagnosis
+    (run it with CUDA_LAUNCH_BLOCKING=1 to localize the faulting kernel)."""
     _need_tilelang()
     if not os.environ.get("DSV41_MODEL_DIR"):
         raise unittest.SkipTest("DSV41_MODEL_DIR not set")
-    with _model("real") as (model, pool), gemv_pin_m1():
-        from runtime.generate import Generator
+    ref_impls = os.environ.get("DSV41_LOOP_REAL_IMPLS", "headline") == "ref"
+    with gemv_pin_m1(), _model("real") as (model, pool):
+        from runtime.generate import Generator, set_determinism
+        from runtime.static_step import DEFAULT_SPARE_SLOTS_ROWS
 
-        gen = Generator(model, os.environ["DSV41_MODEL_DIR"], mode="graph", max_pos=4095)
+        det = set_determinism(0)
+        impls: dict = {} if ref_impls else dict(moe_impl="dg-inplace", fp8_impl="gemv", glue_impl="fused",
+                                                 attn_impl="flashmla", spare_slots=DEFAULT_SPARE_SLOTS_ROWS)
+        gen = Generator(model, os.environ["DSV41_MODEL_DIR"], mode="graph", max_pos=4095, **impls)
+        grown = 0
+        if not ref_impls and getattr(gen, "pool", None) is not None:
+            grown = gen.pool.add_spare_slots(DEFAULT_SPARE_SLOTS_ROWS, model)   # once, before any StaticStep
         ids = gen.encode([{"role": "user", "content": "Write a Python function that reverses a linked list."}])
         truth, _ = _truth(gen, ids, 64)
         loop = _loop(gen, 64, 2)
@@ -558,12 +805,15 @@ def test_loop_real():
             loop.close()
         assert a["token_ids"] == b["token_ids"] and a["accepts"] == b["accepts"], "real: replay differs"
         k = _first_div(a["token_ids"], truth)
-        REPORT.append(f"real: stream vs 1-row {'equal' if k is None else f'first divergence at {k}'}; "
+        REPORT.append(f"real ({'ref impls' if ref_impls else 'headline impls ' + str(impls)}; pool spare "
+                      f"{getattr(gen.pool, 'spare', None)}, +{grown / 2**30:.2f} GiB; determinism {det}): stream vs "
+                      f"1-row {'equal' if k is None else f'first divergence at {k}'}; "
                       f"{a['tokens_per_step']:.3f} tok/step; step {sum(a['step_ms']) / len(a['step_ms']):.2f} ms")
         COUNTS["gates"] += 1
 
 
-TESTS = [test_loop_stream_equals_greedy_static, test_loop_stream_as_is_reported, test_loop_forced_rejections_static,
+TESTS = [test_loop_reduction_row_invariance_census, test_loop_stream_equals_greedy_static,
+         test_loop_stream_as_is_reported, test_loop_forced_rejections_static,
          test_loop_eos_and_noop_steps_static, test_loop_graph_two_and_one_equal_static_replay_no_sync,
          test_loop_stream_gemv_pinned, test_loop_real]
 
