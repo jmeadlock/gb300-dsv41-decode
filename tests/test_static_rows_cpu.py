@@ -677,10 +677,11 @@ def rows_dg(emu, monkeypatch):
 def test_static6_dg_inplace_equals_dg_masked_emulated(rows_dg, kind, L):
     """Part B (1): the 6-row dg-inplace step == the 6-row dg-masked step, torch.equal on every row's fp32 logits,
     main_hidden and the caches (the GPU test's D row on the emulation), both P0 parities, ring wrapped; the
-    contiguous calls' contract: S = 6k blocks, each valid block's count rows tagged with its group (hot pool slot or
-    the spare slot H + u), padding and unused slots -1; the cold (spare-slot) path ran."""
+    contiguous calls' contract: 6k blocks, each valid block's count rows tagged with its group (hot pool slot or,
+    M1-T10-FIX2, the compact spare slot H + c, S = 8 spare slots), padding and unused slots -1; the cold
+    (spare-slot) path ran; no overflow."""
     from runtime.moe_rows import DGInplaceMoERows, DGMaskedMoERows
-    from runtime.static_step import StaticStep
+    from runtime.static_step import DEFAULT_SPARE_SLOTS_ROWS, StaticStep
 
     model, pool, fk, fake = rows_dg(kind)
     hid = (len(model.layers) - 1,)
@@ -688,18 +689,22 @@ def test_static6_dg_inplace_equals_dg_masked_emulated(rows_dg, kind, L):
     ids, toks = _tf_tokens(L, 6 * n, 23 + L)
     st = StaticStep(model, pool, max_pos=511, rows=6, hidden_layers=hid, moe_impl="dg-inplace", _allow_cpu=True)
     k = st.topk
-    S = 6 * k
+    B = 6 * k
+    S = min(DEFAULT_SPARE_SLOTS_ROWS, B)
     b = st.dg
-    assert pool.spare == S and b.k == S and all(isinstance(m, DGInplaceMoERows) for m in st.moes)
-    assert b.mi.shape == (S * b.align,) and st.describe()["moe_impl"] == "dg-inplace"
+    assert pool.spare == S == b.spare_limit == st.spare_slots and b.k == B
+    assert all(isinstance(m, DGInplaceMoERows) for m in st.moes)
+    assert b.mi.shape == (B * b.align,) and st.describe()["moe_impl"] == "dg-inplace"
     a_lg, a_h, a_s = _static_run(model, st, ids, toks, n)
     calls = list(fake.contig_calls)
     rc = st.routed_counts()
+    ov = st.overflow_counts()
     st.detach()
     n_layers = len(model.layers)
     assert len(calls) == 3 * n_layers * n and fk.calls["stage"] == n_layers * n and not fake.calls
+    assert ov["steps"] == 0 and ov["experts"] == 0 and ov["steps_counted"] == n
     Gs = {len(pool.hot[l]) + S for l in range(n_layers)}
-    assert all(c[0] == S * b.align and c[1] in Gs for c in calls)
+    assert all(c[0] == B * b.align and c[1] in Gs for c in calls)
     assert sum(1 for c in calls for h in c[4] if h >= c[1] - S) > 0      # cold experts went through spare slots
     assert any(h < 0 for c in calls for h in c[4])                        # unused slots (U < S) tagged -1
     m2 = StaticStep(model, pool, max_pos=511, rows=6, hidden_layers=hid, moe_impl="dg-masked", _allow_cpu=True)
@@ -746,46 +751,70 @@ def rows_glue(rows_dg, monkeypatch):
     return build
 
 
-@pytest.mark.parametrize("moe_impl", ["ref", "dg-inplace"])
-def test_fused_glue_rows_equals_ref_glue_emulated(rows_glue, monkeypatch, moe_impl):
-    """Part B (2): glue_impl fused at 6 rows -- the row-parallel clusters on (self-checked at 6 rows), every other
-    cluster n/a with a `rows=6:` reason -- == glue_impl ref at 6 rows, torch.equal (the GPU test's G row)."""
+@pytest.mark.parametrize("moe_impl,fp8_impl", [("ref", "ref"), ("dg-inplace", "ref"), ("dg-inplace", "gemv"),
+                                               ("dg-masked", "ref")])
+def test_fused_glue_rows_equals_ref_glue_emulated(rows_glue, monkeypatch, moe_impl, fp8_impl):
+    """M1-T10-PORT (the GPU test's G row on the Mac's torch mirrors): glue_impl fused at 6 rows -- EVERY cluster
+    applicable to the impls on (self-checked at 6 rows) except the two left off (fused_glue.ROWS_WHY, n/a with a
+    `rows=6:` reason) -- == glue_impl ref at 6 rows, torch.equal; one launch per cluster instance for all 6 rows."""
     from runtime import fused_glue as FG
+    from runtime import fused_glue_r2 as R2
+    from runtime import moe_rows as MR
     from runtime.static_step import StaticStep
 
     model, pool, _, _ = rows_glue("mini4")
     hid = (len(model.layers) - 1,)
     ids, toks = _tf_tokens(18, 12, 31)
-    st = StaticStep(model, pool, max_pos=255, rows=6, hidden_layers=hid, moe_impl=moe_impl, glue_impl="fused",
-                    _allow_cpu=True)
+    st = StaticStep(model, pool, max_pos=255, rows=6, hidden_layers=hid, moe_impl=moe_impl, fp8_impl=fp8_impl,
+                    glue_impl="fused", _allow_cpu=True)
     d = st.glue.describe()
-    assert set(d["on"]) == set(FG.ROWS_CLUSTERS), d["clusters"]
-    assert all(s.startswith("n/a") for c, s in d["clusters"].items() if c not in FG.ROWS_CLUSTERS), d["clusters"]
-    assert all(s.startswith("n/a: rows=6") for c, s in d["clusters"].items()
-               if c in ("hc_norm", "router", "o_rope_qdq", "kv_path", "q_path", "engram", "indexer_post"))
+    never = set(FG.ROWS_WHY)
+    if moe_impl == "ref":
+        never |= {"dg_act", "swiglu_routed", "moe_combine"}
+    if moe_impl == "dg-inplace":
+        never |= {"gather"}
+    else:                                              # M1-T10-MOE: dg_sf_pack is dg-inplace's (ported to R rows)
+        never |= {"dg_sf_pack"}
+    if fp8_impl == "ref":
+        never |= {"q_rope_epilogue", "gemv_pair", "reduce_fold"}
+    assert set(d["on"]) == set(FG.CLUSTERS) - never, d["clusters"]
+    assert all(s.startswith("n/a") for c, s in d["clusters"].items() if c in never), d["clusters"]
+    if moe_impl == "dg-inplace":   # M1-T10-MOE: on at 6 rows after its R-row self-check; the GEMMs took packed SF
+        assert d["clusters"]["dg_sf_pack"] == "on" and st.dg.sf_pack, d["clusters"]
+        assert d["calibration"]["r4"]["verify_dg_sf_pack"] == "equal", d["calibration"]
     assert all(v == "equal" for k_, v in d["calibration"].items() if k_.startswith("verify_")), d["calibration"]
+    assert all(v == "equal" for v in d["calibration"].get("r4", {}).values()), d["calibration"]
     assert d["calibration"]["hc_post"]["picked"] is not None
-    assert st.glue_note and "swiglu_shared" in st.glue_note and "rows" in st.glue.glue_line()
-    seen = {"hc": 0, "sw": 0}
-    real_hc, real_sw = FG.launch_hc_post, FG.launch_swiglu_quant
+    assert st.glue_note and "hc_norm" in st.glue_note and "rows 6" in st.glue.glue_line()
+    names = {FG: ["launch_hc_post", "launch_swiglu_quant", "launch_o_rope_qdq", "launch_act_quant_bcast",
+                  "launch_moe_combine"],
+             R2: ["launch_hc_norm", "launch_norm_row", "launch_router_post", "launch_engram_gate",
+                  "launch_topk_post"],
+             MR: ["dedup_fused"]}
+    seen = {n: 0 for ns in names.values() for n in ns}
+    for mod, ns in names.items():
+        for n in ns:
+            real = getattr(mod, n)
 
-    def hc(*a, **k):
-        seen["hc"] += 1
-        return real_hc(*a, **k)
-
-    def sw(*a, **k):
-        seen["sw"] += 1
-        return real_sw(*a, **k)
-
-    monkeypatch.setattr(FG, "launch_hc_post", hc)
-    monkeypatch.setattr(FG, "launch_swiglu_quant", sw)
+            def wrap(*a, _real=real, _n=n, **k):
+                seen[_n] += 1
+                return _real(*a, **k)
+            monkeypatch.setattr(mod, n, wrap)
     f_lg, f_h, f_s = _static_run(model, st, ids, toks, 2)
-    n_layers = len(model.layers)
-    assert seen == {"hc": 2 * 2 * n_layers, "sw": 2 * n_layers}, seen   # one launch per instance for all 6 rows
+    L = len(model.layers)
+    n_eng = sum(l.engram is not None for l in model.layers)
+    n_idx = sum(l.attn.is_index_source for l in model.layers)
+    dg = moe_impl != "ref"
+    want = {"launch_hc_post": 2 * 2 * L, "launch_swiglu_quant": 2 * L * (2 if dg else 1), "launch_o_rope_qdq": 2 * L,
+            "launch_act_quant_bcast": 2 * L if dg else 0, "launch_moe_combine": 2 * L if dg else 0,
+            "launch_hc_norm": 2 * (2 * L + 1), "launch_norm_row": 2 * 2 * L, "launch_router_post": 2 * L,
+            "launch_engram_gate": 2 * n_eng, "launch_topk_post": 2 * n_idx, "dedup_fused": 2 * L}
+    assert seen == want, seen                          # per step: one launch per instance for all 6 rows
     st.detach()
-    ref = StaticStep(model, pool, max_pos=255, rows=6, hidden_layers=hid, moe_impl=moe_impl, _allow_cpu=True)
+    ref = StaticStep(model, pool, max_pos=255, rows=6, hidden_layers=hid, moe_impl=moe_impl, fp8_impl=fp8_impl,
+                     _allow_cpu=True)
     r_lg, r_h, r_s = _static_run(model, ref, ids, toks, 2)
-    _assert_rows_equal(f_lg, r_lg, f"6-row fused glue vs ref glue ({moe_impl})")
+    _assert_rows_equal(f_lg, r_lg, f"6-row fused glue vs ref glue ({moe_impl}, {fp8_impl})")
     assert all(torch.equal(x, y) for x, y in zip(f_h, r_h))
     for k_ in r_s:
         assert torch.equal(f_s[k_], r_s[k_]), k_
@@ -831,14 +860,26 @@ def test_first_light_rows_accepts_dg_inplace_and_fused_glue(rows_glue, tmp_path,
     assert rc == 0 and not report["errors"], report["errors"]
     assert rm["moe_impl_rows"] == "dg-inplace" and "step_cell_r1_rows_moe" not in rm
     assert rm["static"]["moe_impl"] == "dg-inplace" and rm["static"]["glue_effective"] == "fused"
-    assert set(rm["glue_rows_on"]) == set(FG.ROWS_CLUSTERS) and rm["dg_rows"]["spare_slots"] == 6 * 4
+    assert set(rm["glue_rows_on"]) == set(FG.ROWS_CLUSTERS) - {"gather", "q_rope_epilogue", "gemv_pair", "reduce_fold"}
+    assert rm["dg_rows"]["spare_slots"] == 16                 # M1-T10-PORT default (min(16, R*k = 24))
+    assert rm["dg_rows"]["spare_limit"] == 16 and rm["static"]["spare_slots"] == 16
+    # M1-T10-FIX2 (3): the builds' records -- the 1-row dg-inplace build grew the pool to topk = 4 spare slots, the
+    # 6-row build to 16 (12 more per layer, M1-T10-PORT); (2): no overflow in any 6-row step
+    b1, br = rm["build_1row"], rm["build_rows"]
+    per = sum(n_ * (k_ // 2) for n_, k_ in pool.proj_nk.values())
+    assert b1["spare_slots"] == 4 and b1["spare_added_B"] == pool.n_layers * 4 * per and b1["spare_limit"] is None
+    assert br["spare_slots"] == 16 and br["spare_added_B"] == pool.n_layers * 12 * per and br["spare_limit"] == 16
+    assert rm["overflow"]["steps"] == 0 and rm["overflow"]["spare_slots"] == 16 and rm["overflow"]["steps_counted"] > 0
     assert rm["self_replay"][2]["identical"] == rm["self_replay"][2]["n"] == 2
     assert rm["step_cell_rows"]["n_steps"] == 2 and rm["step_cell_rows"]["r6_over_r1"] > 0
     out = capsys.readouterr().out
     assert "[glue] fused: rows 6" in out
+    assert "[hbm] 1-row build (moe dg-inplace)" in out and "[hbm] 6-row build (moe dg-inplace, spare budget 16)" in out
+    assert "[overflow] 6-row dg-inplace: 0/" in out
     lines = out.strip().splitlines()
     assert lines[-12].startswith("FIRST LIGHT d | rows 6 teacher-forced | mode static | moe dg-inplace (rows: dg-inplace)")
     assert "glue fused (rows: " in lines[-12]
+    assert "| overflow steps: 0 (0 experts, spare 16/layer) |" in lines[-1] and "HBM after build: 1-row" in lines[-1]
     print("\n".join(lines[-12:]))
 
 
@@ -898,9 +939,21 @@ def test_gpu_test_d_g_rows_dry_run_on_cpu(rows_glue, monkeypatch, capsys):
     monkeypatch.setattr(G, "_need_tilelang", lambda: None)
     monkeypatch.setattr(G, "_model", model_cpu)
     monkeypatch.setattr(G, "FAST", dict(moe_impl="dg-masked", fp8_impl=None, glue_impl="fused", attn_impl=None))
+    real = sys.modules["deep_gemm"].m_grouped_fp8_fp4_gemm_nt_contiguous
+
+    def finite_skips(a, b, d, m_indices, **kw):  # the forced-overflow case: skipped blocks finite, as on the GPU
+        real(a, b, d, m_indices, **kw)
+        d.nan_to_num_(0.0)
+
     G.test_static6_dg_inplace_equals_dg_masked()
     G.test_static6_fused_glue_equals_ref_glue()
+    monkeypatch.setattr(sys.modules["deep_gemm"], "m_grouped_fp8_fp4_gemm_nt_contiguous", finite_skips)
+    G.test_static6_dg_inplace_forced_overflow_trips_counter()
     out = capsys.readouterr().out
-    assert out.count("6-row dg-inplace == dg-masked") == 2 and out.count("== ref glue") == 2, out
-    assert G.COUNTS["gates"] == 4 and G.COUNTS["logit_rows"] == 4 * 24, G.COUNTS
+    n_off = len(G._rows_expected_on("dg-inplace", "ref"))    # M1-T10-PORT: the G row's each-cluster-alone-off runs
+    assert out.count("6-row dg-inplace == dg-masked") == 2 and out.count("== ref glue") == 3, out
+    assert f"each of {n_off} clusters alone off == ref glue" in out and "all equal" in out, out
+    assert "(budget 8)" in out and "overflow steps 0" in out and "overflow S=1: eager " in out, out
+    assert G.COUNTS["gates"] == 5 + n_off and G.COUNTS["logit_rows"] == (4 + n_off) * 24, G.COUNTS
+    assert G.COUNTS["g_clusters"] > 0, G.COUNTS
     print(out)

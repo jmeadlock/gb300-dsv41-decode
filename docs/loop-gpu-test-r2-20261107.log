@@ -1,0 +1,157 @@
+Traceback (most recent call last):
+  File "/work/tests/gpu/test_dspark_loop_gpu.py", line 577, in <module>
+    t()
+  File "/work/tests/gpu/test_dspark_loop_gpu.py", line 473, in test_loop_stream_equals_greedy_static
+    _gate_stream("mini3", 17, 64, mode="static")
+  File "/work/tests/gpu/test_dspark_loop_gpu.py", line 347, in _gate_stream
+    assert ev["ok"], f"{tag}: logits rows {bad[:8]} differ from the 1-row step and are NOT explained by an " \
+           ~~^^^^^^
+AssertionError: mini3 L=17 mode=static row-invariant : logits rows [17] differ from the 1-row step and are NOT explained by an indexer top-k tie: {'ok': False, 'bad_requested': [17], 'bad_static': [17], 'rows': [{'row': 17, 'pos': 33, 'clen': 17, 'k': 16, 'verify_row': 0, 'gap_k_k1': 0.0, 'kth': 0.0, 'score_bits_equal': True, 'max_score_diff': 0.0, 'sel_equal': True, 'only_1row': [], 'only_6row': [], 'tie': True}], 'bad_after_injection': [17], 'stream_equal_after_injection': True}
+FAIL test_loop_stream_equals_greedy_static (26.4s)
+  mini3 L=17 mode=static as-is : REPORTED divergence at 6
+PASS test_loop_stream_as_is_reported (8.9s)
+  mini3 L=17 mode=static: forced rejections, 14 steps, accept hist [3, 2, 2, 2, 2, 3], positions 17..65: stream == greedy, 47 logit rows == 1-row
+  mini3 L=250 mode=static: forced rejections, 15 steps, accept hist [3, 2, 2, 2, 2, 4], positions 250..304: stream == greedy, 55 logit rows == 1-row
+PASS test_loop_forced_rejections_static (4.5s)
+  mini3 L=19: EOS 1182 at token 17: loop stops there (finish stop, 17 live steps of 32 issued); 3 steps after done change nothing
+PASS test_loop_eos_and_noop_steps_static (3.7s)
+Traceback (most recent call last):
+  File "/work/tests/gpu/test_dspark_loop_gpu.py", line 577, in <module>
+    t()
+  File "/work/tests/gpu/test_dspark_loop_gpu.py", line 496, in test_loop_graph_two_and_one_equal_static_replay_no_sync
+    _gate_stream("mini3", 17, 64, mode="graph", n_graphs=ng)
+  File "/work/tests/gpu/test_dspark_loop_gpu.py", line 347, in _gate_stream
+    assert ev["ok"], f"{tag}: logits rows {bad[:8]} differ from the 1-row step and are NOT explained by an " \
+           ~~^^^^^^
+AssertionError: mini3 L=17 mode=graph/2g row-invariant : logits rows [17] differ from the 1-row step and are NOT explained by an indexer top-k tie: {'ok': False, 'bad_requested': [17], 'bad_static': [17], 'rows': [{'row': 17, 'pos': 33, 'clen': 17, 'k': 16, 'verify_row': 0, 'gap_k_k1': 0.0, 'kth': 0.0, 'score_bits_equal': True, 'max_score_diff': 0.0, 'sel_equal': True, 'only_1row': [], 'only_6row': [], 'tie': True}], 'bad_after_injection': [17], 'stream_equal_after_injection': True}
+FAIL test_loop_graph_two_and_one_equal_static_replay_no_sync (10.9s)
+Traceback (most recent call last):
+  File "/work/tests/gpu/test_dspark_loop_gpu.py", line 577, in <module>
+    t()
+  File "/work/tests/gpu/test_dspark_loop_gpu.py", line 538, in test_loop_stream_gemv_pinned
+    _gate_stream("mini3", 17, 64, mode="graph", n_graphs=2, pin=True, fp8_impl="gemv")
+  File "/work/tests/gpu/test_dspark_loop_gpu.py", line 347, in _gate_stream
+    assert ev["ok"], f"{tag}: logits rows {bad[:8]} differ from the 1-row step and are NOT explained by an " \
+           ~~^^^^^^
+AssertionError: mini3 L=17 mode=graph/2g row-invariant gemv-pinned {'fp8_impl': 'gemv'}: logits rows [17] differ from the 1-row step and are NOT explained by an indexer top-k tie: {'ok': False, 'bad_requested': [17], 'bad_static': [17], 'rows': [{'row': 17, 'pos': 33, 'clen': 17, 'k': 16, 'verify_row': 0, 'gap_k_k1': 0.0, 'kth': 0.0, 'score_bits_equal': True, 'max_score_diff': 0.0, 'sel_equal': True, 'only_1row': [], 'only_6row': [], 'tie': True}], 'bad_after_injection': [17], 'stream_equal_after_injection': True}
+FAIL test_loop_stream_gemv_pinned (12.4s)
+[transformers] You are using a model of type `deepseek_v41` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+/__w/pytorch/pytorch/aten/src/ATen/native/cuda/IndexKernel.cu:111: operator(): block: [0,0,0], thread: [0,0,0] Assertion `-sizes[i] <= index && index < sizes[i] && "index out of bounds"` failed.
+Traceback (most recent call last):
+  File "/work/tests/gpu/test_dspark_loop_gpu.py", line 168, in _model
+    yield model, res.pool
+  File "/work/tests/gpu/test_dspark_loop_gpu.py", line 552, in test_loop_real
+    truth, _ = _truth(gen, ids, 64)
+               ^^^^^^^^^^^^^^^^^^^^
+  File "/work/tests/gpu/test_dspark_loop_gpu.py", line 198, in _truth
+    gen.greedy(ids, n, stop_on_eos=stop_on_eos)
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/work/runtime/generate.py", line 640, in greedy
+    self._ensure_captured()
+  File "/work/runtime/generate.py", line 488, in _ensure_captured
+    self.capture()  # before the real prefill: capture prefills a dummy prompt and runs warm-up steps
+    ^^^^^^^^^^^^^^
+  File "/work/runtime/generate.py", line 484, in capture
+    return self.static_step().capture(fills=fills)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/runtime/static_step.py", line 1167, in capture
+    self.forward_static(parity_of(p))
+  File "/work/runtime/static_step.py", line 1072, in forward_static
+    self._body(int(parity) & 1 if self.rows == 1 else 0)
+  File "/work/runtime/static_step.py", line 1044, in _body
+    h, pre_mix = self._block(layer, h, pre_mix, parity)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/runtime/static_step.py", line 978, in _block
+    x = self._ffn(layer, x)
+        ^^^^^^^^^^^^^^^^^^^
+  File "/work/runtime/static_step.py", line 998, in _ffn
+    return layer.ffn(x, None)
+           ^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1789, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/runtime/patches.py", line 92, in forward
+    return st(x)  # design #14 (model.py:891-906); M1-T10: the step's R rows
+           ^^^^^
+  File "/work/runtime/static_step.py", line 380, in __call__
+    y += ex(x, w[j].view(1, 1))                                # model.py:902 (1 row: idx = [0])
+         ^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1789, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/reference/deepseek-inference/model.py", line 853, in forward
+    return self.w2(x.to(dtype))
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1789, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/reference/deepseek-inference/model.py", line 243, in forward
+    return linear(x, self.weight, self.bias)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/runtime/patches.py", line 191, in linear
+    return orig(x, weight, bias)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/work/reference/deepseek-inference/model.py", line 187, in linear
+    x, s = act_quant(x, fp8_block_size, scale_fmt, scale_dtype)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/reference/deepseek-inference/kernel.py", line 120, in act_quant
+    kernel(z.view(-1, N), y.view(-1, N), s.view(-1, N // block_size))
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py", line 202, in __call__
+    return self.torch_function(*args, **kwds)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/jit/adapter/tvm_ffi.py", line 287, in func
+    executable(*tensor_list)
+  File "/usr/local/lib/python3.12/dist-packages/tvm_ffi/module.py", line 299, in __call__
+    return self.main(*args)
+           ^^^^^^^^^^^^^^^^
+  File "python/tvm_ffi/cython/function.pxi", line 968, in tvm_ffi.core.Function.__call__
+  File "<unknown>", line 0, in __tvm_ffi_main
+  File "<unknown>", line 0, in __tvm_ffi_act_quant_kernel_
+  File "/project/3rdparty/tvm/src/runtime/cuda/cuda_module.cc", line 367, in void tvm::runtime::CUDAWrappedFunc::operator()(tvm::ffi::PackedArgs, tvm::ffi::Any*, void**) const
+tvm.error.InternalError: CUDALaunch Error: CUDA_ERROR_ASSERT
+ grid=(1,72,1),  block=(128,1,1) dyn_smem_bytes=2048
+
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/work/tests/gpu/test_dspark_loop_gpu.py", line 577, in <module>
+    t()
+  File "/work/tests/gpu/test_dspark_loop_gpu.py", line 547, in test_loop_real
+    with _model("real") as (model, pool), gemv_pin_m1():
+  File "/usr/lib/python3.12/contextlib.py", line 158, in __exit__
+    self.gen.throw(value)
+  File "/work/tests/gpu/test_dspark_loop_gpu.py", line 172, in _model
+    torch.cuda.synchronize()
+  File "/usr/local/lib/python3.12/dist-packages/torch/cuda/__init__.py", line 1219, in synchronize
+    return torch._C._cuda_synchronize()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch.AcceleratorError: CUDA error: device-side assert triggered
+Search for `cudaErrorAssert' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+
+[load] 96085 tensors in 48 shards, map /work/docs/maps/hot-v26ar-seed-295.json, config /ref/inference/config.json
+[load] linears with scale: 46370; wo_a dequantized: 40; widened: ['layers.14.attn.compressor.wgate.weight', 'layers.14.attn.compressor.wkv.weight', 'layers.2.attn.compressor.wgate.weight', 'layers.2.attn.compressor.wkv.weight', 'layers.8.attn.compressor.wgate.weight', 'layers.8.attn.compressor.wkv.weight', 'head.weight']
+[load-mtp] 3 stages, 2395 tensors, HBM 7.543 GiB (expert stacks 6.724, other 0.820); linears with scale 1174; wo_a dequantized 3; widened ['mtp.2.confidence_head.proj.weight', 'mtp.2.markov_head.head.weight']
+FAIL test_loop_real (65.6s)
+  note: mini3 L=17 mode=static row-invariant : 64 tokens, 63 steps, 1.000 tok/step, stream == greedy, logits rows differing 1/64
+  note: mini3 L=17 mode=static row-invariant : T12-FIX rows [17] explained=False: row 17 pos 33: clen 17 > k 16, k-th score 0.0, gap k/k+1 0.0, 6-row vs 1-row scores bit-equal True (max |d| 0.0), dropped only by 6-row [] / only by 1-row []; rows differing after injecting the 1-row selections: [17] (stream equal True); static-mode rows [17]
+  note: mini3 L=17 mode=static as-is : 64 tokens, 63 steps, 1.000 tok/step, stream diverges at 6, logits rows differing 63/64
+  note: mini3 L=17 mode=graph/2g row-invariant : 64 tokens, 63 steps, 1.000 tok/step, stream == greedy, logits rows differing 1/64
+  note: mini3 L=17 mode=graph/2g row-invariant : T12-FIX rows [17] explained=False: row 17 pos 33: clen 17 > k 16, k-th score 0.0, gap k/k+1 0.0, 6-row vs 1-row scores bit-equal True (max |d| 0.0), dropped only by 6-row [] / only by 1-row []; rows differing after injecting the 1-row selections: [17] (stream equal True); static-mode rows [17]
+  note: mini3 L=17 mode=graph/2g row-invariant gemv-pinned {'fp8_impl': 'gemv'}: 64 tokens, 63 steps, 1.000 tok/step, stream == greedy, logits rows differing 1/64
+  note: mini3 L=17 mode=graph/2g row-invariant gemv-pinned {'fp8_impl': 'gemv'}: T12-FIX rows [17] explained=False: row 17 pos 33: clen 17 > k 16, k-th score 0.0, gap k/k+1 0.0, 6-row vs 1-row scores bit-equal True (max |d| 0.0), dropped only by 6-row [] / only by 1-row []; rows differing after injecting the 1-row selections: [17] (stream equal True); static-mode rows [17]
+comparisons executed: {'gates': 4, 'tokens': 64, 'logit_rows': 166, 'steps': 63, 'forced_steps': 29, 'graph': 0, 'explained_rows': 0}
+3/7 not failed; 4 failed

@@ -80,10 +80,13 @@ runtime/residency.py ResidencyManager on the static step: built before the Stati
 after (it owns the pointer tables), `after_step()` after every static/graph step (hit counter, publish, drain every
 drain_n steps, one swap barrier) -- all between replays, outside the graph; `reset_static` restores the boot placement
 and closes it. The logits do not depend on it (bytes are the checkpoint's wherever they live); `last_meta["residency"]`
-counts a greedy call's swaps.
+counts a greedy call's swaps. At R rows (dg-inplace) the manager is sized from the step's compact-cold-index budget
+(`spare_slots`, default 16) and its headroom calc follows the rows; `step_rows` / `teacher_forced` call `after_step()`
+and runtime/dspark_loop.py calls it after every loop step (see docs/A2-2-BOX-PLAN.md).
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import importlib.util
 import json
@@ -298,7 +301,7 @@ class Generator:
                  mode: str = "eager", max_pos: Optional[int] = None, marker: bool = False,
                  static_counters: bool = True, static_factory: Optional[Callable] = None, moe_impl: str = "ref",
                  fp8_impl: str = "ref", glue_impl: str = "ref", attn_impl: str = "ref", glue_approx: bool = False,
-                 rows: int = 1, hidden_layers: Sequence[int] = (), residency=None):
+                 rows: int = 1, hidden_layers: Sequence[int] = (), spare_slots: Optional[int] = None, residency=None):
         self.model = model
         self.tokenizer_dir = tokenizer_dir
         self.tokenizer = tokenizer if tokenizer is not None else (load_tokenizer(tokenizer_dir) if tokenizer_dir else None)
@@ -329,6 +332,10 @@ class Generator:
         self.marker = bool(marker)
         self.static_counters = bool(static_counters)
         self.static_factory = static_factory
+        # M1-T12 hooks (runtime/dspark_loop.py): the class the default build uses (None = StaticStep; the loop sets
+        # dspark_loop.VerifyStep) and extra constructor kwargs (CPU tests: {"_allow_cpu": True})
+        self.static_cls = None
+        self.static_kw: dict = {}
         self.static = None  # runtime.static_step.StaticStep (or the factory's stand-in), built on first use
         self._static_max_pos = max_pos
         self._marker_ctr = None
@@ -348,6 +355,10 @@ class Generator:
         self.hidden_layers = tuple(int(i) for i in hidden_layers)
         self.main_hidden: Optional[torch.Tensor] = None  # the last R-row step's main_hidden (step_rows)
         self.set_rows(rows)
+        # M1-T10-FIX2: spare slots per layer of the R-row dg-inplace step (None: StaticStep's default, 8); used only
+        # at rows > 1 with moe_impl dg-inplace (the 1-row dg-inplace step always uses topk)
+        self.spare_slots: Optional[int] = None
+        self.set_spare_slots(spare_slots)
         # A2-2: adaptive residency (runtime/residency.py) on the static step's pointer tables; None = off
         self.residency = None
         self.residency_mgr = None
@@ -432,7 +443,7 @@ class Generator:
 
     def _residency_build(self):
         """The ResidencyManager for the step about to be built (grows the pool's weight storage first)."""
-        from runtime.residency import ResidencyManager, n_stage_for
+        from runtime.residency import ResidencyManager, n_stage_for, sf_store_for
 
         if self.pool is None:
             raise ValueError("residency needs the model's ExpertPool (model.runtime_load.pool)")
@@ -440,8 +451,30 @@ class Generator:
         if old is not None and old.st is None:  # orphan of a build that failed before attach
             old.close()
         topk = int(self.model.layers[0].ffn.n_activated_experts)
-        return ResidencyManager(self.pool, self.model, self.residency,
-                                n_stage=n_stage_for(self.moe_impl, self.rows, topk))
+        # R-row dg-inplace: the step's staging slots are its compact-cold-index budget S (M1-T10-FIX2), not R*topk
+        spare = self.spare_slots if (self.rows > 1 and self.moe_impl == "dg-inplace") else None
+        cfg = self.residency
+        if cfg.kv_rows < self.rows:   # the KV reservation of the headroom calc follows the step's rows (~150 MB each)
+            cfg = dataclasses.replace(cfg, kv_rows=self.rows)
+        return ResidencyManager(self.pool, self.model, cfg,
+                                n_stage=n_stage_for(self.moe_impl, self.rows, topk, spare),
+                                sf_store=sf_store_for(self.moe_impl, self.rows))
+
+    def _spare_kw(self) -> dict:
+        """M1-T10-FIX2: {"spare_slots": n} for the R-row dg-inplace build, {} otherwise."""
+        if self.rows > 1 and self.moe_impl == "dg-inplace" and self.spare_slots is not None:
+            return {"spare_slots": self.spare_slots}
+        return {}
+
+    def set_spare_slots(self, n: Optional[int]) -> None:
+        """M1-T10-FIX2: the R-row dg-inplace step's spare-slot budget (None = StaticStep's default). A change that
+        affects the current build drops the StaticStep."""
+        n = None if n is None else int(n)
+        if n is not None and n < 1:
+            raise ValueError(f"spare_slots {n} < 1")
+        if n != self.spare_slots and self.static is not None and self.rows > 1 and self.moe_impl == "dg-inplace":
+            self.reset_static()
+        self.spare_slots = n
 
     @property
     def max_pos(self) -> int:
@@ -469,15 +502,18 @@ class Generator:
                         kw["glue_opts"] = {"approx": True}
                 if self.attn_impl != "ref":
                     kw["attn_impl"] = self.attn_impl
+                kw.update(self._spare_kw())
                 self.static = self.static_factory(self.model, **kw)
             else:
                 from runtime.static_step import StaticStep
 
-                self.static = StaticStep(self.model, self.pool, max_pos=self._static_max_pos, marker=self.marker,
-                                         counters=self.static_counters, moe_impl=self.moe_impl,
-                                         fp8_impl=self.fp8_impl, glue_impl=self.glue_impl,
-                                         glue_opts={"approx": True} if self.glue_approx else None,
-                                         attn_impl=self.attn_impl, rows=self.rows, hidden_layers=self.hidden_layers)
+                cls = self.static_cls or StaticStep
+                self.static = cls(self.model, self.pool, max_pos=self._static_max_pos, marker=self.marker,
+                                  counters=self.static_counters, moe_impl=self.moe_impl,
+                                  fp8_impl=self.fp8_impl, glue_impl=self.glue_impl,
+                                  glue_opts={"approx": True} if self.glue_approx else None,
+                                  attn_impl=self.attn_impl, rows=self.rows, hidden_layers=self.hidden_layers,
+                                  **self._spare_kw(), **self.static_kw)
             if rm is not None:  # A2-2: the manager owns the new step's pointer tables from here on
                 try:
                     rm.attach(self.static)

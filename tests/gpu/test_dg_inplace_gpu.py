@@ -110,7 +110,9 @@ def _layer(H, S, N, KH, KS, E, cold_host=True, seed=0):
                 gtab=gtab.cuda(), reg=reg)
 
 
-def _stage_case(N, KH, KS, all_scales, cold_host):
+def _stage_case(N, KH, KS, all_scales, cold_host, spare=None):
+    """spare (M1-T10-FIX2): the 6-row step's sidx path -- compact cold index over the 6 slots, `spare` spare slots
+    (< 3 cold: the overflow guard and counter), kernel vs contract incl. the counter."""
     from runtime import dg_inplace as DI
     from runtime.static_kernels import stage_inplace
 
@@ -122,20 +124,33 @@ def _stage_case(N, KH, KS, all_scales, cold_host):
         sf = {p: DI.packed_sf_zeros(H + S, N[p], C[p], "cuda") for p in DI.PROJS}
         dsts = [L["full"][p] for p in DI.PROJS] + [sf[p] for p in DI.PROJS]
         dtab = torch.tensor([t.data_ptr() for t in dsts], dtype=torch.int64, device="cuda")
-        ids = torch.tensor(sorted(L["hot"][:3] + L["cold"][:3]), dtype=torch.int64, device="cuda")
+        idl = sorted(L["hot"][:3] + L["cold"][:3])
+        ids = torch.tensor(idl, dtype=torch.int64, device="cuda")
         mi = torch.full((S * A,), -1, dtype=torch.int32, device="cuda")
         ids_out = torch.zeros(S, dtype=torch.int64, device="cuda")
         args = (L["ptab"], ids, L["gtab"], dtab, dsts, mi, H, A, N["w1"] * KH["w1"],
                 ((N["w1"], C["w1"]), (N["w2"], C["w2"])), all_scales, ids_out)
+        kw, ovf = {}, None
+        if spare is not None:
+            cold = set(L["cold"])
+            cs = [-1] * len(idl)
+            n = 0
+            for j, e in enumerate(idl):
+                if e in cold:
+                    cs[j], n = n, n + 1
+            ovf = torch.zeros(1, dtype=torch.int32, device="cuda")
+            kw = {"sidx": torch.tensor(cs, dtype=torch.int64, device="cuda"), "spare": spare, "ovf": ovf}
         if kernel:
-            stage_inplace(*args)
+            stage_inplace(*args, **kw)
         else:
             reg = L["reg"]
-            DI.stage_inplace_emulated(lambda a: reg[a].cuda(), *args)
+            DI.stage_inplace_emulated(lambda a: reg[a].cuda(), *args, **kw)
         torch.cuda.synchronize()
-        outs.append([t.clone() for t in dsts] + [mi, ids_out])
+        outs.append([t.clone() for t in dsts] + [mi, ids_out] + ([ovf] if ovf is not None else []))
     bad = [i for i, (a, b) in enumerate(zip(*outs)) if not torch.equal(a, b)]
-    assert not bad, ("stage kernel vs contract", N, KH, all_scales, cold_host, bad)
+    assert not bad, ("stage kernel vs contract", N, KH, all_scales, cold_host, spare, bad)
+    if spare is not None:
+        assert int(outs[0][-1]) == max(0, 3 - spare), (spare, int(outs[0][-1]))
 
 
 def test_stage_kernel_equals_contract_real_rows():
@@ -146,6 +161,18 @@ def test_stage_kernel_equals_contract_real_rows():
     for all_scales in (True, False):
         _stage_case(N, KH, KS, all_scales, cold_host=True)
     print("  t9a2_stage_inplace == contract: real rows (EVEN path), pinned-host cold sources, both scale modes")
+
+
+def test_stage_kernel_sidx_equals_contract_real_rows():
+    """M1-T10-FIX2: the sidx path (compact cold index, overflow guard + counter) on real row sizes."""
+    _need_dg()
+    N = {"w1": 2304, "w3": 2304, "w2": 5120}
+    KH = {"w1": 2560, "w3": 2560, "w2": 1152}
+    KS = {"w1": 160, "w3": 160, "w2": 72}
+    for all_scales in (True, False):
+        for spare in (6, 3, 2, 1):
+            _stage_case(N, KH, KS, all_scales, cold_host=True, spare=spare)
+    print("  t9a2_stage_inplace (sidx) == contract: compact cold index, spare 6/3/2/1 (overflow 0/0/1/2 counted)")
 
 
 def test_stage_kernel_equals_contract_odd_rows():
@@ -407,6 +434,7 @@ def test_inplace_graph_step_cell_informative():
 
 
 TESTS = [test_pack_sf_equals_deepgemm_packing, test_stage_kernel_equals_contract_real_rows,
+         test_stage_kernel_sidx_equals_contract_real_rows,
          test_stage_kernel_equals_contract_odd_rows, test_contiguous_vs_masked_synthetic_bytes,
          test_contiguous_vs_masked_real_layer0_bytes, test_inplace_static_selfreplay_mini,
          test_inplace_static_selfreplay_mini4, test_inplace_graph_equals_static_mini,

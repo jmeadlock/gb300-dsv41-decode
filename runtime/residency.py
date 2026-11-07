@@ -57,6 +57,7 @@ from __future__ import annotations
 import hashlib
 import math
 import mmap
+import os
 import sys
 from collections import deque
 from dataclasses import asdict, dataclass, fields
@@ -127,27 +128,89 @@ class ResidencyConfig:
         return asdict(self)
 
 
-def n_stage_for(moe_impl: str, rows: int, topk: int) -> int:
+def n_stage_for(moe_impl: str, rows: int, topk: int, spare_slots: Optional[int] = None) -> int:
     """Staging slots the StaticStep appends to every layer's weight pool (runtime/static_step.py `_build_moe`):
-    dg-inplace stages cold experts at H + j, j < topk * rows; ref and dg-masked stage into their own buffers."""
-    return int(topk) * int(rows) if moe_impl == "dg-inplace" else 0
+    dg-inplace stages cold experts at H + c; ref and dg-masked stage into their own buffers (0).
+      1 row   : c < topk (cold slot j -> H + j).
+      R rows  : c < S = the compact cold index budget (M1-T10-FIX2), S = `spare_slots` or static_step's
+                DEFAULT_SPARE_SLOTS_ROWS (16), capped at R * topk (StaticStep: `min(S, ns)`). The residency slots
+                start at H + S, after the staging slots the dedup kernel addresses (never H + R*topk = 36)."""
+    if moe_impl != "dg-inplace":
+        return 0
+    if int(rows) <= 1:
+        return int(topk)
+    if spare_slots is None:
+        from runtime.static_step import DEFAULT_SPARE_SLOTS_ROWS as spare_slots
+    return min(int(spare_slots), int(topk) * int(rows))
+
+
+def sf_store_for(moe_impl: str, rows: int) -> Optional[str]:
+    """Where the dg-inplace step keeps the packed scale factors of the HBM-resident experts (runtime/dg_inplace.py):
+    "step" (the staging launch re-packs them every step from the pointer tables), or "pool" / "resident" (packed
+    once; the manager must write a promoted expert's packed SF itself). None: not dg-inplace. This is the REQUESTED
+    store (env / defaults, as StaticStep reads them); `attach` re-reads the one the build ended up with."""
+    if moe_impl != "dg-inplace":
+        return None
+
+    from runtime import dg_inplace as DI
+
+    if int(rows) > 1:
+        return os.environ.get(DI.ROWS_SF_STORE_ENV) or DI.ROWS_SF_STORE_DEFAULT
+    return os.environ.get(DI.SF_STORE_ENV, "step")
+
+
+def add_cli_args(ap) -> None:
+    """The --residency* flags (bench/headline.py; bench/first_light.py declares the same names itself)."""
+    ap.add_argument("--residency", choices=["off", "on"], default="off",
+                    help="A2-2: host-side swap policy (m3 v26 core) on the static/graph step's pointer tables")
+    ap.add_argument("--residency-drain", type=int, default=64, help="host steps between counter drains")
+    ap.add_argument("--residency-swaps-per-drain", type=int, default=2)
+    ap.add_argument("--residency-hyst", type=float, default=1.5)
+    ap.add_argument("--residency-min-abs", type=float, default=8.0)
+    ap.add_argument("--residency-halflife", type=float, default=500.0)
+    ap.add_argument("--residency-cap", type=int, default=4, help="swaps applied per step (swaps_per_barrier)")
+    ap.add_argument("--residency-spare", type=int, default=None, help="spare HBM slots/layer (default: headroom calc)")
+    ap.add_argument("--residency-demote", type=int, default=64, help="Grace demotion slots/layer")
+    ap.add_argument("--residency-reserve-gib", type=float, default=8.0, help="HBM held back in the headroom calc")
+    ap.add_argument("--residency-frozen", action="store_true", help="count + drain, never swap (frozen-map arm)")
+    ap.add_argument("--residency-force-random", type=int, default=0, help="forced random swaps per step (T-R1)")
+
+
+def config_from_args(a) -> Optional[dict]:
+    """--residency on -> ResidencyConfig fields (None = off); the inverse of add_cli_args."""
+    if getattr(a, "residency", "off") != "on":
+        return None
+    return {"drain_n": a.residency_drain, "swaps_per_drain": a.residency_swaps_per_drain, "hyst": a.residency_hyst,
+            "min_abs": a.residency_min_abs, "halflife": a.residency_halflife, "swaps_per_barrier": a.residency_cap,
+            "n_spare": a.residency_spare, "n_demote": a.residency_demote, "reserve_gib": a.residency_reserve_gib,
+            "frozen": bool(a.residency_frozen), "force_random": a.residency_force_random}
 
 
 def spare_budget(free_bytes: Optional[int], n_layers: int, expert_bytes: int, weight_bytes: int, *, n_stage_new: int,
-                 reserve_gib: float, kv_rows: int, kv_ctx: int) -> dict:
+                 reserve_gib: float, kv_rows: int, kv_ctx: int, step_extra_bytes: int = 0,
+                 sf_group_bytes: int = 0, prepaid_bytes: int = 0) -> dict:
     """HBM headroom -> affordable spare slots per layer. free_bytes = free HBM when the manager is built (before the
     StaticStep build); minus the staging slots this manager is about to allocate for the step, the KV reservation
     (docs/LEDGER.md: ~150 MB per row at 32K) and a reserve for capture / workspaces [A]; one spare slot costs one
-    expert (weights + scales) in every layer."""
+    expert (weights + scales) in every layer. A2-2 rebase: `step_extra_bytes` = what the StaticStep build allocates
+    AFTER the manager (the R-row dg-inplace step's pool-owned packed-SF copy, 12.8 GiB at 16 spare slots, plus the
+    headroom its build insists on, else it falls back to the slower "step" store and the A/B is confounded);
+    `sf_group_bytes` = the packed SF one more pool group adds in that copy (one spare slot = +1 group per layer);
+    `prepaid_bytes` = weight slots already in HBM beyond the step's staging (a caller that grew the pool once up front,
+    bench/headline.py): they are not free, but they are not new cost either."""
     kv = int(kv_rows * KV_BYTES_PER_ROW_32K * kv_ctx / 32768)
     stage = int(n_stage_new) * n_layers * int(weight_bytes)
     reserve = int(reserve_gib * GiB)
-    per_slot = n_layers * int(expert_bytes)
+    extra = int(step_extra_bytes)
+    per_slot = n_layers * (int(expert_bytes) + int(sf_group_bytes))
     out = {"free_GiB": None if free_bytes is None else round(free_bytes / GiB, 3), "kv_GiB": round(kv / GiB, 3),
            "stage_new_GiB": round(stage / GiB, 3), "reserve_GiB": round(reserve / GiB, 3),
+           "step_extra_GiB": round(extra / GiB, 3),
            "per_spare_slot_all_layers_GiB": round(per_slot / GiB, 4), "affordable_per_layer": None}
+    out["prepaid_GiB"] = round(int(prepaid_bytes) / GiB, 3)
     if free_bytes is not None:
-        out["affordable_per_layer"] = max(0, (int(free_bytes) - kv - stage - reserve) // per_slot)
+        out["affordable_per_layer"] = max(0, (int(free_bytes) + int(prepaid_bytes) - kv - stage - reserve - extra)
+                                          // per_slot)
     return out
 
 
@@ -177,7 +240,9 @@ class _Swap:
 # ------------------------------------------------------------------------------------------------ the manager
 class ResidencyManager:
     def __init__(self, pool, model: nn.Module, cfg: Optional[ResidencyConfig] = None, *, n_stage: int = 0,
-                 log: Optional[Callable[[str], None]] = None):
+                 log: Optional[Callable[[str], None]] = None, sf_store: Optional[str] = None):
+        """n_stage: the step's own staging slots per layer (`n_stage_for`). sf_store: the packed-SF store the step will
+        use (`sf_store_for`; "pool" / "resident" make the budget count the packed-SF copy and its headroom)."""
         self.cfg = cfg or ResidencyConfig()
         self.pool, self.model = pool, model
         self.log = log or (lambda s: print(s, file=sys.stderr, flush=True))
@@ -193,9 +258,24 @@ class ResidencyManager:
         free = c.hbm_free_bytes
         if free is None and self.cuda:
             free = torch.cuda.mem_get_info(self.dev)[0]
+        self.sf_store_req = sf_store     # requested (sf_store_for); sf_store_got = what the step build ended up with
+        self.sf_store_got: Optional[str] = None
+        s_row = sum(n * (k // 32) for n, k in pool.proj_nk.values())  # packed SF bytes of one pool group (K/128 int32)
+        sf_group = s_row if sf_store in ("pool", "resident") else 0
+        step_extra = 0
+        if sf_group:
+            from runtime import dg_inplace as DI
+
+            # the step's packed-SF copy before the residency slots (always paid: growing the pool re-keys any older
+            # copy, runtime/dg_inplace.py pool_sf_key, so it is rebuilt) + the headroom its build insists on
+            groups = sum(self.H) + self.L * max(self.n_stage, int(pool.spare))
+            head = float(os.environ.get(DI.SF_POOL_HEADROOM_ENV, DI.SF_POOL_HEADROOM_GIB)) * GiB
+            step_extra = int(groups * s_row + head)
         self.budget = spare_budget(free, self.L, pool.expert_bytes, weight_bytes,
                                    n_stage_new=max(0, self.n_stage - pool.spare), reserve_gib=c.reserve_gib,
-                                   kv_rows=c.kv_rows, kv_ctx=c.kv_ctx)
+                                   kv_rows=c.kv_rows, kv_ctx=c.kv_ctx, step_extra_bytes=step_extra,
+                                   sf_group_bytes=sf_group,
+                                   prepaid_bytes=max(0, int(pool.spare) - self.n_stage) * self.L * weight_bytes)
         aff = self.budget["affordable_per_layer"]
         if c.n_spare is not None:
             self.n_spare = int(c.n_spare)
@@ -234,7 +314,7 @@ class ResidencyManager:
         self.copy_stream = torch.cuda.Stream(device=self.dev) if self.cuda else None
         with torch.inference_mode(False):
             self.cnt = torch.zeros(self.L, self.E, dtype=torch.int32, device=self.dev)
-            self.cnt_host = torch.zeros(self.L, self.E, dtype=torch.int32, pin_memory=self.cuda)
+            self.cnt_host = torch.zeros(self.L, self.E, dtype=torch.int32, device="cpu", pin_memory=self.cuda)
             self._ar = torch.arange(self.E, dtype=torch.long, device=self.dev)
         # residency state (physical)
         self.slot_of: List[Dict[int, int]] = []
@@ -401,8 +481,8 @@ class ResidencyManager:
                 if "gtab" in tt:
                     add(l, "gtab", tt["gtab"], None, f"moes[{l}].t[gtab]")
                 sf = tt.get("sf")
-                if getattr(getattr(st, "dg", None), "sf_store", None) == "resident" and isinstance(sf, dict):
-                    self.resident_sf[l] = sf
+                if getattr(getattr(st, "dg", None), "sf_store", None) in ("resident", "pool") and isinstance(sf, dict):
+                    self.resident_sf[l] = sf   # packed once at build: a promoted expert's packed SF is ours to write
         glue = getattr(st, "glue", None)
         for l, t in (getattr(glue, "_ptab6", None) or {}).items():
             add(l, "ptab6", t, None, f"glue._ptab6[{l}]")
@@ -424,6 +504,13 @@ class ResidencyManager:
             self.st = None
             raise RuntimeError(f"residency: pointer-table copies this manager does not own: {unknown[:6]} "
                                "(register them in ResidencyManager.attach or the swap would leave them stale)")
+        got = getattr(getattr(st, "dg", None), "sf_store", None)
+        self.sf_store_got = got
+        if self.sf_store_req in ("pool", "resident") and got == "step":
+            # dg_inplace._check_sf_hbm: free HBM - the packed-SF copy < $DSV41_SF_POOL_HEADROOM_GIB -> the slower
+            # "step" store (hot scales re-packed every step): the on/off A/B would be confounded -> say so loudly
+            self.log(f"[residency] WARNING the step fell back to sf_store 'step' ({getattr(st.dg, 'sf_store_why', None)});"
+                     f" fewer spare slots (--residency-spare) or a lower $DSV41_SF_POOL_HEADROOM_GIB keeps 'pool'")
         self.baseline()
         for l in range(self.L):  # every Grace view a publish can need, made now (view creation off the step path)
             for d in range(self.D):
@@ -501,11 +588,14 @@ class ResidencyManager:
         """policy.baseline on the current counter (the hook's GO: prev = cnt, ewma = 0, seen = host_steps)."""
         P.baseline(self.state, self.cnt.detach().cpu().numpy().astype(np.int64), self.host_steps)
 
-    def after_step(self) -> None:
+    def after_step(self, live: Optional[torch.Tensor] = None) -> None:
         """Call once after every StaticStep step/replay (on the replay stream's order): count, publish the swaps
-        whose copies are done, drain if a counter read landed, one barrier, every drain_n steps a counter read."""
+        whose copies are done, drain if a counter read landed, one barrier, every drain_n steps a counter read.
+        live: the DSpark loop's device-side live flag (runtime/dspark_loop.py LoopBuffers.live, 1 element): steps the
+        loop issues after `done` are predicated no-ops whose routed ids are stale, so they are not counted (a device
+        multiply, no host sync)."""
         with torch.inference_mode():
-            self._count()
+            self._count(live)
             self.host_steps += 1
             for fn in self._deferred:
                 fn()
@@ -520,17 +610,20 @@ class ResidencyManager:
             if self.host_steps % max(1, int(self.params.drain_n)) == 0:
                 self._read_counters()
 
-    def _count(self) -> None:
+    def _count(self, live: Optional[torch.Tensor] = None) -> None:
         st = self.st
         hit = st.ids_step.unsqueeze(-1) == self._ar                       # [L, ns, E]
         if st.rows > 1:
             hit = hit & (st.uvalid_step.unsqueeze(-1) > 0)
-        self.cnt.add_(hit.sum(1, dtype=torch.int32))
+        n = hit.sum(1, dtype=torch.int32)
+        if live is not None:
+            n = n * (live.reshape(-1)[:1] > 0).to(torch.int32)
+        self.cnt.add_(n)
 
     def inject_counts(self, delta) -> None:
         """Synthetic counters (tests / probes): cnt += delta ([L, E] ints), on the stream's order."""
         with torch.inference_mode():
-            self.cnt.add_(torch.as_tensor(np.asarray(delta), dtype=torch.int32).to(self.dev))
+            self.cnt.add_(torch.as_tensor(np.asarray(delta), dtype=torch.int32, device="cpu").to(self.dev))
 
     def _read_counters(self) -> None:
         if self._pending_read is not None:
@@ -948,7 +1041,7 @@ class ResidencyManager:
             free = {"free_GiB": round(f / GiB, 3), "total_GiB": round(tot / GiB, 3),
                     "allocated_GiB": round(torch.cuda.memory_allocated(self.dev) / GiB, 3)}
         return {"config": self.cfg.as_dict(), "params": self.params.as_dict(), "n_spare": self.n_spare,
-                "n_stage": self.n_stage, "n_demote": self.D, "budget": self.budget, "hbm": self.hbm_bytes(),
+                "n_stage": self.n_stage, "sf_store": {"requested": self.sf_store_req, "got": self.sf_store_got}, "n_demote": self.D, "budget": self.budget, "hbm": self.hbm_bytes(),
                 "hbm_now": free, "host_steps": self.host_steps, "stats": dict(self.stats),
                 "policy": {"n_swaps": self.state.n_swaps, "stale": self.state.stale, "drains": self.state.drains,
                            "cum_sel": self.state.cum_sel, "cum_cold": self.state.cum_cold,

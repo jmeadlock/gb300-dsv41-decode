@@ -1,0 +1,71 @@
+  mini L=17: DraftStep static-eager == reference forward_spec (first draft ctx 1/0, mid ctx [1, 3, 6], chained): drafts, logits, confidence, rings
+PASS test_draft_equals_reference_mini (8.3s)
+  mini3 L=17: DraftStep static-eager == reference forward_spec (first draft ctx 1/0, mid ctx [1, 3, 6], chained): drafts, logits, confidence, rings
+  mini3w L=18: DraftStep static-eager == reference forward_spec (first draft ctx 1/0, mid ctx [1, 3, 6]): drafts, logits, confidence, rings
+PASS test_draft_equals_reference_mini3 (1.7s)
+  mini3 L=150: DraftStep static-eager == reference forward_spec (first draft ctx 1/0, mid ctx [6], chained): drafts, logits, confidence, rings
+PASS test_draft_equals_reference_ring_wrapped (0.8s)
+/usr/local/lib/python3.12/dist-packages/torch/cuda/__init__.py:1333: UserWarning: Synchronization debug mode is a prototype feature and does not yet detect all synchronizing operations (Triggered internally at /__w/pytorch/pytorch/torch/csrc/cuda/Module.cpp:1028.)
+  torch._C._cuda_set_sync_debug_mode(debug_mode)
+  draft graph == static-eager (ctx 0/1/3/6); replay x2, fills-on recapture, relaunch equal; no host sync; staging 1.0 MiB
+PASS test_draft_graph_replay_relaunch_no_sync (0.8s)
+[transformers] You are using a model of type `deepseek_v41` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+[load] 96085 tensors in 48 shards, map /work/docs/maps/hot-v26ar-seed-295.json, config /ref/inference/config.json
+[load] linears with scale: 46370; wo_a dequantized: 40; widened: ['layers.14.attn.compressor.wgate.weight', 'layers.14.attn.compressor.wkv.weight', 'layers.2.attn.compressor.wgate.weight', 'layers.2.attn.compressor.wkv.weight', 'layers.8.attn.compressor.wgate.weight', 'layers.8.attn.compressor.wkv.weight', 'head.weight']
+[load-mtp] 3 stages, 2395 tensors, HBM 7.543 GiB (expert stacks 6.724, other 0.820); linears with scale 1174; wo_a dequantized 3; widened ['mtp.2.confidence_head.proj.weight', 'mtp.2.markov_head.head.weight']
+  real: mtp {'read': 7.3881, 'hbm_params': 0.8197, 'hbm_expert_stacks': 6.7236, 'hbm_total': 7.5434}; HBM free 22.55 GiB
+  real L=40: DraftStep static-eager == reference forward_spec (first draft ctx 1/0, mid ctx [1, 3, 6], chained): drafts, logits, confidence, rings
+PASS test_draft_equals_reference_real (65.5s)
+  mini3 L=17 {'fp8_impl': 'gemv', 'glue_impl': 'fused'}: DraftStep static-eager == reference forward_spec (GEMV scope) (first draft ctx 1/0, mid ctx [1, 3, 6], chained): drafts, logits, confidence, rings
+  mini3w L=18 {'glue_impl': 'fused'}: DraftStep static-eager == reference forward_spec (first draft ctx 1/0, mid ctx [1, 3, 6]): drafts, logits, confidence, rings
+  mini3 L=150 {'fp8_impl': 'gemv', 'glue_impl': 'fused'}: DraftStep static-eager == reference forward_spec (GEMV scope) (first draft ctx 1/0, mid ctx [6], chained): drafts, logits, confidence, rings
+PASS test_draft_port_exact_mini3 (117.5s)
+  mini3: draft DG MoE == reference eager MoE within the 1-ulp class (max ulp 1; {'buffers': 2708480, 'packed_sf': 73728})
+  mini3w: draft DG MoE == reference eager MoE within the 1-ulp class (max ulp 0; {'buffers': 4062720, 'packed_sf': 73728})
+PASS test_draft_port_dg_moe_mini3 (2.5s)
+  mini3 full impls {'fp8_impl': 'gemv', 'moe_impl': 'dg-inplace', 'glue_impl': 'fused', 'attn_impl': 'flashmla'}: graph == static-eager (ctx 0/1/3/6); replay x2, relaunch equal; no host sync; draft buffers 2.7 MiB
+PASS test_draft_port_full_graph_mini3 (1.4s)
+[transformers] You are using a model of type `deepseek_v41` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+[transformers] You are using a model of type `deepseek_v41` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+Traceback (most recent call last):
+  File "/work/tests/gpu/test_draft_gpu.py", line 496, in <module>
+    t()
+  File "/work/tests/gpu/test_draft_gpu.py", line 402, in test_draft_port_real
+    _gate_dg_moe("real", n_x=2)
+  File "/work/tests/gpu/test_draft_gpu.py", line 304, in _gate_dg_moe
+    assert c["max_ulp"] <= DG_MAX_ULP, f"{kind} stage {s} x{j}: DG MoE vs reference {c}"
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: real stage 1 x1: DG MoE vs reference {'equal': False, 'mismatch_frac': 3.9062499126885086e-05, 'max_ulp': 16, 'n_ulp_gt1': 1, 'max_abs': 0.5, 'n': 25600, 'nonfinite': 0}
+[load] 96085 tensors in 48 shards, map /work/docs/maps/hot-v26ar-seed-295.json, config /ref/inference/config.json
+[load] linears with scale: 46370; wo_a dequantized: 40; widened: ['layers.14.attn.compressor.wgate.weight', 'layers.14.attn.compressor.wkv.weight', 'layers.2.attn.compressor.wgate.weight', 'layers.2.attn.compressor.wkv.weight', 'layers.8.attn.compressor.wgate.weight', 'layers.8.attn.compressor.wkv.weight', 'head.weight']
+[load-mtp] 3 stages, 2395 tensors, HBM 7.543 GiB (expert stacks 6.724, other 0.820); linears with scale 1174; wo_a dequantized 3; widened ['mtp.2.confidence_head.proj.weight', 'mtp.2.markov_head.head.weight']
+  real: mtp {'read': 7.3881, 'hbm_params': 0.8197, 'hbm_expert_stacks': 6.7236, 'hbm_total': 7.5434}; HBM free 22.44 GiB
+  real L=40 {'fp8_impl': 'gemv', 'glue_impl': 'fused'}: DraftStep static-eager == reference forward_spec (GEMV scope) (first draft ctx 1/0, mid ctx [1, 6]): drafts, logits, confidence, rings
+[load] 96085 tensors in 48 shards, map /work/docs/maps/hot-v26ar-seed-295.json, config /ref/inference/config.json
+[load] linears with scale: 46370; wo_a dequantized: 40; widened: ['layers.14.attn.compressor.wgate.weight', 'layers.14.attn.compressor.wkv.weight', 'layers.2.attn.compressor.wgate.weight', 'layers.2.attn.compressor.wkv.weight', 'layers.8.attn.compressor.wgate.weight', 'layers.8.attn.compressor.wkv.weight', 'head.weight']
+[load-mtp] 3 stages, 2395 tensors, HBM 7.543 GiB (expert stacks 6.724, other 0.820); linears with scale 1174; wo_a dequantized 3; widened ['mtp.2.confidence_head.proj.weight', 'mtp.2.markov_head.head.weight']
+  real: mtp {'read': 7.3881, 'hbm_params': 0.8197, 'hbm_expert_stacks': 6.7236, 'hbm_total': 7.5434}; HBM free 21.64 GiB
+FAIL test_draft_port_real (231.1s)
+  note: mini L=17: reference re-write of slot (L-1)%128 at decode numerics is a byte no-op
+  note: mini L=17 ctx 6: ctx_rowwise (M=1 context GEMMs) == default (M=6): True
+  note: mini3 L=17: reference re-write of slot (L-1)%128 at decode numerics is a byte no-op
+  note: mini3 L=17 ctx 6: ctx_rowwise (M=1 context GEMMs) == default (M=6): True
+  note: mini3w L=18: reference re-write of slot (L-1)%128 at decode numerics is a byte no-op
+  note: mini3 L=150: reference re-write of slot (L-1)%128 at decode numerics is a byte no-op
+  note: real L=40: reference re-write of slot (L-1)%128 at decode numerics is a byte no-op
+  note: real L=40 ctx 6: ctx_rowwise (M=1 context GEMMs) == default (M=6): True
+  note: mini3 L=17 {'fp8_impl': 'gemv', 'glue_impl': 'fused'}: draft glue ['hc_post', 'o_rope_qdq', 'swiglu_shared'] on (hc_mode 0, rope_inv (0, 0))
+  note: mini3 L=17 {'fp8_impl': 'gemv', 'glue_impl': 'fused'}: reference re-write of slot (L-1)%128 at decode numerics is a byte no-op
+  note: mini3 L=17 {'fp8_impl': 'gemv', 'glue_impl': 'fused'} ctx 6: ctx_rowwise (M=1 context GEMMs) == default (M=6): True
+  note: mini3w L=18 {'glue_impl': 'fused'}: draft glue ['hc_post', 'o_rope_qdq', 'swiglu_shared'] on (hc_mode 0, rope_inv (0, 0))
+  note: mini3w L=18 {'glue_impl': 'fused'}: reference re-write of slot (L-1)%128 at decode numerics is a byte no-op
+  note: mini3 L=150 {'fp8_impl': 'gemv', 'glue_impl': 'fused'}: draft glue ['hc_post', 'o_rope_qdq', 'swiglu_shared'] on (hc_mode 0, rope_inv (0, 0))
+  note: mini3 L=150 {'fp8_impl': 'gemv', 'glue_impl': 'fused'}: reference re-write of slot (L-1)%128 at decode numerics is a byte no-op
+  note: mini3: draft DG MoE vs reference eager MoE (bf16): s0x0: equal False, mismatch 0.078%, max ulp 1, max |d| 64; s0x1: equal True, mismatch 0.000%, max ulp 0, max |d| 0; s0x2: equal True, mismatch 0.000%, max ulp 0, max |d| 0; s1x0: equal True, mismatch 0.000%, max ulp 0, max |d| 0; s1x1: equal True, mismatch 0.000%, max ulp 0, max |d| 0; s1x2: equal True, mismatch 0.000%, max ulp 0, max |d| 0; s2x0: equal True, mismatch 0.000%, max ulp 0, max |d| 0; s2x1: equal True, mismatch 0.000%, max ulp 0, max |d| 0; s2x2: equal True, mismatch 0.000%, max ulp 0, max |d| 0
+  note: mini3w: draft DG MoE vs reference eager MoE (bf16): s0x0: equal True, mismatch 0.000%, max ulp 0, max |d| 0; s0x1: equal True, mismatch 0.000%, max ulp 0, max |d| 0; s0x2: equal True, mismatch 0.000%, max ulp 0, max |d| 0; s1x0: equal True, mismatch 0.000%, max ulp 0, max |d| 0; s1x1: equal True, mismatch 0.000%, max ulp 0, max |d| 0; s1x2: equal True, mismatch 0.000%, max ulp 0, max |d| 0; s2x0: equal True, mismatch 0.000%, max ulp 0, max |d| 0; s2x1: equal True, mismatch 0.000%, max ulp 0, max |d| 0; s2x2: equal True, mismatch 0.000%, max ulp 0, max |d| 0
+  note: mini3 full impls {'fp8_impl': 'gemv', 'moe_impl': 'dg-inplace', 'glue_impl': 'fused', 'attn_impl': 'flashmla'}: glue on ['hc_post', 'o_rope_qdq', 'swiglu_shared', 'dg_act', 'swiglu_routed', 'moe_combine'], attn {'impl': 'flashmla', 'on': True, 'reason': None, 'load': {'so': '/usr/local/lib/python3.12/dist-packages/vllm/_flashmla_C.abi3.so', 'loaded': True, 'vllm_modules': []}}, moe dg-inplace (resident stacks) {'buffers': 2708480, 'packed_sf': 73728}
+  note: mini3 full impls: drafts == reference forward_spec (GEMV scope) in 3/3 cases; max |logit delta| 0 (DG / FlashMLA classes, reported)
+  note: real L=40 {'fp8_impl': 'gemv', 'glue_impl': 'fused'}: draft glue ['hc_post', 'o_rope_qdq', 'swiglu_shared'] on (hc_mode 0, rope_inv (0, 0))
+  note: real L=40 {'fp8_impl': 'gemv', 'glue_impl': 'fused'}: reference re-write of slot (L-1)%128 at decode numerics is a byte no-op
+bit-equal comparisons executed: 12 gate runs, 74 draft sets, 370 fp32 logit rows, 210 ring tensors, 2 graph runs
+8/9 not failed; 1 failed

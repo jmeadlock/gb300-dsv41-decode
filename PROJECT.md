@@ -15,8 +15,9 @@ Renamed from "GB300 DSV4.1 Megakernel" on 2026-11-06 (James): the technique was 
 |---|---|
 | Headline | C1 decode step time, ms/step, 6 rows (DSpark k=5), nsys on the `cudaProfilerApi` range, fixed prompt corpus |
 | Baseline | Pg61: **7.36 ms/step** (production, 2026-10-29) |
-| Bar | **≤ 5.0 ms/step** (≈1.5× Pg61) |
-| Why that bar | It exceeds the modeled fusion pool (−0.7…−1.4 ms, W1 2026-10-28). Reaching it requires removing the MoE-section round trip, not just fusing kernels. The bar is honest about what the project really is. |
+| Bar | **Beat Pg61: < 7.36 ms per 6-row step, and publish ms/token alongside it** (restated by James 2026-11-07; the original bar was ≤ 5.0 ms/step) |
+| Why restated | Measured 2026-11-07: a 6-row step moves ~29 GB (17 GB of routed experts at ~22 unique/layer); at the Station's measured HBM copy rate that is 4.6 ms of bytes alone, so 5.0 ms needs 92 % of HBM for the whole step — not reachable with stock weights at 6 rows under any fusion design (`docs/M2-FUSED-CHAIN-DESIGN.md` §5, `research/round2-20261107/REPORT.md`). 7.36 needs 3.9 TB/s and is reachable (fusion ladder models ~9, persistent per-layer ~7.3). ms/token (step ÷ accepted tokens) is the number a user feels and is reported from the same instrument (`bench/headline.py`). |
+| Instrument | `bench/headline.py`: ms per 6-row DSpark step (cuda events, live steps ≥ 32, 8 fixture prompts), tokens/step, ms/token; first reading 2026-11-07 **22.3 ms/step, 2.97 tok/step, 7.5 ms/token** (`docs/HEADLINE-20261107.md`) |
 | Secondary gates | quality gates as calibrated (margin-weighted flips vs reference, tool gauntlet 12/12, GSM8K-200 within control spread); C32 is a declared non-goal of the runtime; 1M context gates production candidacy only |
 
 ## Decisions (settled)
@@ -49,9 +50,9 @@ Renamed from "GB300 DSV4.1 Megakernel" on 2026-11-06 (James): the technique was 
 | M | Target | Done when |
 |---|---|---|
 | **W0** | first dark window (measurement only, ~1 day) | (1) Pg61 per-role nsys step breakdown at 7.36 ms; (2) per-boundary PDL gap histogram on Pg61 (kernel N end → N+1 first CTA → N+1 wait release); (3) 1-row greedy logit capture on the agent fixture = M0 parity reference. Taken while Pg61 still exists; then Pg61 down for good |
-| **M0** | **2026-12-18** | single Python process, no vLLM; loads `1bae0e10` from `/models`; Engram pinned in host; experts split HBM/Grace per existing map; borrowed kernels end to end; greedy 1-row parity vs W0 capture (margin-weighted flips within calibrated bar) and `torch.equal` on own replays; 32K ctx; step trace with named boundaries + per-boundary gap histogram; step ≤ Pg61 + 10% at 1-row-equivalent |
-| **M1** | Jan 2027 | DSpark k=5 in the runtime, 6-row step, headline instrument live → first honest ms/step vs 7.36 |
-| **M2** | Feb 2027 | recipe A fused chain: mHC / attention / indexer boundaries fused; C2C self-fetch of cold rows. The thesis test. Plus the "everything in Grace" bounding measurement |
+| **M0** | **2026-12-18** → *met 2026-11-07 under A3 (approved)* | single Python process, no vLLM; loads `1bae0e10` from `/models`; Engram pinned in host; experts split HBM/Grace per existing map; borrowed kernels end to end; greedy 1-row parity vs W0 capture (margin-weighted flips within calibrated bar) and `torch.equal` on own replays; 32K ctx; step trace with named boundaries + per-boundary gap histogram; step ≤ Pg61 + 10% at 1-row-equivalent |
+| **M1** | Jan 2027 → **done 2026-11-07** | DSpark k=5 in the runtime, 6-row step, headline instrument live → first honest ms/step vs 7.36. *Done: 22.3 ms/step, 2.97 tok/step, 7.5 ms/token; verify and draft bit-equal to the reference (`docs/HEADLINE-20261107.md`).* |
+| **M2** | Feb 2027 → *started 2026-11-07 (`docs/M2-FUSED-CHAIN-DESIGN.md`)* | recipe A fused chain: mHC / attention / indexer boundaries fused; C2C self-fetch of cold rows. The thesis test. Plus the "everything in Grace" bounding measurement |
 | **M3** | Mar 2027 | recipe B: persistent cooperative RTX kernel (GP1 shape) on the same runtime |
 | **M4** | — | minimal OpenAI surface; 128K → 1M; production-candidacy review (C32/seat rules revisited then, not before) |
 | stretch | — | per-layer persistent kernel, only if M2's trace still shows boundary cost worth it |
@@ -88,7 +89,7 @@ PROJECT.md      this charter
 CUTOVER.md      Station → Sparks cutover checklist (reversible)
 ```
 
-## Amendments proposed (2026-11-06, awaiting James) — see `docs/LEDGER.md`
+## Amendments (proposed 2026-11-06; **A1, A2, A3 approved by James 2026-11-07**) — see `docs/LEDGER.md`
 
 - **A1 (decision 4 wording).** "No KV quantization" was written against Pg61's `--kv-cache-dtype fp8_ds_mla`. D1 (`docs/D1-KV-NUMERICS.md`) shows the *model definition* (DeepSeek's reference) attends FP4-QDQ'd compressed-KV and index-K values, and that Pg61 skips that QDQ and stores MXFP8 of the raw latent instead. Proposal: the runtime's default KV numerics = the reference's (E2M1/E4M3-16 QDQ of the latent, FP8/32 window, FP4/32 index-K), with a `--kv-numerics pg61` switch kept only for the parity instrument; decision 4 then reads "no quantization below the model definition's own".
 - **A2 (decision 13).** Static map for M0 (parity) stays. For M2 (recipe A thesis test) the static map is replaced by adaptive residency (our v26ar seed map + swap policy, ported into the runtime): at the static map's cold share the C2C self-fetch costs ~3.9 ms/step on bandwidth alone (`docs/C2C-PROBE-20261106.md`), so the thesis cannot be tested with it. The M2 bar is restated as `cold bytes/step ÷ 390 GB/s` exposed time, with copies pipelined under hot-expert work (shown fully concurrent).

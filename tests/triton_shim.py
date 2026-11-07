@@ -3,6 +3,9 @@ use, so the Mac (no Triton, no GPU) can execute the real `@triton.jit` function 
 added: tl.max/abs/fma, the `mul.rn/add.rn/sub.rn.f32` inline-asm forms, reshape/split/join/broadcast_to, uint8 and
 fp8e4nv casts (RNE, as `fp_downcast_rounding="rtne"`), `%`, `>>`, `^`, unary minus, fp32 scalar args, the
 `enable_fp_fusion` launch option, and write-back of any stored-to fp8/uint8/int buffer.)
+T9b-5 (runtime/static_kernels.py t9b5_head_fp32 / t9b5_mix_fp32, tests/test_fp32_fixed_cpu.py): those bodies use only
+ops whose shim form is exact and order-explicit -- tl.fma (one rounding), fp32 `+` of tl.split halves (the pair
+tree), tl.reshape / broadcast_to / static_range -- and no tl.sum / tl.dot, so the shim executes the GPU's order.
 
 What it is for: the kernels' INDEX MATH and CONTROL FLOW -- pointer arithmetic, row/column clamping, masks, the
 split-K K-block ranges, the KU unroll and its tail, the workspace layout, the reduce order, the constexpr branches.
@@ -122,6 +125,9 @@ class P:
 
     __radd__ = __add__
 
+    def __sub__(self, o):  # M1-T10-MOE: `ptr + t - 1` (the warp dedup's neighbour load)
+        return P(self.buf, self.off - np.asarray(_v(o)).astype(np.int64))
+
 
 class _DT:
     def __init__(self, name, npt):
@@ -202,7 +208,30 @@ def maximum(a, b):
 
 
 def sum(x, axis):  # noqa: A001 - Triton's name
-    return T(np.sum(_v(x), axis=axis, dtype=np.float32))
+    a = np.asarray(_v(x))
+    # fp32 accumulation for floats (as before); M1-T10-MOE: integer / bool sums stay integer (Triton's int sum is an
+    # int: the warp dedup shifts and indexes with them)
+    return T(np.sum(a, axis=axis, dtype=np.float32 if a.dtype.kind == "f" else np.int64))
+
+
+# M1-T10-MOE (runtime/moe_rows.py m1_dedup_warp): 1-D sort / scan and the block barrier. Programs run one after
+# another here and statements in order, so the barrier is a no-op.
+def sort(x, dim=None, descending=False):
+    a = np.sort(np.asarray(_v(x)), axis=-1, kind="stable")
+    return T(a[..., ::-1].copy() if descending else a)
+
+
+def cumsum(x, axis=0, reverse=False):
+    a = np.asarray(_v(x))
+    if a.dtype == bool:
+        a = a.astype(np.int32)
+    if reverse:
+        return T(np.flip(np.cumsum(np.flip(a, axis), axis=axis), axis))
+    return T(np.cumsum(a, axis=axis))
+
+
+def debug_barrier():
+    return None
 
 
 def dot(a, b):
@@ -318,6 +347,18 @@ STORES: list = []
 DIRTY: set = set()  # id() of the buffers a launch stored to (fp8 / uint8 / int64 ones are written back only then)
 
 
+def atomic_add(ptr, val, mask=None):
+    """M1-T10-FIX2 (t9a2_stage_inplace's overflow counter): scalar or block add at the pointer(s); returns the old
+    value(s). Programs run one after another here, so the read-modify-write is trivially atomic."""
+    off = np.atleast_1d(ptr.off)
+    m = np.ones(off.shape, bool) if mask is None else np.broadcast_to(_v(mask), off.shape)
+    assert ((off[m] >= 0) & (off[m] < ptr.buf.size)).all(), "out-of-bounds atomic"
+    old = ptr.buf[off].copy()
+    np.add.at(ptr.buf, off[m], np.broadcast_to(np.asarray(_v(val)), off.shape)[m].astype(ptr.buf.dtype))
+    DIRTY.add(id(ptr.buf))
+    return T(old.reshape(np.shape(ptr.off)))
+
+
 # ------------------------------------------------------------------------------------------------ jit + launch
 def _flat(t: torch.Tensor) -> torch.Tensor:
     """1-D view of t's storage from t's first element to the end (so a strided view's row stride indexes it the way
@@ -363,23 +404,29 @@ class JitFunction:
         def launch(*args, num_warps=None, num_stages=None, enable_fp_fusion=None, **constexprs):
             bufs = {}
             conv = []
-            for x in args:
+
+            def cv(x):
                 if isinstance(x, torch.Tensor):
                     key = (x.data_ptr(), x.dtype)
                     if key not in bufs:
                         bufs[key] = (x, _buffer(x))
-                    conv.append(P(bufs[key][1], 0))
-                elif isinstance(x, float):
-                    conv.append(np.float32(x))    # Triton passes a Python float as an fp32 scalar
-                else:
-                    conv.append(int(x))
+                    return P(bufs[key][1], 0)
+                if isinstance(x, float):
+                    return np.float32(x)          # Triton passes a Python float as an fp32 scalar
+                return int(x)
+
+            for x in args:
+                conv.append(cv(x))
+            # M1-T10-PORT: tensor (pointer) arguments passed by keyword, as the real launcher accepts them
+            kw = {k: (cv(v) if isinstance(v, torch.Tensor) else v) for k, v in constexprs.items()}
             g = tuple(grid) + (1,) * (3 - len(grid))
-            self.launches.append({"grid": tuple(grid), "constexprs": dict(constexprs),
+            self.launches.append({"grid": tuple(grid), "constexprs": {k: v for k, v in constexprs.items()
+                                                                      if not isinstance(v, torch.Tensor)},
                                   "enable_fp_fusion": enable_fp_fusion})
             DIRTY.clear()
             for pid in itertools.product(*(range(n) for n in g)):
                 _PID[:] = list(pid)
-                self.fn(*conv, **constexprs)
+                self.fn(*conv, **kw)
             for t, b in bufs.values():  # write back (untouched elements round-trip exactly)
                 if t.dtype in (torch.float32, torch.bfloat16) or id(b) in DIRTY:
                     _write_back(t, b)
@@ -399,7 +446,7 @@ def _modules():
     for name in ("T", "P", "int32", "int64", "float32", "bfloat16", "constexpr", "program_id", "arange", "zeros",
                  "where", "minimum", "maximum", "sum", "dot", "trans", "static_range", "load", "store",
                  "uint8", "float8e4nv", "max", "abs", "fma", "inline_asm_elementwise", "reshape", "split", "join",
-                 "broadcast_to", "pointer_type", "multiple_of"):
+                 "broadcast_to", "pointer_type", "multiple_of", "atomic_add", "sort", "cumsum", "debug_barrier"):
         setattr(tl, name, globals()[name])
     tr = types.ModuleType("triton")
     tr.jit, tr.cdiv, tr.language, tr.__version__ = jit, cdiv, tl, "numpy-shim"

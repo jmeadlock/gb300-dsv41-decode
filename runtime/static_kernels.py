@@ -11,6 +11,10 @@ so the Mac tests never need triton).
   t9b2_gather_tables  T9b-2 (`--glue-impl fused`, clusters #11 + #9): a layer's six gathers in one launch, dg-masked's
                    e8m0 -> fp32 scale conversion and the ids_step copy folded in (data movement + an exact decode).
                    T9b-3a: 16-byte vectors per lane.
+  t9b5_head_fp32 / t9b5_mix_fp32   T9b-5 (`--fp32-impl fixed`, docs/HANDOFF-T9B5-FP32-FIXED.md): out[r, n] =
+                   sum_k x[r, k] * w[n, k] in fp32 in ONE fixed order per output (fixed_dot below): the head
+                   (F.linear(x.float(), head.weight), model.py:1014) and the mHC mixes (F.linear(x, hc_fn) * rsqrt,
+                   model.py:956). Row-invariant by construction; the CPU mirror is fused_glue_r2.fixed_dot_torch.
 
 T9b-3a Task B (docs/HANDOFF-T9B3A-ATTN-BOUND.md): the T8 / T9b-2 kernels (kept below, bodies unchanged, as
 `t8_gather_rows_u8` / `t9b2_gather_tables_u8`: the GPU equality test's reference, gather_bench's baseline and
@@ -35,6 +39,7 @@ import torch
 import triton
 import triton.language as tl
 
+HAVE_TRITON = True         # (tests/triton_shim.load_module_under_shim asserts it)
 GATHER_BLOCK = 8192        # bytes per program of the _u8 kernels (bench/moe_static_spike.py:126)
 VEC_BLOCK_BYTES = int(os.environ.get("DSV41_GATHER_BLOCK_BYTES", "8192"))  # bytes per program, vec kernels
 VEC_WARPS = int(os.environ.get("DSV41_GATHER_WARPS", "4"))
@@ -295,30 +300,45 @@ def _t9a2_pack_scales(ptab, dtab, e, E, p, grp, q, N13, C13, N2, C2, BN: tl.cons
 
 
 @triton.jit
-def t9a2_stage_inplace(ptab, ids, gtab, dtab, mi, ids_out, E, H, ALIGN, N13, C13, N2, C2,
+def t9a2_stage_inplace(ptab, ids, gtab, dtab, mi, ids_out, sidx, ovf, E, H, S, ALIGN, N13, C13, N2, C2,
                        ROW_W: tl.constexpr, BW: tl.constexpr, NBW: tl.constexpr, BN: tl.constexpr,
                        BC: tl.constexpr, NPROG: tl.constexpr, EVEN_W: tl.constexpr, ALL_SCALES: tl.constexpr,
-                       IDS: tl.constexpr):
+                       IDS: tl.constexpr, SIDX: tl.constexpr):
     """T9a-2: one launch per layer before its three contiguous grouped GEMMs (runtime/dg_inplace.py). Program
-    (j, q, p): e = ids[j] (sorted routed id), g = gtab[e] (its hot pool slot, or -1 = cold). group = g if hot else
-    H + j (the j-th spare slot). (j, 0, 0) writes mi[j*ALIGN] = group (the contiguous layout's group id of A block j;
-    every other mi row stays -1) and, IDS, ids_out[j] = e. Cold only: program q copies 8-KiB weight blocks
-    q, q+NPROG, ... of row ptab[p, e] (an HBM or UVA address) into slot `group` of the layer's [H+S, N, K/2] weight
-    pool at dtab[p] (int64 words, 16-B vectors as t8_gather_rows). Scales: always (ALL_SCALES, the shared packed SF
-    of sf_store "step") or cold only ("resident"): _t9a2_pack_scales. Row addresses 16-B aligned (host-checked)."""
+    (j, q, p): e = ids[j] (sorted routed id), g = gtab[e] (its hot pool slot, or -1 = cold). Spare index c = j
+    (SIDX 0, the 1-row step: k slots, S = k spares) or c = sidx[j] (SIDX 1, M1-T10-FIX2's 6-row step: the compact
+    cold index, -1 = skip this slot). group = g if hot else H + c. (j, 0, 0) writes mi[j*ALIGN] = group (-1 for a
+    skipped or overflowing cold slot; every other mi row stays -1), IDS: ids_out[j] = e, and SIDX: a cold slot with
+    c >= S (more cold experts than spare slots) adds 1 to the step's overflow counter ovf[0] (nothing of it is
+    staged: its GEMM rows are wrong, never out of bounds). Staged cold slots only (0 <= c < S): program q copies
+    8-KiB weight blocks q, q+NPROG, ... of row ptab[p, e] (an HBM or UVA address) into slot `group` of the layer's
+    [H+S', N, K/2] weight pool at dtab[p] (int64 words, 16-B vectors as t8_gather_rows). Scales: hot + staged cold
+    (ALL_SCALES, the shared packed SF of sf_store "step") or staged cold only ("resident"): _t9a2_pack_scales. Row
+    addresses 16-B aligned (host-checked)."""
     j = tl.program_id(0)
     q = tl.program_id(1)
     p = tl.program_id(2)
     e = tl.load(ids + j)
     g = tl.load(gtab + e).to(tl.int64)
     cold = g < 0
-    grp = tl.where(cold, g * 0 + j + H, g)      # int64 either way (g * 0 + ...: promotes j + H without a cast)
+    hot = g >= 0
+    if SIDX:
+        c = tl.load(sidx + j).to(tl.int64)
+    else:
+        c = g * 0 + j                            # int64 (g * 0 + ...: promotes j without a cast)
+    fits = (c >= 0) & (c < S)
+    stage = cold & fits
+    grp = tl.where(cold, c + H, g)
+    head = tl.where(hot | stage, grp, g * 0 - 1)
     if q == 0:
         if p == 0:
-            tl.store(mi + j * ALIGN, grp.to(tl.int32))
+            tl.store(mi + j * ALIGN, head.to(tl.int32))
             if IDS:
                 tl.store(ids_out + j, e)
-    if cold:
+            if SIDX:
+                if cold & (c >= S):
+                    tl.atomic_add(ovf, 1)
+    if stage:
         w_src = tl.multiple_of(tl.load(ptab + p * E + e).to(tl.pointer_type(tl.int64)), 16)
         w_dst = tl.multiple_of(tl.load(dtab + p).to(tl.pointer_type(tl.int64)), 16)
         w_row = w_dst + grp * ROW_W
@@ -332,26 +352,35 @@ def t9a2_stage_inplace(ptab, ids, gtab, dtab, mi, ids_out, E, H, ALIGN, N13, C13
                 wm_m = wm_off < ROW_W
                 tl.store(w_row + wm_off, tl.load(w_src + wm_off, mask=wm_m), mask=wm_m)
     if ALL_SCALES:
-        _t9a2_pack_scales(ptab, dtab, e, E, p, grp, q, N13, C13, N2, C2, BN, BC, NPROG)
+        if hot | stage:
+            _t9a2_pack_scales(ptab, dtab, e, E, p, grp, q, N13, C13, N2, C2, BN, BC, NPROG)
     else:
-        if cold:
+        if stage:
             _t9a2_pack_scales(ptab, dtab, e, E, p, grp, q, N13, C13, N2, C2, BN, BC, NPROG)
 
 
 def stage_inplace(ptab6: torch.Tensor, ids: torch.Tensor, gtab: torch.Tensor, dtab: torch.Tensor, dsts, mi,
                   H: int, align: int, row_w: int, sf_dims, all_scales: bool, ids_out=None,
                   block_bytes: Optional[int] = None, nprog: Optional[int] = None,
-                  num_warps: Optional[int] = None) -> None:
+                  num_warps: Optional[int] = None, *, sidx: Optional[torch.Tensor] = None,
+                  spare: Optional[int] = None, ovf: Optional[torch.Tensor] = None) -> None:
     """T9a-2 (runtime/dg_inplace.py, contract: dg_inplace.stage_inplace_emulated): ONE launch per layer.
     ptab6 int64 [6, E] source rows (w1/w3/w2 weights, then their e8m0 scales; HBM pool slot or UVA host address);
     gtab int32 [E] hot slot or -1; dtab int64 [6] = data_ptr()s of `dsts` = the layer's three [H+S, N, K/2] weight
     pools, then the three packed SF tensors (int32 [G, N, C] MN-major); mi int32 [k*align] (-1 except the block
     heads this writes); sf_dims ((N13, C13), (N2, C2)) = (rows, int32 words per row) of the w1/w3 and w2 scales.
-    `dsts` is read only for the host-side alignment check."""
+    `dsts` is read only for the host-side alignment check.
+    M1-T10-FIX2 (the 6-row step): sidx int64 [k] = each slot's compact cold index (-1: skip the slot), spare = the
+    spare slots a cold expert may use (c < spare), ovf int32 [1] = the step's overflow counter (one atomic add per
+    cold slot with c >= spare). All three or none (None: c = j, the 1-row contract; spare defaults to k there)."""
     k = ids.numel()
     (n13, c13), (n2, c2) = sf_dims
     if row_w % VEC_ALIGN or any(t.data_ptr() % VEC_ALIGN for t in dsts):
         raise ValueError(f"stage_inplace: weight row {row_w} B or a destination not {VEC_ALIGN}-B aligned")
+    use_sidx = sidx is not None
+    if use_sidx != (ovf is not None) or (use_sidx and spare is None):
+        raise ValueError("stage_inplace: sidx, spare and ovf go together")
+    S = int(spare) if spare is not None else k
     bw = _block_bytes(block_bytes) // 8
     ww = row_w // 8
     nbw = triton.cdiv(ww, bw)
@@ -359,11 +388,243 @@ def stage_inplace(ptab6: torch.Tensor, ids: torch.Tensor, gtab: torch.Tensor, dt
     bc = triton.next_power_of_2(max(int(c13), int(c2)))
     even = ww % bw == 0 and nbw % npg == 0
     t9a2_stage_inplace[(k, npg, 3)](ptab6, ids, gtab, dtab, mi, ids_out if ids_out is not None else ids,
-                                    ptab6.size(1), int(H), int(align), int(n13), int(c13), int(n2), int(c2),
+                                    sidx if use_sidx else ids, ovf if use_sidx else mi,
+                                    ptab6.size(1), int(H), S, int(align), int(n13), int(c13), int(n2), int(c2),
                                     ww, bw, nbw, STAGE_BN, bc, npg, even, bool(all_scales), ids_out is not None,
-                                    num_warps=int(num_warps or VEC_WARPS))
+                                    use_sidx, num_warps=int(num_warps or VEC_WARPS))
 
 
 def step_marker(ctr: torch.Tensor) -> None:
     """One program, one warp: `ctr[0] += 1`. Fixed kernel name `t8_step_marker` for nsys."""
     t8_step_marker[(1,)](ctr, num_warps=1)
+
+
+# ------------------------------------------------------------------------------------------------ M1-T10-MOE (rows)
+@triton.jit
+def m1_stage_rows(ptab, uniq, gtab, sidx, wl, dtab, E, H, N13, C13, N2, C2,
+                  ROW_W: tl.constexpr, BW: tl.constexpr, NBW: tl.constexpr, BN: tl.constexpr, BC: tl.constexpr,
+                  NPROG: tl.constexpr, EVEN_W: tl.constexpr):
+    """M1-T10-MOE: the R-row dg-inplace staging launch, driven by the dedup's work list. Program (j, q, p): slot
+    u = wl[j] (-1: nothing to do -- the program exits at once), expert e = uniq[u], g = gtab[e]. A cold slot (g < 0;
+    the dedup lists only staged ones, compact index c = sidx[u] < spare budget) copies 8-KiB weight blocks q,
+    q+NPROG, ... of row ptab[p, e] (HBM or UVA) into pool slot H + c (int64 words, 16-B vectors), then packs its
+    scales into group H + c of the packed SF; a hot slot (listed only under sf_store "step") packs its scales into
+    group g. So the scale work is once per unique expert (<= U slots, not R*k blocks) and, with the hot SF
+    pre-packed (sf_store "pool" / "resident"), only cold experts are touched at all. m_indices, the overflow count
+    and the stage ids are the dedup's (moe_rows.m1_dedup_warp). Contract: dg_inplace.stage_rows_emulated."""
+    j = tl.program_id(0)
+    q = tl.program_id(1)
+    p = tl.program_id(2)
+    u = tl.load(wl + j)
+    if u >= 0:
+        e = tl.load(uniq + u)
+        g = tl.load(gtab + e).to(tl.int64)
+        c = tl.load(sidx + u).to(tl.int64)
+        cold = g < 0
+        grp = tl.where(cold, c + H, g)
+        if cold:
+            r_src = tl.multiple_of(tl.load(ptab + p * E + e).to(tl.pointer_type(tl.int64)), 16)
+            r_dst = tl.multiple_of(tl.load(dtab + p).to(tl.pointer_type(tl.int64)), 16)
+            r_row = r_dst + grp * ROW_W
+            if EVEN_W:
+                for it in range(0, NBW // NPROG):
+                    re_off = (q + it * NPROG) * BW + tl.arange(0, BW)
+                    tl.store(r_row + re_off, tl.load(r_src + re_off))
+            else:
+                for it2 in range(0, (NBW + NPROG - 1) // NPROG):
+                    rm_off = (q + it2 * NPROG) * BW + tl.arange(0, BW)
+                    rm_m = rm_off < ROW_W
+                    tl.store(r_row + rm_off, tl.load(r_src + rm_off, mask=rm_m), mask=rm_m)
+        _t9a2_pack_scales(ptab, dtab, e, E, p, grp, q, N13, C13, N2, C2, BN, BC, NPROG)
+
+
+def stage_rows(ptab6: torch.Tensor, uniq: torch.Tensor, gtab: torch.Tensor, dtab: torch.Tensor, dsts,
+               sidx: torch.Tensor, wl: torch.Tensor, H: int, row_w: int, sf_dims, n_work: int,
+               block_bytes: Optional[int] = None, nprog: Optional[int] = None,
+               num_warps: Optional[int] = None) -> None:
+    """M1-T10-MOE: ONE launch per layer of the R-row dg-inplace step (m1_stage_rows) over the first `n_work` entries
+    of the dedup's work list `wl` (the spare budget S when only cold experts are listed, R*k with sf_store "step").
+    ptab6 / gtab / dtab / dsts / sf_dims as stage_inplace; uniq / sidx / wl int64 [R*k] from the dedup."""
+    (n13, c13), (n2, c2) = sf_dims
+    if row_w % VEC_ALIGN or any(t.data_ptr() % VEC_ALIGN for t in dsts):
+        raise ValueError(f"stage_rows: weight row {row_w} B or a destination not {VEC_ALIGN}-B aligned")
+    nw = int(n_work)
+    if not 1 <= nw <= wl.numel():
+        raise ValueError(f"stage_rows: n_work {nw} outside [1, {wl.numel()}]")
+    bw = _block_bytes(block_bytes) // 8
+    ww = row_w // 8
+    nbw = triton.cdiv(ww, bw)
+    npg = int(nprog or STAGE_NPROG)
+    bc = triton.next_power_of_2(max(int(c13), int(c2)))
+    even = ww % bw == 0 and nbw % npg == 0
+    m1_stage_rows[(nw, npg, 3)](ptab6, uniq, gtab, sidx, wl, dtab, ptab6.size(1), int(H), int(n13), int(c13),
+                                int(n2), int(c2), ww, bw, nbw, STAGE_BN, bc, npg, even,
+                                num_warps=int(num_warps or VEC_WARPS))
+
+
+# ------------------------------------------------------------------------------------------------ T9b-5 (fp32 fixed)
+# docs/HANDOFF-T9B5-FP32-FIXED.md. out[r, n] = sum_k x[r, k] * w[n, k] in fp32, in ONE order per output that does not
+# depend on R, on the launch configuration or on the device's choice of algorithm (cuBLAS picks split-K / gemv vs
+# sgemm by M, so the 6-row step's head and mixes differ from the 1-row step's, docs/HEADLINE-20261107.md). The order
+# (fused_glue_r2.fixed_dot_torch is its CPU definition; tests/test_fp32_fixed_cpu.py runs this body under the shim):
+#   KB lanes (a power of two dividing K); lane j accumulates k = j, j + KB, j + 2 KB, ... sequentially from +0.0 with
+#   one IEEE fp32 FMA per term (acc = fma(x, w, acc)); then an adjacent-pair tree over the lanes,
+#   s[i] = s[2i] + s[2i+1], log2(KB) levels; then (HAS_SC) one fp32 multiply by sc[r] (the mixes' * rsqrt).
+# Launched with enable_fp_fusion=False (no other contraction exists, but nothing is left to the compiler). Nothing
+# else is a free parameter of the arithmetic: BN (outputs per program), RB (rows per program: the rows share every
+# weight tile, so the weight is read once per step at any R <= 8), U (K tiles unrolled per loop trip: more loads in
+# flight, same adds in the same order), num_warps and num_stages change speed only (the GPU test asserts every
+# config is bit-identical). Rows r >= R and outputs n >= N are masked: they never feed a stored output.
+T9B5_KB_MAX = 4096
+T9B5_RB_MAX = 8
+# per site and rows-per-program RB: (BN, U, num_warps, num_stages). Speed-only knobs (bench/t9b5_bench.py sweeps them);
+# override: DSV41_T9B5_CFG="head:8=16,2,8,1;mix:1=1,8,4,1".
+T9B5_CFG = {"head": {1: (32, 4, 4, 1), 2: (32, 2, 4, 1), 4: (16, 4, 4, 1), 8: (16, 4, 8, 1)},
+            "mix": {1: (1, 20, 16, 1)}}   # mixes: 40 K tiles in 2 trips (latency: few programs at 1 row)
+T9B5_CFG_ENV = "DSV41_T9B5_CFG"
+
+
+@triton.jit
+def _t9b5_pairs(s, M: tl.constexpr, H: tl.constexpr):
+    """[M, 2H] -> [M, H]: s[:, 2i] + s[:, 2i + 1] (one IEEE fp32 add each)."""
+    pa, pb = tl.split(tl.reshape(s, [M, H, 2]))
+    return pa + pb
+
+
+@triton.jit
+def _t9b5_tree(acc, RB: tl.constexpr, BN: tl.constexpr, KB: tl.constexpr):
+    """acc [RB, BN, KB] -> [RB, BN]: the adjacent-pair tree over the KB lanes (KB a power of two <= 4096)."""
+    s = tl.reshape(acc, [RB * BN, KB])
+    if KB >= 4096:
+        s = _t9b5_pairs(s, RB * BN, 2048)
+    if KB >= 2048:
+        s = _t9b5_pairs(s, RB * BN, 1024)
+    if KB >= 1024:
+        s = _t9b5_pairs(s, RB * BN, 512)
+    if KB >= 512:
+        s = _t9b5_pairs(s, RB * BN, 256)
+    if KB >= 256:
+        s = _t9b5_pairs(s, RB * BN, 128)
+    if KB >= 128:
+        s = _t9b5_pairs(s, RB * BN, 64)
+    if KB >= 64:
+        s = _t9b5_pairs(s, RB * BN, 32)
+    if KB >= 32:
+        s = _t9b5_pairs(s, RB * BN, 16)
+    if KB >= 16:
+        s = _t9b5_pairs(s, RB * BN, 8)
+    if KB >= 8:
+        s = _t9b5_pairs(s, RB * BN, 4)
+    if KB >= 4:
+        s = _t9b5_pairs(s, RB * BN, 2)
+    if KB >= 2:
+        s = _t9b5_pairs(s, RB * BN, 1)
+    return tl.reshape(s, [RB, BN])
+
+
+@triton.jit
+def _t9b5_dot(x, w, out, sc, R, N, sxr, swn, sor, NK: tl.constexpr, KB: tl.constexpr, BN: tl.constexpr,
+              RB: tl.constexpr, U: tl.constexpr, HAS_SC: tl.constexpr):
+    """Program (pn, pr): outputs n in [pn*BN, (pn+1)*BN) of rows r in [pr*RB, (pr+1)*RB). x [R, K] (fp32 or bf16
+    values, row stride sxr), w [N, K] (fp32 or bf16, row stride swn), out [R, N] fp32 (row stride sor), K = NK*KB."""
+    pn = tl.program_id(0)
+    pr = tl.program_id(1)
+    n = pn * BN + tl.arange(0, BN)
+    r = pr * RB + tl.arange(0, RB)
+    j = tl.arange(0, KB)
+    mn = n < N
+    mr = r < R
+    wp = w + n.to(tl.int64)[:, None] * swn + j[None, :]
+    xp = x + r.to(tl.int64)[:, None] * sxr + j[None, :]
+    wm = mn[:, None] & (j[None, :] >= 0)
+    xm = mr[:, None] & (j[None, :] >= 0)
+    acc = tl.zeros([RB, BN, KB], dtype=tl.float32)
+    for t in range(NK // U):
+        for u in tl.static_range(U):
+            k0 = (t * U + u) * KB
+            wv = tl.load(wp + k0, mask=wm, other=0.0).to(tl.float32)
+            xv = tl.load(xp + k0, mask=xm, other=0.0).to(tl.float32)
+            acc = tl.fma(tl.broadcast_to(xv[:, None, :], [RB, BN, KB]), tl.broadcast_to(wv[None, :, :], [RB, BN, KB]),
+                         acc)
+    for t2 in range((NK // U) * U, NK):          # the tiles past the last whole unroll (same order: tile t2 next)
+        k2 = t2 * KB
+        wv2 = tl.load(wp + k2, mask=wm, other=0.0).to(tl.float32)
+        xv2 = tl.load(xp + k2, mask=xm, other=0.0).to(tl.float32)
+        acc = tl.fma(tl.broadcast_to(xv2[:, None, :], [RB, BN, KB]), tl.broadcast_to(wv2[None, :, :], [RB, BN, KB]),
+                     acc)
+    s = _t9b5_tree(acc, RB, BN, KB)
+    if HAS_SC:
+        s = s * tl.load(sc + r, mask=mr, other=1.0)[:, None]
+    tl.store(out + r.to(tl.int64)[:, None] * sor + n[None, :], s, mask=mr[:, None] & mn[None, :])
+
+
+@triton.jit
+def t9b5_head_fp32(x, w, out, sc, R, N, sxr, swn, sor, NK: tl.constexpr, KB: tl.constexpr, BN: tl.constexpr,
+                   RB: tl.constexpr, U: tl.constexpr, HAS_SC: tl.constexpr):
+    """The head (model.py:1014): logits [R, V] = x [R, D] . W [V, D]^T (named launch for nsys)."""
+    _t9b5_dot(x, w, out, sc, R, N, sxr, swn, sor, NK, KB, BN, RB, U, HAS_SC)
+
+
+@triton.jit
+def t9b5_mix_fp32(x, w, out, sc, R, N, sxr, swn, sor, NK: tl.constexpr, KB: tl.constexpr, BN: tl.constexpr,
+                  RB: tl.constexpr, U: tl.constexpr, HAS_SC: tl.constexpr):
+    """The mHC mixes (model.py:956): [R, mix_hc] = (x [R, hc*D] . hc_fn^T) * rsqrt[R] (named launch for nsys)."""
+    _t9b5_dot(x, w, out, sc, R, N, sxr, swn, sor, NK, KB, BN, RB, U, HAS_SC)
+
+
+T9B5_KERNELS = {"head": t9b5_head_fp32, "mix": t9b5_mix_fp32}
+
+
+def _t9b5_env_cfg() -> dict:
+    out = {}
+    for item in (os.environ.get(T9B5_CFG_ENV) or "").split(";"):
+        item = item.strip()
+        if not item:
+            continue
+        key, val = item.split("=")
+        site, rb = key.split(":")
+        out[(site.strip(), int(rb))] = tuple(int(v) for v in val.split(","))
+    return out
+
+
+def t9b5_rows_per_program(site: str, R: int) -> int:
+    """RB: the mixes run one row per program (their 2 MB weight is L2-resident across the R programs that share
+    it); the head puts every row (<= 8) in one program so its 2.65 GB weight is read once per step."""
+    if site == "mix":
+        return 1
+    return min(T9B5_RB_MAX, triton.next_power_of_2(max(1, int(R))))
+
+
+def t9b5_config(site: str, R: int) -> tuple:
+    """(RB, BN, U, num_warps, num_stages) for a call of `site` at R rows."""
+    rb = t9b5_rows_per_program(site, R)
+    env = _t9b5_env_cfg()
+    bn, u, nw, ns = env.get((site, rb)) or T9B5_CFG[site].get(rb) or T9B5_CFG[site][max(T9B5_CFG[site])]
+    return rb, bn, u, nw, ns
+
+
+def fixed_dot(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor, *, kb: int, site: str,
+              scale: Optional[torch.Tensor] = None, cfg: Optional[tuple] = None) -> None:
+    """T9b-5: out [R, N] fp32 <- x [R, K] . w [N, K]^T (* scale [R]) in the fixed order of KB = kb lanes (the
+    contract above; fused_glue_r2.fixed_dot_torch on CPU). site "head" / "mix" picks the named kernel and the
+    default launch config; cfg = (RB, BN, U, num_warps, num_stages) overrides it (speed only)."""
+    if x.dim() != 2 or w.dim() != 2 or out.dim() != 2:
+        raise ValueError(f"fixed_dot: x {tuple(x.shape)}, w {tuple(w.shape)}, out {tuple(out.shape)} must be 2-D")
+    R, K = x.shape
+    N = w.size(0)
+    if w.size(1) != K or tuple(out.shape) != (R, N) or out.dtype != torch.float32:
+        raise ValueError(f"fixed_dot: x [{R}, {K}], w {tuple(w.shape)}, out {tuple(out.shape)} {out.dtype}")
+    if x.stride(1) != 1 or w.stride(1) != 1 or out.stride(1) != 1:
+        raise ValueError("fixed_dot: x / w / out rows must be contiguous")
+    if kb < 1 or kb & (kb - 1) or kb > T9B5_KB_MAX or K % kb:
+        raise ValueError(f"fixed_dot: kb {kb} must be a power of two <= {T9B5_KB_MAX} dividing K = {K}")
+    if scale is not None and (scale.numel() != R or scale.dtype != torch.float32 or not scale.is_contiguous()):
+        raise ValueError(f"fixed_dot: scale must be fp32 contiguous [R = {R}]")
+    if R == 0:
+        return
+    rb, bn, u, nw, ns = cfg if cfg is not None else t9b5_config(site, R)
+    nk = K // kb
+    u = max(1, min(int(u), nk))
+    T9B5_KERNELS[site][(triton.cdiv(N, bn), triton.cdiv(R, rb))](
+        x, w, out, scale if scale is not None else out, R, N, x.stride(0), w.stride(0), out.stride(0),
+        nk, kb, bn, rb, u, scale is not None, num_warps=nw, num_stages=ns, enable_fp_fusion=False)

@@ -94,13 +94,17 @@ R2_CLUSTER_NAMES = ("hc_norm", "mix_stat", "kv_path", "q_path", "router", "engra
 # T9b-4 (docs/HANDOFF-T9B4-RESIDUAL.md): sub-switches of existing clusters / impls, each bit-identical or data movement
 # only and self-checked at build like the rest (DSV41_GLUE_DISABLE names them for A/B and bisecting)
 R4_PARTS = ("hc_split", "gemv_pair", "reduce_fold", "dg_sf_pack")
-CLUSTERS = R1_CLUSTERS + R2_CLUSTER_NAMES + R4_PARTS
+# M1-T10-PORT: the R-row MoE's dedup (runtime/moe_rows.dedup_fused: sort-by-id + unique + slot/rank + posmat +
+# masked_m / m_indices tags + the counters in one launch); rows > 1 only
+M1_PARTS = ("dedup",)
+CLUSTERS = R1_CLUSTERS + R2_CLUSTER_NAMES + R4_PARTS + M1_PARTS
 CLUSTER_AUDIT = {"gather": "#11+#9", "dg_act": "#9", "swiglu_routed": "#2+#9", "swiglu_shared": "#2",
                  "moe_combine": "#8", "hc_post": "#7", "o_rope_qdq": "#10", "q_rope_epilogue": "#13",
                  "concat_free": "#16", "hc_norm": "#1", "mix_stat": "#5", "kv_path": "#3", "q_path": "#6",
                  "router": "#4 (non-topk)", "engram": "#15", "indexer_post": "#14 (non-topk)",
                  "hc_split": "T9b-4 L1", "gemv_pair": "T9b-4 L2a", "reduce_fold": "T9b-4 L2b",
-                 "dg_sf_pack": "T9b-4 L4"}
+                 "dg_sf_pack": "T9b-4 L4", "dedup": "M1-T10-PORT #3"}
+DEDUP_MAX_PAIRS = 64          # runtime/moe_rows.DEDUP_MAX_PAIRS (one-program dedup kernel)
 CONCAT_FREE_WHY = ("not implemented in round 1: the window ring is per layer while the compressed cache and the "
                    "published topk_idxs are shared by every layer of a kv/index group, so one buffer per layer "
                    "needs either per-layer copies of the compressed rows (no launch saved) or re-allocating the "
@@ -108,30 +112,20 @@ CONCAT_FREE_WHY = ("not implemented in round 1: the window ring is per layer whi
 ACT_CLUSTERS = ("dg_act", "swiglu_routed", "swiglu_shared", "o_rope_qdq",   # need the act_quant table parity
                 "hc_norm", "kv_path", "q_path")
 DISABLE_ENV = "DSV41_GLUE_DISABLE"
-# M1-T10-FIX: the clusters that run at rows > 1 (the 6-row verify step). Each is row-parallel -- the fused op on row r
-# reads and writes row r only, with the one-row op's per-element arithmetic -- and is self-checked at R rows at build
-# (hc_post: the 4-term order is re-picked on R-row data against Block.hc_post at R rows). Every other cluster is n/a
-# at rows > 1 with the reason below; its call site then runs the reference ops (the T10 6-row step's glue).
-ROWS_CLUSTERS = ("swiglu_shared", "hc_post")
+# M1-T10-FIX / M1-T10-PORT: the clusters that run at rows > 1 (the 6-row verify step). Every kernel has a row axis
+# (grid axis or one program per row) and keeps the one-row kernel's per-element arithmetic and, per row, its reduction
+# order -- picked again for the R-row reference shapes at build (fused_glue_r2.calibrate_r2) -- so each is self-checked
+# at R rows against the reference glue at R rows (the G rows of tests/gpu/test_static_rows_gpu.py). The R-row MoE's
+# routed glue runs through the dedup map (runtime/moe_rows.py: dedup_fused, then the IDX forms of the act_quant /
+# SwiGLU / combine kernels). Not ported, with the reason: ROWS_WHY.
 ROWS_WHY = {
-    "gather": "the R-row MoEs stage R*k dedup slots themselves (runtime/moe_rows.py); the one-launch gather is not wired",
-    "dg_act": "the R-row MoEs scatter pair rows by the dedup map (arow); the kernel writes row 0 of k groups",
-    "swiglu_routed": "pair rows gathered by arow (runtime/moe_rows.py); the kernel reads row 0 of k groups",
-    "moe_combine": "per-row combine through posmat (moe_rows.combine_rows); the kernel sums k rows into one",
-    "o_rope_qdq": "one position's freqs row per launch (rows need per-row freqs)",
-    "q_rope_epilogue": "the GEMV's RoPE epilogue takes one position's freqs row",
-    "hc_norm": "one-row buffers ([1,1,D] y/xf/q/s, one mix statistic)",
-    "mix_stat": "rides in hc_norm (one row)",
-    "kv_path": "one ring slot per launch",
-    "q_path": "one-row q_norm buffers",
-    "router": "one-row gate (ids [k]); the R-row MoEs route [R, k] and dedup",
-    "engram": "one-row gate buffers ([1,1,HC])",
-    "indexer_post": "scalar compress_lens per launch; the R-row step has [R, 1]",
-    "hc_split": "needs hc_norm",
-    "gemv_pair": "its consumers (q/kv path, hc_norm's shared-expert input) are one-row (T9b-4 _rows(xq) == 1 guards)",
-    "reduce_fold": "its consumers (q/kv path, hc_norm's shared-expert input) are one-row (T9b-4 _rows(xq) == 1 guards)",
-    "dg_sf_pack": "needs the one-row dg_act + swiglu_routed writers",
+    "concat_free": CONCAT_FREE_WHY,
 }
+# M1-T10-MOE: dg_sf_pack is ported to R rows -- the R-row writers (dg_act_rows, routed_swiglu_rows) store the codes
+# through a PackedRows over EVERY A row (dg_inplace.DGInplaceBuffers.xsp_all: row r = A row r, the dedup's arow), and
+# fused_glue_r2._verify_sf_pack runs the R-row A/B self-check (codes == the fp32 scales' codes on the pairs' rows,
+# then the layout's GEMM with packed vs fp32 SF, bitwise). The masked call shape keeps fp32 SF (n/a there).
+ROWS_CLUSTERS = tuple(c for c in CLUSTERS if c not in ROWS_WHY)
 NBF16 = 65536                   # bf16 bit patterns (table rows)
 SILU_LIM = NBF16                # silu table entry holding silu(swiglu_limit)
 ROPE_MODES = (0, 1, 2)
@@ -397,47 +391,70 @@ if HAVE_TRITON:
 
     @triton.jit
     def t9b2_act_quant_bcast(x, x_rs, q, q_gs, s, s_gs, G, KB, tab, BB: tl.constexpr, S_F32: tl.constexpr,
-                             s_cs=0, S_PACK: tl.constexpr = False):
+                             s_cs=0, S_PACK: tl.constexpr = False, xi=0, oi=0, IDX: tl.constexpr = False):
         """Program (pb, r): 32-blocks [pb*BB, (pb+1)*BB) of input row r (bf16, row stride x_rs) -> fp8 values and the
         block scales (fp32 value or uint8 e8m0 code) written to output rows r*G + g for g < G (strides q_gs, s_gs):
         dg_act writes one activation row into row 0 of every DeepGEMM group this way. T9b-4 S_PACK: the codes go
-        into DeepGEMM's packed MN-major SF bytes (_t9b4_store_code; s_gs / s_cs in bytes)."""
+        into DeepGEMM's packed MN-major SF bytes (_t9b4_store_code; s_gs / s_cs in bytes). M1-T10-PORT IDX: program
+        r is the R-row MoE's sorted pair r: input row xi[r] (its token row) -> output row oi[r] (its A row), G = 1 --
+        the act_quant of the R rows + the index_select / index_copy scatter of runtime/moe_rows.py in one launch."""
         pb = tl.program_id(0)
         r = tl.program_id(1)
         bi = pb * BB + tl.arange(0, BB)
         bok = bi < KB
         cols = bi[:, None] * 32 + tl.arange(0, 32)[None, :]
         m = bok[:, None] & (cols >= 0)
-        v = tl.load(x + r * x_rs + cols, mask=m, other=0.0).to(tl.float32)
+        if IDX:
+            v = tl.load(x + tl.load(xi + r) * x_rs + cols, mask=m, other=0.0).to(tl.float32)
+        else:
+            v = tl.load(x + r * x_rs + cols, mask=m, other=0.0).to(tl.float32)
         code = _t9b2_code(tl.max(tl.abs(v), axis=1), tab)
         qv = _t9b2_q8(v, _t9b2_ipow2(code)[:, None])
-        for g in range(G):
-            o = r * G + g
-            tl.store(q + o * q_gs + cols, qv, mask=m)
+        if IDX:
+            ro = tl.load(oi + r)
+            tl.store(q + ro * q_gs + cols, qv, mask=m)
             if S_PACK:
-                _t9b4_store_code(s, o, bi, code, bok, s_gs, s_cs, True)
+                _t9b4_store_code(s, ro, bi, code, bok, s_gs, s_cs, True)
             elif S_F32:
-                tl.store(s + o * s_gs + bi, _t9b2_pow2(code), mask=bok)
+                tl.store(s + ro * s_gs + bi, _t9b2_pow2(code), mask=bok)
             else:
-                tl.store(s + o * s_gs + bi, code.to(tl.uint8), mask=bok)
+                tl.store(s + ro * s_gs + bi, code.to(tl.uint8), mask=bok)
+        else:
+            for g in range(G):
+                o = r * G + g
+                tl.store(q + o * q_gs + cols, qv, mask=m)
+                if S_PACK:
+                    _t9b4_store_code(s, o, bi, code, bok, s_gs, s_cs, True)
+                elif S_F32:
+                    tl.store(s + o * s_gs + bi, _t9b2_pow2(code), mask=bok)
+                else:
+                    tl.store(s + o * s_gs + bi, code.to(tl.uint8), mask=bok)
 
     @triton.jit
     def t9b2_swiglu_quant(g, g_gs, u, u_gs, w, q, q_gs, s, s_gs, KB, silu_tab, tab, lim,
                           BB: tl.constexpr, HAS_W: tl.constexpr, HAS_LIM: tl.constexpr, S_F32: tl.constexpr,
                           s_cs=0, GS=0, US=0, S_PACK: tl.constexpr = False, NSG: tl.constexpr = 0,
-                          NSU: tl.constexpr = 0):
+                          NSU: tl.constexpr = 0, ri=0, IDX: tl.constexpr = False):
         """Program (pb, j): group/row j, 32-blocks [pb*BB, (pb+1)*BB). gate/up bf16 -> silu(clamp(gate)) by table,
         clamp(up), silu*up, (w[j] *), bf16 RNE, then act_quant -> fp8 q and the scale (fp32 or e8m0 code). T9b-4:
         NSG / NSU > 0 = gate / up are the GEMV's fp32 split partials (split strides GS / US) reduced on load in the
-        split-K reduce's order (_t9b4_ld); S_PACK = codes into DeepGEMM's packed SF bytes (_t9b4_store_code)."""
+        split-K reduce's order (_t9b4_ld); S_PACK = codes into DeepGEMM's packed SF bytes (_t9b4_store_code).
+        M1-T10-PORT IDX: program j is the R-row MoE's sorted pair j: gate / up / q / s rows ri[j] (its A row), the
+        weight w[j] (its routing weight in sorted-pair order) -- runtime/moe_rows.py's index_select + glue +
+        act_quant + index_copy in one launch."""
         pb = tl.program_id(0)
         j = tl.program_id(1)
         bi = pb * BB + tl.arange(0, BB)
         bok = bi < KB
         cols = bi[:, None] * 32 + tl.arange(0, 32)[None, :]
         m = bok[:, None] & (cols >= 0)
-        gv = _t9b4_ld(g + j * g_gs, cols, m, NSG, GS)
-        uv = _t9b4_ld(u + j * u_gs, cols, m, NSU, US)
+        if IDX:
+            rj = tl.load(ri + j)
+            gv = _t9b4_ld(g + rj * g_gs, cols, m, NSG, GS)
+            uv = _t9b4_ld(u + rj * u_gs, cols, m, NSU, US)
+        else:
+            gv = _t9b4_ld(g + j * g_gs, cols, m, NSG, GS)
+            uv = _t9b4_ld(u + j * u_gs, cols, m, NSU, US)
         sv = tl.load(silu_tab + ((gv.to(tl.int32, bitcast=True) >> 16) & 0xFFFF))
         if HAS_LIM:
             sv = tl.where(gv > lim, tl.load(silu_tab + 65536), sv)
@@ -448,24 +465,42 @@ if HAVE_TRITON:
             h = tl.load(w + j) * h
         h = _t9b2_bf16(h)
         code = _t9b2_code(tl.max(tl.abs(h), axis=1), tab)
-        tl.store(q + j * q_gs + cols, _t9b2_q8(h, _t9b2_ipow2(code)[:, None]), mask=m)
-        if S_PACK:
-            _t9b4_store_code(s, j, bi, code, bok, s_gs, s_cs, True)
-        elif S_F32:
-            tl.store(s + j * s_gs + bi, _t9b2_pow2(code), mask=bok)
+        if IDX:
+            tl.store(q + rj * q_gs + cols, _t9b2_q8(h, _t9b2_ipow2(code)[:, None]), mask=m)
+            if S_PACK:
+                _t9b4_store_code(s, rj, bi, code, bok, s_gs, s_cs, True)
+            elif S_F32:
+                tl.store(s + rj * s_gs + bi, _t9b2_pow2(code), mask=bok)
+            else:
+                tl.store(s + rj * s_gs + bi, code.to(tl.uint8), mask=bok)
         else:
-            tl.store(s + j * s_gs + bi, code.to(tl.uint8), mask=bok)
+            tl.store(q + j * q_gs + cols, _t9b2_q8(h, _t9b2_ipow2(code)[:, None]), mask=m)
+            if S_PACK:
+                _t9b4_store_code(s, j, bi, code, bok, s_gs, s_cs, True)
+            elif S_F32:
+                tl.store(s + j * s_gs + bi, _t9b2_pow2(code), mask=bok)
+            else:
+                tl.store(s + j * s_gs + bi, code.to(tl.uint8), mask=bok)
 
     @triton.jit
-    def t9b2_moe_combine(d, d_gs, KS, sh, out, N, BLOCK_C: tl.constexpr):
-        """out = bf16(((0 + d[0]) + d[1] + ... + d[KS-1]) + sh), fp32 adds in slot order."""
+    def t9b2_moe_combine(d, d_gs, KS, sh, out, N, BLOCK_C: tl.constexpr, pidx=0, IDX: tl.constexpr = False):
+        """out = bf16(((0 + d[0]) + d[1] + ... + d[KS-1]) + sh), fp32 adds in slot order. M1-T10-PORT IDX: program
+        (pb, t) = token row t of the R-row MoE: its KS rows of d are pidx[t*KS + j] (runtime/moe_rows.py `posmat`:
+        its pairs' A rows in ascending expert id), sh / out are row t -- combine_rows + `+= shared` + type_as."""
         i = tl.program_id(0) * BLOCK_C + tl.arange(0, BLOCK_C)
         ok = i < N
         acc = tl.zeros([BLOCK_C], dtype=tl.float32)
-        for j in range(KS):
-            acc = acc + tl.load(d + j * d_gs + i, mask=ok, other=0.0).to(tl.float32)
-        acc = acc + tl.load(sh + i, mask=ok, other=0.0).to(tl.float32)
-        tl.store(out + i, acc.to(tl.bfloat16, fp_downcast_rounding="rtne"), mask=ok)
+        if IDX:
+            t = tl.program_id(1)
+            for j in range(KS):
+                acc = acc + tl.load(d + tl.load(pidx + t * KS + j) * d_gs + i, mask=ok, other=0.0).to(tl.float32)
+            acc = acc + tl.load(sh + t * N + i, mask=ok, other=0.0).to(tl.float32)
+            tl.store(out + t * N + i, acc.to(tl.bfloat16, fp_downcast_rounding="rtne"), mask=ok)
+        else:
+            for j in range(KS):
+                acc = acc + tl.load(d + j * d_gs + i, mask=ok, other=0.0).to(tl.float32)
+            acc = acc + tl.load(sh + i, mask=ok, other=0.0).to(tl.float32)
+            tl.store(out + i, acc.to(tl.bfloat16, fp_downcast_rounding="rtne"), mask=ok)
 
     @triton.jit
     def t9b2_hc_post(x, res, post, comb, out, D, HC: tl.constexpr, BLOCK_C: tl.constexpr, MODE: tl.constexpr):
@@ -500,11 +535,15 @@ if HAVE_TRITON:
 
     @triton.jit
     def t9b2_o_rope_qdq(o, NB, freqs, tab, HD: tl.constexpr, RD: tl.constexpr, BB: tl.constexpr,
-                        RE_MODE: tl.constexpr, IM_MODE: tl.constexpr):
+                        RE_MODE: tl.constexpr, IM_MODE: tl.constexpr, FS=0):
         """In place on one bf16 row of NB 32-blocks (heads of HD, RoPE on the last RD of each): program pb takes
         blocks [pb*BB, (pb+1)*BB) as even/odd element pairs; rope columns get the INVERSE rotation by (c, -d)
-        rounded to bf16; then the block's act_quant QDQ, bf16(fp32(q) * s), is stored back."""
+        rounded to bf16; then the block's act_quant QDQ, bf16(fp32(q) * s), is stored back. M1-T10-PORT: grid axis
+        1 = token row t (1 at the one-row step): row t of o (stride NB*32) with its own freqs row (stride FS)."""
         pb = tl.program_id(0)
+        t = tl.program_id(1)
+        o = o + t * (NB * 32)
+        freqs = freqs + t * FS
         bi = pb * BB + tl.arange(0, BB)
         bok = bi < NB
         ce = bi[:, None] * 32 + 2 * tl.arange(0, 16)[None, :]          # even columns [BB, 16]
@@ -582,24 +621,35 @@ def _store_scales_torch(s, row: int, code: torch.Tensor) -> None:
         s.view(torch.uint8)[row].copy_(code.to(torch.uint8))
 
 
-def launch_act_quant_bcast(x, q, s, code_tab, groups: int):
+def launch_act_quant_bcast(x, q, s, code_tab, groups: int, src_rows=None, dst_rows=None):
     """x [R, K] bf16 (unit inner stride) -> q rows (r*groups + g) fp8 [.., K] and s rows (fp32 or e8m0/uint8, or
-    T9b-4: a runtime.dg_inplace.PackedRows -- the codes straight into DeepGEMM's packed activation SF)."""
+    T9b-4: a runtime.dg_inplace.PackedRows -- the codes straight into DeepGEMM's packed activation SF).
+    M1-T10-PORT: src_rows / dst_rows int64 [P] (both or neither; groups 1): output row dst_rows[p] <- act_quant of
+    input row src_rows[p], one program row per p (the R-row MoE's pair scatter)."""
     R_, K = x.shape
     KB = K // BLOCK
     pk = _is_packed(s)
     s_f32 = (not pk) and s.dtype == torch.float32
+    idx = src_rows is not None
+    if idx and (dst_rows is None or int(groups) != 1):
+        raise ValueError("launch_act_quant_bcast: src_rows needs dst_rows and groups 1")
     if _kern(x):
         if pk:
             su, s_gs, s_cs = s.u8, s.row_stride, s.col_stride
         else:
             su = s if s_f32 else s.view(torch.uint8)
             s_gs, s_cs = su.stride(0), 0
-        t9b2_act_quant_bcast[(triton.cdiv(KB, AQ_BB), R_)](
+        P = src_rows.numel() if idx else R_
+        t9b2_act_quant_bcast[(triton.cdiv(KB, AQ_BB), P)](
             x, x.stride(0), q, q.stride(0), su, s_gs, int(groups), KB, code_tab, BB=AQ_BB, S_F32=s_f32,
-            s_cs=int(s_cs), S_PACK=pk, **LAUNCH)
+            s_cs=int(s_cs), S_PACK=pk, **(dict(xi=src_rows, oi=dst_rows, IDX=True) if idx else {}), **LAUNCH)
         return
     qv, code = act_quant_torch(x.float(), code_tab)
+    if idx:
+        for p, (r, o) in enumerate(zip(src_rows.tolist(), dst_rows.tolist())):
+            q[o].copy_(qv[r])
+            _store_scales_torch(s, o, code[r])
+        return
     for r in range(R_):
         for g in range(groups):
             o = r * groups + g
@@ -607,25 +657,39 @@ def launch_act_quant_bcast(x, q, s, code_tab, groups: int):
             _store_scales_torch(s, o, code[r])
 
 
-def launch_swiglu_quant(g, u, w, q, s, silu_tab, code_tab, lim: float):
+def launch_swiglu_quant(g, u, w, q, s, silu_tab, code_tab, lim: float, rows_idx=None):
     """g, u: [G, I] bf16 row views (unit inner stride) or (T9b-4 reduce fold) gemv_mxfp8.SplitK partials of the
     shared expert's w1 / w3 GEMVs; w: [G] fp32 or None; q [G, I] fp8; s [G, I/32] fp32/e8m0 or (T9b-4) a
-    runtime.dg_inplace.PackedRows."""
+    runtime.dg_inplace.PackedRows. M1-T10-PORT rows_idx int64 [P]: program p reads gate / up rows rows_idx[p] of the
+    [A, I] row views g / u, w[p], and writes q / s rows rows_idx[p] (the R-row MoE's sorted pairs)."""
     gt, G_, I, g_gs, nsg, gs = _split_src(g)
     ut, _, _, u_gs, nsu, us = _split_src(u)
     KB = I // BLOCK
     pk = _is_packed(s)
     s_f32 = (not pk) and s.dtype == torch.float32
+    idx = rows_idx is not None
+    if idx and (nsg or nsu):
+        raise ValueError("launch_swiglu_quant: rows_idx with split-K partials")
     if _kern(gt):
         if pk:
             su, s_gs, s_cs = s.u8, s.row_stride, s.col_stride
         else:
             su = s if s_f32 else s.view(torch.uint8)
             s_gs, s_cs = su.stride(0), 0
-        t9b2_swiglu_quant[(triton.cdiv(KB, AQ_BB), G_)](
+        P = rows_idx.numel() if idx else G_
+        t9b2_swiglu_quant[(triton.cdiv(KB, AQ_BB), P)](
             gt, g_gs, ut, u_gs, w if w is not None else gt, q, q.stride(0), su, s_gs, KB,
             silu_tab, code_tab, float(lim), BB=AQ_BB, HAS_W=w is not None, HAS_LIM=lim > 0, S_F32=s_f32,
-            s_cs=int(s_cs), GS=int(gs), US=int(us), S_PACK=pk, NSG=int(nsg), NSU=int(nsu), **LAUNCH)
+            s_cs=int(s_cs), GS=int(gs), US=int(us), S_PACK=pk, NSG=int(nsg), NSU=int(nsu),
+            **(dict(ri=rows_idx, IDX=True) if idx else {}), **LAUNCH)
+        return
+    if idx:
+        ri = rows_idx.reshape(-1)
+        h = swiglu_torch(g.index_select(0, ri), u.index_select(0, ri), w, silu_tab, lim)
+        qv, code = act_quant_torch(h, code_tab)
+        q.view(torch.uint8).index_copy_(0, ri, qv.contiguous().view(torch.uint8))
+        for p, r in enumerate(ri.tolist()):
+            _store_scales_torch(s, r, code[p])
         return
     gb = g.reduce_torch() if nsg else g
     ub = u.reduce_torch() if nsu else u
@@ -639,8 +703,21 @@ def launch_swiglu_quant(g, u, w, q, s, silu_tab, code_tab, lim: float):
         s.copy_(pow2_code(code))
 
 
-def launch_moe_combine(rows, shared, out):
-    """rows [KS, N] bf16 (row views, unit inner), shared [N] bf16, out [N] bf16."""
+def launch_moe_combine(rows, shared, out, posmat=None):
+    """rows [KS, N] bf16 (row views, unit inner), shared [N] bf16, out [N] bf16. M1-T10-PORT posmat int64 [R, k]:
+    rows = all A rows [A, N], shared / out [R, N]: out[t] = bf16((0 + sum_j rows[posmat[t, j]]) + shared[t])."""
+    if posmat is not None:
+        R_, KS = posmat.shape
+        N = rows.size(1)
+        if _kern(rows):
+            t9b2_moe_combine[(triton.cdiv(N, COMBINE_BLOCK), R_)](rows, rows.stride(0), KS, shared, out, N,
+                                                                  BLOCK_C=COMBINE_BLOCK, pidx=posmat, IDX=True,
+                                                                  **LAUNCH)
+            return out
+        y = torch.zeros(R_, N, dtype=torch.float32, device=rows.device)
+        for j in range(KS):
+            y = y + rows.index_select(0, posmat[:, j]).float()
+        return out.copy_((y + shared.reshape(R_, N).float()).to(torch.bfloat16))
     KS, N = rows.shape
     if _kern(rows):
         t9b2_moe_combine[(triton.cdiv(N, COMBINE_BLOCK),)](rows, rows.stride(0), KS, shared, out, N,
@@ -664,13 +741,28 @@ def launch_hc_post(x, res, post, comb, out, mode: int):
 
 
 def launch_o_rope_qdq(o_row, freqs_real, code_tab, head_dim: int, rope_dim: int, modes: Tuple[int, int]):
-    """In place on o_row [N] bf16 contiguous (N = n_heads * head_dim): inverse RoPE + act_quant QDQ."""
-    N = o_row.numel()
+    """In place on o_row [N] bf16 contiguous (N = n_heads * head_dim): inverse RoPE + act_quant QDQ. M1-T10-PORT:
+    o_row [R, N] with freqs_real [R, rope_dim/2, 2] (row t rotated by its own position), one launch."""
+    rows = o_row.dim() == 2
+    R_ = o_row.size(0) if rows else 1
+    N = o_row.numel() // R_
     if _kern(o_row):
         NB = N // BLOCK
-        t9b2_o_rope_qdq[(triton.cdiv(NB, AQ_BB),)](o_row, NB, freqs_real, code_tab, HD=head_dim, RD=rope_dim,
-                                                   BB=AQ_BB, RE_MODE=int(modes[0]), IM_MODE=int(modes[1]), **LAUNCH)
+        grid = (triton.cdiv(NB, AQ_BB), R_) if rows else (triton.cdiv(NB, AQ_BB),)
+        fs = {"FS": int(freqs_real.stride(0))} if rows and freqs_real.dim() == 3 else {}
+        t9b2_o_rope_qdq[grid](o_row, NB, freqs_real, code_tab, HD=head_dim, RD=rope_dim, BB=AQ_BB,
+                              RE_MODE=int(modes[0]), IM_MODE=int(modes[1]), **fs, **LAUNCH)
         return o_row
+    if rows:
+        for t in range(R_):
+            _o_rope_qdq_torch(o_row[t], freqs_real[t] if freqs_real.dim() == 3 else freqs_real, code_tab, head_dim,
+                              rope_dim, modes)
+        return o_row
+    return _o_rope_qdq_torch(o_row, freqs_real, code_tab, head_dim, rope_dim, modes)
+
+
+def _o_rope_qdq_torch(o_row, freqs_real, code_tab, head_dim: int, rope_dim: int, modes) -> torch.Tensor:
+    """launch_o_rope_qdq's CPU mirror for one row."""
     r = rope_rows_torch(o_row, freqs_real, head_dim, rope_dim, modes, inverse=True) if rope_dim else o_row
     return o_row.copy_(qdq_torch(r.float(), code_tab))
 
@@ -724,7 +816,7 @@ class FusedGlue(R2Glue):
         self.rows = int(getattr(owner, "rows", 1))
         for c in CLUSTERS:
             why = self._applicable(c, layers, mx)
-            if why is None and self.rows > 1 and c not in ROWS_CLUSTERS:  # M1-T10-FIX: one-row cluster
+            if why is None and self.rows > 1 and c not in ROWS_CLUSTERS:  # M1-T10-PORT: not ported to rows
                 why = f"rows={self.rows}: {ROWS_WHY.get(c, 'one-row kernel')}"
             self.status[c] = "on" if why is None else f"n/a: {why}"
         for c in manual:
@@ -787,6 +879,12 @@ class FusedGlue(R2Glue):
             return None
         if c == "hc_post":
             return None
+        if c == "dedup":
+            if self.rows == 1:
+                return "rows=1: the one-row MoE routes k distinct experts (no dedup)"
+            if self.rows * o.topk > DEDUP_MAX_PAIRS:
+                return f"rows x topk = {self.rows * o.topk} pairs > {DEDUP_MAX_PAIRS} (one-program dedup kernel)"
+            return None
         attns = [l.attn for l in layers]
         if c == "o_rope_qdq":
             same = all((a.head_dim, a.rope_head_dim) == (self.head_dim, self.rope_dim) for a in attns)
@@ -848,6 +946,42 @@ class FusedGlue(R2Glue):
         launch_moe_combine(out_rows, shared.reshape(-1), y.view(-1))
         return y
 
+    # ---------------------------------------------------------------- MoE at R rows (M1-T10-PORT, runtime/moe_rows.py)
+    def dg_act_rows(self, x: torch.Tensor, m: dict) -> None:
+        """act_quant(x) of the R rows straight into the pair A rows of DeepGEMM's w1/w3 input: A row arow[t] <- row
+        prow[t] (fp8 + fp32 scales), one launch (the reference: act_quant, 2 index_select, e8m0_to_f32, 2 index_copy)."""
+        b = self.o.dg
+        D = x.size(-1)
+        launch_act_quant_bcast(x.reshape(-1, D), b.xq[1].view(-1, D), self.dg_scale_rows(1, D // BLOCK), self.code_tab,
+                               1, src_rows=m["prow"], dst_rows=m["arow"])
+
+    def dg_scale_rows(self, which: int, kb: int):
+        """M1-T10-MOE: where the R-row writers' scales of DeepGEMM input `which` go -- the fp32 xs as [A rows, K/32],
+        or (dg_sf_pack ported to R rows) the packed activation SF addressed by A row."""
+        b = self.o.dg
+        if getattr(b, "sf_pack", False) and getattr(b, "xsp_all", None):
+            return b.xsp_all[which]
+        return b.xs[which].view(-1, kb)
+
+    def routed_swiglu_rows(self, gate_rows: torch.Tensor, up_rows: torch.Tensor, m: dict) -> None:
+        """The pairs' SwiGLU (model.py:845-853) on the w1/w3 GEMM outputs [A, I] at rows arow, weights pw, then
+        act_quant into the same A rows of the w2 input: one launch (reference: 2 index_select, clamp, silu, *, *w,
+        bf16, act_quant, e8m0_to_f32, 2 index_copy)."""
+        b = self.o.dg
+        I = gate_rows.size(-1)
+        launch_swiglu_quant(gate_rows, up_rows, m["pw"], b.xq[2].view(-1, I), self.dg_scale_rows(2, I // BLOCK),
+                            self.silu_tab, self.code_tab, b.swiglu_limit, rows_idx=m["arow"])
+
+    def combine_rows(self, out_rows: torch.Tensor, posmat: torch.Tensor, shared: torch.Tensor,
+                     x: torch.Tensor) -> torch.Tensor:
+        """moe_rows.combine_rows + `+= shared` + type_as(x) (model.py:895-906 at R rows) in one launch: row t =
+        bf16((0 + sum_j out[posmat[t, j]]) + shared[t]), fp32 adds in ascending expert id."""
+        D = x.size(-1)
+        R_ = x.numel() // D
+        y = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+        launch_moe_combine(out_rows, shared.reshape(R_, D).contiguous(), y.view(R_, D), posmat=posmat)
+        return y
+
     def shared_expert(self, ex, x: torch.Tensor) -> torch.Tensor:
         """Expert.forward (model.py:843-853, weights None) with the SwiGLU + bf16 + w2's act_quant in one kernel; w1,
         w3 and w2 keep their GEMM path (patches.fp8_linear_prequant routes w2 exactly as linear() would)."""
@@ -897,8 +1031,16 @@ class FusedGlue(R2Glue):
 
     # ---------------------------------------------------------------- attention (#10, #13)
     def o_path(self, attn, o: torch.Tensor, freqs_cis: torch.Tensor) -> None:
-        """In place on the sparse_attn output o [1,1,H,head_dim]: inverse RoPE + act_quant QDQ (model.py:783-788)."""
-        launch_o_rope_qdq(o.view(-1), torch.view_as_real(freqs_cis).reshape(-1, 2), self.code_tab, attn.head_dim,
+        """In place on the sparse_attn output o [1,T,H,head_dim]: inverse RoPE + act_quant QDQ (model.py:783-788);
+        T token rows (1, or M1-T10-PORT the R-row step's R with freqs_cis [R, rd/2]: one launch, row t at its own
+        position)."""
+        T_ = o.numel() // (attn.n_local_heads * attn.head_dim)
+        fr = torch.view_as_real(freqs_cis)
+        if T_ > 1:
+            launch_o_rope_qdq(o.view(T_, -1), fr.reshape(T_, -1, 2).contiguous(), self.code_tab, attn.head_dim,
+                              attn.rope_head_dim, self.rope_inv)
+            return
+        launch_o_rope_qdq(o.view(-1), fr.reshape(-1, 2), self.code_tab, attn.head_dim,
                           attn.rope_head_dim, self.rope_inv)
 
     def q_proj(self, attn, qr: torch.Tensor, freqs_cis: torch.Tensor, qq=None) -> Optional[torch.Tensor]:
@@ -917,8 +1059,10 @@ class FusedGlue(R2Glue):
             xq, s = qq
         else:
             xq, s = R.act_quant(qr, R.fp8_block_size, R.scale_fmt, R.scale_dtype)   # model.py:197 (inside wq_b)
-        out = linear_fp8_rope(xq, s, w, w.scale, torch.view_as_real(freqs_cis).reshape(-1, 2), attn.head_dim,
-                              attn.rope_head_dim, self.rope_fwd)
+        T_ = xq.numel() // xq.size(-1)
+        fr = torch.view_as_real(freqs_cis)       # M1-T10-PORT: [T, rd/2, 2] at T rows (row m at its own position)
+        fr = fr.reshape(T_, -1, 2).contiguous() if T_ > 1 else fr.reshape(-1, 2)
+        out = linear_fp8_rope(xq, s, w, w.scale, fr, attn.head_dim, attn.rope_head_dim, self.rope_fwd)
         return out.unflatten(-1, (attn.n_local_heads, attn.head_dim))
 
     # ---------------------------------------------------------------- self-check
@@ -937,7 +1081,7 @@ class FusedGlue(R2Glue):
             for c, fn in (("dg_act", self._verify_dg_act), ("swiglu_routed", self._verify_swiglu_routed),
                           ("swiglu_shared", self._verify_swiglu_shared), ("moe_combine", self._verify_combine),
                           ("o_rope_qdq", self._verify_o_path), ("q_rope_epilogue", self._verify_q_proj),
-                          ("gather", self._verify_gather)):
+                          ("gather", self._verify_gather), ("dedup", self._verify_dedup)):
                 if self.on(c):
                     why = fn(g)
                     cal[f"verify_{c}"] = why or "equal"
@@ -1130,6 +1274,8 @@ class FusedGlue(R2Glue):
 
     def _verify_swiglu_routed(self, g) -> Optional[str]:
         R, b = self.R, self.o.dg
+        if self.rows > 1:
+            return self._verify_swiglu_routed_rows(g)
         for _ in range(3):
             gate, up = self._rand_gate_up(g, b.k, b.inter)
             w = (torch.rand(b.k, generator=g, device="cpu") * 2).float().to(self.dev)
@@ -1144,6 +1290,34 @@ class FusedGlue(R2Glue):
             if not (torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
                     and torch.equal(s.view(torch.int32), s_ref32.view(torch.int32))):
                 return "routed SwiGLU+act_quant differs from the reference glue"
+        return None
+
+    def _verify_swiglu_routed_rows(self, g) -> Optional[str]:
+        """M1-T10-PORT: the IDX form (pairs at arbitrary A rows) == index_select + the reference glue + act_quant +
+        e8m0_to_f32 + index_copy (DGMaskedMoERows' path), rows not addressed untouched."""
+        from runtime.dg_moe import e8m0_to_f32
+
+        R, b = self.R, self.o.dg
+        P = b.k                         # R*k slots = the pair count
+        A = 2 * P
+        I = b.inter
+        for _ in range(3):
+            gate, up = self._rand_gate_up(g, A, I)
+            ri = torch.randperm(A, generator=g, device="cpu")[:P].to(self.dev)
+            w = (torch.rand(P, generator=g, device="cpu") * 2).float().to(self.dev)
+            h = self._ref_swiglu(gate.index_select(0, ri), up.index_select(0, ri), w, b.swiglu_limit, torch.bfloat16)
+            q_ref, s_ref = R.act_quant(h, R.fp8_block_size, R.scale_fmt, R.scale_dtype)
+            s_ref32 = torch.empty(P, I // BLOCK, dtype=torch.float32, device=self.dev)
+            e8m0_to_f32(s_ref, s_ref32, b.e8m0_method)
+            qw = torch.zeros(A, I, dtype=FP8, device=self.dev)
+            sw = torch.zeros(A, I // BLOCK, dtype=torch.float32, device=self.dev)
+            qw.view(torch.uint8).index_copy_(0, ri, q_ref.contiguous().view(torch.uint8))
+            sw.index_copy_(0, ri, s_ref32)
+            q, s = torch.zeros_like(qw), torch.zeros_like(sw)
+            launch_swiglu_quant(gate, up, w, q, s, self.silu_tab, self.code_tab, b.swiglu_limit, rows_idx=ri)
+            if not (torch.equal(q.view(torch.uint8), qw.view(torch.uint8)) and torch.equal(s.view(torch.int32),
+                                                                                         sw.view(torch.int32))):
+                return f"routed SwiGLU+act_quant at {self.rows} rows (pair rows) differs from the reference glue"
         return None
 
     def _verify_swiglu_shared(self, g) -> Optional[str]:
@@ -1167,6 +1341,8 @@ class FusedGlue(R2Glue):
         from runtime.dg_moe import e8m0_to_f32
 
         R, b = self.R, self.o.dg
+        if self.rows > 1:
+            return self._verify_dg_act_rows(g)
         for _ in range(3):
             x = _rand_act(g, 1, b.dim).to(self.dev)
             q_ref, s_ref = R.act_quant(x, R.fp8_block_size, R.scale_fmt, R.scale_dtype)
@@ -1180,8 +1356,36 @@ class FusedGlue(R2Glue):
                 return "act_quant into the DeepGEMM rows differs from act_quant + load_act"
         return None
 
+    def _verify_dg_act_rows(self, g) -> Optional[str]:
+        """M1-T10-PORT: act_quant of R rows scattered to pair A rows == act_quant + index_select + e8m0_to_f32 +
+        index_copy (DGMaskedMoERows._load)."""
+        from runtime.dg_moe import e8m0_to_f32
+
+        R, b = self.R, self.o.dg
+        T_, P, D = self.rows, b.k, b.dim
+        A = b.xq[1].numel() // D
+        for _ in range(3):
+            x = _rand_act(g, T_, D).to(self.dev)
+            prow = torch.randint(0, T_, (P,), generator=g, device="cpu").to(self.dev)
+            arow = torch.randperm(A, generator=g, device="cpu")[:P].to(self.dev)
+            q_ref, s_ref = R.act_quant(x, R.fp8_block_size, R.scale_fmt, R.scale_dtype)
+            s32 = torch.empty(T_, D // BLOCK, dtype=torch.float32, device=self.dev)
+            e8m0_to_f32(s_ref, s32, b.e8m0_method)
+            qw = torch.zeros(A, D, dtype=FP8, device=self.dev)
+            sw = torch.zeros(A, D // BLOCK, dtype=torch.float32, device=self.dev)
+            qw.view(torch.uint8).index_copy_(0, arow, q_ref.contiguous().view(torch.uint8).index_select(0, prow))
+            sw.index_copy_(0, arow, s32.index_select(0, prow))
+            q, s = torch.zeros_like(qw), torch.zeros_like(sw)
+            launch_act_quant_bcast(x, q, s, self.code_tab, 1, src_rows=prow, dst_rows=arow)
+            if not (torch.equal(q.view(torch.uint8), qw.view(torch.uint8))
+                    and torch.equal(s.view(torch.int32), sw.view(torch.int32))):
+                return f"act_quant into the pair A rows at {self.rows} rows differs from act_quant + _load"
+        return None
+
     def _verify_combine(self, g) -> Optional[str]:
         b = self.o.dg
+        if self.rows > 1:
+            return self._verify_combine_rows(g)
         for _ in range(3):
             rows = _rand_act(g, b.k, b.dim, lo=-8, hi=8).to(self.dev)
             sh = _rand_act(g, 1, b.dim, lo=-8, hi=8).to(self.dev)
@@ -1195,14 +1399,37 @@ class FusedGlue(R2Glue):
                 return "combine differs from the fp32 slot-order sum"
         return None
 
+    def _verify_combine_rows(self, g) -> Optional[str]:
+        """M1-T10-PORT: the posmat combine + shared + bf16 == moe_rows.combine_rows; y += shared; y.type_as(x)."""
+        from runtime.moe_rows import combine_rows
+
+        b, T_, k = self.o.dg, self.rows, self.o.topk
+        A = 2 * b.k
+        for _ in range(3):
+            rows = _rand_act(g, A, b.dim, lo=-8, hi=8).to(self.dev)
+            sh = _rand_act(g, T_, b.dim, lo=-8, hi=8).to(self.dev)
+            posmat = torch.stack([torch.randperm(A, generator=g, device="cpu")[:k] for _ in range(T_)]).to(self.dev)
+            y = combine_rows(rows, posmat, sh)
+            y += sh
+            ref = y.type_as(sh)
+            got = self.combine_rows(rows, posmat, sh, sh)
+            if not torch.equal(got.view(torch.int16), ref.view(torch.int16)):
+                return f"combine at {self.rows} rows differs from combine_rows + shared"
+        return None
+
     def _verify_o_path(self, g) -> Optional[str]:
         R = self.R
         attn = self.o.model.layers[0].attn
         G_ = attn.n_local_groups
-        for x, f in self._rope_data(g, attn, True)[:4]:
+        T_ = self.rows
+        data = self._rope_data(g, attn, True)
+        if T_ > 1:   # M1-T10-PORT: T rows at T different positions per draw
+            data = [(torch.cat([data[(i + j) % len(data)][0] for j in range(T_)], 1),
+                     torch.cat([data[(i + j) % len(data)][1] for j in range(T_)], 0)) for i in range(4)]
+        for x, f in data[:4]:
             ref = x.clone()
             R.apply_rotary_emb(ref[..., -self.rope_dim:], f, True)
-            ref = ref.view(1, 1, G_, -1)
+            ref = ref.view(1, T_, G_, -1)
             R.act_quant(ref, R.fp8_block_size, R.scale_fmt, R.scale_dtype, True)
             got = x.clone()
             self.o_path(attn, got, f)
@@ -1218,10 +1445,11 @@ class FusedGlue(R2Glue):
         try:
             torch.set_default_dtype(torch.bfloat16)
             with o._active():
+                T_ = self.rows   # M1-T10-PORT: T rows, row m at position pos + m
                 for t in range(3):
-                    qr = _rand_act(g, 1, K, lo=-4, hi=4).view(1, 1, K).to(self.dev)
-                    pos = int(torch.randint(1, attn.freqs_cis.size(0), (1,), generator=g, device="cpu"))
-                    f = attn.freqs_cis[pos:pos + 1]
+                    qr = _rand_act(g, T_, K, lo=-4, hi=4).view(1, T_, K).to(self.dev)
+                    pos = int(torch.randint(1, attn.freqs_cis.size(0) - T_ + 1, (1,), generator=g, device="cpu"))
+                    f = attn.freqs_cis[pos:pos + T_]
                     got = self.q_proj(attn, qr, f)
                     if got is None:
                         return "wq_b does not take the GEMV in this step's scope"
@@ -1242,7 +1470,10 @@ class FusedGlue(R2Glue):
         o = self.o
         sm = o.moes[0]
         E = sm.moe.n_routed_experts
-        ids = torch.randperm(E, generator=g, device="cpu")[: o.topk].sort().values.to(self.dev)
+        if self.rows > 1:   # M1-T10-PORT: the R*k dedup slots (ids ascending, padded with repeats like uniq)
+            ids = torch.randint(0, E, (o.n_slots,), generator=g, device="cpu").sort().values.to(self.dev)
+        else:
+            ids = torch.randperm(E, generator=g, device="cpu")[: o.topk].sort().values.to(self.dev)
         ref = {}
         for key, tab in sm.ptabs.items():
             gather_rows(tab, ids, o.staging[key], o.row_bytes[key])
@@ -1272,6 +1503,70 @@ class FusedGlue(R2Glue):
                 o.ids_step[sm.layer].copy_(ids_prev)
         return None
 
+    def _verify_dedup(self, g) -> Optional[str]:
+        """M1-T10-PORT: the one-launch dedup == moe_rows.dedup_routes (+ masked_m, the counters' rows and -- dg-inplace
+        -- compact_cold's stage ids / sidx / m_indices tags) on random routings of the step's R x k pairs with heavy
+        cross-row repeats, on layer 0's real hot-slot table."""
+        from runtime import moe_rows as MR
+
+        o = self.o
+        T_, k = self.rows, o.topk
+        sm = o.moes[0]
+        E = sm.moe.n_routed_experts
+        inpl = sm._route_kw().get("inpl") if hasattr(sm, "_route_kw") else None
+        P = T_ * k
+        for t in range(8):
+            span = min(E, k + 2 + 3 * t)                  # few distinct experts first: many repeats
+            idx = torch.stack([torch.randperm(span, generator=g, device="cpu")[:k] for _ in range(T_)])
+            idx = (idx + int(torch.randint(0, E - span + 1, (1,), generator=g, device="cpu"))).to(self.dev)
+            w = torch.rand(T_, k, generator=g, device="cpu").float().to(self.dev)
+            br = T_ + (t % 3)
+            if inpl is not None and inpl.get("v2"):   # M1-T10-MOE: private m_indices / gl / counter (live ones stay)
+                lay = inpl.get("layout", "contiguous")
+                if lay == "masked":
+                    br = int(o.dg.block_rows)
+                inpl = dict(inpl, mi=torch.full((P * br,), -1, dtype=torch.int32, device=self.dev)
+                            if lay == "contiguous" else None,
+                            gl=torch.zeros(max(int(inpl.get("G") or 0), 1), dtype=torch.int32, device=self.dev),
+                            ovf=torch.zeros(1, dtype=torch.int32, device=self.dev))
+            buf = MR.DedupBuffers(T_, k, self.dev)
+            mm = torch.full((P,), -7, dtype=torch.int32, device=self.dev)
+            ids = torch.full((P,), -7, dtype=torch.long, device=self.dev)
+            uv = torch.full((P,), -7, dtype=torch.long, device=self.dev)
+            got = MR.dedup_fused(buf, idx, w, br, mm=mm, ids_step=ids, uval=uv, inpl=inpl)
+            ref = MR.dedup_routes(idx, w, br)
+            ext = MR.rows_layout(ref, inpl, br, T_, k) if inpl is not None and inpl.get("v2") else None
+            for key, v in ref.items():
+                if ext is not None and key in ("arow", "posmat"):
+                    v = ext[key]
+                if not torch.equal(got[key], v):
+                    return f"dedup {key} differs from dedup_routes"
+            if not (torch.equal(mm, ref["counts"].int()) and torch.equal(ids, ref["uniq"])
+                    and torch.equal(uv, ref["valid"])):
+                return "dedup masked_m / counter rows differ"
+            if ext is not None:
+                if inpl["mi"] is not None:
+                    got_tags = inpl["mi"].view(P, br)[:, :T_]
+                    if not (torch.equal(got_tags, ext["tags"]) and bool((inpl["mi"].view(P, br)[:, T_:] == -1).all())):
+                        return "dedup's m_indices tags differ"
+                if ext["gl"] is not None and not torch.equal(inpl["gl"][: ext["gl"].numel()], ext["gl"]):
+                    return "dedup's psum / masked_m vector differs"
+                if not (torch.equal(got["wl"], ext["wl"]) and int(inpl["ovf"]) == int(ext["n_over"])
+                        and torch.equal(got["sidx"], ext["sidx"]) and torch.equal(got["ids_stage"], ext["ids_stage"])):
+                    return "dedup's work list / overflow count / stage ids differ"
+                continue
+            if inpl is not None:
+                gq = inpl["gtab"].index_select(0, ref["uniq"]).long()
+                cold, ok, grp, sidx = MR.compact_cold(gq, ref["counts"], int(inpl["H"]), int(inpl["S"]))
+                stage = torch.where(ref["counts"] > 0, ref["uniq"], inpl["dummy"]) if inpl["has_dummy"] else ref["uniq"]
+                n_ok = torch.where(ok, ref["counts"], 0)
+                ar = torch.arange(T_, dtype=torch.long, device=self.dev).view(1, -1)
+                tags = torch.where(ar < n_ok.view(-1, 1), grp.view(-1, 1), -1).to(torch.int32)
+                if not (torch.equal(got["sidx"], sidx) and torch.equal(got["ids_stage"], stage)
+                        and torch.equal(got["tags"], tags)):
+                    return "dedup's dg-inplace stage ids / compact cold index / m_indices tags differ"
+        return None
+
     # ---------------------------------------------------------------- report
     def describe(self) -> dict:
         d = {"impl": "fused", "triton": getattr(triton, "__version__", None) if HAVE_TRITON else None,
@@ -1293,7 +1588,8 @@ class FusedGlue(R2Glue):
         off = [c for c in CLUSTERS if not self.on(c)]
         out = self.describe_r2()["outcome"]
         num = ", ".join(f"{c} {'(i)' if (v or '').startswith('(i)') else '(ii)'}" for c, v in out.items())
-        rows = f"rows {self.rows} (row-parallel clusters only: {','.join(ROWS_CLUSTERS)}); " if self.rows > 1 else ""
+        rows = (f"rows {self.rows} (self-checked at {self.rows} rows; not ported: {','.join(ROWS_WHY)}); "
+                if self.rows > 1 else "")
         return (f"[glue] fused: {rows}on {','.join(on) or '-'}; approx {','.join(ap) or '-'}; off {','.join(off) or '-'}; "
                 f"r2 numerics {num or '-'}; orders {self.describe_r2()['orders']}")
 

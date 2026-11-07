@@ -1,0 +1,23 @@
+W3 is done. The report is written and has every section in the output contract. The headline: the GEMV cost comes from per-launch latency, not from bandwidth. Fixing the GEMV and the head saves about 2.3 ms of the projected ~21 ms 6-row step, which is worth doing but won't get us to 5.0 ms. All the ms estimates below are modeled; none were measured on the box.
+
+1. **Why it's slow:** the 290 fp8 GEMVs move 5.5 GB per step (0.69–0.79 ms at 7–8 TB/s) but take 3.43 ms (measured). 208 of them are 2.6–12 MB weights that each pay about 8 µs of fixed cost. The cause is our load pattern: one 32-byte chunk per weight row per K-block, so too few bytes are in flight, plus a second launch for the split-K reduce.
+2. **What others get:** published single-launch kernels for the same weight sizes run 2.5–5 µs (claimed), flat up to 8–16 rows (FlashInfer TGV and tinygemm2). TensorRT-LLM issue #20634 is DSV4.1's own wq_a/wkv, though in bf16 on Vera Rubin (a different GPU): 3.7–3.9 µs there. Big shapes reach about 5.3 TB/s; our cuBLAS head already hits 6.3 TB/s (measured).
+3. **G1, GEMV rewrite (`runtime/gemv_mxfp8.py`):** read 256–512 B of each row at a time with a deep pipeline. Do the split-K reduce inside the same launch (the last block to finish sums the parts in fixed order, as CUTLASS stream-K does). Pick the split by shape only, never by row count, so 6 rows give the same bits as 1 row. Also launch same-input projections together: {wq_a, wkv}, {w1, w3}, {wq_b, indexer wq_b}.
+   - Estimate: 3.43 → ~1.4 ms; −2.0 ms at 6 rows, −1.2 to −1.6 ms at 1 row (T9b-4 already took part of it).
+   - Numerics: bit-identical to today's GEMV when the 32-block partial sums are formed the same way; otherwise our existing 1-ulp class.
+   - The 6-row path also needs T9b-4's pairing and reduce-folding, which are currently one-row only.
+4. **G2, head in bf16:** the checkpoint head is bf16 and the reference only widens it, so every product is exact in fp32. Storing it as bf16 and running our own fixed-order fp32 kernel is a layout change, not a requant.
+   - 0.42 → ~0.21 ms at 1–8 rows.
+   - Same bits for 1 and 6 rows, which removes the last kernel that changes with row count.
+   - 1-ulp class vs the cuBLAS reference; frees 1.32 GB of HBM.
+5. **The drafter's heads aren't in the 21 ms projection.** The DSpark draft reuses the 2.65 GB head on 5 rows plus five 132 MB Markov heads. In bf16 that saves about 0.5–0.8 ms per cycle. W2 should price this.
+6. **Production's head:** the vendored vLLM code doesn't set an fp32 head, so Pg61 probably produces bf16 logits. I couldn't check whether its launcher overrides that (no ssh). For us that's A1, so we must not copy it; it may also explain part of the production parity gap (a 20-minute probe would test this).
+7. **Fallbacks and rejects:**
+   - Fallback: vLLM/SGLang's `torch.mm(..., out_dtype=fp32)`. About 0.2 ms, but tensor-core accumulation makes it A3 and it changes with row count.
+   - Rejected: cuBLASLt MXFP8 at small row counts, bf16-dequantized weights, and atomic split-K.
+8. **Alternative to G1 (G3):** borrow FlashInfer's `tgv_gemm_sm100`, which takes MXFP8 at up to 8 rows. Unverified whether our image's flashinfer 0.7.0.post1 has the MX path.
+9. **Box probes:** P1–P7 in the report, each 30 minutes or less. Run P1 first: a fresh nsys anatomy at 10.52 ms and at 6 rows. Without it, every G-number above is measured against the old 13.9 ms anatomy.
+
+Report: /Users/jamesmeadlock/hermes/gb300-dsv41-decode/research/round2-20261107/W3-gemv-head.md
+
+W3: The GEMV is bound by per-launch latency, not bandwidth. A GEMV rewrite (−2.0 ms at 6 rows) plus a bf16-stored fixed-order head (−0.2 ms per step, −0.5 to −0.8 ms per DSpark cycle) is worth ~2.3 ms of the 6-row step; do it, but the 5.0 ms bar depends on launch count and MoE.

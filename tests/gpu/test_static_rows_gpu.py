@@ -22,7 +22,14 @@ M1-T10-FIX (docs/HANDOFF-M1-T10-FIX.md):
     cache targets, the window indices under a CPU-seeded lru cache, one direct reference sparse_attn call on cuda.
     The final line counts the bit-equal comparisons that actually executed.
   * D row: 6-row dg-inplace == 6-row dg-masked (torch.equal: logits, main_hidden, caches; graph == eager);
-  * G row: 6-row fused glue (row-parallel clusters) == 6-row ref glue on the fast impls (dg-inplace and dg-masked).
+  * G row: 6-row fused glue == 6-row ref glue on the fast impls (dg-inplace and dg-masked); M1-T10-PORT: every
+    ported cluster on (fused_glue.ROWS_CLUSTERS), its build-time self-check at 6 rows equal, and each alone off.
+M1-T10-FIX2 (docs/HANDOFF-M1-T10-FIX2.md): the D row at spare_slots = 8 (compact cold index, the real Triton
+  staging kernel), no overflow; forced overflow (spare_slots = 1): the device counter == the host expectation from
+  each eager step's routing, and the graph replay trips it identically.
+T9b-5 (docs/HANDOFF-T9B5-FP32-FIXED.md): the V0 census also lists the fixed-order fp32 kernels (family "T9b-5 fixed
+  fp32": mixes + head, row-invariant by construction) next to cuBLAS on the same inputs, and the step-level table has
+  "ref, fp32 fixed" and "fast, GEMV M=1 cfg pinned, fp32 fixed" ($DSV41_FP32_IMPL=fixed for both steps).
 
 Run on the box (orchestrator), same line as tests/gpu/test_static_mini_gpu.py, repo at $W:
 
@@ -62,7 +69,7 @@ STATIC_KW = {}    # ... with {"_allow_cpu": True}
 FAST = dict(moe_impl="dg-masked", fp8_impl="gemv", glue_impl="fused", attn_impl="flashmla")
 FAST_INPLACE = dict(FAST, moe_impl="dg-inplace")  # M1-T10-FIX: the 6-row fast path
 # M1-T10-FIX: how many bit-equal comparisons actually executed (the round-1 run reached none of them)
-COUNTS = {"logit_rows": 0, "main_hidden": 0, "caches": 0, "gates": 0}
+COUNTS = {"logit_rows": 0, "main_hidden": 0, "caches": 0, "gates": 0, "g_clusters": 0}
 
 
 def _need_tilelang():
@@ -445,21 +452,25 @@ def _eq_runs(a, b, what):
 
 
 def test_static6_dg_inplace_equals_dg_masked():
-    """D row at 6 rows (M1-T10-FIX Part B 1): dg-inplace (DeepGEMM contiguous grouped GEMM over the pool in place,
-    6k spare slots) == dg-masked, torch.equal on every row's fp32 logits, main_hidden and the caches, both P0
-    parities, static-eager; dg-inplace graph == its static-eager. The dg-inplace step is built first (it grows the
+    """D row at 6 rows (M1-T10-FIX Part B 1; M1-T10-FIX2: S = 8 spare slots, compact cold index): dg-inplace
+    (DeepGEMM contiguous grouped GEMM over the pool in place) == dg-masked, torch.equal on every row's fp32 logits,
+    main_hidden and the caches, both P0 parities, static-eager; dg-inplace graph == its static-eager; no overflow
+    (mini4: at most 4 cold unique experts per layer-step < 8). The dg-inplace step is built first (it grows the
     pool; a step built before the growth refuses to run)."""
     _need_tilelang()
     with _model("mini4") as (model, pool):
         hid = (len(model.layers) - 1,)
         for L in (17, 18):
             ids, toks = _toks(L, ROWS * 4, 60 + L)
-            si = _need_step(model, pool, rows=ROWS, hidden_layers=hid, moe_impl="dg-inplace")
+            si = _need_step(model, pool, rows=ROWS, hidden_layers=hid, moe_impl="dg-inplace", spare_slots=8)
+            assert si.spare_slots == 8 and si.dg.spare_limit == 8 and pool.spare >= 8
             a = _static(model, si, ids, toks, 4)
             if DEV == "cuda":  # (the CPU dry run has no graphs)
                 si.capture()
                 ag = _static(model, si, ids, toks, 4, graph=True)
                 _assert_rows(ag[0], a[0], "6-row dg-inplace graph vs static-eager")
+            ov = si.overflow_counts()
+            assert ov["steps"] == 0 and ov["experts"] == 0, ov
             dd = si.dg.describe()
             si.detach()
             sm = _need_step(model, pool, rows=ROWS, hidden_layers=hid, moe_impl="dg-masked")
@@ -467,24 +478,85 @@ def test_static6_dg_inplace_equals_dg_masked():
             sm.detach()
             _eq_runs(a, b, f"D L={L}: 6-row dg-inplace vs dg-masked")
             print(f"  D P0 {L} (parity {L % 2}): 6-row dg-inplace == dg-masked, {len(a[0])} rows x V + main_hidden + "
-                  f"caches; graph == eager; spare slots {dd['spare_slots']}, groups/layer {dd['groups_per_layer']}, "
-                  f"HBM added {dd['hbm_added_GiB']} GiB")
+                  f"caches; graph == eager; spare slots {dd['spare_slots']} (budget {dd['spare_limit']}), groups/layer "
+                  f"{dd['groups_per_layer']}, HBM added {dd['hbm_added_GiB']} GiB; overflow steps {ov['steps']}")
+
+
+def _expected_overflow(st, S):
+    """Cold unique experts beyond S over all layers of the last EAGER step (each MoE's `last` routing)."""
+    from runtime.moe_rows import compact_cold_host
+
+    return sum(compact_cold_host(m.t["gtab"].tolist(), m.last["uniq"].tolist(), m.last["counts"].tolist(),
+                                 m.t["H"], S)["overflow"] for m in st.moes)
+
+
+def test_static6_dg_inplace_forced_overflow_trips_counter():
+    """M1-T10-FIX2 (2): spare_slots = 1 on mini4 (4 of 8 experts hot per layer): the staging kernel's device counter
+    counts exactly the cold unique experts beyond the first per layer (host expectation from each eager step's
+    routing), the steps still run, and the graph replay of the same inputs trips the counter identically (the
+    counter is graph-safe: zeroed and accumulated inside the captured step)."""
+    _need_tilelang()
+    with _model("mini4") as (model, pool):
+        ids, toks = _toks(17, ROWS * 3, 91)
+        st = _need_step(model, pool, rows=ROWS, moe_impl="dg-inplace", spare_slots=1)
+        assert st.spare_slots == 1
+        _prefill(model, ids)
+        want = []
+        with torch.inference_mode():
+            for s in range(3):
+                st.step(toks[s * ROWS:(s + 1) * ROWS], len(ids) + s * ROWS, graph=False)
+                want.append(_expected_overflow(st, 1))
+                assert int(st.ovf_step.item()) == want[-1], (s, int(st.ovf_step.item()), want[-1])
+        ov = st.overflow_counts()
+        assert sum(want) > 0 and ov["experts"] == sum(want) and ov["steps"] == sum(1 for w in want if w), (ov, want)
+        COUNTS["gates"] += 1
+        g_ov = None
+        if DEV == "cuda":
+            st.capture()
+            _static(model, st, ids, toks, 3, graph=True)
+            g_ov = st.overflow_counts()
+            assert g_ov["experts"] == sum(want) and g_ov["steps"] == ov["steps"], (g_ov, want)
+        print(f"  overflow S=1: eager {ov['steps']}/3 steps, {ov['experts']} cold experts not staged (host "
+              f"expectation {want}); graph {g_ov if g_ov is None else (g_ov['steps'], g_ov['experts'])}")
+        st.detach()
+
+
+def _rows_expected_on(moe, fp8="gemv"):
+    """M1-T10-PORT: the clusters that must be on at 6 rows with `moe` / `fp8`: every cluster but the two left off
+    (fused_glue.ROWS_WHY) and those n/a by impl (dg-inplace: gather; fp8 ref -- the CPU dry run --: the GEMV parts)."""
+    from runtime import fused_glue as FG
+
+    never = set(FG.ROWS_WHY) | ({"gather"} if moe == "dg-inplace" else {"dg_sf_pack"})   # M1-T10-MOE: dg_sf_pack
+    if fp8 != "gemv":                                                                      # ported (dg-inplace's)
+        never |= {"q_rope_epilogue", "gemv_pair", "reduce_fold"}
+    return set(FG.CLUSTERS) - never
 
 
 def test_static6_fused_glue_equals_ref_glue():
-    """G row at 6 rows (M1-T10-FIX Part B 2): glue fused (row-parallel clusters on, self-checked at 6 rows; the
-    one-row clusters n/a with their reasons) == glue ref, torch.equal, on the fast impls (gemv, flashmla) with
-    dg-masked and dg-inplace; graph == static-eager."""
+    """G row at 6 rows (M1-T10-FIX Part B 2; M1-T10-PORT: EVERY ported cluster): glue fused -- all clusters
+    applicable to the fast impls on at 6 rows, each self-checked at build against the reference glue at 6 rows
+    (`verify_<cluster>` == "equal": the per-cluster G rows), only fused_glue.ROWS_WHY n/a -- == glue ref, torch.equal,
+    on the fast impls (gemv, flashmla) with dg-masked and dg-inplace; graph == static-eager. Then, dg-inplace, each
+    cluster alone OFF (DSV41_GLUE_DISABLE) == ref glue (bisects a cluster that breaks only in combination)."""
     _need_tilelang()
+    from runtime import fused_glue as FG
+
     with _model("mini4") as (model, pool):
         hid = (len(model.layers) - 1,)
         ids, toks = _toks(18, ROWS * 4, 77)
+        refs = {}
         for moe in ("dg-inplace", "dg-masked"):
             kw = dict(FAST, moe_impl=moe)
             f = _need_step(model, pool, rows=ROWS, hidden_layers=hid, **kw)
             d = f.glue.describe()
-            print(f"  G {moe}: {f.glue.glue_line()[:300]}")
-            assert d["on"], d["clusters"]
+            print(f"  G {moe}: {f.glue.glue_line()[:400]}")
+            want = _rows_expected_on(moe, f.fp8_impl)
+            assert set(d["on"]) == want, {c: d["clusters"][c] for c in want ^ set(d["on"])}
+            ver = {k_: v for k_, v in d["calibration"].items() if k_.startswith("verify_")}
+            ver.update({k_: v for k_, v in d["calibration"].get("r4", {}).items() if k_.startswith("verify_")})
+            assert all(v == "equal" for v in ver.values()), ver
+            print(f"  G {moe} per-cluster self-checks at {ROWS} rows: {', '.join(sorted(ver))} all equal")
+            COUNTS["g_clusters"] += len(ver)
             a = _static(model, f, ids, toks, 4)
             if DEV == "cuda":
                 f.capture()
@@ -494,8 +566,27 @@ def test_static6_fused_glue_equals_ref_glue():
             r = _need_step(model, pool, rows=ROWS, hidden_layers=hid, **dict(kw, glue_impl="ref"))
             b = _static(model, r, ids, toks, 4)
             r.detach()
+            refs[moe] = b
+            refs.setdefault("fp8", f.fp8_impl)
             _eq_runs(a, b, f"G {moe}: 6-row fused glue vs ref glue")
             print(f"  G {moe}: 6-row fused glue ({','.join(d['on'])}) == ref glue, {len(a[0])} rows; graph == eager")
+        moe = "dg-inplace"
+        prev = os.environ.get(FG.DISABLE_ENV)
+        fp8 = refs["fp8"]
+        try:
+            for c in sorted(_rows_expected_on(moe, fp8)):
+                os.environ[FG.DISABLE_ENV] = c
+                f = _need_step(model, pool, rows=ROWS, hidden_layers=hid, **dict(FAST, moe_impl=moe))
+                assert f.glue.status[c].startswith("off"), f.glue.status[c]
+                a = _static(model, f, ids, toks, 4)
+                f.detach()
+                _eq_runs(a, refs[moe], f"G {moe}: 6-row fused glue without {c} vs ref glue")
+            print(f"  G {moe}: each of {len(_rows_expected_on(moe, fp8))} clusters alone off == ref glue")
+        finally:
+            if prev is None:
+                os.environ.pop(FG.DISABLE_ENV, None)
+            else:
+                os.environ[FG.DISABLE_ENV] = prev
 
 
 # ------------------------------------------------------------------------------------------------ V0
@@ -506,19 +597,31 @@ def test_v0_census_and_step_level_table():
 
     with _model("mini4") as (model, pool):
         recs = census(model, rows=ROWS)
+        # T9b-5: the two cuBLAS fp32 sites under --fp32-impl fixed (the fixed-order kernels, next to cuBLAS on the
+        # same inputs); with the switch both sites' families read row-invariant
+        from runtime.fused_glue_r2 import fp32_fixed_census
+
+        recs += fp32_fixed_census(model, rows=ROWS)
         for line in census_table(recs):
             print("  " + line)
         ids, toks = _toks(18, ROWS * 4, 44)
         n_pos = ROWS * 4
         print(f"  STEP-LEVEL V0: 6-row step row j vs the 1-row step at P0+j, same impls, {n_pos} positions")
         print(f"  {'impls':44s} {'bit-equal':>9s} {'max|dlogit|':>12s} {'argmax':>7s}")
-        cases = [("ref", {}, None, False), ("ref, row_invariant_mode", {}, None, True),
-                 ("fast, GEMV tuned M=6 cfg", dict(FAST), "0", False),
-                 ("fast, GEMV M=1 cfg pinned", dict(FAST), "1", False)]
-        for label, kw, pin, rim in cases:
+        cases = [("ref", {}, None, False, None), ("ref, row_invariant_mode", {}, None, True, None),
+                 ("ref, fp32 fixed (T9b-5)", {}, None, False, "fixed"),
+                 ("fast, GEMV tuned M=6 cfg", dict(FAST), "0", False, None),
+                 ("fast, GEMV M=1 cfg pinned", dict(FAST), "1", False, None),
+                 ("fast, GEMV M=1 cfg pinned, fp32 fixed", dict(FAST), "1", False, "fixed")]
+        from runtime.fused_glue_r2 import FP32_IMPL_ENV
+
+        for label, kw, pin, rim, fp32 in cases:
             prev = os.environ.get(PIN_ENV)
+            prev32 = os.environ.get(FP32_IMPL_ENV)
             if pin is not None:
                 os.environ[PIN_ENV] = pin
+            if fp32 is not None:
+                os.environ[FP32_IMPL_ENV] = fp32
             try:
                 cm = row_invariant_mode() if rim else contextlib.nullcontext()
                 with cm:
@@ -540,6 +643,11 @@ def test_v0_census_and_step_level_table():
                         os.environ.pop(PIN_ENV, None)
                     else:
                         os.environ[PIN_ENV] = prev
+                if fp32 is not None:
+                    if prev32 is None:
+                        os.environ.pop(FP32_IMPL_ENV, None)
+                    else:
+                        os.environ[FP32_IMPL_ENV] = prev32
 
 
 # ------------------------------------------------------------------------------------------------ first light cells
@@ -583,7 +691,8 @@ def test_first_light_rows_cells_graph(mode="graph"):
 TESTS = [test_static6_equals_reference_mini_both_parities, test_static6_equals_reference_mini4_both_parities,
          test_static6_equals_reference_attn_bounded, test_static6_ring_wrapped_both_parities,
          test_static1_ring256_past_wrap_equals_reference, test_static6_graph_replay_relaunch_no_sync,
-         test_static6_dg_inplace_equals_dg_masked, test_static6_fused_glue_equals_ref_glue,
+         test_static6_dg_inplace_equals_dg_masked, test_static6_dg_inplace_forced_overflow_trips_counter,
+         test_static6_fused_glue_equals_ref_glue,
          test_static6_fast_impls_drift_graded, test_v0_census_and_step_level_table,
          test_first_light_rows_cells_graph]
 
@@ -604,6 +713,7 @@ if __name__ == "__main__":
         print(f"{results[t.__name__]:4s} {t.__name__} ({time.time() - t0:.1f}s)", flush=True)
     n_fail = sum(v == "FAIL" for v in results.values())
     print(f"bit-equal comparisons executed: {COUNTS['gates']} gate runs, {COUNTS['logit_rows']} fp32 logit rows, "
-          f"{COUNTS['main_hidden']} main_hidden, {COUNTS['caches']} cache tensors (torch.equal)")
+          f"{COUNTS['main_hidden']} main_hidden, {COUNTS['caches']} cache tensors (torch.equal); "
+          f"{COUNTS['g_clusters']} per-cluster 6-row self-checks equal")
     print(f"{len(results) - n_fail}/{len(results)} not failed; {n_fail} failed")
     sys.exit(1 if n_fail else 0)

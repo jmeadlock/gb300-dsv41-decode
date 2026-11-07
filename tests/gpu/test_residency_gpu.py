@@ -13,6 +13,11 @@ CUDA/tilelang (Mac); the Mac half is tests/test_residency_cpu.py + tests/test_re
      MUST diverge -- otherwise this test could not see an ordering bug.
   3. after_step makes no host sync (torch.cuda.set_sync_debug_mode("error")) while swapping.
   4. (report only) graph step time with residency on vs off on the mini model.
+  5. (A2-2 rebase) the same at 6 ROWS per step (Generator rows=6, teacher-forced step_rows, graph): the compact-cold-
+     index dg-inplace step (S = 16 staging slots at H.., the residency slots after them), packed-SF stores "pool"
+     (default at 6 rows: a promoted expert's packed SF is written by the manager) and "step", and ref; swaps of
+     experts the next step routes (only the used unique slots) racing queued replays with n_spare 1 and ~1 GiB of
+     dummy H2D ahead of each swap; the same publish_before_copy negative control; overflow counter 0 throughout.
 
 Run on the box (orchestrator), from the repo checkout, inside the library image (same line as the other GPU tests):
 
@@ -170,7 +175,7 @@ def _event_ordering_run(gen, ids, routed, mutation=None):
     gen.static_step()
     rm = gen.residency_mgr
     rm._mutation = mutation
-    big_src = torch.empty(256 << 20, dtype=torch.uint8, pin_memory=True)
+    big_src = torch.empty(256 << 20, dtype=torch.uint8, device="cpu", pin_memory=True)
     big_dst = torch.empty(256 << 20, dtype=torch.uint8, device=rm.dev)
     orig = rm._copies
 
@@ -264,9 +269,175 @@ def test_residency_step_time_report():
               f"({(res['on'] - res['off']) / res['off'] * 100:+.1f} %; mini-model numbers, not the real step)")
 
 
+# ------------------------------------------------------------------------------------------------ 6 rows (rebase)
+ROWS = 6
+N_ROW_STEPS = 24
+
+
+def _gen_rows(model, tokdir, moe_impl, residency=None, glue_impl="ref"):
+    from runtime.generate import Generator, set_determinism
+
+    set_determinism(0)
+    return Generator(model, tokdir, max_pos=MAX_POS, mode="graph", moe_impl=moe_impl, glue_impl=glue_impl, rows=ROWS,
+                     residency=residency)
+
+
+def _rows_steps(gen, ids, toks_dev, n, before=None):
+    """prefill + n teacher-forced 6-row graph steps fed from a device tensor (no host sync in the loop): device clones
+    of every step's fp32 logits [6, V] and the routed unique ids / used flags; one sync at the end."""
+    gen.static_step()  # built (and the residency manager attached) before the first `before` hook
+    gen.prefill(ids)
+    out, routed = [], []
+    pos = len(ids)
+    for k in range(n):
+        if before is not None:
+            before(k)
+        lg = gen.step_rows(toks_dev[ROWS * k:ROWS * (k + 1)], pos)
+        out.append(lg.float().clone())
+        routed.append((gen.static.ids_step.clone(), gen.static.uvalid_step.clone()))
+        pos += ROWS
+    torch.cuda.synchronize()
+    return out, [(i.cpu(), u.cpu()) for i, u in routed]
+
+
+def _used_ids(routed_k):
+    """per layer: a 1-D tensor of the unique experts the step routed (uvalid > 0), for _routed_swaps."""
+    ids, uv = routed_k
+    return [ids[l][uv[l] > 0] for l in range(ids.size(0))]
+
+
+def _rows_combo(moe_impl, sf_store=None, glue_impl="ref"):
+    _need_tilelang()
+    _need_impl(moe_impl)
+    from runtime.residency import golden_from_index
+
+    saved = os.environ.get("DSV41_ROWS_SF_STORE")
+    if sf_store is not None:
+        os.environ["DSV41_ROWS_SF_STORE"] = sf_store
+    try:
+        with _model("mini4") as (model, tokdir):
+            gen = _gen_rows(model, tokdir, moe_impl, glue_impl=glue_impl)
+            ids = _ids(16, 31)
+            toks = torch.tensor(_ids(ROWS * N_ROW_STEPS, 32), dtype=torch.long, device="cpu").to("cuda")
+            off, routed = _rows_steps(gen, ids, toks, N_ROW_STEPS)
+            gen.set_residency(_cfg())
+            rng = np.random.default_rng(5)
+
+            def before(k):
+                rm = gen.residency_mgr
+                rm.inject_counts(_hot_cold_bias(rm, rng))
+                if 6 <= k < 18 and k + 1 < N_ROW_STEPS:   # forced mid-run: experts the next step routes come in / out
+                    rm.force_swaps(_routed_swaps(rm, _used_ids(routed[k + 1]), demote_routed=k % 2 == 1))
+
+            on, _ = _rows_steps(gen, ids, toks, N_ROW_STEPS, before)
+            rm = gen.residency_mgr
+            _assert_equal(on, off, f"6-row {moe_impl}/{sf_store}: residency on vs off")
+            s = rm.stats
+            assert s["published"] > 8 and s["forced_swaps"] > 4, s
+            if moe_impl == "dg-inplace":
+                S = gen.static.spare_slots
+                assert rm.n_stage == S == min(16, ROWS * 4) and all(b == len(gen.pool.hot[l]) + S
+                                                                   for l, b in enumerate(rm.base)), (rm.n_stage, S)
+                ov = gen.static.overflow_counts()
+                assert ov["experts"] == 0 and ov["steps"] == 0, ov
+                assert bool(rm.resident_sf) == (gen.static.dg.sf_store in ("pool", "resident")), gen.static.dg.sf_store
+            rm.flush()
+            a = rm.audit(golden=golden_from_index(model.runtime_load.index))
+            assert a["ok"], a["errors"][:6]
+            d = rm.describe()
+            store = gen.static.dg.sf_store if moe_impl == "dg-inplace" else None
+            gen.set_residency(None)
+            assert model.runtime_load.pool.residency is None
+            again, _ = _rows_steps(gen, ids, toks, N_ROW_STEPS)
+            _assert_equal(again, off, f"6-row {moe_impl}/{sf_store}: off after restore_boot vs off")
+            print(f"  6-row {moe_impl} (sf store {store}): on == off over prefill + {N_ROW_STEPS} graph steps; "
+                  f"{s['published']} swaps published ({s['forced_swaps']} forced), audit {a['experts_checked']} experts "
+                  f"ok; swaps/step {d['swaps_per_step']}")
+            gen.reset_static()
+            del gen
+    finally:
+        if saved is None:
+            os.environ.pop("DSV41_ROWS_SF_STORE", None)
+        else:
+            os.environ["DSV41_ROWS_SF_STORE"] = saved
+
+
+def test_residency_rows6_on_equals_off_ref():
+    _rows_combo("ref")
+
+
+def test_residency_rows6_on_equals_off_dg_inplace_pool_sf():
+    _rows_combo("dg-inplace", "pool")
+
+
+def test_residency_rows6_on_equals_off_dg_inplace_step_sf():
+    _rows_combo("dg-inplace", "step")
+
+
+def test_residency_rows6_on_equals_off_dg_inplace_fused_glue():
+    """The headline's glue: the row-generic fused clusters read the stacked _ptab6 (a table copy the manager owns)."""
+    _rows_combo("dg-inplace", "pool", glue_impl="fused")
+
+
+def _rows_event_ordering_run(gen, ids, toks, routed, mutation=None):
+    gen.set_residency(_cfg(n_spare=1, frozen=True, drain_n=1 << 20))
+    gen.static_step()
+    rm = gen.residency_mgr
+    rm._mutation = mutation
+    big_src = torch.empty(256 << 20, dtype=torch.uint8, device="cpu", pin_memory=True)
+    big_dst = torch.empty(256 << 20, dtype=torch.uint8, device=rm.dev)
+    orig = rm._copies
+
+    def slow(sw, ev):  # ~1 GiB of H2D queued on the copy stream ahead of every swap's own copies
+        with torch.cuda.stream(rm.copy_stream):
+            for _ in range(4):
+                big_dst.copy_(big_src, non_blocking=True)
+        orig(sw, ev)
+
+    rm._copies = slow
+
+    def before(k):
+        if k + 1 < len(routed):
+            rm.force_swaps(_routed_swaps(rm, _used_ids(routed[k + 1]), demote_routed=k % 3 == 0))
+
+    out, _ = _rows_steps(gen, ids, toks, len(routed), before)
+    stats = dict(rm.stats)
+    rm._mutation = None
+    rm._copies = orig
+    gen.set_residency(None)
+    return out, stats
+
+
+def test_residency_rows6_swaps_while_replays_queued_event_ordering():
+    """The 6-row graph reads the promoted / demoted experts' slots in place (DeepGEMM groups = pool slots) and the
+    packed-SF copy; a swap must not overwrite a slot a queued replay still reads, nor publish before its bytes (and
+    packed SF) landed. Same schedule as the 1-row test; the negative control must diverge."""
+    _need_tilelang()
+    _need_impl("dg-inplace")
+    with _model("mini4") as (model, tokdir):
+        gen = _gen_rows(model, tokdir, "dg-inplace")
+        ids = _ids(16, 33)
+        toks = torch.tensor(_ids(ROWS * 16, 34), dtype=torch.long, device="cpu").to("cuda")
+        off, routed = _rows_steps(gen, ids, toks, 16)
+        on, stats = _rows_event_ordering_run(gen, ids, toks, routed)
+        _assert_equal(on, off, "6-row swaps racing queued replays (n_spare 1, slow copies)")
+        assert stats["published"] > len(routed) // 2 and stats["forced_flush"] > 0, stats
+        bad, bstats = _rows_event_ordering_run(gen, ids, toks, routed, mutation="publish_before_copy")
+        n_bad = sum(not torch.equal(x, y) for x, y in zip(bad, off))
+        assert n_bad > 0, "negative control: publish-before-copy went unseen -> this test cannot see ordering bugs"
+        print(f"  6-row event ordering: {stats['published']} swaps (n_spare 1, ~1 GiB dummy H2D ahead of each) racing "
+              f"queued replays -> bit-equal; {stats['forced_flush']} forced flushes; negative control diverged at "
+              f"{n_bad}/{len(off)} steps")
+        gen.reset_static()
+        del gen
+
+
 TESTS = [test_residency_on_equals_off_ref, test_residency_on_equals_off_fused_glue,
          test_residency_on_equals_off_dg_inplace, test_residency_swaps_while_replays_queued_event_ordering,
-         test_residency_after_step_has_no_host_sync, test_residency_step_time_report]
+         test_residency_after_step_has_no_host_sync, test_residency_step_time_report,
+         test_residency_rows6_on_equals_off_ref, test_residency_rows6_on_equals_off_dg_inplace_pool_sf,
+         test_residency_rows6_on_equals_off_dg_inplace_step_sf, test_residency_rows6_on_equals_off_dg_inplace_fused_glue,
+         test_residency_rows6_swaps_while_replays_queued_event_ordering]
 
 if __name__ == "__main__":
     import traceback

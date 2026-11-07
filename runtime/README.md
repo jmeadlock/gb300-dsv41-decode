@@ -373,6 +373,31 @@ then `tests/gpu/test_dg_inplace_gpu.py` (same line, the /ref mount optional: rea
 `--moe-impl dg-inplace --fp8-impl gemv --glue-impl fused --attn-impl bounded --map docs/maps/hot-v26ar-seed-295.json
 --mode graph --parity-levels` (the T9b-3a line with the moe impl swapped).
 
+### M1-T10-FIX2: the 6-row dg-inplace step's spare slots (compact cold index)
+
+The 6-row step (`runtime/moe_rows.py` `DGInplaceMoERows`) has R·k = 36 A blocks per layer (one per unique routed
+expert, ascending id). FIX staged a cold expert of block u into spare slot `H + u`, so every block index needed its
+own spare slot: 36 per layer = 25.5 GB, which OOMed in `add_spare_slots` next to the 218.6 GiB model on the box. FIX2
+gives each **cold** unique expert a compact index `c = cumsum(is_cold over the used blocks) − 1` (`compact_cold`,
+device ops) and stages it into `H + c`; hot experts keep their pool slot; `m_indices` tags each block's rows with that
+group. Same bytes, same GEMM rows, same combine → bit-equal to FIX and to dg-masked.
+
+- **Budget** `spare_slots` = S (StaticStep / Generator / `first_light --spare-slots`; default **8** at rows > 1,
+  clamped to R·k; the 1-row step keeps topk and the old `H + j` contract). Pool growth `40 × S × 17.7 MB`: 5.7 GB at
+  S = 8 (+1.4 GB over the 1-row step's 6). At the seed map ~0.3 cold unique experts per layer per step.
+- **Overflow is counted, never silent.** A layer-step with more than S cold unique experts stages the first S
+  (ascending id); the rest are not staged (no out-of-bounds write), their blocks are tagged −1 (the GEMM skips
+  them), and `t9a2_stage_inplace` (SIDX path) atomically adds one per such expert to the step's device counter
+  `ovf_step` — that step's logits are wrong. The step zeroes `ovf_step` first and accumulates `ovf_steps` /
+  `ovf_total` last, all inside the graph; `StaticStep.overflow_counts()` reads them (since capture or build).
+- **first_light --rows 6:** `[hbm] 1-row build …` / `[hbm] 6-row build …` lines (HBM right after each build, pool
+  spare slots, bytes this build added; `rows_mode.build_1row` / `build_rows`), `[overflow] …` and the summary's
+  `overflow steps: n` (`rows_mode.overflow`).
+- **Tests:** `tests/test_spare_compact_cpu.py` (mapping incl. ties / zero-cold / all-cold, staging contract and the
+  kernel body under the shim with sidx + counter, the 6-row step at S = 8 / 4 (boundary) / 24 == dg-masked, forced
+  overflow S = 1 counted exactly, validation, Generator/first_light plumbing); GPU: `tests/gpu/test_static_rows_gpu.py`
+  D row at S = 8 and `test_static6_dg_inplace_forced_overflow_trips_counter` (eager and graph).
+
 ## T9b-1: fp8 Linear layers on a Triton MXFP8 GEMV (`--fp8-impl gemv`, `gemv_mxfp8.py`)
 
 Spec: `docs/HANDOFF-T9B1-GEMV.md`. Every `Linear` whose weight is fp8 with 32x32 e8m0 block scales goes through
@@ -823,14 +848,24 @@ self-check's reason), `fused_glue.calibration.r4`, `dg_moe.act_sf_packed`, the G
 
 Design: docs/A2-RESIDENCY-DESIGN.md 3.1-3.4, handoff docs/HANDOFF-A2-2-RESIDENCY.md. Off by default; with it off
 nothing in the step changes. With it on, `Generator` builds a `ResidencyManager` BEFORE the StaticStep (the pool's
-weight tensors grow to `H + n_stage + n_spare` slots per layer: dg-inplace's own `topk*rows` staging slots first,
-then `n_spare` residency slots; their scales live in the manager), then attaches it to the step (discovers every
+weight tensors grow to `H + n_stage + n_spare` slots per layer: dg-inplace's own staging slots first -- `topk` at 1
+row, the compact-cold-index budget `S` (16) at R rows, `residency.n_stage_for` -- then `n_spare` residency slots; their
+scales live in the manager; with the R-row `pool`/`resident` packed-SF store the manager also writes a promoted
+expert's packed SF, `residency.sf_store_for`), then attaches it to the step (discovers every
 pointer table, checks it names the boot homes, refuses unknown copies). Every step: one-hot hit counter from
 `ids_step` (x `uvalid_step` at rows > 1), publish finished swaps, drain (vendored m3 policy) when a counter read has
 landed, one barrier (<= `swaps_per_barrier` = 4 swaps), every `drain_n` steps an async counter read. All of it runs
 between replays on the replay stream; copies run on a copy stream; the graph is never recaptured. Spare slots per
 layer default to min(4, headroom calc) -- the calc is printed: free HBM at build - staging - KV (rows x 150 MB x
-ctx/32K) - `--residency-reserve-gib` (8 [A]), over 40 layers x 17.93 MiB per spare slot.
+ctx/32K) - `--residency-reserve-gib` (8 [A]) - (R-row pool SF store) the packed-SF copy the step build allocates after
+the manager and its 6 GiB build headroom, over 40 layers x (17.93 MiB + 1.05 MiB packed SF) per spare slot.
+
+**Rebase onto the 6-row path (docs/HANDOFF-A2-2-REBASE.md):** `DSparkLoop.step_once` calls `rm.after_step(live=b.live)`
+after every step's replay (the hook runs after the step's end event; `generate` reports its GPU time as `mgr_ms`);
+`bench/headline.py --residency on --residency-drain 64 [--residency-ref <off JSON>] [--residency-audit]` reports
+swaps/step, the cold-share curve (per drain and per sequence), `ms_manager_per_step`, `ms_per_step_incl_manager`, and
+with a reference the per-prompt emitted-token / accept-length equality. Exact box commands: docs/A2-2-BOX-PLAN.md.
+Mac: `tests/test_residency_rebase_cpu.py`.
 
 **Mac:** `tests/test_residency_cpu.py` (vendored policy sha + lockstep on Card M2 run-2 arm C: replay reproduces all
 16 dumps, `queue` on each dump's EWMA reproduces m3's live decisions bit-exactly, pair drains == the documented
@@ -855,12 +890,30 @@ with n_spare 1 behind ~1 GiB of dummy H2D per swap, plus the publish-before-copy
 --no-fill-uninit`):
 
     (1) off:      bench/first_light.py --model-dir /ref --map docs/maps/hot-v26ar-seed-295.json F \
-                    --out scratch/fl-a22-off.jsonl --json docs/first-light-a22-off-<date>.json
-    (2) on:       ... same + --residency on --residency-ref docs/first-light-a22-off-<date>.json --residency-audit \
-                    --out scratch/fl-a22-on.jsonl --json docs/first-light-a22-on-<date>.json
+                    --out scratch/fl-a22-off.jsonl --json scratch/first-light-a22-off.json
+    (2) on:       ... same + --residency on --residency-ref scratch/first-light-a22-off.json --residency-audit \
+                    --out scratch/fl-a22-on.jsonl --json scratch/first-light-a22-on.json
                   gate: residency.vs_off.rep1_files_byte_identical, step_cell_tokens_equal; swaps/step <= 4;
                   step_ms_delta_pct (G3 <= 1 %); audit ok
     (3) shifted:  --hot-per-layer 295 (no --map: first-295) F --residency on --out scratch/fl-a22-shift.jsonl \
-                    --json docs/first-light-a22-shift-<date>.json
+                    --json scratch/first-light-a22-shift.json
                   report: residency.cold_share_curve (per drain over reps + cell), cold_share_first_drain ->
                   cold_share_last4_drains, step_cell_cold_share_first64 -> last64, rep_cold_share per prompt
+
+## M1-T11: the DSpark draft step (`mtp_loader.py`, `draft_step.py`)
+
+`build_and_load(..., load_mtp=True)` (CLI `--load-mtp`) then `mtp_loader.attach_mtp`: the checkpoint config's three
+reference `DSparkBlock`s (model.py:1103-1159, 1210-1216) built on meta like the backbone, every `mtp.*` tensor in HBM
+(dense; each stage's routed experts as one stacked `[E, N, K/2]` + `[E, N, K/32]` block per projection, the reference
+Experts bound as views), the loader's three value paths (wo_a dequant, bf16 -> fp32 widening of the Markov head and
+the confidence proj, I8 -> fp4 views), `stage.temperature = 0` (model.py:1113/1156; design memo 0.5), shared
+embed/head; refusal lists as the loader; bytes in `model.runtime_mtp.summary()`. The backbone keeps the overlay.
+
+`draft_step.DraftStep(model, main_hidden=..., tok=...)`: the static, graph-capturable draft (design 2.3): device A'
+and ctx_count; context write of <= 6 rows into the stage rings, predicated; 5-row stage forward over
+`[ring(128) | block(5)]` with the reference's index list (-1 padding moved to the end: same kernel bits); the draft MoE
+on `moe_rows.dedup_routes` with an `index_select` gather from the stacks; the reference `forward_head` (Markov chain,
+confidence). Oracle helpers: `prefill_hidden`, `seed_draft_rings`, `reference_draft` (forward_spec decode calls, one
+context row each). Mac: `tests/test_draft_cpu.py` (incl. the GPU gate dry-run on the kernel emulations); box:
+`tests/gpu/test_draft_gpu.py` (V2 gate, graph, optional real checkpoint via `DSV41_MODEL_DIR`) and
+`bench/draft_bench.py` (draft ms in a graph; acceptance vs the 1-row greedy records, W0 fixture).

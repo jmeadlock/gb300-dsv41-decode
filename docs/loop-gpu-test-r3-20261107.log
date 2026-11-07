@@ -1,0 +1,145 @@
+  reduction census: 14 sites; plain: 7 sites row-variant at 6 rows (reported); row_invariant_mode: all row-invariant
+PASS test_loop_reduction_row_invariance_census (0.8s)
+  mini3 L=17 mode=static row-invariant : loop == 1-row greedy (64 tokens, 63 steps)
+  mini3 L=18 mode=static row-invariant : loop == 1-row greedy (64 tokens, 63 steps)
+PASS test_loop_stream_equals_greedy_static (28.5s)
+  mini3 L=17 mode=static as-is : REPORTED -- stream diverges at 6, logits rows differing 63/64
+  mini3 L=17 mode=static row-invariant(T12 linear+einsum only) : REPORTED -- stream == greedy, logits rows differing 1/64 [17]
+PASS test_loop_stream_as_is_reported (17.9s)
+  mini3 L=17 mode=static: forced rejections, 14 steps, accept hist [3, 2, 2, 2, 2, 3], positions 17..65: stream == greedy, 47 logit rows == 1-row
+  mini3 L=250 mode=static: forced rejections, 15 steps, accept hist [3, 2, 2, 2, 2, 4], positions 250..304: stream == greedy, 55 logit rows == 1-row
+PASS test_loop_forced_rejections_static (5.1s)
+  mini3 L=19: EOS 1182 at token 17: loop stops there (finish stop, 17 live steps of 32 issued); 3 steps after done change nothing
+PASS test_loop_eos_and_noop_steps_static (3.8s)
+/usr/local/lib/python3.12/dist-packages/torch/cuda/__init__.py:1333: UserWarning: Synchronization debug mode is a prototype feature and does not yet detect all synchronizing operations (Triggered internally at /__w/pytorch/pytorch/torch/csrc/cuda/Module.cpp:1028.)
+  torch._C._cuda_set_sync_debug_mode(debug_mode)
+  mini3 L=17 mode=graph/2g row-invariant : loop == 1-row greedy (64 tokens, 63 steps)
+  mini3 L=17 mode=graph/2g: forced rejections, 14 steps, accept hist [3, 2, 2, 2, 2, 3], positions 17..65: stream == greedy, 47 logit rows == 1-row
+  mini3 L=17 mode=graph/1g row-invariant : loop == 1-row greedy (64 tokens, 63 steps)
+  mini3 L=17 mode=graph/1g: forced rejections, 14 steps, accept hist [3, 2, 2, 2, 2, 3], positions 17..65: stream == greedy, 47 logit rows == 1-row
+  mini3 L=19: EOS 1182 at token 17: loop stops there (finish stop, 17 live steps of 32 issued); 3 steps after done change nothing
+  graph (2 and 1) == static-eager: tokens, accepts, 64 logit rows; replay x2; no host sync in 3 replays; step 5.599 ms (verify 2.640 + draft 2.960)
+PASS test_loop_graph_two_and_one_equal_static_replay_no_sync (15.9s)
+  mini3 L=17 mode=graph/2g row-invariant gemv-pinned {'fp8_impl': 'gemv'}: loop == 1-row greedy (64 tokens, 63 steps)
+  mini3 L=18 mode=graph/2g: forced rejections, 14 steps, accept hist [3, 2, 2, 2, 2, 3], positions 18..66: stream == greedy, 47 logit rows == 1-row
+PASS test_loop_stream_gemv_pinned (3.1s)
+[transformers] You are using a model of type `deepseek_v41` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+/__w/pytorch/pytorch/aten/src/ATen/native/cuda/IndexKernel.cu:111: operator(): block: [0,0,0], thread: [0,0,0] Assertion `-sizes[i] <= index && index < sizes[i] && "index out of bounds"` failed.
+Traceback (most recent call last):
+  File "/work/tests/gpu/test_dspark_loop_gpu.py", line 223, in _model
+    yield model, res.pool
+  File "/work/tests/gpu/test_dspark_loop_gpu.py", line 799, in test_loop_real
+    truth, _ = _truth(gen, ids, 64)
+               ^^^^^^^^^^^^^^^^^^^^
+  File "/work/tests/gpu/test_dspark_loop_gpu.py", line 253, in _truth
+    gen.greedy(ids, n, stop_on_eos=stop_on_eos)
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/work/runtime/generate.py", line 640, in greedy
+    self._ensure_captured()
+  File "/work/runtime/generate.py", line 488, in _ensure_captured
+    self.capture()  # before the real prefill: capture prefills a dummy prompt and runs warm-up steps
+    ^^^^^^^^^^^^^^
+  File "/work/runtime/generate.py", line 484, in capture
+    return self.static_step().capture(fills=fills)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/runtime/static_step.py", line 1202, in capture
+    self.forward_static(parity_of(p))
+  File "/work/runtime/static_step.py", line 1107, in forward_static
+    self._body(int(parity) & 1 if self.rows == 1 else 0)
+  File "/work/runtime/static_step.py", line 1079, in _body
+    h, pre_mix = self._block(layer, h, pre_mix, parity)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/runtime/static_step.py", line 1013, in _block
+    x = self._ffn(layer, x)
+        ^^^^^^^^^^^^^^^^^^^
+  File "/work/runtime/static_step.py", line 1033, in _ffn
+    return layer.ffn(x, None)
+           ^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1789, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/runtime/patches.py", line 92, in forward
+    return st(x)  # design #14 (model.py:891-906); M1-T10: the step's R rows
+           ^^^^^
+  File "/work/runtime/dg_inplace.py", line 837, in __call__
+    return self._combine(out, x).view(shape)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/work/runtime/dg_moe.py", line 330, in _combine
+    sh = self._shared(x)                                                  # model.py:905
+         ^^^^^^^^^^^^^^^
+  File "/work/runtime/dg_moe.py", line 341, in _shared
+    return glue.shared_expert(self.moe.shared_experts, x)                 # T9b-2 #2 (shared)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/runtime/fused_glue.py", line 994, in shared_expert
+    return self._shared_from_q(ex, x, xq)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/runtime/fused_glue.py", line 1005, in _shared_from_q
+    g2, u2 = self._gemv_pair(xq, ex.w1, ex.w3, ("w1", "w3"))
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/runtime/fused_glue_r2.py", line 1782, in _gemv_pair
+    ra, rb = gemv_pair(xq[0].reshape(-1, K), xq[1].reshape(-1, K // BLOCK), la.weight, la.weight.scale,
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/runtime/gemv_mxfp8.py", line 1039, in gemv_pair
+    _launch_pair(xq, xs, wa, sa, wb, sb, pp, bufs[0][0], bufs[0][1], bufs[1][0], bufs[1][1])
+  File "/work/runtime/gemv_mxfp8.py", line 1001, in _launch_pair
+    t9b4_mxfp8_gemv2[pp["grid"]](
+  File "/usr/local/lib/python3.12/dist-packages/triton/runtime/jit.py", line 370, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/triton/runtime/jit.py", line 761, in run
+    kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata, launch_metadata,
+  File "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/driver.py", line 328, in __call__
+    self.launch(gridX, gridY, gridZ, stream, function, self.launch_cooperative_grid, self.launch_pdl,
+RuntimeError: Triton Error [CUDA]: device-side assert triggered
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/work/tests/gpu/test_dspark_loop_gpu.py", line 827, in <module>
+    t()
+  File "/work/tests/gpu/test_dspark_loop_gpu.py", line 787, in test_loop_real
+    with gemv_pin_m1(), _model("real") as (model, pool):
+  File "/usr/lib/python3.12/contextlib.py", line 158, in __exit__
+    self.gen.throw(value)
+  File "/work/tests/gpu/test_dspark_loop_gpu.py", line 227, in _model
+    torch.cuda.synchronize()
+  File "/usr/local/lib/python3.12/dist-packages/torch/cuda/__init__.py", line 1219, in synchronize
+    return torch._C._cuda_synchronize()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch.AcceleratorError: CUDA error: device-side assert triggered
+Search for `cudaErrorAssert' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+
+[load] 96085 tensors in 48 shards, map /work/docs/maps/hot-v26ar-seed-295.json, config /ref/inference/config.json
+[load] linears with scale: 46370; wo_a dequantized: 40; widened: ['layers.14.attn.compressor.wgate.weight', 'layers.14.attn.compressor.wkv.weight', 'layers.2.attn.compressor.wgate.weight', 'layers.2.attn.compressor.wkv.weight', 'layers.8.attn.compressor.wgate.weight', 'layers.8.attn.compressor.wkv.weight', 'head.weight']
+[load-mtp] 3 stages, 2395 tensors, HBM 7.543 GiB (expert stacks 6.724, other 0.820); linears with scale 1174; wo_a dequantized 3; widened ['mtp.2.confidence_head.proj.weight', 'mtp.2.markov_head.head.weight']
+FAIL test_loop_real (71.9s)
+  note: reduction census [mini3] mHC mixes norm x.square().mean(-1) [1,R,hc*D] (model.py:955): rows differing 6-row vs 1-row plain 14/96, in row_invariant_mode 0/96
+  note: reduction census [mini3] RMSNorm x.square().mean(-1) [1,R,D] (model.py:291): rows differing 6-row vs 1-row plain 0/96, in row_invariant_mode 0/96
+  note: reduction census [mini3] Engram h.square().mean(-1) [1,R,hc,D] (model.py:359): rows differing 6-row vs 1-row plain 58/96, in row_invariant_mode 0/96
+  note: reduction census [mini3] Engram (h*w*k).sum(-1) [1,R,hc,D] (model.py:360): rows differing 6-row vs 1-row plain 95/96, in row_invariant_mode 0/96
+  note: reduction census [mini3] hc_pre torch.sum(dim=2) [1,R,hc,D] (model.py:961): rows differing 6-row vs 1-row plain 0/96, in row_invariant_mode 0/96
+  note: reduction census [mini3] hc_post torch.sum(dim=2) [1,R,hc,hc,D] (model.py:967): rows differing 6-row vs 1-row plain 0/96, in row_invariant_mode 0/96
+  note: reduction census [mini3] indexer .sum(dim=2) over heads [1,R,H,W] (model.py:558): rows differing 6-row vs 1-row plain 0/96, in row_invariant_mode 0/96
+  note: reduction census [real-shaped] mHC mixes norm x.square().mean(-1) [1,R,hc*D] (model.py:955): rows differing 6-row vs 1-row plain 33/96, in row_invariant_mode 0/96
+  note: reduction census [real-shaped] RMSNorm x.square().mean(-1) [1,R,D] (model.py:291): rows differing 6-row vs 1-row plain 15/96, in row_invariant_mode 0/96
+  note: reduction census [real-shaped] Engram h.square().mean(-1) [1,R,hc,D] (model.py:359): rows differing 6-row vs 1-row plain 57/96, in row_invariant_mode 0/96
+  note: reduction census [real-shaped] Engram (h*w*k).sum(-1) [1,R,hc,D] (model.py:360): rows differing 6-row vs 1-row plain 96/96, in row_invariant_mode 0/96
+  note: reduction census [real-shaped] hc_pre torch.sum(dim=2) [1,R,hc,D] (model.py:961): rows differing 6-row vs 1-row plain 0/96, in row_invariant_mode 0/96
+  note: reduction census [real-shaped] hc_post torch.sum(dim=2) [1,R,hc,hc,D] (model.py:967): rows differing 6-row vs 1-row plain 0/96, in row_invariant_mode 0/96
+  note: reduction census [real-shaped] indexer .sum(dim=2) over heads [1,R,H,W] (model.py:558): rows differing 6-row vs 1-row plain 0/96, in row_invariant_mode 0/96
+  note: mini3 L=17 mode=static row-invariant : 64 tokens, 63 steps, 1.000 tok/step, stream == greedy, logits rows differing 0/64
+  note: mini3 L=18 mode=static row-invariant : 64 tokens, 63 steps, 1.000 tok/step, stream == greedy, logits rows differing 0/64
+  note: mini3 L=17 mode=static as-is : 64 tokens, 63 steps, 1.000 tok/step, stream diverges at 6, logits rows differing 63/64
+  note: mini3 L=17 mode=static row-invariant(T12 linear+einsum only) : 64 tokens, 63 steps, 1.000 tok/step, stream == greedy, logits rows differing 1/64 [17]
+  note: mini3 L=17 mode=graph/2g row-invariant : 64 tokens, 63 steps, 1.000 tok/step, stream == greedy, logits rows differing 0/64
+  note: mini3 L=17 mode=graph/1g row-invariant : 64 tokens, 63 steps, 1.000 tok/step, stream == greedy, logits rows differing 0/64
+  note: mini3 L=17 mode=graph/2g row-invariant gemv-pinned {'fp8_impl': 'gemv'}: 64 tokens, 63 steps, 1.000 tok/step, stream == greedy, logits rows differing 0/64
+comparisons executed: {'gates': 15, 'tokens': 448, 'logit_rows': 691, 'steps': 441, 'forced_steps': 71, 'graph': 1}
+7/8 not failed; 1 failed

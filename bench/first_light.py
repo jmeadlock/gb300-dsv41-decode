@@ -81,6 +81,10 @@ and one timed step cell.
     cold share per rep; `--residency-ref <the off run's report JSON>` adds rep 1 byte-identical to the off run (an
     error if not), step-cell tokens equal, step-ms delta %; `--residency-audit` hashes every moved expert against
     the shards. The 12-line summary's per-layer cold line becomes the residency line. 1-row report only.
+    M1-T10-FIX2: the 6-row dg-inplace step stages cold experts into --spare-slots (default 8) spare slots per layer
+    by a compact cold index; `[hbm]` lines after the 1-row and the 6-row build (HBM + the spare bytes each added;
+    `rows_mode.build_1row` / `build_rows`), `[overflow]` + the summary's `overflow steps: n` (`rows_mode.overflow`:
+    steps in which a layer had more cold unique experts than spare slots -- those steps' logits are wrong).
 Writes docs/first-light-<YYYYMMDD>.json (or --json) and prints a 12-line summary. One prompt failing logs its
 traceback and the run continues.
 
@@ -313,6 +317,46 @@ def _hbm(gen) -> Optional[dict]:
             "free_GiB": round(free / 2**30, 3), "total_GiB": round(total / 2**30, 3)}
 
 
+def build_report(gen, label: str, report: Dict) -> Optional[dict]:
+    """M1-T10-FIX2 (3): build the Generator's static step now (static/graph mode; eager: nothing) and record the HBM
+    right after the build (before any capture) and the spare weight slots it added: {"label", "rows", "moe_impl",
+    "spare_slots" (pool slots per layer after the build), "spare_limit" (the R-row dg-inplace budget), "spare_added_B"
+    / "_GiB" (this build's growth), "hbm"}. Prints one `[hbm]` line. A failing build (e.g. CUDA OOM) is recorded in
+    report["errors"] (stage build_<label>) and printed; the caller's later uses retry it as before."""
+    if gen.mode == "eager":
+        return None
+    try:
+        with torch.inference_mode():  # as every lazy build (Generator.step / step_rows / greedy run under it)
+            st = gen.static_step()
+    except Exception:
+        tb = traceback.format_exc()
+        print(f"[hbm] {label} build FAILED\n{tb}", file=sys.stderr, flush=True)
+        report["errors"].append({"stage": f"build_{label}", "traceback": tb})
+        return {"label": label, "failed": True, "hbm": _hbm(gen)}
+    dg = getattr(st, "dg", None)
+    pool = getattr(dg, "pool", None) or getattr(gen, "pool", None)
+    added = getattr(dg, "spare_added_B", None)
+    rec = {"label": label, "rows": getattr(st, "rows", gen.rows), "moe_impl": getattr(st, "moe_impl", gen.moe_impl),
+           "spare_slots": getattr(pool, "spare", None), "spare_limit": getattr(st, "spare_slots", None),
+           "spare_added_B": added, "spare_added_GiB": None if added is None else round(added / 2**30, 3),
+           "hbm": _hbm(gen)}
+    if getattr(dg, "layout", None) is not None and getattr(st, "rows", 1) > 1:   # M1-T10-MOE: the R-row call shape
+        rec["rows_moe"] = {"gemm": getattr(dg, "rows_gemm", None), "layout": dg.layout, "align": dg.align,
+                           "sf_store": dg.sf_store, "sf_store_why": dg.sf_store_why,
+                           "layout_check": dg.layout_check, "dedup": st.describe().get("dedup_impl")}
+        print(f"[rows-moe] gemm {dg.layout} align {dg.align} sf_store {dg.sf_store}"
+              f"{'' if dg.layout_check is None else ' check equal=' + str(dg.layout_check.get('equal'))}"
+              f"{'' if not (dg.layout_check or {}).get('fallback') else ' FALLBACK ' + dg.layout_check['fallback']}",
+              flush=True)
+    h = rec["hbm"] or {}
+    f = lambda x, d=2: "-" if x is None else f"{x:.{d}f}"  # noqa: E731
+    print(f"[hbm] {label} build (moe {rec['moe_impl']}"
+          f"{'' if rec['spare_limit'] is None else ', spare budget ' + str(rec['spare_limit'])}): "
+          f"{f(h.get('allocated_GiB'))} GiB alloc, {f(h.get('free_GiB'))} GiB free; pool spare slots "
+          f"{rec['spare_slots']}/layer (+{f(rec['spare_added_GiB'], 3)} GiB this build)", flush=True)
+    return rec
+
+
 @torch.inference_mode()
 def step_cell_rows(gen: Generator, ids: List[int], targets: List[int], n_steps: int, stats_from: int = 32) -> dict:
     """The R-row teacher-forced step cell (R = gen.rows): prefill, then `n_steps` R-row steps, step s feeding
@@ -428,6 +472,7 @@ def measure_rows(gen: Generator, a, report: Dict, *, out: str, json_path: str, f
 
     # phase 1: 1 row
     gen.set_rows(1)
+    rm["build_1row"] = build_report(gen, "1-row", report)  # M1-T10-FIX2 (3): HBM after the 1-row build
     p1 = f"{stem}-r1{ext or '.jsonl'}"
     t = time.time()
     res1 = run_rep(gen, rows, a.max_new, p1, 1)
@@ -470,6 +515,7 @@ def measure_rows(gen: Generator, a, report: Dict, *, out: str, json_path: str, f
     gen.reset_static()
     gen.set_moe_impl(rm["moe_impl_rows"])
     gen.set_rows(R_)
+    rm["build_rows"] = build_report(gen, f"{R_}-row", report)  # M1-T10-FIX2 (3): HBM after the R-row build
     reps: Dict[int, dict] = {}
     for rep in range(1, a.reps + 1):
         p = f"{stem}-tf{R_}{'' if rep == 1 else f'-replay{rep - 1}'}{ext or '.jsonl'}"
@@ -521,6 +567,8 @@ def measure_rows(gen: Generator, a, report: Dict, *, out: str, json_path: str, f
     if sc1 is not None:
         try:
             ids = gen.encode([{"role": "user", "content": step_row["prompt"]}])
+            if a.profile:  # nsys window over the 6-row cell (same arming as the 1-row cell)
+                report["profile_window_rows"] = gen.arm_profile(a.profile_warm, a.profile_steps)
             scr = step_cell_rows(gen, ids, sc1["token_ids"], a.step_cell, a.stats_from)
             r6 = scr["ms_per_step"].get("mean")
             r1m = sc1["ms_per_step_same_positions"].get("mean")
@@ -538,6 +586,18 @@ def measure_rows(gen: Generator, a, report: Dict, *, out: str, json_path: str, f
             print(f"[step-cell rows] FAILED\n{tb}", file=sys.stderr)
             report["errors"].append({"stage": "step_cell_rows", "traceback": tb})
     rm["hbm_rows"] = _hbm(gen)
+    # M1-T10-FIX2 (2): spare-slot overflows of the R-row dg-inplace step over everything it ran since its capture
+    # (graph) / build (static): the teacher-forced reps and the step cell
+    st = getattr(gen, "static", None)
+    if st is not None and hasattr(st, "overflow_counts"):
+        try:
+            rm["overflow"] = st.overflow_counts()
+        except Exception:
+            report["errors"].append({"stage": "overflow_counts", "traceback": traceback.format_exc()})
+    if rm.get("overflow") is not None:
+        ov = rm["overflow"]
+        print(f"[overflow] {R_}-row dg-inplace: {ov['steps']}/{ov['steps_counted']} steps overflowed the spare budget "
+              f"{ov['spare_slots']}/layer ({ov['experts']} cold experts not staged)", flush=True)
 
     # the V0 census (eager; layer-0 shapes; the GEMV with tuned vs pinned-M=1 configs)
     if not a.skip_census:
@@ -545,6 +605,9 @@ def measure_rows(gen: Generator, a, report: Dict, *, out: str, json_path: str, f
             from runtime.row_census import census, census_table
 
             recs = census(gen.model, rows=R_)
+            from runtime.fused_glue_r2 import fp32_fixed_census
+
+            recs += fp32_fixed_census(gen.model, rows=R_)   # T9b-5: the fixed kernels next to cuBLAS (same inputs)
             rm["v0_census"] = recs
             for line in census_table(recs):
                 print(line, flush=True)
@@ -605,11 +668,18 @@ def summary_rows_lines(r: dict, json_path: str) -> List[str]:
                  f"{f(ms.get('mean'), 3)} / p50 {f(ms.get('p50'), 3)} / p90 {f(ms.get('p90'), 3)} ms per step, "
                  f"{f(sr_.get('ms_per_position_mean'), 3)} ms/position; argmax agree {sr_.get('argmax_agree', '-')}/"
                  f"{sr_.get('argmax_compared', '-')}")
-    hb = sr_.get("hbm_after_build") or {}
+    hb1 = ((rm.get("build_1row") or {}).get("hbm") or {})
+    br = rm.get("build_rows") or {}
+    hbr = br.get("hbm") or {}
+    ov = rm.get("overflow")
+    ovs = (f"{ov['steps']} ({ov['experts']} experts, spare {ov['spare_slots']}/layer)" if ov else "n/a")
     lines.append(f"R{R_}/R1 = {f(sr_.get('r6_over_r1'), 3)} (same positions; first-n {f(sr_.get('r6_over_r1_first_n'), 3)}; "
                  f"vs 1-row {rm.get('moe_impl_rows')} {f(sr_.get('r6_over_r1_same_moe'), 3)})"
-                 f" | HBM after {R_}-row build {f(hb.get('allocated_GiB'))} GiB alloc, {f(hb.get('free_GiB'))} GiB free "
-                 f"| errors: {len(r['errors'])} | report {json_path}")
+                 f" | overflow steps: {ovs}"
+                 f" | HBM after build: 1-row {f(hb1.get('allocated_GiB'))} alloc / {f(hb1.get('free_GiB'))} free, "
+                 f"{R_}-row {f(hbr.get('allocated_GiB'))} / {f(hbr.get('free_GiB'))} GiB (+"
+                 f"{f(br.get('spare_added_GiB'), 3)} GiB spare)"
+                 f" | errors: {len(r['errors'])} | report {json_path}")
     assert len(lines) == 12, len(lines)
     return lines
 
@@ -947,6 +1017,11 @@ def build_parser() -> argparse.ArgumentParser:
                          "bounded = the same kernel with its block loop bounded by a device per-row valid-block "
                          "count, bit-identical (T9b-3a, runtime/kernels/sparse_attn_bounded.py) / flashmla = "
                          "FlashMLA sparse_prefill_fwd on every layer, A3-class (T9b-3c, runtime/attn_flashmla.py)")
+    ap.add_argument("--fp32-impl", choices=["cublas", "fixed"], default="cublas",
+                    help="the mHC mixes' and the head's fp32 F.linear: cublas = torch/cuBLAS (algorithm and split-K "
+                         "chosen by M: not row-invariant) / fixed = our fixed-order fp32 FMA kernels, row-invariant "
+                         "by construction, 1-ulp class vs cuBLAS (T9b-5, runtime/fused_glue_r2.py; sets "
+                         "$DSV41_FP32_IMPL; the glue self-check and the reference-op path adopt the same order)")
     ap.add_argument("--max-pos", type=int, default=4095,
                     help="static/graph: largest decode position (fixes the compressed-KV cat and index-score widths)")
     ap.add_argument("--marker", action="store_true", help="launch t8_step_marker once per decode step (nsys)")
@@ -980,7 +1055,32 @@ def build_parser() -> argparse.ArgumentParser:
                     help="report JSON of the residency-off run: rep-1 JSONL byte compare, step-cell tokens, ms delta")
     ap.add_argument("--residency-audit", action="store_true",
                     help="end of run: sha256 of every moved expert (HBM and Grace copies) vs the checkpoint shards")
+    ap.add_argument("--spare-slots", type=int, default=None,
+                    help="--rows with dg-inplace: spare pool slots per layer for the R-row step's cold experts "
+                         "(compact cold index, M1-T10-FIX2; default 8); a layer-step with more cold unique experts "
+                         "overflows (counted: `overflow steps` in the rows summary; those steps' logits are wrong)")
+    ap.add_argument("--rows-moe-gemm", default="contiguous16",
+                    choices=["contiguous", "contiguous64", "contiguous32", "contiguous16", "psum", "masked"],
+                    help="M1-T10-MOE: the R-row dg-inplace routed GEMM call shape (default contiguous = ALIGN 128; "
+                         "anything else is checked bitwise at build vs that call on layer 0's real bytes, falling "
+                         "back to it on a mismatch; sets $DSV41_ROWS_MOE_GEMM)")
+    ap.add_argument("--rows-sf-store", default=None, choices=["step", "resident", "pool"],
+                    help="M1-T10-MOE: where the R-row dg-inplace step's hot packed weight SF live (default pool: one "
+                         "pre-packed copy owned by the expert pool, cold-only staging; sets $DSV41_ROWS_SF_STORE)")
     return ap
+
+
+def rows_moe_env(a) -> Dict[str, str]:
+    """M1-T10-MOE: --rows-moe-gemm / --rows-sf-store -> the environment StaticStep's R-row dg-inplace build reads."""
+    from runtime import dg_inplace as DI
+
+    env = {}
+    if getattr(a, "rows_moe_gemm", None):
+        env[DI.ROWS_GEMM_ENV] = a.rows_moe_gemm
+    if getattr(a, "rows_sf_store", None):
+        env[DI.ROWS_SF_STORE_ENV] = a.rows_sf_store
+    os.environ.update(env)
+    return env
 
 
 def hidden_layers_arg(a) -> List[int]:
@@ -1109,6 +1209,11 @@ def main(argv=None) -> int:
         fixture2 = None
     report: Dict = {"date": time.strftime("%Y-%m-%d %H:%M:%S %Z"), "argv": sys.argv[1:] if argv is None else argv,
                     "errors": []}
+    report["rows_moe_env"] = rows_moe_env(a)
+    from runtime.fused_glue_r2 import FP32_IMPL_ENV, describe_fp32
+
+    os.environ[FP32_IMPL_ENV] = a.fp32_impl      # T9b-5: before any StaticStep / glue build
+    report["fp32"] = describe_fp32()
     from runtime.loader import build_and_load
 
     t0 = time.time()
@@ -1129,14 +1234,23 @@ def main(argv=None) -> int:
     gen = Generator(model, a.tokenizer_dir or a.model_dir, mode=a.mode, max_pos=a.max_pos, marker=a.marker,
                     moe_impl=a.moe_impl, fp8_impl=a.fp8_impl, glue_impl=a.glue_impl, attn_impl=a.attn_impl,
                     glue_approx=a.glue_approx,
-                    hidden_layers=hidden_layers_arg(a), residency=residency_config(a))
+                    hidden_layers=hidden_layers_arg(a), spare_slots=a.spare_slots, residency=residency_config(a))
     report["generator"] = {"eos_ids": gen.eos_ids, "top_k": gen.top_k, "max_seq_len": gen.max_seq_len,
                            "tokenizer_dir": gen.tokenizer_dir, "mode": gen.mode, "max_pos": gen.max_pos,
                            "marker": gen.marker, "moe_impl": gen.moe_impl, "fp8_impl": gen.fp8_impl,
+                           "spare_slots": gen.spare_slots,
                            "glue_impl": gen.glue_impl, "glue_approx": gen.glue_approx, "attn_impl": gen.attn_impl,
-                           "residency": residency_config(a)}
+                           "fp32_impl": a.fp32_impl, "residency": residency_config(a)}
     if a.nvtx_layers:
         install_layer_nvtx(model)
+    if a.rows != 1 and a.moe_impl == "dg-inplace" and gen.pool is not None:
+        # M1-T10-FIX2 (box round 3): grow the pool to the R-row spare budget ONCE, before any StaticStep build. The 1-row
+        # build (R1) asks for k spares and the 6-row build for `spare_slots`; a re-growth between them re-allocated every
+        # layer's weight block while the old blocks were still referenced -> +24 GiB -> OOM. Idempotent for S <= spare.
+        from runtime.static_step import DEFAULT_SPARE_SLOTS_ROWS
+        S = DEFAULT_SPARE_SLOTS_ROWS if a.spare_slots is None else int(a.spare_slots)
+        b = gen.pool.add_spare_slots(S, model)
+        print(f"[pool] pre-grown to {gen.pool.spare} spare slots/layer (+{b / 2**30:.2f} GiB) before the 1-row build", flush=True)
     if a.rows != 1:
         return measure_rows(gen, a, report, out=out, json_path=json_path, fixture2=fixture2)
     return measure(gen, a, report, n_layers=len(model.layers), out=out, json_path=json_path, fixture2=fixture2)

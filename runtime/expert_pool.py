@@ -125,10 +125,11 @@ class ExpertPool:
                 for p in self.proj_nk:
                     w, s = self.hbm[l][p]
                     h = w.size(0)
+                    old = self.hbm_full[l][p].size(0)  # H + the previous spare count (a re-growth adds only the rest)
                     full = torch.empty(h + S, *w.shape[1:], dtype=w.dtype, device=w.device)
                     full[:h].copy_(w)
                     full[h:].zero_()
-                    added += (full.numel() - w.numel()) * full.element_size()
+                    added += (h + S - old) * full[0].numel() * full.element_size()
                     self.hbm_full[l][p] = full
                     self.hbm[l][p] = (full[:h], s)
                     for slot, e in enumerate(self.hot[l]):

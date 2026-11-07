@@ -12,7 +12,8 @@ import numpy as np
 import pytest
 import torch
 
-from runtime.residency import ResidencyConfig, ResidencyManager, golden_from_index, n_stage_for
+from runtime.residency import (ResidencyConfig, ResidencyManager, golden_from_index, n_stage_for,
+                               sf_store_for)
 from test_residency_cpu import _hot_cold_bias, _install
 from test_static_rows_cpu import _assert_rows_equal, _prefill, _tf_tokens, emu  # noqa: F401
 
@@ -40,7 +41,7 @@ def _run6(model, st, ids, toks, n, rm=None, after=None):
 
 @pytest.mark.parametrize("impl", ["ref", "dg-inplace"])
 def test_residency_rows6_on_equals_off(emu, monkeypatch, impl):
-    from runtime.static_step import StaticStep
+    from runtime.static_step import DEFAULT_SPARE_SLOTS_ROWS, StaticStep
 
     model, pool, _ = emu("mini4")
     if impl == "dg-inplace":
@@ -61,8 +62,11 @@ def test_residency_rows6_on_equals_off(emu, monkeypatch, impl):
     k = model.layers[0].ffn.n_activated_experts
     cfg = ResidencyConfig(drain_n=2, min_abs=1.0, hyst=1.0, halflife=20.0, n_spare=2, n_demote=4, reserve_gib=0.0,
                           force_random=2)
-    rm = ResidencyManager(pool, model, cfg, n_stage=n_stage_for(impl, 6, k))
-    assert rm.base == [len(pool.hot[l]) + (6 * k if impl == "dg-inplace" else 0) for l in range(pool.n_layers)]
+    rm = ResidencyManager(pool, model, cfg, n_stage=n_stage_for(impl, 6, k), sf_store=sf_store_for(impl, 6))
+    # the R-row dg-inplace step stages by a compact cold index into S = min(16, R*topk) slots (M1-T10-FIX2/PORT)
+    ns = min(DEFAULT_SPARE_SLOTS_ROWS, 6 * k)
+    assert n_stage_for(impl, 6, k) == (ns if impl == "dg-inplace" else 0)
+    assert rm.base == [len(pool.hot[l]) + (ns if impl == "dg-inplace" else 0) for l in range(pool.n_layers)]
     st = StaticStep(model, pool, max_pos=255, rows=6, moe_impl=impl, _allow_cpu=True)
     rm.attach(st)
     rng = np.random.default_rng(2)

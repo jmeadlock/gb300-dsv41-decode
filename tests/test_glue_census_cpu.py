@@ -46,3 +46,27 @@ def test_census_matches_anatomy_kernel_counts(tmp_path):
     lt = rep["paths"]["static-dg-gemv"]["layer_types"]
     assert sum(v["layers"] for t, v in lt.items() if t != "step") == 40
     assert lt["r1"]["layers"] == 15 and lt["r2"]["layers"] == 15
+
+
+def test_census_rows6_fused_glue_one_launch_per_cluster(tmp_path):
+    """M1-T10-PORT `--rows 6`: the 6-row step with the fused glue -- every ported cluster on at 6 rows, the R-row MoE
+    glue in one launch per cluster per layer (dedup, router pre/post, dg_act, routed SwiGLU, combine), no reference
+    dedup ops left; the launch count well below the ref glue's at 6 rows."""
+    js = tmp_path / "census6.json"
+    r = subprocess.run([sys.executable, os.path.join(REPO, "bench", "glue_census.py"), "--rows", "6", "--json", str(js)],
+                       cwd=REPO, capture_output=True, text=True, timeout=600)
+    assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-4000:]
+    rep = json.loads(js.read_text())
+    assert rep["rows"] == 6 and set(rep["paths"]) == {"static-dg-gemv", "static-dg-gemv-fused"}
+    k = _kernel_counts(rep["paths"])["static-dg-gemv-fused"]
+    L = rep["config"]["n_layers"]
+    for name in ("m1_dedup_warp", "t9b2r2_router_pre", "t9b2r2_router_post", "t9b2_act_quant_bcast",
+                 "t9b2_moe_combine", "t9b2_o_rope_qdq"):
+        assert k[name] == L, (name, k[name])
+    assert k["t9b2_swiglu_quant"] == 2 * L and k["t9b2r2_norm_row"] == 2 * L and k["t9b2r2_hc_norm"] == 2 * L + 1
+    fused = rep["paths"]["static-dg-gemv-fused"]
+    assert "moe.dedup" not in fused["regions"] and "moe.dedup" in rep["paths"]["static-dg-gemv"]["regions"]
+    t = rep["rows_port"]
+    assert t["removed"] > 0.5 * t["launches_per_step"]["ref glue"], t["launches_per_step"]
+    assert set(t["off"]) == {"concat_free", "dg_sf_pack"}, t["off"]
+    assert "M1-T10-PORT rows 6: launches/step" in r.stdout

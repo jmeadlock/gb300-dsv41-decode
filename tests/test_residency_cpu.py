@@ -360,10 +360,23 @@ def test_spare_budget_on_the_real_model_numbers():
     assert b["affordable_per_layer"] == want and want >= ResidencyConfig().spare_cap
     b6 = spare_budget(free, 40, eb, wb, n_stage_new=6, reserve_gib=8.0, kv_rows=6, kv_ctx=32768)
     assert b6["affordable_per_layer"] == (free - int(6 * 150e6) - 6 * 40 * wb - 8 * 2 ** 30) // (40 * eb)
+    # A2-2 rebase: the 6-row dg-inplace step builds a pool-owned packed-SF copy AFTER the manager (sum(H) + 40 x 16
+    # groups, 1.05 MiB each, + a 6 GiB build headroom) and each spare slot adds one more SF group
+    s_row = 2 * 2304 * 160 + 5120 * 72      # packed SF bytes of one pool group (w1/w3 [2304, 160], w2 [5120, 72])
+    extra = 40 * (295 + 16) * s_row + 6 * 2 ** 30
+    bp = spare_budget(free, 40, eb, wb, n_stage_new=0, reserve_gib=8.0, kv_rows=6, kv_ctx=32768,
+                      step_extra_bytes=extra, sf_group_bytes=s_row)
+    assert bp["affordable_per_layer"] == (free - int(6 * 150e6) - 8 * 2 ** 30 - extra) // (40 * (eb + s_row))
+    assert bp["affordable_per_layer"] < b6["affordable_per_layer"] and bp["step_extra_GiB"] > 6
     assert spare_budget(None, 40, eb, wb, n_stage_new=0, reserve_gib=8, kv_rows=1, kv_ctx=1)["affordable_per_layer"] \
         is None
-    assert n_stage_for("dg-inplace", 1, 6) == 6 and n_stage_for("dg-inplace", 6, 6) == 36
-    assert n_stage_for("ref", 6, 6) == 0 and n_stage_for("dg-masked", 1, 6) == 0
+    # the 1-row step stages into topk slots; the 6-row step by a compact cold index into S = 16 (M1-T10-PORT; FIX's
+    # R*topk = 36 per layer was 25.5 GB and OOMed), S capped at R*topk; the residency slots start after them
+    assert n_stage_for("dg-inplace", 1, 6) == 6 and n_stage_for("dg-inplace", 6, 6) == 16
+    assert n_stage_for("dg-inplace", 6, 6, 8) == 8 and n_stage_for("dg-inplace", 2, 6, 16) == 12
+    assert n_stage_for("ref", 6, 6) == 0 and n_stage_for("dg-masked", 1, 6) == 0 and n_stage_for("dg-masked", 6, 6) == 0
+    from runtime.static_step import DEFAULT_SPARE_SLOTS_ROWS
+    assert DEFAULT_SPARE_SLOTS_ROWS == 16
     assert ResidencyConfig.from_any("off") is None and ResidencyConfig.from_any(None) is None
     assert ResidencyConfig.from_any("on") == ResidencyConfig() and ResidencyConfig.from_any({"drain_n": 8}).drain_n == 8
     with pytest.raises(ValueError):
@@ -410,12 +423,19 @@ def _install(monkeypatch, pool):
     fk.calls["stage"] = 0
     fk.reg = reg
 
-    def stage_inplace(ptab6, ids, gtab, dtab, dsts, mi, H, align, row_w, sf_dims, all_scales, ids_out=None):
+    def stage_inplace(ptab6, ids, gtab, dtab, dsts, mi, H, align, row_w, sf_dims, all_scales, ids_out=None, **kw):
         DI.stage_inplace_emulated(reg.__getitem__, ptab6, ids, gtab, dtab, dsts, mi, H, align, row_w, sf_dims,
-                                  all_scales, ids_out)
+                                  all_scales, ids_out, **kw)
         fk.calls["stage"] += 1
 
     fk.stage_inplace = stage_inplace
+
+    def stage_rows(ptab6, uniq, gtab, dtab, dsts, sidx, wl, H, row_w, sf_dims, n_work, **kw):
+        """M1-T10-MOE: the R-row staging launch (cold bytes + scales from the dedup's work list) = its contract."""
+        DI.stage_rows_emulated(reg.__getitem__, ptab6, uniq, gtab, dtab, dsts, sidx, wl, H, row_w, sf_dims, n_work)
+        fk.calls["stage"] += 1
+
+    fk.stage_rows = stage_rows
     monkeypatch.setitem(sys.modules, "runtime.static_kernels", fk)
     return fk
 

@@ -93,10 +93,12 @@ compress_lens [R, 1] (the prefill spelling, model.py:564-566); MoE through runti
 (row, expert) pairs, U <= R*k slots, per-row ascending-id combine); head on all rows -> `logits[R, V]`, `t_out[R]`;
 `main_hidden[R, len(hidden_layers) * dim]` (model.py:1267-1269) when `hidden_layers` is given. One graph (no parity).
 M1-T10-FIX: `moe_impl="dg-inplace"` at R rows = runtime/moe_rows.py DGInplaceMoERows (contiguous grouped GEMM over the
-pool in place, R*k spare slots per layer). `glue_impl="fused"` at R rows builds a FusedGlue whose row-parallel
-clusters (runtime/fused_glue.py ROWS_CLUSTERS: shared-expert SwiGLU, mHC post) are on and self-checked at R rows;
-every one-row cluster is n/a with its reason (`st.glue.describe()`, `glue_note`) and its call site runs the reference
-ops.
+pool in place; M1-T10-FIX2: cold experts by a compact cold index into `spare_slots` spare slots per layer, default 16
+since M1-T10-PORT (8 overflowed in 123 of 1,018 box steps), overflows counted on the device -- `overflow_counts()`).
+`glue_impl="fused"` at R rows (M1-T10-PORT) builds a FusedGlue whose clusters all have a row axis
+(runtime/fused_glue.py ROWS_CLUSTERS; the R-row MoE glue incl. the dedup through runtime/moe_rows.py) and are
+self-checked at R rows against the reference glue at R rows; the clusters not ported (fused_glue.ROWS_WHY) are n/a
+with their reason (`st.glue.describe()`, `glue_note`) and their call sites run the reference ops.
 
 `main_hiddens` at rows=1: computed only when `hidden_layers` is given (MTP-only, never feeds the logits); the loader's
 overlay sets dspark_target_layer_ids=() and `StaticStep` refuses a model that has target layers.
@@ -126,6 +128,7 @@ DUMMY_PROMPT = (0, 1)
 RING = 256                        # M1-T10 #20: window ring slots (>= 128 + 5, docs/M1-DSPARK-DESIGN.md 1.5)
 MAX_ROWS = 8                      # rows per step: the GEMV's M <= 8 (runtime/gemv_mxfp8.py)
 MOE_IMPLS_ROWS = ("ref", "dg-masked", "dg-inplace")  # MoE impls at rows > 1 (runtime/moe_rows.py)
+DEFAULT_SPARE_SLOTS_ROWS = 16    # M1-T10-PORT (was 8: 123/1018 box steps overflowed); M1-T10-FIX2: spare slots per layer of the R-row dg-inplace step (compact cold index)
 
 
 # ------------------------------------------------------------------------------------------------ pure index math
@@ -399,6 +402,19 @@ class StaticMoE:
 
 
 # ------------------------------------------------------------------------------------------------ the step
+def _dedup_describe():
+    from runtime.moe_rows import dedup_describe
+
+    return dedup_describe()
+
+
+def _fp32_impl() -> str:
+    """T9b-5: $DSV41_FP32_IMPL (cublas | fixed): the mixes' and the head's fp32 F.linear (runtime/fused_glue_r2.py)."""
+    from runtime.fused_glue_r2 import fp32_impl
+
+    return fp32_impl()
+
+
 class StaticStep:
     """Fixed-shape 1-row decode step over the reference model (module docstring for the row-by-row mapping).
 
@@ -417,7 +433,8 @@ class StaticStep:
                  counters: bool = True, moe_impl: str = "ref", dg_deterministic: bool = True,
                  fp8_impl: str = "ref", glue_impl: str = "ref", glue_opts: Optional[dict] = None,
                  attn_impl: str = "ref", rows: int = 1, hidden_layers: Sequence[int] = (),
-                 _allow_cpu: bool = False):
+                 spare_slots: Optional[int] = None, rows_moe_gemm: Optional[str] = None,
+                 rows_sf_store: Optional[str] = None, _allow_cpu: bool = False):
         R = _ref()
         from runtime import patches
 
@@ -425,6 +442,16 @@ class StaticStep:
         if rows != 1 and not (2 <= rows <= MAX_ROWS and rows % 2 == 0):
             raise ValueError(f"rows {rows}: 1 or an even number <= {MAX_ROWS} (ratio-2 pooling needs whole groups)")
         self.rows = rows
+        if spare_slots is not None and not (rows > 1 and moe_impl == "dg-inplace"):
+            raise ValueError(f"spare_slots is the R-row dg-inplace step's budget (rows {rows}, moe_impl {moe_impl!r}: "
+                             f"the 1-row dg-inplace step always uses topk spare slots)")
+        self._spare_req = spare_slots
+        # M1-T10-MOE: the R-row dg-inplace step's GEMM call shape and SF store (runtime/dg_inplace.py ROWS_GEMMS /
+        # SF_STORES; defaults $DSV41_ROWS_MOE_GEMM or "contiguous", $DSV41_ROWS_SF_STORE or "pool")
+        if (rows_moe_gemm is not None or rows_sf_store is not None) and not (rows > 1 and moe_impl == "dg-inplace"):
+            raise ValueError(f"rows_moe_gemm / rows_sf_store configure the R-row dg-inplace step (rows {rows}, "
+                             f"moe_impl {moe_impl!r})")
+        self._rows_gemm_req, self._rows_sf_req = rows_moe_gemm, rows_sf_store
         if moe_impl not in MOE_IMPLS:
             raise ValueError(f"moe_impl {moe_impl!r} not in {MOE_IMPLS}")
         if rows > 1 and moe_impl not in MOE_IMPLS_ROWS:
@@ -525,10 +552,11 @@ class StaticStep:
             from runtime.fused_glue import FusedGlue
 
             self.glue = FusedGlue(self, **(glue_opts or {}))
-            if rows > 1:  # M1-T10-FIX: only the row-parallel clusters run at R rows (fused_glue.ROWS_CLUSTERS)
+            if rows > 1:  # M1-T10-PORT: every ported cluster runs at R rows (fused_glue.ROWS_CLUSTERS)
                 on = [c for c, s in self.glue.status.items() if self.glue.on(c)]
-                self.glue_note = (f"rows={rows}: fused {','.join(on) or '-'} (row-parallel, self-checked at {rows} "
-                                  f"rows); the one-row clusters run the reference ops")
+                off = [c for c, s in self.glue.status.items() if not self.glue.on(c)]
+                self.glue_note = (f"rows={rows}: fused {','.join(on) or '-'} (self-checked at {rows} rows); "
+                                  f"reference ops for {','.join(off) or '-'}")
         if self.attn_impl == "bounded":  # #18: install the routed wrapper, then the build-time self-check (eager)
             patches.sparse_attn_bounded(True)
             self._attn_selfcheck(attns)
@@ -649,6 +677,19 @@ class StaticStep:
         d, pool, k = self.dev, self.pool, self.topk
         ns = k * self.rows  # staging slots: k at 1 row; R*k at R rows (U <= R*k unique experts, runtime/moe_rows.py)
         self.n_slots = ns
+        # M1-T10-FIX2: the R-row dg-inplace step's spare-slot budget (compact cold index) and its overflow counter:
+        # ovf_step = cold unique experts that did not fit, this step (zeroed first in every step, graph-safe);
+        # ovf_steps / ovf_total accumulate steps with an overflow / overflowed experts (reset at capture)
+        self._ovf_on = False
+        self.spare_slots: Optional[int] = None
+        if self.rows > 1 and self.moe_impl == "dg-inplace":
+            s = DEFAULT_SPARE_SLOTS_ROWS if self._spare_req is None else int(self._spare_req)
+            if s < 1:
+                raise ValueError(f"spare_slots {s} < 1")
+            self.spare_slots = min(s, ns)  # more than the R*k A blocks can never be used
+        self.ovf_step = torch.zeros(1, dtype=torch.int32, device=d)
+        self.ovf_steps = torch.zeros(1, dtype=torch.long, device=d)
+        self.ovf_total = torch.zeros(1, dtype=torch.long, device=d)
         moe0 = layers[0].ffn
         ex0 = next(e for e in moe0.experts if e is not None)
         shapes = {p: tuple(getattr(ex0, p).weight.shape) for p in ("w1", "w3", "w2")}
@@ -682,15 +723,15 @@ class StaticStep:
                 self.dg = DGBuffers(self, shapes, sshapes, swiglu_limit=lim, deterministic=self.dg_deterministic,
                                     slots=ns)
                 moe_cls = moe_rows.DGMaskedMoERows
-            elif self.moe_impl == "dg-inplace":  # M1-T10-FIX: contiguous GEMM in place, R*k spare slots per layer
+            elif self.moe_impl == "dg-inplace":  # M1-T10-FIX2: contiguous GEMM in place, S spare slots per layer
                 from runtime.dg_inplace import DGInplaceBuffers
 
                 if pool is None:
                     raise ValueError("moe_impl dg-inplace needs the model's ExpertPool")
-                added = pool.add_spare_slots(ns, self.model)  # before the pointer tables below (storage moves)
-                self.dg = DGInplaceBuffers(self, shapes, sshapes, pool=pool, swiglu_limit=lim,
-                                           deterministic=self.dg_deterministic, slots=ns)
+                added = pool.add_spare_slots(self.spare_slots, self.model)  # before the pointer tables (storage moves)
+                self.dg = self._build_rows_dg(shapes, sshapes, lim, ns)
                 self.dg.spare_added_B = added
+                self._ovf_on = True
                 moe_cls = moe_rows.DGInplaceMoERows
         elif self.moe_impl == "dg-masked":  # T9a-1: same staging + pointer tables, routed GEMMs on DeepGEMM
             from runtime.dg_moe import DGBuffers, DGMaskedMoE
@@ -755,6 +796,30 @@ class StaticStep:
         self.uvalid_step = torch.ones(n_layers, ns, dtype=torch.long, device=d)  # rows > 1: 1 = a used unique slot
         self.cold_acc = torch.zeros(n_layers, dtype=torch.long, device=d)
         self.uniq_acc = torch.zeros(n_layers, dtype=torch.long, device=d)       # routed expert calls (unique/layer)
+
+    def _build_rows_dg(self, shapes, sshapes, lim: float, ns: int):
+        """M1-T10-MOE: the R-row dg-inplace buffers in the requested GEMM call shape and SF store; a call shape other
+        than the T9a-2 contiguous ALIGN 128 must pass DGInplaceBuffers.check_layout (bitwise vs that call on layer
+        0's real pool bytes) or the build falls back to it (the record says why: describe()["layout_check"])."""
+        from runtime import dg_inplace as DI
+
+        spec = self._rows_gemm_req or os.environ.get(DI.ROWS_GEMM_ENV) or "contiguous16"  # probe 2026-11-07: fastest bit-equal
+        layout, align = DI.parse_rows_gemm(spec)
+        store = self._rows_sf_req or os.environ.get(DI.ROWS_SF_STORE_ENV) or DI.ROWS_SF_STORE_DEFAULT
+        kw = dict(pool=self.pool, swiglu_limit=lim, deterministic=self.dg_deterministic, slots=ns,
+                  spare_slots=self.spare_slots, sf_store=store)
+        b = DI.DGInplaceBuffers(self, shapes, sshapes, layout=layout, align=align, **kw)
+        if os.environ.get(DI.LAYOUT_CHECK_ENV, "1") != "0" and (layout != "contiguous" or b.align != DI.MK_ALIGN):
+            rec = b.check_layout()
+            if not rec.get("equal"):
+                print(f"[dg-inplace] rows moe gemm {spec!r} failed its build check ({rec.get('error') or rec}); "
+                      f"falling back to contiguous ALIGN {DI.MK_ALIGN}", file=sys.stderr, flush=True)
+                del b
+                b = DI.DGInplaceBuffers(self, shapes, sshapes, layout="contiguous", align=DI.MK_ALIGN, **kw)
+                b.layout_check = dict(rec, fallback=f"{spec} -> contiguous (align {DI.MK_ALIGN})")
+                spec = "contiguous"
+        b.rows_gemm = spec
+        return b
 
     # ---------------------------------------------------------------- body
     @contextlib.contextmanager
@@ -928,9 +993,9 @@ class StaticStep:
         kernel)."""
         R = self.R
         g = self.glue
-        if g is not None and g.on("o_rope_qdq"):
+        if g is not None and g.on("o_rope_qdq") and o.is_contiguous():
             g.o_path(attn, o, freqs_cis)
-            return o.view(1, 1, attn.n_local_groups, -1)
+            return o.view(1, self.rows, attn.n_local_groups, -1)
         R.apply_rotary_emb(o[..., -attn.rope_head_dim:], freqs_cis, True)
         o = o.view(1, self.rows, attn.n_local_groups, -1)
         R.act_quant(o, R.fp8_block_size, R.scale_fmt, R.scale_dtype, True)
@@ -962,10 +1027,13 @@ class StaticStep:
         g = self.glue
         if g is not None and g.on("hc_norm") and x.is_contiguous() and pre_mix.is_contiguous():
             return g.mix_pre_norm(layer, x, pre_mix, side)
+        from runtime.fused_glue_r2 import fp32_fixed, hc_mixes_fixed
+
+        mixes = (lambda *a: hc_mixes_fixed(self.R, layer, *a)) if fp32_fixed() else layer.hc_mixes  # T9b-5
         if side == "attn":
-            pre, post, comb = layer.hc_mixes(x, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base)
+            pre, post, comb = mixes(x, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base)
             return pre, post, comb, layer.attn_norm(layer.hc_pre(x, pre_mix)), None
-        pre, post, comb = layer.hc_mixes(x, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base)
+        pre, post, comb = mixes(x, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base)
         return pre, post, comb, layer.ffn_norm(layer.hc_pre(x, pre_mix)), None
 
     def _ffn(self, layer, x):
@@ -989,6 +1057,10 @@ class StaticStep:
         g, m = self.glue, self.model
         if g is not None and g.on("hc_norm") and h.is_contiguous() and pre_mix.is_contiguous():
             return g.head(layer, h, pre_mix)
+        from runtime.fused_glue_r2 import fp32_fixed, head_fixed
+
+        if fp32_fixed():                                                      # T9b-5: the fixed-order head
+            return head_fixed(m, m.norm(layer.hc_pre(h, pre_mix)), full_logits=self.rows > 1)
         if self.rows > 1:                                                     # M1-T10: logits for every row
             return m.head(m.norm(layer.hc_pre(h, pre_mix)), full_logits=True)  # model.py:1010-1014, [1, R, V]
         return m.head(m.norm(layer.hc_pre(h, pre_mix)))
@@ -1001,6 +1073,8 @@ class StaticStep:
             raise ValueError("StaticStep is greedy only (model.temperature must be 0)")
         self._c = _StepScalars(self)
         self._idx_nblk = self._idx_tlen = None
+        if self._ovf_on:
+            self.ovf_step.zero_()                                             # M1-T10-FIX2: this step's overflows
         if self.marker:
             from runtime.static_kernels import step_marker
             step_marker(self.marker_ctr)
@@ -1027,6 +1101,9 @@ class StaticStep:
         else:
             self.t_out.copy_(logits.argmax(dim=-1).view(rows))                # teacher-forced: tok is the caller's
         self.pos.add_(rows)
+        if self._ovf_on:                                                      # M1-T10-FIX2 (device ops, no sync)
+            self.ovf_steps.add_((self.ovf_step > 0).long())
+            self.ovf_total.add_(self.ovf_step.long())
         if self.counters:
             if rows == 1:
                 self.cold_acc.add_(self.cold_tab.gather(1, self.ids_step).sum(-1))
@@ -1160,6 +1237,8 @@ class StaticStep:
         with torch.inference_mode():  # cold_acc is an inference tensor (built under the caller's inference_mode); in-place ops need the mode
             self.cold_acc.zero_()
             self.uniq_acc.zero_()
+            self.ovf_steps.zero_()
+            self.ovf_total.zero_()
         self.n_counted = 0
         self._dev_pos = None
         self.captured_fills = bool(fills)
@@ -1204,12 +1283,24 @@ class StaticStep:
             calls = [int(v) for v in self.uniq_acc.tolist()]
         return [a - b for a, b in zip(calls, cold)], cold
 
+    def overflow_counts(self) -> Optional[dict]:
+        """M1-T10-FIX2: the R-row dg-inplace step's spare-slot overflows since capture (or build, eager): {"steps":
+        steps in which some layer had more than `spare_slots` cold unique experts (those steps' logits are wrong),
+        "experts": cold unique experts not staged, summed over layers and steps, "steps_counted", "spare_slots"}.
+        None for any other step. Syncs."""
+        if not self._ovf_on:
+            return None
+        return {"steps": int(self.ovf_steps.item()), "experts": int(self.ovf_total.item()),
+                "steps_counted": self.n_counted, "spare_slots": self.spare_slots}
+
     def describe(self) -> dict:
         return {"rows": self.rows, "ring": self.ring, "win": self.win, "max_pos": self.max_pos,
                 "moe_impl": self.moe_impl, "fp8_impl": self.fp8_impl, "glue_impl": self.glue_impl,
                 "glue_effective": "fused" if self.glue is not None else "ref", "glue_note": self.glue_note,
                 "attn_impl": self.attn_impl, "attn_on": bool(self._attn_on or self._fm_on),
-                "hidden_layers": list(self.hidden_layers), "n_slots": self.n_slots}
+                "hidden_layers": list(self.hidden_layers), "n_slots": self.n_slots, "spare_slots": self.spare_slots,
+                "rows_moe_gemm": getattr(getattr(self, "dg", None), "rows_gemm", None),
+                "dedup_impl": _dedup_describe() if self.rows > 1 else None, "fp32_impl": _fp32_impl()}
 
     def marker_count(self) -> int:
         return int(self.marker_ctr.item())

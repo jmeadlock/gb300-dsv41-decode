@@ -15,8 +15,11 @@ tables = {r[0] for r in q("select name from sqlite_master where type='table'")}
 assert "CUPTI_ACTIVITY_KIND_KERNEL" in tables, tables
 
 # kernels with names and launch (runtime API) start time via correlationId
-kern = q("""select k.start, k.end, k.correlationId, coalesce(s.value, k.demangledName) , k.streamId
-            from CUPTI_ACTIVITY_KIND_KERNEL k left join StringIds s on s.id = k.shortName order by k.start""")
+# M1-T10-MOE: + the demangled name (a template wrapper's short name, e.g. CUTLASS's `Kernel2`, says nothing)
+kern = q("""select k.start, k.end, k.correlationId, coalesce(s.value, k.demangledName), k.streamId,
+                   coalesce(d.value, '')
+            from CUPTI_ACTIVITY_KIND_KERNEL k left join StringIds s on s.id = k.shortName
+            left join StringIds d on d.id = k.demangledName order by k.start""")
 rt = {}
 if "CUPTI_ACTIVITY_KIND_RUNTIME" in tables:
     for s, e, cid in q("select start, end, correlationId from CUPTI_ACTIVITY_KIND_RUNTIME"):
@@ -51,12 +54,13 @@ find_step, find_layer, find_role = finder(steps), finder(layers), finder(roles)
 per_step = []
 role_t = collections.defaultdict(float); role_n = collections.Counter(); layer_t = collections.defaultdict(float)
 kname_t = collections.defaultdict(float); kname_n = collections.Counter()
+kname_full = {}; kname_role = collections.defaultdict(collections.Counter)   # M1-T10-MOE: what/who a name is
 gaps = []
 for si, (ss, se) in enumerate(steps):
     ks = [k for k in kern if ss <= k[0] < se]
     if not ks: continue
     busy = 0; last_end = None; n = 0
-    for s, e, cid, name, _ in ks:
+    for s, e, cid, name, _, full in ks:
         if last_end is None or s > last_end:
             busy += e - s
             if last_end is not None and s - last_end > 0:
@@ -71,6 +75,7 @@ for si, (ss, se) in enumerate(steps):
         role_t[role] += (e - s) / 1e6; role_n[role] += 1
         if L: layer_t[L[2]] += (e - s) / 1e6
         kname_t[name] += (e - s) / 1e6; kname_n[name] += 1
+        kname_full.setdefault(name, full); kname_role[name][role] += 1
     per_step.append({"step": si, "wall_ms": (se - ss) / 1e6, "busy_ms": busy / 1e6, "kernels": n})
 
 ns = len(per_step)
@@ -84,7 +89,9 @@ for L in ["L0", "L1", "L2", "L14", "L39"]:
     if L in layer_t: print(f"  {L:4s} {layer_t[L] / ns:7.2f}")
 print("\ntop kernels by GPU time (ms/step, launches/step, µs each):")
 for name, t in sorted(kname_t.items(), key=lambda x: -x[1])[:18]:
-    print(f"  {t / ns:7.2f} {kname_n[name] / ns:7.0f} {1000 * t / kname_n[name]:8.1f}  {name[:90]}")
+    full = kname_full.get(name, "")
+    print(f"  {t / ns:7.2f} {kname_n[name] / ns:7.0f} {1000 * t / kname_n[name]:8.1f}  {name[:90]}"
+          + (f"  [{full[:120]}]" if full and full != name else ""))
 gaps.sort(reverse=True)
 tot_gap = sum(g[0] for g in gaps) / 1e6 / ns
 print(f"\ninter-kernel idle inside steps: {tot_gap:.2f} ms/step total; largest:")
@@ -93,4 +100,7 @@ for g, si, name, role, L in gaps[:10]:
 if out:
     json.dump({"steps": per_step, "role_ms_per_step": {r: t / ns for r, t in role_t.items()}, "role_launches_per_step": {r: c / ns for r, c in role_n.items()},
                "layer_ms_per_step": {L: t / ns for L, t in layer_t.items()}, "top_kernels": [(n, t / ns, kname_n[n] / ns) for n, t in sorted(kname_t.items(), key=lambda x: -x[1])[:40]],
-               "idle_ms_per_step": tot_gap}, open(out, "w"), indent=1)
+               "idle_ms_per_step": tot_gap,
+               "kernel_names": {n: kname_full.get(n, "")[:400] for n, _ in sorted(kname_t.items(), key=lambda x: -x[1])[:40]},
+               "kernel_roles": {n: {r: c / ns for r, c in kname_role[n].items() if c} for n, _ in sorted(kname_t.items(), key=lambda x: -x[1])[:40]}},
+              open(out, "w"), indent=1)
