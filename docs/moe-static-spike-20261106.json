@@ -1,0 +1,9 @@
+{
+ "equal": 32,
+ "n": 32,
+ "cold_hits": 7,
+ "ref_us": 5389.4244498224,
+ "static_eager_us": 4382.294049719349,
+ "graph_equal_ref": "16/16",
+ "static_graph_us": 1828.1240001670085
+}
