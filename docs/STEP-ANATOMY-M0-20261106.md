@@ -1,0 +1,24 @@
+# Step anatomy — M0 runtime, 2026-11-06 (`bench/step_anatomy.py` on `scratch/prof/step-m0.sqlite`; receipt `step-anatomy-m0-20261106.json`)
+
+nsys `cudaProfilerApi` window, 64 decode steps after 32 warm, 1 row, prose prompt, NVTX per layer/role. Traced steps run 560 ms (tracing cost on 20k launches); untraced: **404.9 ms** with deterministic NaN-fill, **357.1 ms** with `--no-fill-uninit` (same tokens).
+
+| per step | measured |
+|---|---|
+| kernels launched | **20,550** (Pg61 v27: 1,305) |
+| GPU busy (union of kernel intervals) | **108.6 ms** |
+| host/launch idle inside the step | 454 ms traced (≈ 300 ms untraced) |
+| `fp4_gemm` (routed experts) | 720 launches × 78 µs = **56.3 ms** (6 experts × 3 GEMMs × 40 layers) |
+| `fp8_gemm` (attention/shared/dense) | 290 × 55 µs = 15.9 ms |
+| `vectorized_elementwise` glue | **11,570** × 1 µs = 11.7 ms |
+| `sparse_attn` | 40 × 75 µs = 3.0 ms |
+| `act_quant` | 1,090 × 2.6 µs = 2.8 ms |
+| per layer GPU | 2.6–2.8 ms, flat across layers (Engram layers no heavier at 1 row) |
+| by role (GPU) | moe 84.4 · attn 17.6 · other 5.9 · head 0.4 · engram 0.4 |
+
+## Reading
+1. **The step is 73 % host overhead.** 20,550 eager launches from Python at ~15–20 µs each is the 300 ms; the GPU would finish the same work in 109 ms. T8 (one CUDA graph per step) is the first task and is worth ~3.3× on its own — before any kernel changes.
+2. **Of the 109 ms of GPU time, 56 ms is the reference `fp4_gemm` at 18 CTAs/launch** — latency-bound, one expert per launch. Pg61's grouped path does a whole layer's experts in ~79 µs; that is 56 → ~3 ms. T9a is the second task and is worth most of the remainder.
+3. **11,570 one-microsecond elementwise kernels** per step is the reference's torch glue (routing, masks, dtype casts, QDQ scaffolding). Under a CUDA graph their launch cost vanishes but their 11.7 ms of GPU time does not; that is T9's "fused glue" tail, after the GEMMs.
+4. Attention is 17.6 ms (fp8 GEMMs at 55 µs each — also latency-bound at M=1) + 3 ms `sparse_attn`; FlashMLA/fused projections are T9b.
+5. **Projection after T8 + T9a, no other change:** ≈ 109 − 56 + 3 ≈ **56 ms/step at 1 row**, unfused. After T9b (attention) and glue fusion, the floor of this kernel set is ~15–20 ms; the rest of the way to 7.36 → 5.0 is the DSpark 6-row path (per-step amortization) and the fused chain. Consistent with the charter's thesis that fusion is the last 10–15 %, not the first.
+6. NaN-fill under `use_deterministic_algorithms` costs 48 ms/step (405 vs 357). Self-replay was bit-identical with it on; T8 must re-check with it off (it is a debugging aid, not a numerics rule).
