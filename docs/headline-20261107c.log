@@ -1,0 +1,44 @@
+[transformers] You are using a model of type `deepseek_v41` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+[load] 96085 tensors in 48 shards, map /work/docs/maps/hot-v26ar-seed-295.json, config /ref/inference/config.json
+[load] linears with scale: 46370; wo_a dequantized: 40; widened: ['layers.14.attn.compressor.wgate.weight', 'layers.14.attn.compressor.wkv.weight', 'layers.2.attn.compressor.wgate.weight', 'layers.2.attn.compressor.wkv.weight', 'layers.8.attn.compressor.wgate.weight', 'layers.8.attn.compressor.wkv.weight', 'head.weight']
+[load-mtp] 3 stages, 2395 tensors, HBM 7.543 GiB (expert stacks 6.724, other 0.820); linears with scale 1174; wo_a dequantized 3; widened ['mtp.2.confidence_head.proj.weight', 'mtp.2.markov_head.head.weight']
+[pool] pre-grown to 16 spare slots/layer (+10.55 GiB)
+[r1] prose  prompt 42 -> 256 tokens, 20.81 ms/token (1-row)
+[r1] code   prompt 47 -> 256 tokens, 22.22 ms/token (1-row)
+[r1] math   prompt 54 -> 256 tokens, 21.97 ms/token (1-row)
+[r1] json   prompt 38 -> 18 tokens, 22.84 ms/token (1-row)
+[r1] shell  prompt 34 -> 256 tokens, 21.65 ms/token (1-row)
+[r1] tool   prompt 49 -> 21 tokens, 22.34 ms/token (1-row)
+[r1] long   prompt 46 -> 256 tokens, 21.21 ms/token (1-row)
+[r1] story  prompt 31 -> 182 tokens, 21.06 ms/token (1-row)
+[dg-inplace] sf_store pool needs 12.81 GiB, 10.58 GiB free < 6.0 GiB headroom: using step
+[loop 2g] prose  256 tok in 118 steps (2.161 tok/step), 21.04 ms/step, prefill 3954.9 ms
+[loop 2g] code   256 tok in 66 steps (3.879 tok/step), 26.23 ms/step, prefill 4014.6 ms
+[loop 2g] math   256 tok in 56 steps (4.589 tok/step), 24.31 ms/step, prefill 4016.2 ms
+[loop 2g] json   18 tok in 4 steps (4.500 tok/step), 26.87 ms/step, prefill 3652.1 ms
+[loop 2g] shell  256 tok in 69 steps (3.710 tok/step), 23.53 ms/step, prefill 3370.6 ms
+[loop 2g] tool   21 tok in 4 steps (5.000 tok/step), 24.66 ms/step, prefill 4146.7 ms
+[loop 2g] long   256 tok in 105 steps (2.438 tok/step), 22.43 ms/step, prefill 3915.1 ms
+[loop 2g] story  145 tok in 73 steps (1.973 tok/step), 21.58 ms/step, prefill 3339.9 ms
+[loop 1g] prose  256 tok in 118 steps (2.161 tok/step), 21.05 ms/step, prefill 4007.2 ms
+[loop 1g] code   256 tok in 66 steps (3.879 tok/step), 26.24 ms/step, prefill 3925.8 ms
+[loop 1g] math   256 tok in 56 steps (4.589 tok/step), 24.33 ms/step, prefill 3948.2 ms
+[loop 1g] json   18 tok in 4 steps (4.500 tok/step), 26.88 ms/step, prefill 3608.0 ms
+[loop 1g] shell  256 tok in 69 steps (3.710 tok/step), 23.54 ms/step, prefill 3330.1 ms
+[loop 1g] tool   21 tok in 4 steps (5.000 tok/step), 24.67 ms/step, prefill 4097.6 ms
+[loop 1g] long   256 tok in 105 steps (2.438 tok/step), 22.45 ms/step, prefill 3853.7 ms
+[loop 1g] story  145 tok in 73 steps (1.973 tok/step), 21.59 ms/step, prefill 3248.5 ms
+HEADLINE 2026-11-07 12:48:54 UTC | ms per 6-row step, DSpark k=5 | mode graph | impls {'moe': 'dg-inplace', 'fp8': 'gemv', 'glue': 'fused', 'attn': 'flashmla'} | gemv pin M1 True | max_new 256 | prompts 8
+  two_graphs: 22.85 ms/step (verify 19.94 + draft 2.91) | 2.763 tok/step | 8.27 ms/token | window steps >= 32: 590 (all 990 steps: 22.90 ms/step, 2.954 tok/step)
+  one_graph : 22.86 ms/step (verify - + draft -) | 2.763 tok/step | 8.27 ms/token | window steps >= 32: 295 (all 495 steps: 22.91 ms/step, 2.954 tok/step)
+  vs Pg61 7.36 ms/step (bar 5.0); prefill 3778.6 ms mean; HBM after build {'free': 9.229, 'total': 249.814, 'allocated': 239.399, 'max_allocated': 239.404}
+  prompt  tok steps tok/st  ms/step  ms/tok stream vs 1-row              replay
+  prose   256   118  2.161    21.03    9.73 diverge @45 (r1 margin 0.115) ok    
+  code    256    66  3.879    26.23    6.76 diverge @86 (r1 margin 0.059) ok    
+  math    256    56  4.589    24.31    5.30 diverge @146 (r1 margin 0.195) ok    
+  json     18     4  4.500    26.88    5.97 exact                        ok    
+  shell   256    69  3.710    23.53    6.34 diverge @118 (r1 margin 0.153) ok    
+  tool     21     4  5.000    24.67    4.93 exact                        ok    
+  long    256   105  2.438    22.43    9.20 diverge @3 (r1 margin 0.111) ok    
+  story   145    73  1.973    21.58   10.94 diverge @1 (r1 margin 0.528) ok    
+  streams exact vs 1-row: 2/8; self-replay ok: 8/8; overflow {'steps': 0, 'experts': 0, 'steps_counted': 0, 'spare_slots': 16}; errors 0 | scratch/headline-20261107c.json
