@@ -230,15 +230,16 @@ def lin_fp8(x, w, s):
 
 def hidden(n, seed, width=5120):
     """Synthetic residual-stream-like rows: N(0,1) x a fixed per-channel log-normal scale, 16 outlier channels x10."""
+    f32 = torch.float32
     g = torch.Generator(device="cuda")
     g.manual_seed(1234 + width)
-    ch = torch.exp(0.5 * torch.randn(width, generator=g, device="cuda"))
+    ch = torch.exp(0.5 * torch.randn(width, generator=g, device="cuda", dtype=f32))
     ch[torch.randperm(width, generator=g, device="cuda")[:16]] *= 10.0
     g.manual_seed(int(seed))
     out = torch.empty(n, width, dtype=BF, device="cuda")
     for i in range(0, n, 16384):
         m = min(16384, n - i)
-        out[i:i + m] = (torch.randn(m, width, generator=g, device="cuda") * ch).to(BF)
+        out[i:i + m] = (torch.randn(m, width, generator=g, device="cuda", dtype=f32) * ch).to(BF)
     return out
 
 
@@ -246,7 +247,7 @@ def blocky(n, width, seed, block=32):
     """Fallback values: N(0,1) with per-block magnitudes 2^-4..2^4 (exercises the QDQ scales)."""
     g = torch.Generator(device="cuda")
     g.manual_seed(int(seed))
-    x = torch.randn(n, width // block, block, generator=g, device="cuda")
+    x = torch.randn(n, width // block, block, generator=g, device="cuda", dtype=torch.float32)
     x = x * torch.exp2(torch.randint(-4, 5, (n, width // block, 1), generator=g, device="cuda").float())
     return x.view(n, width).to(BF)
 
@@ -500,9 +501,6 @@ def build_data(args):
 
 
 # ------------------------------------------------------------------------------------------------ records (528 / 288)
-E2M1 = None
-
-
 def deq_mxfp8(codes, sc):
     """torch MXFP8 dequant: e4m3 * 2^(e8m0 - 127) per 32 -> bf16 (cache_utils.py:486-499)."""
     n = codes.size(0)
@@ -811,11 +809,10 @@ def sec_outputs(args):
     P = args.page
     have_ops = ST.get("OPS") is not None
     efn = None
-    if have_ops or True:
-        try:
-            efn = resolve_E(args)
-        except Exception as e:  # noqa: BLE001
-            O.setdefault("E", {})["status"] = "resolve failed: %r" % (e,)
+    try:
+        efn = resolve_E(args)
+    except Exception as e:  # noqa: BLE001
+        O.setdefault("E", {})["status"] = "resolve failed: %r" % (e,)
     cases = O.setdefault("cases", {})
     first_B = True
     for t in (0, 2, 1):
@@ -1143,6 +1140,13 @@ def simple_orders(sq):
 
 
 def triton_kernels():
+    if TRITON_ERR is not None:
+        raise RuntimeError(TRITON_ERR)
+    return triton, _sumsq_k, _rsqrt_k
+
+
+# Module-level jit kernels (Triton resolves globals, not closure variables).
+try:
     import triton
     import triton.language as tl
     try:
@@ -1151,14 +1155,14 @@ def triton_kernels():
         from triton.language.extra.cuda import libdevice
 
     @triton.jit
-    def sumsq_k(X, Y, w, stride, BLOCK: tl.constexpr):
+    def _sumsq_k(X, Y, w, stride, BLOCK: tl.constexpr):
         row = tl.program_id(0)
         offs = tl.arange(0, BLOCK)
         x = tl.load(X + row * stride + offs, mask=offs < w, other=0.0).to(tl.float32)
         tl.store(Y + row, tl.sum(x * x, axis=0))
 
     @triton.jit
-    def rsqrt_k(X, Y, n, MODE: tl.constexpr, BLOCK: tl.constexpr):
+    def _rsqrt_k(X, Y, n, MODE: tl.constexpr, BLOCK: tl.constexpr):
         offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
         m = offs < n
         x = tl.load(X + offs, mask=m, other=1.0)
@@ -1178,7 +1182,10 @@ def triton_kernels():
             y = tl.rsqrt(x)
         tl.store(Y + offs, y, mask=m)
 
-    return triton, sumsq_k, rsqrt_k
+    TRITON_ERR = None
+except Exception as _e:  # noqa: BLE001
+    triton = None
+    TRITON_ERR = repr(_e)[:600]
 
 
 def bits32_eq_frac(a, b):
@@ -1271,7 +1278,7 @@ def sec_probes(args):
         C = Pr.setdefault("c_rsqrt", {})
         g = torch.Generator(device="cuda")
         g.manual_seed(77)
-        sweep = torch.exp2(torch.rand(1 << 20, generator=g, device="cuda") * 200.0 - 100.0)
+        sweep = torch.exp2(torch.rand(1 << 20, generator=g, device="cuda", dtype=torch.float32) * 200.0 - 100.0)
         for nm, v in (("var_eps_rows", torch.cat(all_var) if all_var else None), ("logsweep_2^-100..2^100", sweep)):
             if v is None:
                 continue
@@ -1305,14 +1312,15 @@ def sec_probes(args):
         n = args.m1_rows - args.m1_rows % 6
         g = torch.Generator(device="cuda")
         g.manual_seed(5)
-        kv = torch.randn(n, 2, D, generator=g, device="cuda") * 2.0
-        sc = torch.randn(n, 2, D, generator=g, device="cuda") * 3.0
-        sm1, po1 = torch.empty_like(sc), torch.empty(n, 1, D, device="cuda")
+        f32 = torch.float32
+        kv = torch.randn(n, 2, D, generator=g, device="cuda", dtype=f32) * 2.0     # kv_state/score_state are fp32
+        sc = torch.randn(n, 2, D, generator=g, device="cuda", dtype=f32) * 3.0
+        sm1, po1 = torch.empty_like(sc), torch.empty(n, 1, D, device="cuda", dtype=f32)
         for i in range(n):
             s = sc[i:i + 1].softmax(dim=1)
             sm1[i:i + 1] = s
             po1[i:i + 1] = (kv[i:i + 1] * s).sum(dim=1, keepdim=True)
-        sm6, po6 = torch.empty_like(sc), torch.empty(n, 1, D, device="cuda")
+        sm6, po6 = torch.empty_like(sc), torch.empty(n, 1, D, device="cuda", dtype=f32)
         for i in range(0, n, 6):
             s = sc[i:i + 6].softmax(dim=1)
             sm6[i:i + 6] = s
@@ -1374,7 +1382,8 @@ def decide():
     q_quant = bool(sumB) and sumB.get("nearer_bf16q", 0) * 2 < sumB.get("ran", 0)
     speed = all(p("speed.B_ge_2x_A_exact.b%d_p%d" % (b, pp)) for b in BS for pp in POS_SPEED)
     replay = p("speed.replay_equal_all_graphs")
-    values = all(v.get("pass_") for k, v in g.items() if k.startswith("values."))
+    vals = [v.get("pass_") for k, v in g.items() if k.startswith("values.")]
+    values = bool(vals) and all(vals)
     reasons = []
     if not loads:
         reasons.append("does not load without vllm (or op missing)")
