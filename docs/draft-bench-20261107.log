@@ -1,0 +1,22 @@
+[transformers] You are using a model of type `deepseek_v41` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+[load] 96085 tensors in 48 shards, map /work/docs/maps/hot-v26ar-seed-295.json, config /ref/inference/config.json
+[load] linears with scale: 46370; wo_a dequantized: 40; widened: ['layers.14.attn.compressor.wgate.weight', 'layers.14.attn.compressor.wkv.weight', 'layers.2.attn.compressor.wgate.weight', 'layers.2.attn.compressor.wkv.weight', 'layers.8.attn.compressor.wgate.weight', 'layers.8.attn.compressor.wkv.weight', 'head.weight']
+[load-mtp] 3 stages, 2395 tensors, HBM 7.543 GiB (expert stacks 6.724, other 0.820); linears with scale 1174; wo_a dequantized 3; widened ['mtp.2.confidence_head.proj.weight', 'mtp.2.markov_head.head.weight']
+[pool] pre-grown to 8 spare slots/layer (+5.27 GiB)
+[truth] prose  prompt 42 -> 128 tokens
+[truth] code   prompt 47 -> 128 tokens
+[truth] math   prompt 54 -> 128 tokens
+[truth] json   prompt 38 -> 18 tokens
+[truth] shell  prompt 34 -> 128 tokens
+[truth] tool   prompt 49 -> 21 tokens
+[truth] long   prompt 46 -> 128 tokens
+[truth] story  prompt 31 -> 128 tokens
+[accept] prose  127 drafts: mean accepted/position 1.220, hist [45, 39, 24, 10, 7, 2]; loop 58 steps 128 tok -> 2.207 tok/step
+[accept] code   127 drafts: mean accepted/position 3.110, hist [19, 14, 13, 17, 16, 48]; loop 33 steps 128 tok -> 3.879 tok/step
+[accept] math   127 drafts: mean accepted/position 3.504, hist [11, 13, 14, 12, 17, 60]; loop 29 steps 127 tok -> 4.379 tok/step
+[accept] json   13 drafts: mean accepted/position 4.538, hist [0, 0, 1, 1, 1, 10]; loop 3 steps 15 tok -> 5.000 tok/step
+[accept] shell  127 drafts: mean accepted/position 2.984, hist [14, 20, 20, 17, 12, 44]; loop 32 steps 128 tok -> 4.000 tok/step
+[accept] tool   19 drafts: mean accepted/position 4.474, hist [0, 1, 1, 1, 1, 15]; loop 4 steps 20 tok -> 5.000 tok/step
+[accept] long   127 drafts: mean accepted/position 1.874, hist [39, 27, 19, 14, 9, 19]; loop 46 steps 128 tok -> 2.783 tok/step
+[accept] story  127 drafts: mean accepted/position 1.079, hist [54, 37, 18, 10, 6, 2]; loop 65 steps 127 tok -> 1.954 tok/step
+DRAFT BENCH | mtp HBM 7.5434 GiB | draft graph 17.670 ms/call (p50 17.670, p90 17.677, back-to-back 17.670) | acceptance 8 prompts 794 positions: 2.384 accepted drafts/position, loop 2.967 tokens/step | Pg61 tokens/chunk [2.738, 2.6122, 2.9091] | errors 0 | /work/docs/draft-bench-20261107.json
