@@ -290,7 +290,7 @@ def test_first_light_and_headline_flags(monkeypatch):
     assert env[DI.ROWMATCH_ENV] == "off" and os.environ[DI.ROWMATCH_ENV] == "off"
     hl = _bench("headline")
     h = hl.build_parser().parse_args(["--model-dir", "/x"])
-    assert h.moe_rowmatch == "on"
+    assert h.moe_rowmatch == "off"
     assert hl.build_parser().parse_args(["--model-dir", "/x", "--moe-rowmatch", "align"]).moe_rowmatch == "align"
 
 
