@@ -816,14 +816,14 @@ class FusedGlue:
         S = attn.freqs_cis.size(0)
         out = []
         for t in range(12):
-            pos = int(torch.randint(1, max(2, S), (1,), generator=g))
+            pos = int(torch.randint(1, max(2, S), (1,), generator=g, device="cpu"))
             f = attn.freqs_cis[pos:pos + 1]                                      # [1, rd/2] complex
             fr = torch.view_as_real(f).reshape(-1, 2).float().cpu()
             c, d = fr[:, 0], fr[:, 1]
             if inverse:
                 d = -d
             x = _rand_act(g, 1, H * hd).view(H, hd)
-            a = (torch.rand(H, rd // 2, generator=g) + 1.0) * torch.where(torch.rand(H, rd // 2, generator=g) < 0.5,
+            a = (torch.rand(H, rd // 2, generator=g, device="cpu") + 1.0) * torch.where(torch.rand(H, rd // 2, generator=g, device="cpu") < 0.5,
                                                                            -1.0, 1.0)
             a = a.to(torch.bfloat16).float()
             # re ~ 0: b = a*c/d ; im ~ 0: b = -a*d/c (bf16), on alternating heads
@@ -883,13 +883,13 @@ class FusedGlue:
         HC = self.hc
         x = _rand_act(g, 1, D).view(1, 1, D)
         res = _rand_act(g, HC, D).view(1, 1, HC, D)
-        post = (torch.rand(1, 1, HC, generator=g) * 2).float()
-        comb = (torch.randn(1, 1, HC, HC, generator=g) * torch.exp2(torch.randint(-4, 5, (1, 1, HC, HC), generator=g)
+        post = (torch.rand(1, 1, HC, generator=g, device="cpu") * 2).float()
+        comb = (torch.randn(1, 1, HC, HC, generator=g, device="cpu") * torch.exp2(torch.randint(-4, 5, (1, 1, HC, HC), generator=g, device="cpu")
                                                                        .float())).float()
         if HC == 4:
-            big = (torch.randn(D, generator=g) * torch.exp2(torch.randint(10, 17, (D,), generator=g).float()))
+            big = (torch.randn(D, generator=g, device="cpu") * torch.exp2(torch.randint(10, 17, (D,), generator=g, device="cpu").float()))
             big = big.to(torch.bfloat16)
-            cols = torch.arange(D) % 2 == 0
+            cols = torch.arange(D, device="cpu") % 2 == 0
             res[0, 0, 0, cols] = big[cols]
             res[0, 0, 2, cols] = big[cols]
             comb[0, 0, 2, :] = -comb[0, 0, 0, :]
@@ -942,7 +942,7 @@ class FusedGlue:
         R, b = self.R, self.o.dg
         for _ in range(3):
             gate, up = self._rand_gate_up(g, b.k, b.inter)
-            w = (torch.rand(b.k, generator=g) * 2).float().to(self.dev)
+            w = (torch.rand(b.k, generator=g, device="cpu") * 2).float().to(self.dev)
             h = self._ref_swiglu(gate, up, w, b.swiglu_limit, torch.bfloat16)
             q_ref, s_ref = R.act_quant(h, R.fp8_block_size, R.scale_fmt, R.scale_dtype)
             s_ref32 = torch.empty(b.k, b.inter // BLOCK, dtype=torch.float32, device=self.dev)
@@ -1029,7 +1029,7 @@ class FusedGlue:
             with o._active():
                 for t in range(3):
                     qr = _rand_act(g, 1, K, lo=-4, hi=4).view(1, 1, K).to(self.dev)
-                    pos = int(torch.randint(1, attn.freqs_cis.size(0), (1,), generator=g))
+                    pos = int(torch.randint(1, attn.freqs_cis.size(0), (1,), generator=g, device="cpu"))
                     f = attn.freqs_cis[pos:pos + 1]
                     got = self.q_proj(attn, qr, f)
                     if got is None:
@@ -1051,7 +1051,7 @@ class FusedGlue:
         o = self.o
         sm = o.moes[0]
         E = sm.moe.n_routed_experts
-        ids = torch.randperm(E, generator=g)[: o.topk].sort().values.to(self.dev)
+        ids = torch.randperm(E, generator=g, device="cpu")[: o.topk].sort().values.to(self.dev)
         ref = {}
         for key, tab in sm.ptabs.items():
             gather_rows(tab, ids, o.staging[key], o.row_bytes[key])
@@ -1103,12 +1103,12 @@ def _rand_act(g, rows: int, K: int, lo: int = -6, hi: int = 7) -> torch.Tensor:
     """bf16 [rows, K] activations: N(0,1) per 32-block scaled by 2^U[lo, hi), a few zeros, and amax values exactly at
     the scale boundaries 448 * 2^k * {1, 1 - 2^-8, 1 + 2^-7} (CPU generator; the caller moves it)."""
     kb = K // BLOCK
-    x = torch.randn(rows, kb, BLOCK, generator=g) * torch.exp2(torch.randint(lo, hi, (rows, kb, 1), generator=g).float())
-    k = torch.randint(-12, 4, (rows, kb), generator=g).float()
-    edge = 448.0 * torch.exp2(k) * torch.tensor([1.0, 1 - 2 ** -8, 1 + 2 ** -7])[torch.randint(0, 3, (rows, kb),
-                                                                                                  generator=g)]
-    sel = torch.rand(rows, kb, generator=g) < 0.3
-    sign = torch.where(torch.rand(rows, kb, generator=g) < 0.5, -1.0, 1.0)
+    x = torch.randn(rows, kb, BLOCK, generator=g, device="cpu") * torch.exp2(torch.randint(lo, hi, (rows, kb, 1), generator=g, device="cpu").float())
+    k = torch.randint(-12, 4, (rows, kb), generator=g, device="cpu").float()
+    edge = 448.0 * torch.exp2(k) * torch.tensor([1.0, 1 - 2 ** -8, 1 + 2 ** -7], device="cpu")[torch.randint(0, 3, (rows, kb),
+                                                                                                  generator=g, device="cpu")]
+    sel = torch.rand(rows, kb, generator=g, device="cpu") < 0.3
+    sign = torch.where(torch.rand(rows, kb, generator=g, device="cpu") < 0.5, -1.0, 1.0)
     x[..., 0] = torch.where(sel, edge * sign, x[..., 0])
-    x[..., 1] = torch.where(torch.rand(rows, kb, generator=g) < 0.1, torch.zeros(()), x[..., 1])
+    x[..., 1] = torch.where(torch.rand(rows, kb, generator=g, device="cpu") < 0.1, torch.zeros((), device="cpu"), x[..., 1])
     return x.view(rows, K).to(torch.bfloat16)
