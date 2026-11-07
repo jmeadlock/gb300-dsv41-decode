@@ -43,20 +43,21 @@ for proj, N, Kd in (("w1", INTER, DIM), ("w2", DIM, INTER)):
         def t_ref():
             for g in range(G): K.fp4_gemm(xq[g], xs[g], Wfp4[g], Se8[g], E8, act_block_size=32)
         # DeepGEMM: layouts. Try the documented transform on both operands' SF.
+        e2f = lambda t: torch.exp2(t.view(torch.uint8).to(torch.int32).float() - 127.0)   # e8m0 -> fp32 (exact)
+        xs_f = e2f(xs).contiguous(); S_f = e2f(S).contiguous()                              # [G,M,K/32], [G,N,K/32]
         def run(variant):
             d = torch.empty(G, M, N, dtype=torch.bfloat16)
             masked_m = torch.full((G,), M, dtype=torch.int32)
-            if variant == "transform_sf":
-                sfa = dg.transform_sf_into_required_layout(xs.view(torch.uint8).view(G, M, Kd // 32), mn=M, k=Kd, recipe=(1, 1, 32), num_groups=G, is_sfa=True)
-                sfb = dg.transform_sf_into_required_layout(S.view(G, N, Kd // 32), mn=N, k=Kd, recipe=(1, 1, 32), num_groups=G, is_sfa=False)
-            elif variant == "raw_e8m0":
-                sfa, sfb = xs, Se8
+            if variant == "fp32_sf":
+                sfa, sfb = xs_f, S_f
+            elif variant == "transform_sf":
+                sfa = dg.transform_sf_into_required_layout(xs_f, mn=M, k=Kd, recipe=(1, 1, 32), num_groups=G, is_sfa=True)
+                sfb = dg.transform_sf_into_required_layout(S_f, mn=N, k=Kd, recipe=(1, 1, 32), num_groups=G, is_sfa=False)
             elif variant == "packed_mn_major":
-                sfa = dg.get_mn_major_tma_aligned_packed_ue8m0_tensor(xs.view(torch.uint8).view(G, M, Kd // 32))
-                sfb = dg.get_mn_major_tma_aligned_packed_ue8m0_tensor(S.view(G, N, Kd // 32))
-            dg.m_grouped_fp8_fp4_gemm_nt_masked((xq, sfa), (Wfp4, sfb), d, masked_m, M, recipe=(1, 1, 32))
+                sfa = dg.get_mn_major_tma_aligned_packed_ue8m0_tensor(xs_f); sfb = dg.get_mn_major_tma_aligned_packed_ue8m0_tensor(S_f)
+            dg.m_grouped_fp8_fp4_gemm_nt_masked((xq, sfa), (W, sfb), d, masked_m, M, recipe=(1, 1, 32))   # W: int8 packed, low nibble first
             torch.cuda.synchronize(); return d, (sfa.dtype, tuple(sfa.shape), sfb.dtype, tuple(sfb.shape))
-        for variant in ("transform_sf", "packed_mn_major", "raw_e8m0"):
+        for variant in ("fp32_sf", "transform_sf", "packed_mn_major"):
             def probe(variant=variant):
                 d, layouts = run(variant)
                 diff = (d.float() - ref.float()); mism = (d != ref).float().mean().item()
