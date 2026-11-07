@@ -481,6 +481,13 @@ T9B5_RB_MAX = 8
 # override: DSV41_T9B5_CFG="head:8=16,2,8,1;mix:1=1,8,4,1".
 T9B5_CFG = {"head": {1: (32, 4, 4, 1), 2: (32, 2, 4, 1), 4: (16, 4, 4, 1), 8: (16, 4, 8, 1)},
             "mix": {1: (1, 20, 16, 1)}}   # mixes: 40 K tiles in 2 trips (latency: few programs at 1 row)
+# M2-T17 (docs/HANDOFF-M2-T17-BF16-HEAD.md): the head weight kept in its checkpoint dtype, bf16 in HBM -- the SAME kernel
+# (t9b5_head_fp32: the tile is loaded as bf16 and widened to fp32 in registers by `.to(tl.float32)`, which is exact, so
+# every product and every sum is the fp32-stored head's, bit for bit), half the bytes. A bf16 tile is half the bytes of an
+# fp32 tile, so U (K tiles per loop trip) is doubled to keep the bytes in flight per program the same as the fp32 config's.
+# UNTUNED starting point: bench/head_bench.py sweeps (BN, U, num_warps, num_stages) on the box and prints the best as a
+# DSV41_T9B5_CFG string (site key "head_bf16:<RB>"); every config is bit-identical (speed-only knobs).
+T9B5_CFG["head_bf16"] = {1: (32, 8, 4, 1), 2: (32, 4, 4, 1), 4: (16, 8, 4, 1), 8: (16, 8, 8, 1)}
 T9B5_CFG_ENV = "DSV41_T9B5_CFG"
 
 
@@ -589,14 +596,18 @@ def _t9b5_env_cfg() -> dict:
 
 def t9b5_rows_per_program(site: str, R: int) -> int:
     """RB: the mixes run one row per program (their 2 MB weight is L2-resident across the R programs that share
-    it); the head puts every row (<= 8) in one program so its 2.65 GB weight is read once per step."""
+    it); the head (fp32- or bf16-stored: site "head" / "head_bf16") puts every row (<= 8) in one program so its
+    weight is read once per step."""
     if site == "mix":
         return 1
     return min(T9B5_RB_MAX, triton.next_power_of_2(max(1, int(R))))
 
 
-def t9b5_config(site: str, R: int) -> tuple:
-    """(RB, BN, U, num_warps, num_stages) for a call of `site` at R rows."""
+def t9b5_config(site: str, R: int, wdtype: Optional[torch.dtype] = None) -> tuple:
+    """(RB, BN, U, num_warps, num_stages) for a call of `site` at R rows. A bf16-stored head weight (wdtype
+    torch.bfloat16 at site "head", or site "head_bf16" itself) takes the "head_bf16" table / env key."""
+    if site == "head" and wdtype == torch.bfloat16:
+        site = "head_bf16"
     rb = t9b5_rows_per_program(site, R)
     env = _t9b5_env_cfg()
     bn, u, nw, ns = env.get((site, rb)) or T9B5_CFG[site].get(rb) or T9B5_CFG[site][max(T9B5_CFG[site])]
@@ -607,7 +618,12 @@ def fixed_dot(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor, *, kb: int, s
               scale: Optional[torch.Tensor] = None, cfg: Optional[tuple] = None) -> None:
     """T9b-5: out [R, N] fp32 <- x [R, K] . w [N, K]^T (* scale [R]) in the fixed order of KB = kb lanes (the
     contract above; fused_glue_r2.fixed_dot_torch on CPU). site "head" / "mix" picks the named kernel and the
-    default launch config; cfg = (RB, BN, U, num_warps, num_stages) overrides it (speed only)."""
+    default launch config; cfg = (RB, BN, U, num_warps, num_stages) overrides it (speed only). w may be fp32 or
+    bf16 (M2-T17: widened in registers, exact; the head's bf16 weight takes the "head_bf16" launch table)."""
+    if site not in T9B5_KERNELS:
+        raise ValueError(f"fixed_dot: site {site!r} not in {tuple(T9B5_KERNELS)}")
+    if w.dtype not in (torch.float32, torch.bfloat16) or x.dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError(f"fixed_dot: x {x.dtype} / w {w.dtype} must be fp32 or bf16 (the kernel widens bf16 exactly)")
     if x.dim() != 2 or w.dim() != 2 or out.dim() != 2:
         raise ValueError(f"fixed_dot: x {tuple(x.shape)}, w {tuple(w.shape)}, out {tuple(out.shape)} must be 2-D")
     R, K = x.shape
@@ -622,7 +638,7 @@ def fixed_dot(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor, *, kb: int, s
         raise ValueError(f"fixed_dot: scale must be fp32 contiguous [R = {R}]")
     if R == 0:
         return
-    rb, bn, u, nw, ns = cfg if cfg is not None else t9b5_config(site, R)
+    rb, bn, u, nw, ns = cfg if cfg is not None else t9b5_config(site, R, w.dtype)
     nk = K // kb
     u = max(1, min(int(u), nk))
     T9B5_KERNELS[site][(triton.cdiv(N, bn), triton.cdiv(R, rb))](
