@@ -293,13 +293,43 @@ def test_gather_tables_vs_six_gathers():
 
 
 # ------------------------------------------------------------------------------------------------ mini checkpoints
+def _check_cluster_plan(d: dict, want_on: set, what: str) -> None:
+    """The 1-row build's cluster plan (`st.glue.describe()`), checked for what it must say -- the numerics are the
+    caller's bit-equality runs (fused == ref glue, graph == static), which stay strict.
+
+    T12-DIAG (docs/glue-gpu-test-t9b7-20261107.log, 4 failures): the old one-line assertion allowed only round-2
+    clusters on beyond `want_on`, so T9b-4's sub-switches (hc_split, gemv_pair, reduce_fold: fused_glue.R4_PARTS) being
+    ON failed it, and its message printed the NOT-on clusters (all documented n/a), which read like n/a strictness.
+      * every wanted cluster is on (a wanted cluster n/a or off is a real failure);
+      * a cluster on beyond `want_on` belongs to a family whose status another check owns: round 2
+        (tests/gpu/test_fused_glue_r2_gpu.py), T9b-4 parts and M1 parts (each self-checked at build, run here);
+      * every cluster NOT on carries a reason: "n/a: ..." (not applicable to these impls / rows, or documented
+        deferred: fused_glue.ROWS_WHY / CONCAT_FREE_WHY) or "off: ..." (disabled by env or a failed self-check of a
+        cluster outside `want_on` -- reported); anything else is a malformed status and fails."""
+    from runtime.fused_glue import CLUSTERS, CONCAT_FREE_WHY, M1_PARTS, R2_CLUSTER_NAMES, R4_PARTS
+
+    st = d["clusters"]
+    on = set(d["on"])
+    missing = {c: st.get(c) for c in sorted(want_on - on)}
+    assert not missing, f"{what}: wanted clusters not on: {missing}"
+    owned = set(R2_CLUSTER_NAMES) | set(R4_PARTS) | set(M1_PARTS)
+    stray = sorted(on - want_on - owned)
+    assert not stray, f"{what}: clusters on outside any checked family: {stray} ({ {c: st.get(c) for c in stray} })"
+    not_on = {c: st.get(c) or "" for c in CLUSTERS if c not in on}
+    bad = {c: s for c, s in not_on.items() if not (s.startswith("n/a: ") or s.startswith("off: "))}
+    assert not bad, f"{what}: clusters not on without a documented reason: {bad}"
+    deferred = sorted(c for c, s in not_on.items() if CONCAT_FREE_WHY in s)
+    na = sorted(c for c, s in not_on.items() if s.startswith("n/a: ") and c not in deferred)
+    off = {c: s for c, s in not_on.items() if s.startswith("off: ")}
+    print(f"  {what}: plan ok -- on {sorted(on)}; n/a {na}; deferred {deferred}; off {off or '-'}")
+
+
 def _fused_vs_ref(kind, moe, fp8):
     _need_glue()
     if moe != "ref":
         from runtime.dg_moe import import_deep_gemm
 
         import_deep_gemm()
-    from runtime.fused_glue import CLUSTERS
 
     with _model(kind) as (model, tokdir):
         gen = _gen(model, tokdir, moe_impl=moe, fp8_impl=fp8, glue_impl="fused")
@@ -309,12 +339,7 @@ def _fused_vs_ref(kind, moe, fp8):
         want_on = {"gather", "swiglu_shared", "hc_post", "o_rope_qdq"} | (
             {"dg_act", "swiglu_routed", "moe_combine"} if moe != "ref" else set()) | (
             {"q_rope_epilogue"} if fp8 == "gemv" else set())
-        # round 2 (runtime/fused_glue_r2.py) clusters are on when their device calibration is outcome (i); their
-        # status is checked by tests/gpu/test_fused_glue_r2_gpu.py
-        from runtime.fused_glue import R2_CLUSTER_NAMES
-
-        assert want_on <= set(d["on"]) and set(d["on"]) - want_on <= set(R2_CLUSTER_NAMES), \
-            {c: d["clusters"][c] for c in CLUSTERS if c not in d["on"]}
+        _check_cluster_plan(d, want_on, f"{kind} {moe}/{fp8}")
         runs = {}
         for L, seed in ((16, 5), (17, 6)):                               # both prefill parities
             ids = _ids(L, seed)

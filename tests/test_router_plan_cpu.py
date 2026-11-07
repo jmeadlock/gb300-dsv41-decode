@@ -413,7 +413,7 @@ def test_softplus_probe_kernel(SK):
 # ================================================================================ 3. the switch and the glue
 def test_router_impl_env(monkeypatch):
     monkeypatch.delenv(RP.ROUTER_IMPL_ENV, raising=False)
-    assert RP.router_impl() == "fused"
+    assert RP.router_impl() == RP.ROUTER_IMPL_DEFAULT == "plan-gemv"   # box gate passed 2026-11-07: 20.15 ms, streams 7/8
     for v in RP.ROUTER_IMPLS:
         monkeypatch.setenv(RP.ROUTER_IMPL_ENV, v)
         assert RP.router_impl() == v

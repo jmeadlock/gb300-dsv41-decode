@@ -83,7 +83,7 @@ import torch.nn.functional as F
 
 ROUTER_IMPL_ENV = "DSV41_ROUTER_IMPL"
 ROUTER_IMPLS = ("fused", "plan", "plan-gemv")
-ROUTER_IMPL_DEFAULT = "fused"      # until the box gate (HANDOFF-M2-T15)
+ROUTER_IMPL_DEFAULT = "plan-gemv"      # until the box gate (HANDOFF-M2-T15)
 PLAN_LAUNCH_ENV = "DSV41_ROUTER_PLAN_LAUNCH"
 PLAN_LAUNCHES = ("ticket", "split")  # the R-row plan in the last row program / as today's separate dedup launch
 DUMP_ENV = "DSV41_ROUTER_DUMP"

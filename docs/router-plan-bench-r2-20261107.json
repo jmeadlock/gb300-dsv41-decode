@@ -1,0 +1,383 @@
+{
+ "date": "2026-11-07 20:08:57 UTC",
+ "argv": [
+  "--json",
+  "scratch/router-plan-bench2.json"
+ ],
+ "torch": "2.13.0+cu130",
+ "device": "NVIDIA GB300",
+ "errors": [],
+ "softplus": {
+  "n": 20971520,
+  "forms": {
+   "fused": {
+    "mismatch": 28411,
+    "mismatch_outside_subnormal_exp": 0,
+    "examples": [
+     [
+      -93.48828887939453,
+      0.0,
+      2.503559836362718e-41
+     ],
+     [
+      -100.65483093261719,
+      0.0,
+      1.961817850054744e-44
+     ],
+     [
+      -94.42572021484375,
+      0.0,
+      9.804885354880745e-42
+     ],
+     [
+      -103.69911193847656,
+      0.0,
+      1.401298464324817e-45
+     ],
+     [
+      -102.46794128417969,
+      0.0,
+      2.802596928649634e-45
+     ],
+     [
+      -96.33086395263672,
+      0.0,
+      1.4587517013621346e-42
+     ],
+     [
+      -88.66191101074219,
+      0.0,
+      3.123354147133585e-39
+     ],
+     [
+      -101.05396270751953,
+      0.0,
+      1.2611686178923354e-44
+     ]
+    ]
+   },
+   "fused-sub": {
+    "mismatch": 759,
+    "mismatch_outside_subnormal_exp": 0,
+    "examples": [
+     [
+      -87.85578918457031,
+      6.993837195192768e-39,
+      6.993838596491232e-39
+     ],
+     [
+      -88.04875946044922,
+      5.7664650936630185e-39,
+      5.766463692364554e-39
+     ],
+     [
+      -87.67767333984375,
+      8.357381876291746e-39,
+      8.35738327759021e-39
+     ],
+     [
+      -87.64559173583984,
+      8.629847547098135e-39,
+      8.629848948396599e-39
+     ],
+     [
+      -88.130126953125,
+      5.31584394129623e-39,
+      5.3158425399977655e-39
+     ],
+     [
+      -88.89543151855469,
+      2.472889616874041e-39,
+      2.4728882155755766e-39
+     ],
+     [
+      -90.29635620117188,
+      6.0924393463296504e-40,
+      6.092425333345007e-40
+     ],
+     [
+      -88.1200180053711,
+      5.369852786708237e-39,
+      5.369854188006701e-39
+     ]
+    ]
+   },
+   "fused-sub24": {
+    "mismatch": 579,
+    "mismatch_outside_subnormal_exp": 0,
+    "examples": [
+     [
+      -88.04875946044922,
+      5.7664650936630185e-39,
+      5.766463692364554e-39
+     ],
+     [
+      -88.89543151855469,
+      2.472889616874041e-39,
+      2.4728882155755766e-39
+     ],
+     [
+      -89.59879302978516,
+      1.223880065756652e-39,
+      1.2238786644581877e-39
+     ],
+     [
+      -88.66837310791016,
+      3.103237106379738e-39,
+      3.1032357050812734e-39
+     ],
+     [
+      -90.29635620117188,
+      6.0924393463296504e-40,
+      6.092425333345007e-40
+     ],
+     [
+      -90.33222198486328,
+      5.877802460549018e-40,
+      5.877788447564375e-40
+     ],
+     [
+      -89.05738067626953,
+      2.1031542144650093e-39,
+      2.103152813166545e-39
+     ],
+     [
+      -87.62705993652344,
+      8.791265919800639e-39,
+      8.791264518502175e-39
+     ]
+    ]
+   }
+  },
+  "exact": null,
+  "mismatch": 28411
+ },
+ "tie_gate": {
+  "softplus_mode": 0,
+  "R1": {
+   "rows": 50004,
+   "rows_differing": {
+    "topk_order": 0,
+    "ids": 0,
+    "w": 0
+   }
+  },
+  "R6": {
+   "rows": 50004,
+   "rows_differing": {
+    "topk_order": 0,
+    "ids": 0,
+    "w": 0
+   }
+  }
+ },
+ "timing": {
+  "real": {
+   "R1": {
+    "us_per_layer": {
+     "fused": 19.365568161010742,
+     "plan_1cta": 9.220895767211914,
+     "plan": 10.981568336486816,
+     "plan_tsp": 12.036416053771973,
+     "plan-gemv": 13.072912216186523,
+     "plan-gemv_tsp": 14.069472312927246
+    },
+    "phases_us": {
+     "gate_mm": 5.6308159828186035,
+     "gate_gemv": 7.376736164093018,
+     "softplus": 1.5903520584106445,
+     "rows_route": 5.375360012054443,
+     "rows_route_tsp": 4.151887893676758,
+     "fused_tail": 14.230256080627441
+    },
+    "self_replay": {
+     "fused": null,
+     "plan_1cta": true,
+     "plan": true,
+     "plan_tsp": true,
+     "plan-gemv": true,
+     "plan-gemv_tsp": true
+    },
+    "cross_equal": {
+     "plan==plan_1cta": true
+    },
+    "softplus_mode": 1,
+    "gate_kb": 512,
+    "gate_cfg": [
+     1,
+     2,
+     10,
+     4,
+     1
+    ],
+    "rows_warps": 1
+   },
+   "R6": {
+    "us_per_layer": {
+     "fused": 40.475040435791016,
+     "plan_1cta": 42.45905685424805,
+     "plan": 30.789167404174805,
+     "plan_tsp": 32.0633430480957,
+     "plan_split": 30.248863220214844,
+     "plan-gemv": 20.107776641845703,
+     "plan-gemv_tsp": 21.473039627075195,
+     "plan-gemv_split": 19.59619140625
+    },
+    "phases_us": {
+     "gate_mm": 20.581039428710938,
+     "gate_gemv": 9.827856063842773,
+     "softplus": 1.899407982826233,
+     "rows_route": 5.427728176116943,
+     "rows_route_tsp": 4.203120231628418,
+     "rows_ticket_plan": 9.369168281555176,
+     "dedup": 3.2772159576416016,
+     "fused_tail": 15.120863914489746
+    },
+    "self_replay": {
+     "fused": null,
+     "plan_1cta": true,
+     "plan": true,
+     "plan_tsp": true,
+     "plan_split": true,
+     "plan-gemv": true,
+     "plan-gemv_tsp": true,
+     "plan-gemv_split": true
+    },
+    "cross_equal": {
+     "plan==plan_1cta": true,
+     "plan==plan_split": true,
+     "plan-gemv==plan-gemv_split": true,
+     "plan tensors: plan_tsp==fused (today's dedup)": true
+    },
+    "softplus_mode": 1,
+    "gate_kb": 512,
+    "gate_cfg": [
+     1,
+     2,
+     10,
+     4,
+     1
+    ],
+    "rows_warps": 1
+   }
+  },
+  "mini": {
+   "R1": {
+    "us_per_layer": {
+     "fused": 13.974127769470215,
+     "plan_1cta": 4.511087894439697,
+     "plan": 4.61356782913208,
+     "plan_tsp": 5.429215908050537,
+     "plan-gemv": 5.936975955963135,
+     "plan-gemv_tsp": 6.612448215484619
+    },
+    "phases_us": {
+     "gate_mm": 1.8461920022964478,
+     "gate_gemv": 2.253920078277588,
+     "softplus": 1.334015965461731,
+     "rows_route": 2.7649118900299072,
+     "rows_route_tsp": 2.306368112564087,
+     "fused_tail": 11.98902416229248
+    },
+    "self_replay": {
+     "fused": null,
+     "plan_1cta": true,
+     "plan": true,
+     "plan_tsp": true,
+     "plan-gemv": true,
+     "plan-gemv_tsp": true
+    },
+    "cross_equal": {
+     "plan==plan_1cta": true
+    },
+    "softplus_mode": 1,
+    "gate_kb": 256,
+    "gate_cfg": [
+     1,
+     2,
+     10,
+     4,
+     1
+    ],
+    "rows_warps": 1
+   },
+   "R6": {
+    "us_per_layer": {
+     "fused": 18.974992752075195,
+     "plan_1cta": 7.021503925323486,
+     "plan": 9.727807998657227,
+     "plan_tsp": 10.40287971496582,
+     "plan_split": 9.07084846496582,
+     "plan-gemv": 9.114543914794922,
+     "plan-gemv_tsp": 9.69382381439209,
+     "plan-gemv_split": 8.448431968688965
+    },
+    "phases_us": {
+     "gate_mm": 3.635999917984009,
+     "gate_gemv": 2.285536050796509,
+     "softplus": 1.3840800523757935,
+     "rows_route": 2.7678399085998535,
+     "rows_route_tsp": 2.3560800552368164,
+     "rows_ticket_plan": 5.739408016204834,
+     "dedup": 2.2026240825653076,
+     "fused_tail": 12.557760238647461
+    },
+    "self_replay": {
+     "fused": null,
+     "plan_1cta": true,
+     "plan": true,
+     "plan_tsp": true,
+     "plan_split": true,
+     "plan-gemv": true,
+     "plan-gemv_tsp": true,
+     "plan-gemv_split": true
+    },
+    "cross_equal": {
+     "plan==plan_1cta": true,
+     "plan==plan_split": true,
+     "plan-gemv==plan-gemv_split": true,
+     "plan tensors: plan_tsp==fused (today's dedup)": true
+    },
+    "softplus_mode": 1,
+    "gate_kb": 256,
+    "gate_cfg": [
+     1,
+     2,
+     10,
+     4,
+     1
+    ],
+    "rows_warps": 1
+   }
+  }
+ },
+ "verdict": {
+  "plan": {
+   "R1_us": 12.036416053771973,
+   "R6_us": 31.523038864135742,
+   "launch_form": "split",
+   "R6_ticket_us": 32.0633430480957,
+   "R6_split_us": 31.523038864135742,
+   "fused_R1": 19.365568161010742,
+   "fused_R6": 40.475040435791016,
+   "pass_R1": false,
+   "pass_R6": false,
+   "launches_R6": "mm + 3",
+   "numerics": "bit-equal to fused"
+  },
+  "plan-gemv": {
+   "R1_us": 14.069472312927246,
+   "R6_us": 20.961454391479492,
+   "launch_form": "split",
+   "R6_ticket_us": 21.473039627075195,
+   "R6_split_us": 20.961454391479492,
+   "fused_R1": 19.365568161010742,
+   "fused_R6": 40.475040435791016,
+   "pass_R1": false,
+   "pass_R6": true,
+   "launches_R6": "4",
+   "numerics": "own fixed-order oracle (A3 vs fused)"
+  }
+ },
+ "seconds": 48.2
+}
