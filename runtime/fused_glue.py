@@ -67,8 +67,13 @@ def _cpu_default(fn):
     import functools
     @functools.wraps(fn)
     def w(*a, **k):
-        with torch.device("cpu"):
-            return fn(*a, **k)
+        prev = torch.get_default_dtype()
+        torch.set_default_dtype(torch.float32)
+        try:
+            with torch.device("cpu"):
+                return fn(*a, **k)
+        finally:
+            torch.set_default_dtype(prev)
     return w
 
 

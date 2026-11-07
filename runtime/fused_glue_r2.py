@@ -66,8 +66,13 @@ def _cpu_default(fn):
 
     @functools.wraps(fn)
     def w(*a, **k):
-        with torch.device("cpu"):
-            return fn(*a, **k)
+        prev = torch.get_default_dtype()
+        torch.set_default_dtype(torch.float32)   # the runtime runs under a bf16 default; builders were written for fp32
+        try:
+            with torch.device("cpu"):
+                return fn(*a, **k)
+        finally:
+            torch.set_default_dtype(prev)
     return w
 
 
@@ -229,12 +234,12 @@ def _stat_rows(g, n: int, w: int, kind: str) -> torch.Tensor:
     residual stream's shape), exact zeros. sqmean: bf16 values (every statistic input is a bf16 tensor); sum: signed
     fp32; possum: positive fp32 (the router's sqrt(softplus) scores)."""
     kb = -(-w // 32)
-    x = torch.randn(n, kb, 32, generator=g, device="cpu") * torch.exp2(
-        torch.randint(-8, 9, (n, kb, 1), generator=g, device="cpu").float())
+    x = torch.randn(n, kb, 32, generator=g, device="cpu", dtype=torch.float32) * torch.exp2(
+        torch.randint(-8, 9, (n, kb, 1), generator=g, device="cpu").float())   # explicit fp32: runtime default dtype is bf16
     x = x.reshape(n, kb * 32)[:, :w].contiguous()
     k = min(4, w)
     ch = torch.randint(0, w, (n, k), generator=g, device="cpu")
-    x.scatter_(1, ch, torch.randn(n, k, generator=g, device="cpu") * 1024.0)
+    x.scatter_(1, ch, torch.randn(n, k, generator=g, device="cpu", dtype=torch.float32) * 1024.0)
     z = torch.rand(n, w, generator=g, device="cpu") < 0.02
     x = torch.where(z, torch.zeros((), device="cpu"), x)
     if kind == "sqmean":
