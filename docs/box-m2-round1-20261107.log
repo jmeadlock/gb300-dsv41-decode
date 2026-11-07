@@ -1,0 +1,46 @@
+########## L10 (17:29)
+bench rc=1
+rows 1 RP 1: us/layer split 17.45 fused 16.23 (saved 1.23; 0.049 ms/step at 40 layers); bit-identical True; tickets 0 True
+rows 1 RP 1: us/layer split 17.45 fused 16.22 (saved 1.23; 0.049 ms/step at 40 layers); bit-identical True; tickets 0 True
+rows 1 RP 1: us/layer split 17.45 fused 16.23 (saved 1.22; 0.049 ms/step at 40 layers); bit-identical True; tickets 0 True
+rows 1 RP 1: us/layer split 17.45 fused 16.23 (saved 1.23; 0.049 ms/step at 40 layers); bit-identical True; tickets 0 True
+    rep["timing"] = timing(rows, a.layers, a.reps, tuple(int(m) for m in a.rope_modes.split(",")),
+headline rc=0
+  two_graphs: 21.80 ms/step (verify 18.91 + draft 2.90) | 2.903 tok/step | 7.51 ms/token | window steps >= 32: 558 (all 958 steps: 21.95 ms/step, 3.071 tok/step)
+  streams exact vs 1-row: 8/8; self-replay ok: 8/8; overflow {'steps': 0, 'experts': 0, 'steps_counted': 0, 'spare_slots': 16}; errors 0 | scratch/headline-qkv.json
+########## L1 (17:36)
+env fork impl fork
+1-row rc=0
+[self-replay rep1 vs rep2] 8/8 byte-identical, 8/8 logits digests equal, files equal True
+self-replay rep1 vs rep2: 8/8 byte-identical, 8/8 fp32-logit digests equal; diverged: none
+step cell (cuda_events): steps 32..512 mean 9.73 / p50 9.72 / p90 9.98 ms per step
+step cell: 102.77 tok/s (1/mean), 101.87 tok/s wall; prefill 3598 ms; vs rep1 tokens {'compared': 256, 'first_divergence': None}
+1-row stream byte-identical to T9b-8 run
+headline fork rc=0
+  two_graphs: 20.65 ms/step (verify 17.75 + draft 2.90) | 2.903 tok/step | 7.11 ms/token | window steps >= 32: 558 (all 958 steps: 20.80 ms/step, 3.071 tok/step)
+  streams exact vs 1-row: 8/8; self-replay ok: 8/8; overflow {'steps': 0, 'experts': 0, 'steps_counted': 0, 'spare_slots': 16}; errors 0 | scratch/headline-mixes-fork.json
+headline fused rc=0
+  two_graphs: 20.64 ms/step (verify 17.74 + draft 2.90) | 2.903 tok/step | 7.11 ms/token | window steps >= 32: 558 (all 958 steps: 20.79 ms/step, 3.071 tok/step)
+  streams exact vs 1-row: 8/8; self-replay ok: 8/8; overflow {'steps': 0, 'experts': 0, 'steps_counted': 0, 'spare_slots': 16}; errors 0 | scratch/headline-mixes-fused.json
+########## PDL probe clean (17:52)
+probe rc=0
+[mixed] graph bit-identity over 400 replays x 8 rotating inputs vs a: ALL IDENTICAL
+[mixed] graph a-b: -102.02 +- 2.62 us/replay = -2.551 us/pair = -1.291 +- 0.033 us/edge (n=200, first slower in 0 % of samples)
+[mixed] graph a-c: -400.77 +- 0.91 us/replay = -10.019 us/pair = -5.073 +- 0.012 us/edge (n=200, first slower in 0 % of samples)
+[A] graph bit-identity over 400 replays x 8 rotating inputs vs a: ALL IDENTICAL
+[A] graph a-b: -45.47 +- 0.36 us/replay = -1.137 us/pair = -0.576 +- 0.005 us/edge (n=200, first slower in 0 % of samples)
+[A] graph a-c: -135.43 +- 0.32 us/replay = -3.386 us/pair = -1.714 +- 0.004 us/edge (n=200, first slower in 0 % of samples)
+[B] graph bit-identity over 400 replays x 8 rotating inputs vs a: ALL IDENTICAL
+[B] graph a-b: -162.54 +- 2.85 us/replay = -4.064 us/pair = -2.058 +- 0.036 us/edge (n=200, first slower in 0 % of samples)
+[B] graph a-c: -678.62 +- 2.98 us/replay = -16.965 us/pair = -8.590 +- 0.038 us/edge (n=200, first slower in 0 % of samples)
+########## L3 spike debug (17:54)
+dg_mega import ok /work/runtime/dg_mega.py
+spike rc=0
+OK   api {"dg_mega_names": ["bf16_mega_gate", "bf16_mega_moe", "fp8_fp4_mega_moe", "get_bf16_mega_gate_config", "get_block_m_for_mega_moe", "get_symm_buffer_for_mega_moe", "mega", "mega_mhc", "transform_weights_for_mega_
+OK   layouts {"l2_is_pool_w2": true, "l1_copy_bytes": 3668705280, "library_transform_mn": {"l1_equal": true, "sf1_equal_values": true, "sf1_strides_lib_ours": [[184320, 1, 4608], [184320, 1, 4608]], "l2_equal": true, "sf
+OK   first_call {"shared0_mn": {"ok": true, "finite": true, "max_abs": 340.0, "padding_rows_zero": null}, "shared0_k": {"ok": false, "error": "RuntimeError: Assertion error (/workspace/.deps/deepgemm-src/csrc/apis/../jit
+OK   numerics {"R6": {"mega_vs_inplace_routed": {"equal": false, "mismatch_frac": 0.8223958611488342, "max_ulp": 32869, "n_ulp_gt1": 17294, "max_abs": 8.5, "n": 30720, "nonfinite": 0}, "replay_equal": true}, "oracle": {"
+OK   speed {"mega_shared0_R1_hot": {"us": 52.77, "how": "graph"}, "mega_shared0_R1_route_stage_act_call": {"us": 66.96, "how": "graph"}, "mega_shared0_R6_hot": {"us": 92.17, "how": "graph"}, "mega_shared0_R6_route_stage_
+wrote scratch/dg-mega-spike.json
+VERDICT {"abi_call_works": {"shared0": "mn", "shared1": "mn"}, "l2_in_place": true, "l1_in_place": false, "mega_vs_inplace_routed_R6": {"equal": false, "mismatch_frac": 0.8223958611488342, "max_ulp": 32869, "n_ulp_gt1": 
+########## done (17:54)
