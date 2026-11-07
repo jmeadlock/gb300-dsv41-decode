@@ -204,6 +204,13 @@ def test_rowdiv_real_reported():
         pool.add_spare_slots(DEFAULT_SPARE_SLOTS_ROWS, model)
         fx = os.environ.get("DSV41_ROWDIV_FIXTURE")
         ids = P._encode(md, fx if fx and os.path.exists(fx) else None, tag, None)
+        # LOOSE-1107: the mini tests above run in this process; a mini fixture's engram.build_compressed_token_map
+        # patch that outlives them gives this build a 2048-entry token_map and the prefill a device-side index
+        # assert (CUDA_ERROR_ASSERT at the next cuModuleLoadData, docs/rowdiv-gpu-test-r2-20261107.log). Fail on the
+        # host, by name, before any kernel runs.
+        P.check_token_ids(model, ids)
+        assert model.engram_hash is None or int(model.engram_hash.token_map.numel()) > 2048, \
+            "real build got a mini-sized engram token_map"
         kw = dict(ids=ids, max_pos=4095, spare_slots=DEFAULT_SPARE_SLOTS_ROWS, stream="greedy")
         reps = {}
         for name, fix, var in (("PLAIN", False, 0), ("FIX", True, 0), ("PLAIN rejected-variant 1", False, 1)):

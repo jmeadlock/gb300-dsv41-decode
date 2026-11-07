@@ -32,6 +32,10 @@ step): the `overflow` field and the residency line report it; give the off run t
 report key `residency` has swaps/step, the cold-share curve (per drain and per sequence), the headroom calc and HBM, the
 manager's GPU ms per step (`ms_manager_per_step`; `ms_per_step_incl_manager` is the number to compare with the off run)
 and, with `--residency-ref <the off run's JSON>`, per prompt emitted-token / accept-length equality (an error if not).
+`mode_gap` (LOOSE-1107): one_graph vs two_graphs. Without residency they agree within 0.03 ms in every run; with
+residency on the two_graphs cell is measured first and the one_graph cell last, at a different swap-policy state (cold
+share), so the report carries the gap, its split (verify vs draft graph, mean/median/p90), each cell's cold share, and
+a weighted fit of step ms vs cold share (modeled, labeled) -- one printed `mode gap:` line. Defaults are unchanged.
 The C1 instrument proper (nsys cudaProfilerApi range) is M1-T13; --profile TAG:FIRST:N opens that range around N steps
 of one prompt's first fast run, for `nsys profile --capture-range=cudaProfilerApi`.
 
@@ -211,6 +215,147 @@ def rowmatch_line(rm: dict) -> str:
     return s
 
 
+MODE_GAP_TOL_MS = 0.05      # every run without residency has one_graph and two_graphs within 0.03 ms (docs/headline-*.json)
+
+
+def cold_pooled(runs: Sequence[dict]) -> Optional[float]:
+    """Cold share of the routed expert calls over `runs` (call-weighted: sum cold / sum routed), or None when the
+    runs carry no counters (a static-map run without residency still has them; JSONs before LOOSE-1107 do not for
+    the one_graph cell)."""
+    cold = sum(x.get("cold_calls") or 0 for x in runs if x.get("routed_calls"))
+    tot = sum(x.get("routed_calls") or 0 for x in runs)
+    return (cold / tot) if tot else None
+
+
+def _wls(pts: Sequence[tuple]) -> Optional[dict]:
+    """Weighted least squares y = a + b x over (x, y, w) -> {n, intercept, slope, r} (None: < 3 points or no spread)."""
+    pts = [(float(x), float(y), float(w)) for x, y, w in pts if x is not None and y is not None and w]
+    if len(pts) < 3:
+        return None
+    sw = sum(w for _, _, w in pts)
+    mx = sum(w * x for x, _, w in pts) / sw
+    my = sum(w * y for _, y, w in pts) / sw
+    sxx = sum(w * (x - mx) ** 2 for x, _, w in pts)
+    syy = sum(w * (y - my) ** 2 for _, y, w in pts)
+    sxy = sum(w * (x - mx) * (y - my) for x, y, w in pts)
+    if sxx <= 0 or syy <= 0:
+        return None
+    b = sxy / sxx
+    return {"n": len(pts), "intercept": my - b * mx, "slope": b, "r": sxy / (sxx * syy) ** 0.5}
+
+
+def mode_gap(rep: dict) -> Optional[dict]:
+    """LOOSE-1107: why one_graph and two_graphs differ in a run (None when the run has only one of them).
+
+    Both cells replay the same kernels; the loop adds ~0 (every run without residency has them within 0.03 ms). What
+    can differ between the cells is the STATE the run is in when each is measured: `run_cells` measures the first
+    cell (two_graphs: fast x reps + parity x parity_reps per prompt) first and the one_graph cell LAST, one fast run
+    per prompt, and with residency on the manager swaps experts between replays for the whole run, so the cold
+    share -- cold experts are staged and cost verify time -- falls from cell to cell (docs/headline-20261107-
+    residency.json: code 12.9 % -> 10.0 % -> 7.5 % -> 6.2 % over its first four runs). The report therefore carries
+    the gap, where it sits (verify graph vs draft graph, mean vs median, per prompt), the residency state of each
+    cell (cold share when recorded), a weighted fit of the two_graphs cell's own per-prompt step ms against its cold
+    share, and -- when the one_graph cell's cold share is not recorded -- a MODELED one_graph ms from the fit and the
+    policy's drain log over the last drains (labeled modeled). `within_tolerance` False without residency would be
+    a real mode effect; with residency on the cells are not comparable and `cause` says so."""
+    h = rep.get("headline") or {}
+    w2, w1 = h.get("two_graphs"), h.get("one_graph")
+    if not w2 or not w1 or not (w2.get("ms_per_step") or {}).get("n") or not (w1.get("ms_per_step") or {}).get("n"):
+        return None
+    g = lambda w, k: (w.get(k) or {}).get("mean") if w.get(k) else None      # noqa: E731
+    q = lambda w, k: (w.get("ms_per_step") or {}).get(k)                        # noqa: E731
+    m2, m1 = g(w2, "ms_per_step"), g(w1, "ms_per_step")
+    res = rep.get("residency") or {}
+    res_on = bool(rep.get("residency_config")) or bool(res.get("on"))
+    out: dict = {"two_graphs_ms": m2, "one_graph_ms": m1, "gap_ms": m2 - m1, "gap_pct": (m2 - m1) / m1 * 100,
+                 "tolerance_ms": MODE_GAP_TOL_MS, "within_tolerance": abs(m2 - m1) <= MODE_GAP_TOL_MS,
+                 "gap_p50_ms": q(w2, "p50") - q(w1, "p50"), "gap_p90_ms": q(w2, "p90") - q(w1, "p90"),
+                 "steps": {"two_graphs": w2.get("steps"), "one_graph": w1.get("steps")},
+                 "draft_graph_ms_two_graphs": g(w2, "ms_draft_graph"), "verify_graph_ms_two_graphs": g(w2, "ms_verify_graph"),
+                 "residency_on": res_on, "cell_order": "two_graphs measured first, one_graph last",
+                 "sf_store": res.get("sf_store") if res_on else None}
+    if res_on:
+        mg2, mg1 = g(w2, "ms_manager_per_step"), g(w1, "ms_manager_per_step")
+        out["manager_ms_per_step"] = {"two_graphs": mg2, "one_graph": mg1}
+        out["gap_incl_manager_ms"] = (w2.get("ms_per_step_incl_manager") - w1.get("ms_per_step_incl_manager")
+                                      if w2.get("ms_per_step_incl_manager") and w1.get("ms_per_step_incl_manager")
+                                      else None)
+    c2, c1 = w2.get("cold_share"), w1.get("cold_share")
+    out["cold_share"] = {"two_graphs": c2, "one_graph": c1}
+    per, pts = {}, []
+    for tag, p in (rep.get("prompts") or {}).items():
+        a, b = p.get("window") or {}, p.get("window_one_graph") or {}
+        a_all, b_all = (a.get("all_ms_per_step") or {}).get("mean"), (b.get("all_ms_per_step") or {}).get("mean")
+        if a_all is None or b_all is None:
+            continue
+        reps_ = [x for x in (p.get("cold_share_by_rep") or []) if x is not None]
+        cold2 = (sum(reps_) / len(reps_)) if reps_ else None
+        per[tag] = {"steps": p.get("steps"), "two_graphs_ms": a_all, "one_graph_ms": b_all, "gap_ms": a_all - b_all,
+                    "cold_share_two_graphs_reps": p.get("cold_share_by_rep"),
+                    "cold_share_one_graph_reps": p.get("cold_share_by_rep_one_graph")}
+        pts.append((cold2, a_all, p.get("steps") or 0))
+    out["per_prompt"] = per
+    fit = _wls(pts) if res_on else None
+    if fit:
+        out["fit_two_graphs_ms_vs_cold_share"] = dict(
+            fit, ms_per_cold_pct_point=fit["slope"] / 100.0,
+            what="weighted LSQ over prompts: mean step ms of the two_graphs cell (all live steps) vs the mean cold "
+                 "share of its fast reps; MODELED relation, not a measurement of the one_graph cell")
+    if fit and res_on:
+        if c2 is not None and c1 is not None:
+            out["gap_predicted_from_cold_share_ms"] = fit["slope"] * (c2 - c1)      # modeled
+        else:   # one_graph cold share not recorded: take the policy's drain log over the last one_graph steps
+            dl = res.get("drain_log") or []
+            n1, host = int(w1.get("all_steps") or 0), int(res.get("host_steps") or 0)
+            tail = [r["cold_share"] for r in dl if r.get("cold_share") is not None and r.get("host_steps", 0) > host - n1]
+            if tail:
+                cs = sum(tail) / len(tail)
+                out["one_graph_ms_modeled"] = {"cold_share_drain_tail": cs, "drains": len(tail),
+                                               "ms": fit["intercept"] + fit["slope"] * cs,
+                                               "actual_ms": (w1.get("all_ms_per_step") or {}).get("mean") or m1,
+                                               "what": "MODELED: fit intercept + slope x the cold share of the drains "
+                                                       "covering the last one_graph steps (drain log granularity: 64 steps)"}
+    # the verdict
+    if out["within_tolerance"]:
+        out["cause"] = (f"none: the cells agree within {MODE_GAP_TOL_MS} ms (same kernels in the same order; the "
+                        f"residency hook runs after each step's end event in both)")
+        out["headline_mode"] = "either: the cells are the same measurement"
+    elif not res_on:
+        out["cause"] = (f"UNEXPLAINED mode effect: residency off, gap {out['gap_ms']:+.3f} ms; check draft vs verify "
+                        f"graph attribution and run order")
+        out["headline_mode"] = "unresolved"
+    else:
+        bits = [f"residency on: the cells are measured at different policy states (two_graphs first, one_graph last)"]
+        if c2 is not None and c1 is not None:
+            bits.append(f"cold share {c2 * 100:.2f}% (two_graphs) vs {c1 * 100:.2f}% (one_graph)")
+        if fit:
+            bits.append(f"two_graphs step ms rises {fit['slope'] / 100:.3f} ms per cold-share point across prompts "
+                        f"(r {fit['r']:.2f}, n {fit['n']})")
+        if "one_graph_ms_modeled" in out:
+            mm = out["one_graph_ms_modeled"]
+            bits.append(f"modeled one_graph {mm['ms']:.2f} ms at drain-tail cold share {mm['cold_share_drain_tail'] * 100:.2f}% "
+                        f"(actual {mm['actual_ms']:.2f})")
+        sf = out.get("sf_store") or {}
+        if sf.get("got") and sf.get("got") != sf.get("requested"):
+            bits.append(f"sf_store {sf.get('requested')}->{sf.get('got')} is a per-run setting, identical in both cells "
+                        f"(it cannot make one mode slower)")
+        out["cause"] = "; ".join(bits)
+        out["headline_mode"] = ("not decidable from this run: the cells differ in residency state, so the gap is "
+                                "not a property of the graph mode. Compare modes at a fixed state (--residency-frozen "
+                                "after a warm run, or both cells after the same number of passes). Defaults unchanged")
+    return out
+
+
+def mode_gap_line(mg: Optional[dict]) -> Optional[str]:
+    if not mg:
+        return None
+    f = lambda x, d=2: "-" if x is None else f"{x:.{d}f}"          # noqa: E731
+    s = (f"  mode gap: two_graphs {f(mg['two_graphs_ms'])} - one_graph {f(mg['one_graph_ms'])} = {mg['gap_ms']:+.3f} ms "
+         f"(median {mg['gap_p50_ms']:+.2f}, p90 {mg['gap_p90_ms']:+.2f}; draft graph {f(mg['draft_graph_ms_two_graphs'])}"
+         f" ms in the two_graphs cell) | {mg['cause']}")
+    return s
+
+
 def summary_lines(rep: dict) -> List[str]:
     h = rep.get("headline") or {}
     f = lambda x, d=2: "-" if x is None else f"{x:.{d}f}"  # noqa: E731
@@ -232,6 +377,9 @@ def summary_lines(rep: dict) -> List[str]:
                      f"tok/step | {f(w.get('ms_per_token'))} ms/token | window steps >= {w.get('stats_from_step')}: "
                      f"{w.get('steps')} (all {w.get('all_steps')} steps: {f((w.get('all_ms_per_step') or {}).get('mean'))}"
                      f" ms/step, {f(w.get('all_tokens_per_step'), 3)} tok/step)")
+    mgl = mode_gap_line(rep.get("mode_gap"))
+    if mgl:
+        lines.append(mgl)
     lines.append(f"  vs Pg61 {PG61_MS_PER_STEP} ms/step (bar {CHARTER_BAR_MS}); prefill {f(h.get('prefill_ms_mean'), 1)} ms "
                  f"mean; HBM after build {rep.get('hbm_after_build_GiB')}")
     lines.append(f"  {'prompt':6s} {'tok':>4s} {'steps':>5s} {'tok/st':>6s} {'ms/step':>8s} {'ms/tok':>7s} "
@@ -433,6 +581,7 @@ def aggregate(rep: dict, prompts: Dict[str, dict], results: Dict[int, Dict[str, 
                     "r1_vs_ref": p.get("r1_vs_ref"), "finish_reason": base["finish_reason"],
                     "window": window(fast, stats_from),
                     "window_one_graph": window(one["fast"], stats_from) if one else None,
+                    "cold_share_by_rep_one_graph": [x.get("cold_share") for x in one["fast"]] if one else None,
                     "steps_issued": [x["steps_issued"] for x in fast],
                     "wall_ms_fast": [x["wall_ms"] for x in fast]}
     rep["prompts"] = per
@@ -445,6 +594,7 @@ def aggregate(rep: dict, prompts: Dict[str, dict], results: Dict[int, Dict[str, 
         rr = results.get(ng)
         if rr:
             head[key] = window([x for v in rr.values() for x in v["fast"]], stats_from)
+            head[key]["cold_share"] = cold_pooled([x for v in rr.values() for x in v["fast"]])
     w2 = head.get("two_graphs") or head.get("one_graph") or head.get("eager") or {}
     head["ms_per_6row_step_dspark_k5"] = (w2.get("ms_per_step") or {}).get("mean")
     head["ms_verify_graph"] = (w2.get("ms_verify_graph") or {}).get("mean") if w2.get("ms_verify_graph") else None
@@ -668,6 +818,7 @@ def main(argv=None) -> int:
     aggregate(rep, prompts, results, run_graphs, a.stats_from)
     if res_cfg is not None:
         rep["residency"] = residency_report(gen, a, rep, results, run_graphs)   # before loop.close() restores the map
+    rep["mode_gap"] = mode_gap(rep)             # LOOSE-1107: one_graph vs two_graphs, and why they differ if they do
     try:
         from draft_bench import pg61_tokens_per_chunk
 

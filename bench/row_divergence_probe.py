@@ -494,6 +494,7 @@ def run_probe(model, pool, *, impls: dict, L: int = 18, plan: Sequence[int] = (5
         g = torch.Generator(device="cpu").manual_seed(seed)
         ids = torch.randint(2, min(2000, V), (L,), generator=g, device="cpu").tolist()
     L = len(ids)
+    check_token_ids(model, ids)
     if L + n_pos > max_pos:
         raise ValueError(f"prompt {L} + {n_pos} positions > max_pos {max_pos}")
     rep: dict = {"L": L, "plan": plan, "stream": stream, "seed": seed, "impls": dict(impls), "rowwise": rowwise,
@@ -772,7 +773,14 @@ MINI4_HOT = {"0": [0, 2, 5, 7], "1": [1, 3, 4, 6], "2": [0, 1, 2, 3], "3": [4, 5
 
 @contextlib.contextmanager
 def mini_model(kind: str = "mini4", device: str = "cuda"):
-    """tests/gpu/test_static_rows_gpu.py's `_model` (mini / mini4 / mini4w on cuda) -> (model, pool)."""
+    """tests/gpu/test_static_rows_gpu.py's `_model` (mini / mini4 / mini4w on cuda) -> (model, pool).
+
+    The mini fixture replaces `engram.build_compressed_token_map` (a 2048-entry identity map; the mini config's
+    vocab). That replacement is scoped to this context and undone on exit: left in place it leaks into the next
+    `build_and_load` of the SAME process -- the real checkpoint of tests/gpu/test_row_divergence_gpu.py, run after the
+    mini tests -- whose Engram `token_map[input_ids]` then indexes a 2048-entry table with real token ids (up to
+    ~129k): a device-side `index out of bounds` assert in IndexKernel.cu that poisons the context, surfacing as
+    CUDA_ERROR_ASSERT at the next TileLang cuModuleLoadData (docs/rowdiv-gpu-test-r2-20261107.log)."""
     from mini_ckpt import MINI_CONFIG, make_mini_checkpoint
     from runtime.loader import build_and_load
     from runtime.refmodel import import_reference
@@ -780,29 +788,52 @@ def mini_model(kind: str = "mini4", device: str = "cuda"):
     import_reference()
     import engram
 
+    pristine = engram.build_compressed_token_map
     engram.build_compressed_token_map = lambda tok: (list(range(MINI_CONFIG["vocab_size"])),
                                                      MINI_CONFIG["engram_compressed_vocab_size"])
-    cfg, hot = None, None
-    if kind in ("mini4", "mini4w"):
-        cfg = dict(MINI_CONFIG, **MINI4)
-        if kind == "mini4w":
-            cfg.update({"index_topk": 512})
-        hot = MINI4_HOT
-    with tempfile.TemporaryDirectory() as tmp:
-        ck = make_mini_checkpoint(os.path.join(tmp, "ckpt"), cfg=cfg) if cfg else \
-            make_mini_checkpoint(os.path.join(tmp, "ckpt"))
-        model = build_and_load(ck["model_dir"], hot if hot is not None else ck["map"], device, tokenizer=object(),
-                               io_threads=4, stage_bytes=1 << 20, log=lambda *a: None)
-        model.temperature = 0.0
-        res = model.runtime_load
-        try:
-            yield model, res.pool
-        finally:
-            torch.set_default_device("cpu")
-            del model
-            if device == "cuda":
-                torch.cuda.synchronize()
-            res.release()
+    try:
+        cfg, hot = None, None
+        if kind in ("mini4", "mini4w"):
+            cfg = dict(MINI_CONFIG, **MINI4)
+            if kind == "mini4w":
+                cfg.update({"index_topk": 512})
+            hot = MINI4_HOT
+        with tempfile.TemporaryDirectory() as tmp:
+            ck = make_mini_checkpoint(os.path.join(tmp, "ckpt"), cfg=cfg) if cfg else \
+                make_mini_checkpoint(os.path.join(tmp, "ckpt"))
+            model = build_and_load(ck["model_dir"], hot if hot is not None else ck["map"], device, tokenizer=object(),
+                                   io_threads=4, stage_bytes=1 << 20, log=lambda *a: None)
+            model.temperature = 0.0
+            res = model.runtime_load
+            try:
+                yield model, res.pool
+            finally:
+                torch.set_default_device("cpu")
+                del model
+                if device == "cuda":
+                    torch.cuda.synchronize()
+                res.release()
+    finally:
+        engram.build_compressed_token_map = pristine
+
+
+def check_token_ids(model, ids: Sequence[int]) -> None:
+    """Host-side guard before any device work: every prompt id must index the model's embedding and the Engram
+    `token_map` (engram.py NgramHashState.forward: `token_map[input_ids]`). An id past either table is a device-side
+    assert that surfaces much later as an unrelated CUDA_ERROR_ASSERT (see mini_model); name it here instead."""
+    if not len(ids):
+        return
+    lo, hi = min(int(i) for i in ids), max(int(i) for i in ids)
+    tables = [("embed", int(model.embed.weight.size(0)))]
+    eh = getattr(model, "engram_hash", None)
+    if eh is not None:
+        tables.append(("engram token_map", int(eh.token_map.numel())))
+    for name, n in tables:
+        if lo < 0 or hi >= n:
+            raise ValueError(
+                f"prompt token ids span [{lo}, {hi}] but the model's {name} has {n} rows: the model was built under a "
+                f"different tokenizer map (a mini fixture's patched engram.build_compressed_token_map leaking into a "
+                f"real build?) -- this would be a device-side index assert, not a Python error")
 
 
 def build_parser() -> argparse.ArgumentParser:
