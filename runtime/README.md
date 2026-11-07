@@ -16,6 +16,7 @@ Standalone: no vllm import anywhere (charter decision 3). The reference `model.p
 | `static_step.py` | T8: `StaticStep(model, pool, max_pos=)` -- the fixed-shape 1-row decode step (design table 2.1 #1-#15 row by row in its docstring), `forward_static(parity)` eager, `capture()` g_even/g_odd, `replay(pos)` |
 | `static_kernels.py` | T8 Triton kernels (GPU only): the pointer-table gather `t8_gather_rows`, the per-step `t8_step_marker`; T9b-2's one-launch six-table gather `t9b2_gather_tables`; T9b-3a: both gathers move 16-B vectors per lane (the byte kernels kept as `*_u8`, `DSV41_GATHER_IMPL=u8`) |
 | `kernels/sparse_attn_bounded.py` | T9b-3a (`--attn-impl bounded`): a copy of the reference TileLang `sparse_attn` (kernel.py:310-403) whose 64-index block loop is bounded by a device per-row valid-block count; three loop spellings, build-time self-check vs the reference; the count math (`nblk_static`, `valid_blocks`, `ref_width`) |
+| `attn_flashmla.py` | T9b-3c (`--attn-impl flashmla`, A3-class): every layer's `sparse_attn` on FlashMLA's `sparse_prefill_fwd` over our bf16 caches; the op loaded from vllm's `_flashmla_C` .so with `torch.ops.load_library` (no vllm Python, asserted before and after); head / head-dim / topk padding for small shapes; per-row `topk_length`; fp64 oracle and build-time self-check |
 | `dg_moe.py` | T9a-1: `DGMaskedMoE` (`--moe-impl dg-masked`): the static MoE's routed GEMMs as 3 DeepGEMM masked grouped GEMMs over the same staging; `import_deep_gemm` (no vllm import); exact e8m0 → fp32 |
 | `fused_glue.py` | T9b-2 round 1 (`--glue-impl fused`): Triton kernels for the zero/low-risk glue clusters (gather, DG act, SwiGLU+act_quant, MoE combine, mHC post, o-path RoPE+QDQ, q RoPE in the GEMV store), table-driven act_quant/silu, build-time self-check, per-cluster switches; torch mirrors on CPU |
 | `gemv_mxfp8.py` | T9b-1: Triton MXFP8 GEMV `mxfp8_gemv(xq, xs, w, s, out)` for the fp8 Linears at <= 8 rows (`--fp8-impl gemv`); exact e8m0 pair scale; per-(N,K,M) tuning cache; `gemv_torch` = the same algorithm in torch (CPU) |
@@ -554,3 +555,84 @@ cell <= 26 ms; the R1 flags plus `--attn-impl bounded`; same tuned GEMV configs 
 
 Then check `attn_bound` in the report (`on: true`, the spelling, every self-check row "equal") and `gather`
 (`impl: vec`, `vec_error: null`). Any spelling that failed to compile is listed with its error.
+
+
+## T9b-3c: the main sparse attention on FlashMLA (`--attn-impl flashmla`, A3-class)
+
+Spec: `docs/HANDOFF-T9B3C-FLASHMLA.md`; the adoption receipt is the probe (`bench/flashmla_probe.py`,
+`docs/flashmla-probe-20261106.json`: ADOPT; loads with no vllm import; arm C fp64 error <= 1.05x the reference
+kernel's, nearer the bf16-q oracle in 18/18 cases, 13.8-14.4 us/call vs 125-154 in a 40-call graph, replay-equal).
+`ref` stays the default.
+
+**What runs.** `attn_impl="flashmla"` sends EVERY layer's `sparse_attn` (2 ratio-0 + 38 compressed) to
+`runtime/attn_flashmla.py` `sparse_attn_flashmla`, i.e. `torch.ops._flashmla_C.sparse_prefill_fwd` (the probe's arm C)
+over the static step's bf16 kv / int32 indices / fp32 sink / softmax_scale exactly as they are -- no new cache writer,
+no 528/288 B records, no scheduler metadata. Compressed layers pass `topk_length = 128 + min(k, compress_lens)` per row
+(the eager reference's own width; computed where the indices are built and published with them, like T9b-3a's block
+count, of which it is the unrounded form); the compressed indices are a sorted prefix with a -1 tail, so the length
+drops only -1 slots. Ratio-0 layers pass no length. The real shapes (64 heads, 512, widths 128 / 640) go through with
+no copy; smaller shapes (the mini checkpoints) are zero-padded to h_q 64, d 512 and topk % 128, which leaves the
+kept heads' values unchanged. Not bit-identical to the reference (different tiling, exp2 softmax, sink as
+exp(lse)/(exp(lse)+exp(sink))); q stays bf16, so the class is A3 (as the GEMV), not A1.
+
+**Loading.** `<dist-packages>/vllm/_flashmla_C*.so` by glob, `torch.ops.load_library`; 'vllm' must be absent from
+`sys.modules` before and after (else refused: "stop and say so"). Nothing imports `flash_mla_interface.py` (it does
+`import vllm._flashmla_C`). This is the sanctioned reading of decision 3 for this binary (handoff rules).
+
+**Routing / fallback.** No monkeypatch: the static step owns the call site (`StaticStep._sparse_attn`), so the prefill
+and the eager reference never reach FlashMLA. `DSV41_FLASHMLA_TOPK_LENGTH=0` passes no per-row length (the -1 slots
+are masked instead, as the probe's arm C ran) -- a knob in case the kernel mishandles lengths; the GPU test reports
+whether length == masking bitwise. At StaticStep build: load, then a self-check on the model's shapes (the
+T9b-3a index lists: 40 compressed lists with lengths + the window-only lists, a 4-row call) against the reference
+kernel and an fp64 oracle -- gates finite and error <= 2x the reference's; reports the max/mean ratio, mismatch %,
+length == -1-masking, rows independent. A failed load or check leaves the reference in force and says so
+(`st.attn_describe()`, report `attn_bound`, summary `attn flashmla(OFF)`).
+
+Flags: `StaticStep(..., attn_impl="flashmla")` / `Generator(..., attn_impl="flashmla")` / `first_light.py --attn-impl
+flashmla`. With `--parity-levels` the step is a variant (label gains `flashmla`: L0 static rows reported, not gated;
+the gated "ref static-eager vs reference-eager" row; the "<label> vs ref static-eager" drift row), and the attn-`ref`
+static-eager run with the same moe/fp8/glue impls gives the drift row **"flashmla vs ref attn (same other impls)"**
+(level A, not gated; first token divergence + mean |delta logit|; `parity_levels.attn_drift`).
+
+**Mac:** `tests/test_attn_flashmla_cpu.py` -- the length vs the reference width for every position 1..4,096 at both
+ratios (and vs the T9b-3a block count); exactness on the static step's real index lists; argument construction (no
+copy at real shapes, padding at mini shapes, batch offsets); the wrapper through a torch emulation of the op's contract
+== the fp64 oracle, length == masking, rows independent; the load guards (vllm already imported, no .so, a load that
+pulls vllm in, op missing); the self-check's accept / reject; StaticStep routing on the emulated minis (every layer,
+exact lengths) and the load-failure fallback; Generator / first_light plumbing. The op itself only runs on the box.
+
+**Box, GPU test** (load without vllm; flashmla vs the reference kernel at real shapes, positions 300 / 1100 / 4000,
+1 and 6 rows, ratio 0/2/1: mismatch %, max |delta|, fp64-oracle ratio <= 1.1x; a 40-call graph replay x2 == eager at
+b = 1/6 and p = 300/1100/4000 with us/call for flashmla vs the reference and, at 300 and 4000, FlashMLA's decode
+kernel over 528/288 B records (the B-vs-C question: does C's cost grow with context where B's does not); mini / mini4
+/ mini4w (+ dg-masked/gemv/fused) static-eager runs, graph == static, replay x2, fills-on, relaunch, no host sync,
+top-1 stream == attn ref over 10 steps; informative step cells):
+
+    docker run --rm --device nvidia.com/gpu=GPU-1c1855c8-dd10-0247-583e-3c3880ddbf55 --ipc=host --ulimit memlock=-1:-1 \
+      --cap-add IPC_LOCK -v "$W":/work -w /work -e CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+      -v "$HOME/dsv41/w0/jit-cache/tilelang":/root/.tilelang -v "$HOME/dsv41/w0/jit-cache/triton":/root/.triton \
+      -v "$HOME/dsv41/w0/jit-cache/nv":/root/.nv \
+      --entrypoint python3 vllm/vllm-openai:v0.31.0 tests/gpu/test_attn_flashmla_gpu.py
+
+**Box, first light** (gates: L1/L2 8/8, self-replay 8/8, drift row "flashmla vs ref attn" <= 0.05 mean, parity vs
+Pg61 within the A3 class (2/8 identical, 0 weighted flips), step cell <= 22 ms; the default path's flags plus
+`--attn-impl flashmla`):
+
+    cp docs/gemv-tune-gb300-20261106.json scratch/gemv-tune.json
+    docker run --rm --device nvidia.com/gpu=GPU-1c1855c8-dd10-0247-583e-3c3880ddbf55 \
+      --ipc=host --ulimit memlock=-1:-1 --cap-add IPC_LOCK \
+      -v "$W":/work -w /work -v "$W/w0":/work/w0 \
+      -v /models/DeepSeek-V4.1-Flash-1017-1bae0e1088993b9b82de08f59de5be5a34e42170:/ref:ro \
+      -v "$HOME/dsv41/w0/jit-cache/tilelang":/root/.tilelang -v "$HOME/dsv41/w0/jit-cache/triton":/root/.triton \
+      -v "$HOME/dsv41/w0/jit-cache/nv":/root/.nv \
+      -v "$HOME/dsv41/w0/jit-cache/dg":/root/.deep_gemm -e DG_JIT_CACHE_DIR=/root/.deep_gemm \
+      -e CUBLAS_WORKSPACE_CONFIG=:4096:8 -e DSV41_GEMV_CACHE=/work/scratch/gemv-tune.json \
+      --entrypoint python3 vllm/vllm-openai:v0.31.0 \
+      bench/first_light.py --model-dir /ref --map docs/maps/hot-v26ar-seed-295.json --mode graph \
+        --moe-impl dg-masked --fp8-impl gemv --glue-impl fused --attn-impl flashmla --parity-levels --max-pos 4095 \
+        --fixture w0/results/phase1/parity-A.jsonl --out scratch/first-light-flashmla.jsonl --max-new 256 --reps 2 \
+        --step-cell 512 --no-fill-uninit --json docs/first-light-flashmla-<date>.json
+
+Then check `attn_bound` in the report (`impl: flashmla`, `on: true`, `load.vllm_modules: []`, the self-check's
+`max_err_ratio`), the level-A drift row (`parity_levels.attn_drift.mean_abs_dlogit`), and the parity table vs Pg61.
+Kernel name in nsys: FlashMLA's sparse prefill kernel (40 per step); no `sparse_attn_kernel_` should remain.

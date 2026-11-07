@@ -52,6 +52,13 @@ and one timed step cell.
     report records `generator.attn_impl`, `step_cell.attn_impl`, `parity_levels.attn_impl`, `attn_bound` (on/off,
     the TileLang loop spelling the self-check picked, its per-variant results) and `gather` (the staging gather in
     use: 16-B vector or the byte kernel, and why).
+(k) T9b-3c: `--attn-impl flashmla` runs EVERY layer's `sparse_attn` of the static/graph step on FlashMLA's
+    sparse_prefill_fwd (runtime/attn_flashmla.py; loaded from vllm's .so via torch.ops, no vllm import). A3-class: the
+    step is a variant (label gains "flashmla": L0 static rows reported, not gated; the gated "ref static-eager vs
+    reference-eager" row and the "<label> vs ref static-eager" drift row as for dg-masked/gemv), and the attn-ref
+    static-eager run (same moe/fp8/glue) gives the drift row "flashmla vs ref attn (same other impls)" (level A,
+    first token divergence + mean |delta logit|, not gated; `parity_levels.attn_drift`). `attn_bound` in the report
+    holds the flashmla describe (on/off and why, the .so, the self-check's error ratios vs the reference).
 Writes docs/first-light-<YYYYMMDD>.json (or --json) and prints a 12-line summary. One prompt failing logs its
 traceback and the run continues.
 
@@ -81,6 +88,7 @@ from runtime.generate import (Generator, dump_record, install_layer_nvtx, record
                               set_determinism)
 
 PARITY = os.path.join(REPO, "bench", "parity.py")
+ATTN_VARIANTS = ("flashmla",)  # attention impls that are not bit-identical (A3-class): drift row, L0 not gated
 
 
 # ------------------------------------------------------------------------------------------------ helpers
@@ -360,7 +368,8 @@ def parity_levels(gen: Generator, rows: List[dict], steps: int = 32, log=print,
     fimpl = getattr(gen, "fp8_impl", "ref")
     gimpl = getattr(gen, "glue_impl", "ref")
     aimpl = getattr(gen, "attn_impl", "ref")
-    label = "+".join(x for x in (impl, fimpl) if x != "ref") or "ref"
+    attn_variant = aimpl in ATTN_VARIANTS  # T9b-3c: an A3-class attention makes the step a variant (bounded does not)
+    label = "+".join(x for x in (impl, fimpl, aimpl if attn_variant else "ref") if x != "ref") or "ref"
     variant = label != "ref"
     runs: Dict[str, Dict[str, dict]] = {}
     timings: Dict[str, float] = {}
@@ -396,11 +405,12 @@ def parity_levels(gen: Generator, rows: List[dict], steps: int = 32, log=print,
             gen.set_mode("graph")
             gen.capture(fills=bool(f))
             timed("relaunch" + sfx, lambda: _level_run(gen, prompts, steps))
-        if aimpl != "ref":  # T9b-3a: the same static step with the reference sparse_attn (same moe/fp8/glue impls)
+        if aimpl != "ref":  # T9b-3a/3c: the same static step with the reference sparse_attn (same moe/fp8/glue impls)
             set_fill(fills_list[0])
             gen.set_attn_impl("ref")
             gen.set_mode("static")
-            timed("static-attnref" + sfx0, lambda: _level_run(gen, prompts, steps))
+            keep = kept.setdefault("attnref", {}) if attn_variant else None
+            timed("static-attnref" + sfx0, lambda: _level_run(gen, prompts, steps, keep))
             gen.set_attn_impl(aimpl)
         if gimpl != "ref":  # T9b-2: the same static step with the reference glue (same moe/fp8 impls)
             set_fill(fills_list[0])
@@ -463,10 +473,18 @@ def parity_levels(gen: Generator, rows: List[dict], steps: int = 32, log=print,
         fl0 = "-" if fills_list[0] is None else "off"
         table.append((fl0, "G", "fused glue vs ref glue (same moe/fp8 impl)", True,
                       compare_levels(runs["static" + sfx0], runs["static-glueref" + sfx0])))
-    if aimpl != "ref":
+    if aimpl != "ref" and not attn_variant:
         fl0 = "-" if fills_list[0] is None else "off"
         table.append((fl0, "A", "bounded attn vs ref attn (same moe/fp8/glue)", True,
                       compare_levels(runs["static" + sfx0], runs["static-attnref" + sfx0])))
+    attn_drift = None
+    if attn_variant:  # T9b-3c: A3-class -> a drift row (first token divergence + mean |dlogit|), reported, not gated
+        fl0 = "-" if fills_list[0] is None else "off"
+        attn_drift = logit_drift(kept[label], kept["attnref"], runs["static" + sfx0], runs["static-attnref" + sfx0])
+        c = compare_levels(runs["static" + sfx0], runs["static-attnref" + sfx0])
+        c.update({k: v for k, v in attn_drift.items() if k != "per_prompt_drift"})
+        c["per_prompt"] = {t: dict(v, **attn_drift["per_prompt_drift"].get(t, {})) for t, v in c["per_prompt"].items()}
+        table.append((fl0, "A", f"{aimpl} vs ref attn (same other impls)", False, c))
     if ref_runs:
         for k in sorted(set(runs) & set(ref_runs)):
             table.append(("x-proc", "L2", f"{k}: this process vs --levels-ref", True,
@@ -489,9 +507,15 @@ def parity_levels(gen: Generator, rows: List[dict], steps: int = 32, log=print,
             f"{drift['prompts_token_identical']}/{len(prompts)} prompts token-identical, mean |dlogit| "
             f"{drift['mean_abs_dlogit']:.3e} (max {drift['max_abs_dlogit']:.3e}) over {drift['positions_compared']} "
             f"same-context positions")
+    if attn_drift is not None:
+        log(f"drift {aimpl} vs ref attn (same other impls): first token divergence "
+            f"{attn_drift['first_token_divergence'] or 'none'}, {attn_drift['prompts_token_identical']}/{len(prompts)} "
+            f"prompts token-identical, mean |dlogit| {attn_drift['mean_abs_dlogit']:.3e} (max "
+            f"{attn_drift['max_abs_dlogit']:.3e}) over {attn_drift['positions_compared']} same-context positions")
     log(f"PARITY LEVELS ({steps} steps x {len(prompts)} prompts, fp32-logit sha256 per position): {verdict}")
     return {"steps": steps, "n_prompts": len(prompts), "moe_impl": impl, "fp8_impl": fimpl, "glue_impl": gimpl,
-            "attn_impl": aimpl, "variant": label, "verdict": verdict, "rows": rows_out, "drift": drift, "timings_s": timings, "runs": runs}
+            "attn_impl": aimpl, "variant": label, "verdict": verdict, "rows": rows_out, "drift": drift,
+            "attn_drift": attn_drift, "timings_s": timings, "runs": runs}
 
 
 # ------------------------------------------------------------------------------------------------ main
@@ -533,10 +557,11 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--glue-impl", choices=["ref", "fused"], default="ref",
                     help="static/graph glue: ref = today's torch glue ops / fused = the zero/low-risk glue clusters "
                          "as fused kernels, bit-identical to ref (T9b-2, runtime/fused_glue.py)")
-    ap.add_argument("--attn-impl", choices=["ref", "bounded"], default="ref",
-                    help="static/graph compressed-layer sparse_attn: ref = reference TileLang kernel over the fixed "
-                         "640-index width / bounded = the same kernel with its block loop bounded by a device "
-                         "per-row valid-block count, bit-identical (T9b-3a, runtime/kernels/sparse_attn_bounded.py)")
+    ap.add_argument("--attn-impl", choices=["ref", "bounded", "flashmla"], default="ref",
+                    help="static/graph sparse_attn: ref = reference TileLang kernel over the fixed 640-index width / "
+                         "bounded = the same kernel with its block loop bounded by a device per-row valid-block "
+                         "count, bit-identical (T9b-3a, runtime/kernels/sparse_attn_bounded.py) / flashmla = "
+                         "FlashMLA sparse_prefill_fwd on every layer, A3-class (T9b-3c, runtime/attn_flashmla.py)")
     ap.add_argument("--max-pos", type=int, default=4095,
                     help="static/graph: largest decode position (fixes the compressed-KV cat and index-score widths)")
     ap.add_argument("--marker", action="store_true", help="launch t8_step_marker once per decode step (nsys)")

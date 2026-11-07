@@ -411,7 +411,7 @@ def test_generator_attn_impl_plumbing():
     gen.greedy([5, 9, 12, 3], 4)
     assert FakeStaticAttn.built == [("ref", "ref", "ref", "bounded"), ("ref", "ref", "ref", "ref")]
     with pytest.raises(ValueError):
-        gen.set_attn_impl("flashmla")
+        gen.set_attn_impl("fast")  # T9b-3c made "flashmla" a real impl
 
 
 def test_parity_levels_attn_row():
@@ -435,7 +435,7 @@ def test_first_light_attn_flag_report_and_summary(tmp_path, capsys):
     fl = _first_light()
     assert fl.build_parser().parse_args(["--model-dir", "x"]).attn_impl == "ref"
     with pytest.raises(SystemExit):
-        fl.build_parser().parse_args(["--model-dir", "x", "--attn-impl", "flashmla"])
+        fl.build_parser().parse_args(["--model-dir", "x", "--attn-impl", "fast"])
     a = fl.build_parser().parse_args(["--model-dir", "x", "--mode", "graph", "--attn-impl", "bounded",
                                       "--parity-levels", "--level-steps", "2", "--fixture", FIXTURE, "--only",
                                       "prose", "--reps", "1", "--max-new", "4", "--step-cell", "6", "--stats-from",

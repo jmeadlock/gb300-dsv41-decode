@@ -71,7 +71,8 @@ T9b-2: `glue_impl="ref"|"fused"` selects the static step's glue (runtime/fused_g
 today's ops), same rebuild-on-change rule; `last_meta["glue_impl"]`.
 T9b-3a: `attn_impl="ref"|"bounded"` selects the static step's compressed-layer `sparse_attn` (runtime/kernels/
 sparse_attn_bounded.py, bit-identical: the reference kernel with its block loop bounded by a device count), same
-rebuild-on-change rule; `last_meta["attn_impl"]`.
+rebuild-on-change rule; `last_meta["attn_impl"]`. T9b-3c: `attn_impl="flashmla"` runs every layer's `sparse_attn` on
+FlashMLA's sparse_prefill_fwd (runtime/attn_flashmla.py; A3-class, not bit-identical).
 """
 from __future__ import annotations
 
@@ -92,7 +93,7 @@ MODES = ("eager", "static", "graph")
 MOE_IMPLS = ("ref", "dg-masked")  # = runtime.static_step.MOE_IMPLS (not imported: that module needs the reference)
 FP8_IMPLS = ("ref", "gemv")       # = runtime.static_step.FP8_IMPLS (T9b-1)
 GLUE_IMPLS = ("ref", "fused")     # = runtime.static_step.GLUE_IMPLS (T9b-2)
-ATTN_IMPLS = ("ref", "bounded")   # = runtime.static_step.ATTN_IMPLS (T9b-3a)
+ATTN_IMPLS = ("ref", "bounded", "flashmla")  # = runtime.static_step.ATTN_IMPLS (T9b-3a, T9b-3c)
 RECORD_KEYS = ("tag", "prompt", "model", "finish_reason", "n_tokens", "text", "logprobs", "usage")
 
 
@@ -368,7 +369,7 @@ class Generator:
         self.glue_impl = impl
 
     def set_attn_impl(self, impl: str) -> None:
-        """T9b-3a: the static step's compressed-layer sparse_attn ("ref" | "bounded"). A change drops the StaticStep
+        """T9b-3a/3c: the static step's sparse_attn ("ref" | "bounded" | "flashmla"). A change drops the StaticStep
         (and its graphs); the next static/graph use rebuilds it. Eager mode never uses it."""
         if impl not in ATTN_IMPLS:
             raise ValueError(f"attn_impl {impl!r} not in {ATTN_IMPLS}")

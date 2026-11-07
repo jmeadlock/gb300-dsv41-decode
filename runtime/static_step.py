@@ -65,6 +65,13 @@ host-side ints become device tensors and dynamic lengths become fixed lengths (c
       reference at the full and the narrow width (`attn_describe()`); a failing check leaves `ref` in force.
       `attn_impl="ref"` (default) is exactly the T9b-2 step. MoE staging gather (#14/#17): 16-byte vector copies
       (runtime/static_kernels.py), so every source row address must be 16-B aligned: checked at build.
+  #19 T9b-3c, docs/HANDOFF-T9B3C-FLASHMLA.md -> with `attn_impl="flashmla"` EVERY layer's `sparse_attn` (ratio 0 and
+      compressed) runs runtime/attn_flashmla.py: FlashMLA's `sparse_prefill_fwd` (loaded from vllm's .so through
+      torch.ops, never `import vllm`) over the same bf16 kv / int32 indices / sink / scale. Compressed layers pass the
+      per-row count `topk_length = win + min(k, compress_lens)`, computed where the indices are built (as #18's block
+      count, published with `sa.topk_idxs`); ratio-0 layers pass none. A3-class drift (not bit-identical; q stays
+      bf16). Build-time self-check vs the reference and an fp64 oracle (`attn_describe()`); a failing check or load
+      leaves the reference in force.
 
 Not computed: `main_hiddens` (model.py:1267-1269) -- MTP-only, never feeds the logits; the loader's overlay sets
 dspark_target_layer_ids=() and `StaticStep` refuses a model that has target layers.
@@ -85,7 +92,8 @@ SUPPORTED_RATIOS = (0, 1, 2)
 MOE_IMPLS = ("ref", "dg-masked")  # T9a-1: "ref" = StaticMoE (bit-identical), "dg-masked" = runtime/dg_moe.py
 FP8_IMPLS = ("ref", "gemv")       # T9b-1: "ref" = reference fp8_gemm (bit-identical), "gemv" = runtime/gemv_mxfp8.py
 GLUE_IMPLS = ("ref", "fused")     # T9b-2: "ref" = the glue ops as below, "fused" = runtime/fused_glue.py (bit-identical)
-ATTN_IMPLS = ("ref", "bounded")   # T9b-3a: "ref" = reference sparse_attn, "bounded" = runtime/kernels (bit-identical)
+ATTN_IMPLS = ("ref", "bounded", "flashmla")  # T9b-3a: "ref" = reference sparse_attn, "bounded" = runtime/kernels
+#                                              (bit-identical); T9b-3c: "flashmla" = runtime/attn_flashmla.py (A3-class)
 GATHER_ALIGN = 16                 # T9b-3a: the vectorized staging gather moves 16 B per lane (static_kernels.py)
 GATHER_IMPL_ENV = "DSV41_GATHER_IMPL"  # "u8" = the byte-per-lane gather of T8/T9b-2 (bisecting), default "vec"
 DUMMY_PROMPT = (0, 1)
@@ -208,6 +216,11 @@ class _StepScalars:
         from runtime.kernels.sparse_attn_bounded import nblk_static
 
         return self._get(("nblk", r, k, win), lambda: nblk_static(self.clen(r), k, win))
+
+    def tlen(self, r, k, win):  # #19: win + min(k, compress_lens), int32 [rows]
+        from runtime.attn_flashmla import topk_length_static
+
+        return self._get(("tlen", r, k, win), lambda: topk_length_static(self.clen(r), k, win))
 
     def unreach(self, r):  # arange(W_r) >= compress_lens
         return self._get(("unreach", r), lambda: self.o.ar[r] >= self.clen(r))
@@ -334,6 +347,9 @@ class StaticStep:
         self.attn_bound: Optional[dict] = None  # #18: the self-check record when attn_impl == "bounded"
         self._attn_on = False                   # #18: bounded kernel in force (self-check passed)
         self._idx_nblk: Optional[torch.Tensor] = None  # #18: the block count published with sa.topk_idxs
+        self.attn_flashmla: Optional[dict] = None  # #19: the self-check record when attn_impl == "flashmla"
+        self._fm_on = False                        # #19: FlashMLA in force (load + self-check passed)
+        self._idx_tlen: Optional[torch.Tensor] = None  # #19: the topk_length published with sa.topk_idxs
         self.glue = None  # runtime.fused_glue.FusedGlue when glue_impl == "fused" (built after the MoE buffers)
         self.dg = None  # runtime.dg_moe.DGBuffers when moe_impl == "dg-masked"
         self.R, self.model, self.pool = R, model, pool
@@ -393,6 +409,39 @@ class StaticStep:
         if self.attn_impl == "bounded":  # #18: install the routed wrapper, then the build-time self-check (eager)
             patches.sparse_attn_bounded(True)
             self._attn_selfcheck(attns)
+        if self.attn_impl == "flashmla":  # #19: load the ops (no vllm), then the build-time self-check (eager)
+            self._flashmla_selfcheck(attns)
+
+    def _flashmla_selfcheck(self, attns) -> None:
+        """#19: runtime/attn_flashmla.self_check on this model's attention shapes (heads, head_dim, softmax_scale and
+        attn_sink of the first compressed layer, else layer 0; window + k index slots; window + W_max kv rows) against
+        the reference sparse_attn and an fp64 oracle. Fails -> the step stays on the reference (reason recorded)."""
+        from runtime import attn_flashmla as AFM
+        from runtime import patches
+
+        comp = [a for a in attns if a.compress_ratio]
+        a = comp[0] if comp else attns[0]
+        ks = [min(x.indexer.index_topk, self.W[x.compress_ratio]) for x in comp if x.indexer is not None]
+        k = max(ks) if ks else (max(self.W.values()) if self.W else 0)
+        kv_len = self.win + (max(self.W.values()) if self.W else 0)
+        rec = {"impl": "flashmla", "on": False, "reason": None, "check": None, "load": None}
+        try:
+            AFM.load_ops()
+            rec["load"] = AFM.loaded()
+            chk = AFM.self_check(patches.original_sparse_attn(), self.dev, a.n_local_heads, a.head_dim,
+                                 a.softmax_scale, self.win, k, kv_len, attn_sink=a.attn_sink)
+            rec["check"] = chk
+            if chk["ok"]:
+                rec["on"] = True
+            else:
+                rec["reason"] = "self-check: " + str(chk["reason"])
+        except Exception as e:
+            rec["reason"] = f"{type(e).__name__}: {e}"
+        if not rec["on"]:
+            print(f"[static_step] attn_impl flashmla is OFF: {rec['reason']} (the reference sparse_attn runs)",
+                  file=sys.stderr, flush=True)
+        self._fm_on = rec["on"]
+        self.attn_flashmla = rec
 
     def _attn_selfcheck(self, attns) -> None:
         """#18: runtime/kernels/sparse_attn_bounded.self_check on this model's attention shapes (heads, head_dim,
@@ -429,7 +478,10 @@ class StaticStep:
         self.attn_bound = rec
 
     def attn_describe(self) -> dict:
-        """#18: {"impl", "on", "variant", "reason", "check"} (`impl` "ref" -> nothing else)."""
+        """#18: {"impl", "on", "variant", "reason", "check"} (`impl` "ref" -> nothing else); #19 flashmla: {"impl",
+        "on", "reason", "check", "load"}."""
+        if self.attn_impl == "flashmla":
+            return dict(self.attn_flashmla or {}, impl="flashmla")
         if self.attn_impl != "bounded":
             return {"impl": "ref", "on": False}
         return dict(self.attn_bound or {}, impl="bounded")
@@ -566,6 +618,9 @@ class StaticStep:
             if self._attn_on:                                                 # #18: count where idxs are built
                 ix = attn.indexer
                 self._idx_nblk = c.nblk(ix.compress_ratio, min(ix.index_topk, self.W[ix.compress_ratio]), offset)
+            if self._fm_on:                                                   # #19: the same count, unrounded
+                ix = attn.indexer
+                self._idx_tlen = c.tlen(ix.compress_ratio, min(ix.index_topk, self.W[ix.compress_ratio]), offset)
         else:
             idxs = sa.topk_idxs
         if latent is not None:                                                # model.py:752-762
@@ -587,20 +642,30 @@ class StaticStep:
         attn.window_kv_cache[:1].index_copy_(1, c.p_win(), kv)               # #5 (model.py:719)
         kv = attn.window_kv_cache[:1]                                         # model.py:720
         topk_idxs = c.win_idx()                                               # #6
-        nblk = None
+        nblk = tlen = None
         if attn.compress_ratio:
             compress_kv, compress_idxs = self._compress_kv(attn, x, qr, parity, kv.size(1))
             kv = torch.cat([kv, compress_kv], dim=1)
             topk_idxs = torch.cat([topk_idxs, compress_idxs], dim=-1)
             nblk = self._idx_nblk if self._attn_on else None                  # #18 (None: reference call)
-        o = self._sparse_attn(q, kv, attn, topk_idxs, nblk)
+            tlen = self._idx_tlen if self._fm_on else None                    # #19
+        o = self._sparse_attn(q, kv, attn, topk_idxs, nblk, tlen)
         o = self._o_path(attn, o, freqs_cis)
         wo_a = attn.wo_a.weight.view(attn.n_local_groups, attn.o_lora_rank, -1)
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
         return attn.wo_b(o.flatten(2))
 
-    def _sparse_attn(self, q, kv, attn, topk_idxs, nblk):
-        """model.py:781 (#18: inside the bounded scope when a block count is published)."""
+    def _sparse_attn(self, q, kv, attn, topk_idxs, nblk, tlen=None):
+        """model.py:781 (#18: inside the bounded scope when a block count is published; #19: FlashMLA on every layer
+        when its self-check passed, `tlen` on compressed layers)."""
+        if self._fm_on:
+            from runtime.attn_flashmla import sparse_attn_flashmla, use_topk_length
+
+            if not use_topk_length():
+                tlen = None
+            elif attn.compress_ratio and tlen is None:
+                raise RuntimeError("flashmla: compressed layer without a published topk_length")
+            return sparse_attn_flashmla(q, kv, attn.attn_sink, topk_idxs, attn.softmax_scale, tlen)
         if nblk is None:
             return self.R.sparse_attn(q, kv, attn.attn_sink, topk_idxs, attn.softmax_scale)
         from runtime.patches import attn_bound_scope
@@ -662,7 +727,7 @@ class StaticStep:
         if m.temperature != 0:
             raise ValueError("StaticStep is greedy only (model.temperature must be 0)")
         self._c = _StepScalars(self)
-        self._idx_nblk = None
+        self._idx_nblk = self._idx_tlen = None
         if self.marker:
             from runtime.static_kernels import step_marker
             step_marker(self.marker_ctr)
@@ -683,7 +748,7 @@ class StaticStep:
         if self.counters:
             self.cold_acc.add_(self.cold_tab.gather(1, self.ids_step).sum(-1))
         self._c = None
-        self._idx_nblk = None
+        self._idx_nblk = self._idx_tlen = None
 
     # ---------------------------------------------------------------- public
     def forward_static(self, parity: int) -> torch.Tensor:
