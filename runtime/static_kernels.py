@@ -646,6 +646,30 @@ def fixed_dot(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor, *, kb: int, s
         nk, kb, bn, rb, u, scale is not None, num_warps=nw, num_stages=ns, enable_fp_fusion=False)
 
 
+# ------------------------------------------------------------------------------------------------ T9b-8 (compressor)
+# docs/LEDGER.md 2026-11-07 15:05 (T12-DIAG, docs/rowdiv-shell-20261107.log): the ratio-2 attention compressor's wkv /
+# wgate (model.py:463-465: F.linear(x.float(), W), W declared fp32 at ratio > 1 by model.py:444-448 and widened from the
+# checkpoint's bf16 by runtime/loader.py, so every product is exact in fp32 and only the sum order is a choice) were the
+# last cuBLAS fp32 site of the 6-row step that is not row-invariant (85 % of elements differ 6 rows vs 1). Under
+# `--fp32-impl fixed` they run THE T9b-5 order (_t9b5_dot above; KB = fused_glue_r2.FIXED_KB["comp"]) under their own
+# launch name, site "comp" of fixed_dot. Real shapes: [R, 5120] x [512, 5120] fp32 (10.5 MB per weight, 3 ratio-2
+# layers x 2 weights per step). N is small, so BN is small (128-512 programs on one weight) and every row <= 8 shares a
+# program (RB = next_power_of_2(R): the weight is read once per launch at any R). (BN, U, num_warps, num_stages) are
+# speed-only (UNTUNED starting point; override "comp:<RB>=BN,U,nw,ns" in $DSV41_T9B5_CFG).
+@triton.jit
+def t9b8_comp_fp32(x, w, out, sc, R, N, sxr, swn, sor, NK: tl.constexpr, KB: tl.constexpr, BN: tl.constexpr,
+                   RB: tl.constexpr, U: tl.constexpr, HAS_SC: tl.constexpr):
+    """The ratio-2 compressor's wkv / wgate (model.py:464-465): [R, head_dim] = x [R, D] . W [head_dim, D]^T (named
+    launch for nsys)."""
+    _t9b5_dot(x, w, out, sc, R, N, sxr, swn, sor, NK, KB, BN, RB, U, HAS_SC)
+
+
+T9B5_KERNELS["comp"] = t9b8_comp_fp32
+# RB 1: 512 one-output programs (x is one 20 KB row); RB >= 2: 4 outputs per program so the R rows of x (L2 reads,
+# R x 20 KB per program) are shared by 4 weight rows, 128 programs, num_stages 2 to keep the next trip's loads in flight.
+T9B5_CFG["comp"] = {1: (1, 16, 4, 1), 2: (4, 8, 4, 2), 4: (4, 8, 4, 2), 8: (4, 8, 4, 2)}
+
+
 # ------------------------------------------------------------------------------------------------ M2-T15 (L2)
 # docs/HANDOFF-M2-T15-ROUTER-PLAN.md, docs/M2-FUSED-CHAIN-DESIGN.md section 2.2 row L2: the router (Gate.forward,
 # model.py:811-829) and, at R rows, the MoE plan (runtime/moe_rows.m1_dedup_warp's tensors) in ONE launch per layer,

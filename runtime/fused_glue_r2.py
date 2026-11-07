@@ -506,7 +506,7 @@ def indexer_post_torch(idx: torch.Tensor, clen: torch.Tensor, offset: int) -> to
 FP32_IMPL_ENV = "DSV41_FP32_IMPL"
 FP32_IMPLS = ("cublas", "fixed")
 FP32_IMPL_DEFAULT = "cublas"      # until the box gate passes (HANDOFF-T9B5 step 3)
-FIXED_KB = {"head": 64, "mix": 512}   # lanes per output (the order; K tiles of the real model: 80 / 40)
+FIXED_KB = {"head": 64, "mix": 512, "comp": 64}   # lanes per output (the order; K tiles of the real model: 80 / 40 / 80)
 FIXED_SITES = tuple(FIXED_KB)
 
 
@@ -610,6 +610,62 @@ def head_fixed_w(W: torch.Tensor, x: torch.Tensor, full_logits: bool = False) ->
 def head_fixed(model, x: torch.Tensor, full_logits: bool = False) -> torch.Tensor:
     """head_fixed_w on the backbone's head (model.head.weight, fp32- or bf16-stored)."""
     return head_fixed_w(model.head.weight, x, full_logits)
+
+
+# ------------------------------------------------------------------------------------------------ T9b-8: compressor
+# The ratio-2 attention compressor's projections, model.py:463-465: `x = x.float(); kv, score = self.wkv(x),
+# self.wgate(x)` with wkv / wgate declared fp32 at ratio > 1 (model.py:444-448; runtime/loader.py widens the
+# checkpoint's bf16 values, boot record `widened`), i.e. cuBLAS F.linear(fp32, fp32) -- M-dependent, the last site of
+# the 6-row step that is not row-invariant (docs/rowdiv-shell-20261107.log). Under $DSV41_FP32_IMPL=fixed every DECODE
+# call site of the static step (StaticStep 1-row and R-row, dspark_loop.VerifyStep's deferred-commit form) evaluates
+# them in the T9b-5 order, site "comp" (KB = FIXED_KB["comp"]; static_kernels.t9b8_comp_fp32 on CUDA). x is the
+# reference's own x.float() (bf16 values) and the weight is read in its HBM dtype (fp32; a bf16 weight would be widened
+# in registers, exact), so the products are the reference's and only the sum order changes -- vs cuBLAS that is the
+# 1-ulp class of T9b-5, and the 1-row step's latents therefore move with the switch exactly as the head / mixes did.
+# The ratio-1 compressor (bf16 F.linear, row-invariant), the prefill and the eager reference are untouched; under
+# `cublas` (the default) the call sites make the reference's own calls.
+def compressor_fixed(comp) -> bool:
+    """True when `comp`'s projections take the fixed order: $DSV41_FP32_IMPL=fixed and compress ratio > 1."""
+    return fp32_fixed() and int(getattr(comp, "compress_ratio", 0) or 0) > 1
+
+
+def compressor_proj_fixed(comp, xf: torch.Tensor):
+    """(wkv(xf), wgate(xf)) of a ratio > 1 Compressor in the T9b-5 order: xf [b, s, D] fp32 (the reference's x.float())
+    -> (kv, score), each [b, s, head_dim] fp32. Two launches (one per weight), every row in the same order."""
+    D = xf.size(-1)
+    lead = tuple(xf.shape[:-1])
+    xr = xf.reshape(-1, D)
+    if not xr.is_contiguous():
+        xr = xr.contiguous()
+    outs = []
+    for lin in (comp.wkv, comp.wgate):
+        w = lin.weight
+        if w.dtype not in (torch.float32, torch.bfloat16):
+            raise ValueError(f"compressor_proj_fixed: weight dtype {w.dtype} (model.py:444-448 declares fp32)")
+        o = torch.empty(xr.size(0), w.size(0), dtype=torch.float32, device=xf.device)
+        launch_fixed_dot(xr, w, o, site="comp")
+        outs.append(o.view(*lead, w.size(0)))
+    return outs[0], outs[1]
+
+
+def compressor_decode_fixed(comp, x: torch.Tensor, start_pos: int):
+    """Compressor.forward (model.py:458-485) at decode (start_pos > 0, one token per call) with the projections of
+    compressor_proj_fixed; every other op is the reference's own, in its order (slot write 478-480, the pooling
+    expression 482 on the [bsz, ratio, d] state, `.to(dtype)` and norm 485). Returns the latent or None."""
+    if int(start_pos) <= 0:
+        raise ValueError("compressor_decode_fixed: decode only (start_pos > 0; the prefill branch stays reference)")
+    bsz = x.size(0)
+    ratio, dtype = comp.compress_ratio, x.dtype
+    kv, score = compressor_proj_fixed(comp, x.float())                                  # 463-465
+    should_compress = (start_pos + 1) % ratio == 0                                      # 477
+    slot = start_pos % ratio
+    comp.kv_state[:bsz, slot] = kv.squeeze(1)
+    comp.score_state[:bsz, slot] = score.squeeze(1)
+    if should_compress:
+        kv = (comp.kv_state[:bsz] * comp.score_state[:bsz].softmax(dim=1)).sum(dim=1, keepdim=True)
+    if not should_compress:
+        return None
+    return comp.norm(kv.to(dtype))
 
 
 # ------------------------------------------------------------------------------------------------ M2-T17: bf16 head

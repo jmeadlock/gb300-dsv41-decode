@@ -294,7 +294,7 @@ class VerifyStep(StaticStep):
         c = self._c
         dtype = x.dtype
         xf = x.float()
-        kv, score = comp.wkv(xf), comp.wgate(xf)                              # model.py:464-465 (parent's ops)
+        kv, score = self._compressor_proj(comp, xf)                           # model.py:464-465 (parent's ops, T9b-8)
         pooled = pool_ratio2_rows(comp.kv_state[:1, :1], comp.score_state[:1, :1], kv, score, c.r2_seq())
         _, kvs, scs = self._r2[id(comp)]
         kvs[:, :2].copy_(comp.kv_state[:1])                                   # pre-step slots 0, 1

@@ -170,6 +170,11 @@ def test_real_width_census_reported():
         print("  " + line)
     REPORT.append("real-width census NOT row-invariant: " + (", ".join(
         f"{r['op']} ({r.get('max_ulp')} ulp)" for r in recs if r.get("equal") is False) or "none"))
+    # T9b-8: the compressor's wkv / wgate at ratio 2 under --fp32-impl fixed (the kernel the step runs) reads yes
+    comp = [r for r in recs if r["family"] == "T9b-8 fixed fp32" and "compressor wkv / wgate, ratio 2" in r["op"]]
+    assert len(comp) == 1 and comp[0]["equal"] is True, comp
+    assert "replay equal True" in comp[0].get("note", ""), comp
+    REPORT.append(f"real-width census: {comp[0]['op']}: row-invariant yes ({comp[0]['note']})")
 
 
 def test_rowdiv_real_reported():

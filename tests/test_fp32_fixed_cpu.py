@@ -261,11 +261,17 @@ from test_static_rows_cpu import (_assert_rows_equal, _cpu_default_device, _stat
                                   rows_dg, rows_glue)
 
 
+def _n_ratio2(model) -> int:
+    """Layers whose step runs a ratio-2 compressor (kv-source layers with compress ratio > 1; T9b-8's site)."""
+    return sum(1 for l in model.layers if l.attn.is_kv_source and l.attn.compressor is not None
+               and l.attn.compressor.compress_ratio > 1)
+
+
 def _count_sites(monkeypatch, model):
     """Counters: fixed-order launches per site, and F.linear calls on the two sites' weights (cuBLAS's path)."""
     import torch.nn.functional as F
 
-    seen = {"mix": 0, "head": 0, "linear_mix": 0, "linear_head": 0}
+    seen = {"mix": 0, "head": 0, "comp": 0, "linear_mix": 0, "linear_head": 0}
     real_fixed = R2.launch_fixed_dot
 
     def fixed(x, w, out, *, site, scale=None):
@@ -312,17 +318,18 @@ def test_static6_call_sites_follow_the_switch(rows_glue, monkeypatch, fp32, moe_
     f_lg, f_h, f_s = _static_run(model, st, ids, toks, 2)
     L = len(model.layers)
     pre = {"linear_mix": 2 * L, "linear_head": 1}   # _static_run's prefill: the reference forward (unchanged)
+    nc = 2 * 2 * _n_ratio2(model)    # T9b-8: wkv + wgate of every ratio-2 kv-source compressor, per step
     if fp32 == "fixed":
-        assert seen == {"mix": 2 * 2 * L, "head": 2, **pre}, seen
+        assert seen == {"mix": 2 * 2 * L, "head": 2, "comp": nc, **pre}, seen
     else:
-        assert seen == {"mix": 0, "head": 0, "linear_mix": 2 * L + 2 * 2 * L, "linear_head": 1 + 2}, seen
+        assert seen == {"mix": 0, "head": 0, "comp": 0, "linear_mix": 2 * L + 2 * 2 * L, "linear_head": 1 + 2}, seen
     st.detach()
     for k in seen:
         seen[k] = 0
     ref = StaticStep(model, pool, max_pos=255, rows=6, hidden_layers=hid, moe_impl=moe_impl, _allow_cpu=True)
     r_lg, r_h, r_s = _static_run(model, ref, ids, toks, 2)
     if fp32 == "fixed":   # the reference-op path takes the same order (hc_mixes_fixed / head_fixed)
-        assert seen == {"mix": 2 * 2 * L, "head": 2, **pre}, seen
+        assert seen == {"mix": 2 * 2 * L, "head": 2, "comp": nc, **pre}, seen
     _assert_rows_equal(f_lg, r_lg, f"6-row fused glue vs ref glue, fp32 {fp32}")
     assert all(torch.equal(x, y) for x, y in zip(f_h, r_h))
     ref.detach()
@@ -349,8 +356,9 @@ def test_static1_fixed_head_and_mixes(emu, monkeypatch):
             outs[fp32] = torch.stack([st.step(toks[i], len(ids) + i, graph=False)[0].float().clone()
                                       for i in range(4)])
         L = len(model.layers)
-        want = ({"mix": 4 * 2 * L, "head": 4, "linear_mix": 0, "linear_head": 0} if fp32 == "fixed" else
-                {"mix": 0, "head": 0, "linear_mix": 4 * 2 * L, "linear_head": 4})
+        nc = 4 * 2 * _n_ratio2(model)   # T9b-8: the 1-row step's compressor projections, every step
+        want = ({"mix": 4 * 2 * L, "head": 4, "comp": nc, "linear_mix": 0, "linear_head": 0} if fp32 == "fixed" else
+                {"mix": 0, "head": 0, "comp": 0, "linear_mix": 4 * 2 * L, "linear_head": 4})
         assert seen == want, (fp32, seen)
         st.detach()
     d = (outs["fixed"] - outs["cublas"]).abs().max().item()

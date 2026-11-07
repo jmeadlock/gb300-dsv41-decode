@@ -673,8 +673,28 @@ def real_width_census(dev, rows: int = ROWS, seed: int = 0, W: Sequence[int] = (
     xbf = rnd(rows, D)
     rec("cuBLAS fp32 F.linear", "router gate x.float() @ W.float()  (40 layers)", f"[{rows},{D}]x[{E},{D}]",
         lambda: lin_case(x32, rnd(E, D, scale=0.02).float()))
-    rec("cuBLAS fp32 F.linear", "compressor wkv / wgate, ratio 2 (layers 2, 8, 14)", f"[{rows},{D}]x[{HD},{D}]",
-        lambda: lin_case(x32, rnd(HD, D, scale=0.02).float()))
+    rec("cuBLAS fp32 F.linear", "compressor wkv / wgate, ratio 2, cuBLAS (layers 2, 8, 14; --fp32-impl fixed "
+        "replaces it)", f"[{rows},{D}]x[{HD},{D}]", lambda: lin_case(x32, rnd(HD, D, scale=0.02).float()))
+
+    def comp_fixed_case():   # T9b-8: the fixed-order kernel the step runs under --fp32-impl fixed (site "comp")
+        from runtime.fused_glue_r2 import launch_fixed_dot
+
+        g8 = torch.Generator(device="cpu").manual_seed(seed + 8)   # its own stream: the other rows' data unchanged
+        # bf16 checkpoint values widened to fp32 (runtime/loader.py), as in HBM
+        w = (torch.randn(HD, D, generator=g8, device="cpu") * 0.02).to(torch.bfloat16).float().to(dev)
+
+        def fx(x):
+            o = torch.empty(x.size(0), HD, dtype=torch.float32, device=x.device)
+            launch_fixed_dot(x, w, o, site="comp")
+            return o
+
+        full = fx(x32)
+        r = compare(full, [fx(x32[i:i + 1]) for i in range(rows)])
+        r["note"] = f"replay equal {bool(torch.equal(full, fx(x32)))}"
+        return r
+
+    rec("T9b-8 fixed fp32", "compressor wkv / wgate, ratio 2 (layers 2, 8, 14; --fp32-impl fixed)",
+        f"[{rows},{D}]x[{HD},{D}]", comp_fixed_case)
     rec("cuBLAS bf16 F.linear", "compressor wkv, ratio 1 (layer 20)", f"[{rows},{D}]x[{HD},{D}]",
         lambda: lin_case(xbf, rnd(HD, D, scale=0.02)))
     rec("cuBLAS bf16 F.linear", "indexer weights_proj", f"[{rows},{D}]x[{NI},{D}]",

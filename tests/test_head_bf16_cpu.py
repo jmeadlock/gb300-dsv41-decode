@@ -85,7 +85,7 @@ def test_bf16_weight_equals_widened_fp32_weight_under_shim(SK):
 
 def test_launch_tables_and_contract(SK):
     t = SK.T9B5_CFG
-    assert set(t) == {"head", "mix", "head_bf16"} and set(t["head_bf16"]) == set(t["head"])
+    assert set(t) == {"head", "mix", "head_bf16", "comp"} and set(t["head_bf16"]) == set(t["head"])  # comp: T9b-8
     for rb in t["head"]:       # a bf16 tile is half the bytes of an fp32 one: U doubles, BN / warps / stages are kept
         bn, u, nw, ns = t["head"][rb]
         assert t["head_bf16"][rb] == (bn, 2 * u, nw, ns), rb

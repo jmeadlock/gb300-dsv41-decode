@@ -143,6 +143,9 @@ def test_real_width_census_runs_on_cpu():
     assert any("indexer bshd,btd->bsht" in o for o in ops) and any("top-512" in o for o in ops)
     assert all("equal" in r for r in recs), [r for r in recs if "equal" not in r]
     assert not [r for r in recs if r.get("equal") is None], [r for r in recs if r.get("equal") is None]
+    comp = [r for r in recs if r["family"] == "T9b-8 fixed fp32"]    # the fixed-order compressor (fixed_dot_torch)
+    assert len(comp) == 1 and "compressor wkv / wgate, ratio 2" in comp[0]["op"] and comp[0]["equal"] is True, comp
+    assert comp[0]["note"] == "replay equal True", comp
 
 
 def test_parser_defaults():
