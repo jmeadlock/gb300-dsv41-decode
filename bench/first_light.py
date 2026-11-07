@@ -43,6 +43,15 @@ and one timed step cell.
     the step a variant), and the drift reference ("ref static-eager") runs with glue `ref` too (pure T8). The report
     records `generator.glue_impl`, `step_cell.glue_impl`, `parity_levels.glue_impl` and `fused_glue` (clusters on /
     off and why, the self-check's picked RoPE / hc-sum modes).
+(j) T9b-3a: `--attn-impl bounded` (default `ref`) runs the static/graph step's compressed-layer `sparse_attn` through
+    runtime/kernels/sparse_attn_bounded.py (the reference TileLang kernel with its 64-index block loop bounded by a
+    device per-row count; bit-identical by construction and by its build-time self-check). With --parity-levels one
+    more static-eager run with attn `ref` and the SAME moe/fp8/glue impls adds the gated row "bounded attn vs ref
+    attn (same moe/fp8/glue impl)" (level A, fp32-logit sha256 per position); like the fused glue it does not make
+    the step a variant (L0 stays gated when moe/fp8 are ref), and the drift reference runs with attn `ref`. The
+    report records `generator.attn_impl`, `step_cell.attn_impl`, `parity_levels.attn_impl`, `attn_bound` (on/off,
+    the TileLang loop spelling the self-check picked, its per-variant results) and `gather` (the staging gather in
+    use: 16-B vector or the byte kernel, and why).
 Writes docs/first-light-<YYYYMMDD>.json (or --json) and prints a 12-line summary. One prompt failing logs its
 traceback and the run continues.
 
@@ -350,6 +359,7 @@ def parity_levels(gen: Generator, rows: List[dict], steps: int = 32, log=print,
     impl = getattr(gen, "moe_impl", "ref")
     fimpl = getattr(gen, "fp8_impl", "ref")
     gimpl = getattr(gen, "glue_impl", "ref")
+    aimpl = getattr(gen, "attn_impl", "ref")
     label = "+".join(x for x in (impl, fimpl) if x != "ref") or "ref"
     variant = label != "ref"
     runs: Dict[str, Dict[str, dict]] = {}
@@ -386,6 +396,12 @@ def parity_levels(gen: Generator, rows: List[dict], steps: int = 32, log=print,
             gen.set_mode("graph")
             gen.capture(fills=bool(f))
             timed("relaunch" + sfx, lambda: _level_run(gen, prompts, steps))
+        if aimpl != "ref":  # T9b-3a: the same static step with the reference sparse_attn (same moe/fp8/glue impls)
+            set_fill(fills_list[0])
+            gen.set_attn_impl("ref")
+            gen.set_mode("static")
+            timed("static-attnref" + sfx0, lambda: _level_run(gen, prompts, steps))
+            gen.set_attn_impl(aimpl)
         if gimpl != "ref":  # T9b-2: the same static step with the reference glue (same moe/fp8 impls)
             set_fill(fills_list[0])
             gen.set_glue_impl("ref")
@@ -398,6 +414,8 @@ def parity_levels(gen: Generator, rows: List[dict], steps: int = 32, log=print,
                 gen.set_fp8_impl("ref")
             if hasattr(gen, "set_glue_impl"):
                 gen.set_glue_impl("ref")
+            if hasattr(gen, "set_attn_impl"):
+                gen.set_attn_impl("ref")
             gen.set_mode("static")
             timed("static-ref" + sfx0, lambda: _level_run(gen, prompts, steps, kept.setdefault("ref", {})))
     finally:
@@ -408,6 +426,8 @@ def parity_levels(gen: Generator, rows: List[dict], steps: int = 32, log=print,
                 gen.set_fp8_impl(fimpl)
         if hasattr(gen, "set_glue_impl"):
             gen.set_glue_impl(gimpl)
+        if hasattr(gen, "set_attn_impl"):
+            gen.set_attn_impl(aimpl)
         gen.set_mode(mode0)
         if mode0 == "graph":
             gen.capture(fills=False)
@@ -443,6 +463,10 @@ def parity_levels(gen: Generator, rows: List[dict], steps: int = 32, log=print,
         fl0 = "-" if fills_list[0] is None else "off"
         table.append((fl0, "G", "fused glue vs ref glue (same moe/fp8 impl)", True,
                       compare_levels(runs["static" + sfx0], runs["static-glueref" + sfx0])))
+    if aimpl != "ref":
+        fl0 = "-" if fills_list[0] is None else "off"
+        table.append((fl0, "A", "bounded attn vs ref attn (same moe/fp8/glue)", True,
+                      compare_levels(runs["static" + sfx0], runs["static-attnref" + sfx0])))
     if ref_runs:
         for k in sorted(set(runs) & set(ref_runs)):
             table.append(("x-proc", "L2", f"{k}: this process vs --levels-ref", True,
@@ -454,6 +478,7 @@ def parity_levels(gen: Generator, rows: List[dict], steps: int = 32, log=print,
     verdict = "PASS" if all(r["all_equal"] for r in gate_rows) else "FAIL"
     log(f"moe impl {impl}" + ("" if fimpl == "ref" else f", fp8 impl {fimpl}")
         + ("" if gimpl == "ref" else f", glue impl {gimpl}")
+        + ("" if aimpl == "ref" else f", attn impl {aimpl}")
         + ("" if gated_l0 else " (L0 static-eager rows and the drift row are reported, not gated)"))
     log(f"{'fills':7s}{'level':6s}{'comparison':42s}{'equal':>8s}  first diff (tag@position)")
     for r in rows_out:
@@ -466,7 +491,7 @@ def parity_levels(gen: Generator, rows: List[dict], steps: int = 32, log=print,
             f"same-context positions")
     log(f"PARITY LEVELS ({steps} steps x {len(prompts)} prompts, fp32-logit sha256 per position): {verdict}")
     return {"steps": steps, "n_prompts": len(prompts), "moe_impl": impl, "fp8_impl": fimpl, "glue_impl": gimpl,
-            "variant": label, "verdict": verdict, "rows": rows_out, "drift": drift, "timings_s": timings, "runs": runs}
+            "attn_impl": aimpl, "variant": label, "verdict": verdict, "rows": rows_out, "drift": drift, "timings_s": timings, "runs": runs}
 
 
 # ------------------------------------------------------------------------------------------------ main
@@ -508,6 +533,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--glue-impl", choices=["ref", "fused"], default="ref",
                     help="static/graph glue: ref = today's torch glue ops / fused = the zero/low-risk glue clusters "
                          "as fused kernels, bit-identical to ref (T9b-2, runtime/fused_glue.py)")
+    ap.add_argument("--attn-impl", choices=["ref", "bounded"], default="ref",
+                    help="static/graph compressed-layer sparse_attn: ref = reference TileLang kernel over the fixed "
+                         "640-index width / bounded = the same kernel with its block loop bounded by a device "
+                         "per-row valid-block count, bit-identical (T9b-3a, runtime/kernels/sparse_attn_bounded.py)")
     ap.add_argument("--max-pos", type=int, default=4095,
                     help="static/graph: largest decode position (fixes the compressed-KV cat and index-score widths)")
     ap.add_argument("--marker", action="store_true", help="launch t8_step_marker once per decode step (nsys)")
@@ -546,11 +575,11 @@ def main(argv=None) -> int:
                      "device": torch.cuda.get_device_name() if torch.cuda.is_available() else None,
                      "capability": torch.cuda.get_device_capability() if torch.cuda.is_available() else None}
     gen = Generator(model, a.tokenizer_dir or a.model_dir, mode=a.mode, max_pos=a.max_pos, marker=a.marker,
-                    moe_impl=a.moe_impl, fp8_impl=a.fp8_impl, glue_impl=a.glue_impl)
+                    moe_impl=a.moe_impl, fp8_impl=a.fp8_impl, glue_impl=a.glue_impl, attn_impl=a.attn_impl)
     report["generator"] = {"eos_ids": gen.eos_ids, "top_k": gen.top_k, "max_seq_len": gen.max_seq_len,
                            "tokenizer_dir": gen.tokenizer_dir, "mode": gen.mode, "max_pos": gen.max_pos,
                            "marker": gen.marker, "moe_impl": gen.moe_impl, "fp8_impl": gen.fp8_impl,
-                           "glue_impl": gen.glue_impl}
+                           "glue_impl": gen.glue_impl, "attn_impl": gen.attn_impl}
     if a.nvtx_layers:
         install_layer_nvtx(model)
     return measure(gen, a, report, n_layers=len(model.layers), out=out, json_path=json_path, fixture2=fixture2)
@@ -632,6 +661,7 @@ def measure(gen: Generator, a, report: Dict, *, n_layers: int, out: str, json_pa
             sc["mode"], sc["moe_impl"] = gen.mode, getattr(gen, "moe_impl", "ref")
             sc["fp8_impl"] = getattr(gen, "fp8_impl", "ref")
             sc["glue_impl"] = getattr(gen, "glue_impl", "ref")
+            sc["attn_impl"] = getattr(gen, "attn_impl", "ref")
             r1 = next((r for r in reps.get(1, {}).get("prompts", []) if r["tag"] == a.step_tag and "token_ids" in r), None)
             if r1 is not None:
                 n = min(len(r1["token_ids"]), len(sc["token_ids"]))
@@ -647,6 +677,17 @@ def measure(gen: Generator, a, report: Dict, *, n_layers: int, out: str, json_pa
     report.setdefault("generator", {})["moe_impl"] = getattr(gen, "moe_impl", "ref")
     report["generator"]["fp8_impl"] = getattr(gen, "fp8_impl", "ref")
     report["generator"]["glue_impl"] = getattr(gen, "glue_impl", "ref")
+    report["generator"]["attn_impl"] = getattr(gen, "attn_impl", "ref")
+    static = getattr(gen, "static", None)
+    if static is not None and hasattr(static, "attn_describe"):
+        report["attn_bound"] = static.attn_describe()  # T9b-3a: on/off (why), the loop spelling, self-check results
+    if static is not None and hasattr(static, "moes"):
+        try:
+            from runtime.static_kernels import describe as gather_describe
+
+            report["gather"] = gather_describe()  # T9b-3a: 16-B vector gather or the byte kernel (and why)
+        except Exception as e:  # e.g. the Mac's emulated static_kernels: informative only, never an error
+            report["gather"] = {"error": f"{type(e).__name__}: {e}"}
     glue = getattr(getattr(gen, "static", None), "glue", None)
     if glue is not None and hasattr(glue, "describe"):
         report["fused_glue"] = glue.describe()  # clusters on / off (and why), self-check modes and results
@@ -676,8 +717,12 @@ def summary_lines(r: dict, json_path: str) -> List[str]:
     moe = g.get("moe_impl", "ref")
     fp8 = g.get("fp8_impl", "ref")
     glue = g.get("glue_impl", "ref")
+    attn = g.get("attn_impl", "ref")
+    if attn != "ref" and r.get("attn_bound") is not None and not r["attn_bound"].get("on"):
+        attn += "(OFF)"
     lines = [f"FIRST LIGHT {r['date']} | mode {g.get('mode', 'eager')}{'' if moe == 'ref' else f' moe {moe}'}"
              f"{'' if fp8 == 'ref' else f' fp8 {fp8}'}{'' if glue == 'ref' else f' glue {glue}'}"
+             f"{'' if attn == 'ref' else f' attn {attn}'}"
              f"{'' if pl is None else f' levels {pl}'} | "
              f"map {b.get('map')} | boot {f(b.get('wall_s'), 0)} s | "
              f"HBM {f(b.get('cuda_allocated_GiB'))} GiB | {r['env'].get('device')}"]

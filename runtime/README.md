@@ -14,11 +14,12 @@ Standalone: no vllm import anywhere (charter decision 3). The reference `model.p
 | `refmodel.py` | imports the reference modules; `cpu_stubs=True` (Mac tests only) stands in for tilelang/PIL; Python < 3.10 compiles them with `from __future__ import annotations` (the file is untouched) |
 | `generate.py` | T5 driver: `Generator(model, tokenizer_dir)` -- `encode`/`decode` (checkpoint `encoding.py` chat mode + `tokenizer.json`), `prefill`/`step` (generate.py's call pattern), `greedy` -> one parity JSONL record (fp32 log-softmax top-20), NVTX `decode_step`, `arm_profile` (cudaProfilerApi window), `set_determinism`; T8 `mode="eager"|"static"|"graph"`, `marker=True` |
 | `static_step.py` | T8: `StaticStep(model, pool, max_pos=)` -- the fixed-shape 1-row decode step (design table 2.1 #1-#15 row by row in its docstring), `forward_static(parity)` eager, `capture()` g_even/g_odd, `replay(pos)` |
-| `static_kernels.py` | T8 Triton kernels (GPU only): the spike's pointer-table gather `t8_gather_rows`, the per-step `t8_step_marker`; T9b-2's one-launch six-table gather `t9b2_gather_tables` |
+| `static_kernels.py` | T8 Triton kernels (GPU only): the pointer-table gather `t8_gather_rows`, the per-step `t8_step_marker`; T9b-2's one-launch six-table gather `t9b2_gather_tables`; T9b-3a: both gathers move 16-B vectors per lane (the byte kernels kept as `*_u8`, `DSV41_GATHER_IMPL=u8`) |
+| `kernels/sparse_attn_bounded.py` | T9b-3a (`--attn-impl bounded`): a copy of the reference TileLang `sparse_attn` (kernel.py:310-403) whose 64-index block loop is bounded by a device per-row valid-block count; three loop spellings, build-time self-check vs the reference; the count math (`nblk_static`, `valid_blocks`, `ref_width`) |
 | `dg_moe.py` | T9a-1: `DGMaskedMoE` (`--moe-impl dg-masked`): the static MoE's routed GEMMs as 3 DeepGEMM masked grouped GEMMs over the same staging; `import_deep_gemm` (no vllm import); exact e8m0 → fp32 |
 | `fused_glue.py` | T9b-2 round 1 (`--glue-impl fused`): Triton kernels for the zero/low-risk glue clusters (gather, DG act, SwiGLU+act_quant, MoE combine, mHC post, o-path RoPE+QDQ, q RoPE in the GEMV store), table-driven act_quant/silu, build-time self-check, per-cluster switches; torch mirrors on CPU |
 | `gemv_mxfp8.py` | T9b-1: Triton MXFP8 GEMV `mxfp8_gemv(xq, xs, w, s, out)` for the fp8 Linears at <= 8 rows (`--fp8-impl gemv`); exact e8m0 pair scale; per-(N,K,M) tuning cache; `gemv_torch` = the same algorithm in torch (CPU) |
-| `patches.py` | flag-gated monkeypatches: `kv_numerics_pg61` (model.py:761), `static_moe` (model.py:891-906, design #14), `fp8_linear_gemv` (model.py:196-205, design #16) |
+| `patches.py` | flag-gated monkeypatches: `kv_numerics_pg61` (model.py:761), `static_moe` (model.py:891-906, design #14), `fp8_linear_gemv` (model.py:196-205, design #16), `sparse_attn_bounded` (model.py:781 / kernel.py:392-403, design #18) |
 
 ## Value paths (bit-identity rule)
 
@@ -461,3 +462,95 @@ them to scratch first, the cache file is written back: `cp docs/gemv-tune-gb300-
     cmp scratch/first-light-fused.jsonl w0/results/first-light-cand-gemv.jsonl && echo BYTE-IDENTICAL
 
 Then check `fused_glue.clusters` in the report: any cluster "off" is named with its reason (it ran today's ops).
+
+
+## T9b-3a: `sparse_attn` bounded to its valid blocks (`--attn-impl bounded`) + the gather at HBM rate
+
+Spec: `docs/HANDOFF-T9B3A-ATTN-BOUND.md` (memo `docs/T9B3-ATTN-DESIGN.md` sections 0.2 / 5). Both bit-identical.
+
+**Task A.** The static step passes 640 indices (128 window + 512 compressed) to `sparse_attn` on every compressed
+layer; at fixture lengths only 128 + min(512, T/r) of them are valid (the -1 tail of static_step #9), and the kernel
+walks all 10 blocks of 64 serially in one CTA. `attn_impl="bounded"` computes, where the indices are built
+(`_compress_kv`, once per (ratio, k) per step, device ops only), `nblk = ceil((128 + min(k, compress_lens)) / 64)`
+and runs `runtime/kernels/sparse_attn_bounded.py`: kernel.py's `sparse_attn_kernel` text with the block loop bounded
+by `nblk[b, m]`. Why that is exact: a block whose 64 indices are all -1 adds `-inf` scores, so the running max is
+unchanged (reduce_max with clear=False), the rescale is exp(+0) = 1, the probabilities are exp(-inf) = +0, and the
+sum, the bf16 P and the PV accumulate change nothing (walked op by op in the module docstring, kernel.py:358-380);
+the static step already depends on this today (640-wide static == narrow eager reference, T8 L0). Valid entries
+are a sorted prefix, so the count never cuts one (a candidate mask can only make it an over-estimate). Ratio-0
+layers keep the reference call. Long context (T/r >= 512) gives 10 = the full width: correct, no saving.
+TileLang 0.1.12 must compile a loop bound read from a tensor; three spellings are tried in order at StaticStep build
+(`extent`: the Pipelined extent, `serial`: a T.serial loop, `guard`: the fixed Pipelined loop with an `if`), each
+self-checked on the model's shapes against the reference at the full AND the narrow width (`torch.equal`, 40 index
+lists incl. widths 128/278/428/640, leading -1 windows, a 4-row launch); the first that passes is used, none -> the
+step stays on the reference and says so (`st.attn_describe()`, report `attn_bound`, summary `attn bounded(OFF)`).
+Kernel name in nsys: `sparse_attn_bounded_kernel_<variant>_` (2 ratio-0 layers keep `sparse_attn_kernel_`).
+Expected (memo, est.): 128 µs -> ~30-60 µs per call at fixture length, ~2.5-3.5 ms/step.
+
+**Task B.** `t8_gather_rows` / `t9b2_gather_tables` loaded uint8 through a row address read from memory (alignment
+unknown to Triton: one byte per lane, ~1.3 TB/s). They now copy int64 words through addresses declared 16-B
+aligned (`tl.multiple_of`): 16-B vectors per lane, unmasked when a row is a whole number of 8 KiB blocks (every real
+table). Same bytes, so nothing numeric changes; the old kernels stay as `t8_gather_rows_u8` / `t9b2_gather_tables_u8`
+(GPU test reference, bench baseline, `DSV41_GATHER_IMPL=u8`). Row bytes and destination alignment are checked per
+call (metadata), source row addresses at StaticStep build (the pool's 256-B host blocks and torch's allocations
+always satisfy it). Tuning knobs: `DSV41_GATHER_BLOCK_BYTES` (8192), `DSV41_GATHER_WARPS` (4).
+
+Flags: `StaticStep(..., attn_impl="bounded")` / `Generator(..., attn_impl=...)` / `first_light.py --attn-impl bounded`
+(threaded like `--glue-impl`). With `--parity-levels` one extra static-eager run with attn `ref` and the same
+moe/fp8/glue impls gives the gated row **"bounded attn vs ref attn (same moe/fp8/glue)"** (level A); L0 stays gated
+for ref moe/fp8 (bounded is not a variant).
+
+**Mac:** `tests/test_attn_bound_cpu.py` -- the count vs the reference width 128 + min(512, T/r) for every position
+1..4,096 at both ratios and the rounding edges; the count vs the last valid block of the static step's real index
+lists (ties, candidate masks); the kernel's algorithm in torch bounded == full == narrow width; the self-check's
+pick and rejection; the patch's routing; bounded StaticStep == ref StaticStep == the reference forward on the
+emulated mini checkpoints (incl. mini4 at index_topk 256, where blocks are really skipped) with every bounded call's
+count checked against the host formula; the build-time gather alignment check; Generator / first_light plumbing.
+TileLang and the Triton gathers themselves only run on the box.
+
+**Box, GPU test** (bounded vs reference kernel at real shapes, every spelling reported; vector vs byte gather on
+real-size HBM + UVA rows and on mini4's tables; mini / mini4 / mini4w bounded == ref static-eager, graph == static,
+replay x2, fills-on, relaunch, no host sync; mini4w with dg-masked/gemv/fused too; informative step cells):
+
+    docker run --rm --device nvidia.com/gpu=GPU-1c1855c8-dd10-0247-583e-3c3880ddbf55 --ipc=host --ulimit memlock=-1:-1 \
+      --cap-add IPC_LOCK -v "$W":/work -w /work -e CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+      -v "$HOME/dsv41/w0/jit-cache/tilelang":/root/.tilelang -v "$HOME/dsv41/w0/jit-cache/triton":/root/.triton \
+      -v "$HOME/dsv41/w0/jit-cache/nv":/root/.nv \
+      -v "$HOME/dsv41/w0/jit-cache/dg":/root/.deep_gemm -e DG_JIT_CACHE_DIR=/root/.deep_gemm \
+      --entrypoint python3 vllm/vllm-openai:v0.31.0 tests/gpu/test_attn_bound_gpu.py
+
+**Box, gather bench** (real layer-0 expert rows: 36 hot in HBM, 12 cold in registered host memory; M = 6 ids, hot and
+cold cases separately; byte vs vector kernels, a block/warps sweep, the HBM->HBM copy ceiling; every arm verified
+`torch.equal` first; gate line: best hot one-launch gather >= 3 TB/s copied):
+
+    docker run --rm --device nvidia.com/gpu=GPU-1c1855c8-dd10-0247-583e-3c3880ddbf55 \
+      --ipc=host --ulimit memlock=-1:-1 --cap-add IPC_LOCK -v "$W":/work -w /work \
+      -v /models/DeepSeek-V4.1-Flash-1017-1bae0e1088993b9b82de08f59de5be5a34e42170:/ref:ro \
+      -v "$HOME/dsv41/w0/jit-cache/triton":/root/.triton -v "$HOME/dsv41/w0/jit-cache/nv":/root/.nv \
+      --entrypoint python3 vllm/vllm-openai:v0.31.0 \
+      bench/gather_bench.py --model-dir /ref --layer 0 --json docs/gather-bench-<date>.json
+
+If the best sweep config beats the default, rerun first light with `-e DSV41_GATHER_BLOCK_BYTES=<b> -e
+DSV41_GATHER_WARPS=<w>` (the gather config is not part of the numerics).
+
+**Box, first light** (gates: row A 8/8, L1/L2 8/8, output byte-identical to the R1 run with the same flags, step
+cell <= 26 ms; the R1 flags plus `--attn-impl bounded`; same tuned GEMV configs copied to scratch first):
+
+    cp docs/gemv-tune-gb300-20261106.json scratch/gemv-tune.json
+    docker run --rm --device nvidia.com/gpu=GPU-1c1855c8-dd10-0247-583e-3c3880ddbf55 \
+      --ipc=host --ulimit memlock=-1:-1 --cap-add IPC_LOCK \
+      -v "$W":/work -w /work -v "$W/w0":/work/w0 \
+      -v /models/DeepSeek-V4.1-Flash-1017-1bae0e1088993b9b82de08f59de5be5a34e42170:/ref:ro \
+      -v "$HOME/dsv41/w0/jit-cache/tilelang":/root/.tilelang -v "$HOME/dsv41/w0/jit-cache/triton":/root/.triton \
+      -v "$HOME/dsv41/w0/jit-cache/nv":/root/.nv \
+      -v "$HOME/dsv41/w0/jit-cache/dg":/root/.deep_gemm -e DG_JIT_CACHE_DIR=/root/.deep_gemm \
+      -e CUBLAS_WORKSPACE_CONFIG=:4096:8 -e DSV41_GEMV_CACHE=/work/scratch/gemv-tune.json \
+      --entrypoint python3 vllm/vllm-openai:v0.31.0 \
+      bench/first_light.py --model-dir /ref --map docs/maps/hot-v26ar-seed-295.json --mode graph \
+        --moe-impl dg-masked --fp8-impl gemv --glue-impl fused --attn-impl bounded --parity-levels --max-pos 4095 \
+        --fixture w0/results/phase1/parity-A.jsonl --out scratch/first-light-attn.jsonl --max-new 256 --reps 2 \
+        --step-cell 512 --no-fill-uninit --json docs/first-light-attn-<date>.json
+    cmp scratch/first-light-attn.jsonl <the R1 run's rep-1 JSONL, same map/flags> && echo BYTE-IDENTICAL
+
+Then check `attn_bound` in the report (`on: true`, the spelling, every self-check row "equal") and `gather`
+(`impl: vec`, `vec_error: null`). Any spelling that failed to compile is listed with its error.

@@ -55,6 +55,16 @@ host-side ints become device tensors and dynamic lengths become fixed lengths (c
       (default: the ops above, unchanged) with the same moe/fp8 impls; each cluster is self-checked at construction
       and stays on the reference ops if it fails (`st.glue.describe()`). The sub-steps are methods (`_q_proj`,
       `_o_path`, `_hc_post`; StaticMoE `_gather`, `_shared`) so the census can attribute launches.
+  #18 T9b-3a, docs/HANDOFF-T9B3A-ATTN-BOUND.md -> with `attn_impl="bounded"` the compressed layers' `sparse_attn`
+      (kernel.py:392-403) runs runtime/kernels/sparse_attn_bounded.py: the reference kernel text with its 64-index
+      block loop bounded by a per-row device count `nblk = ceil((win + min(k, compress_lens)) / 64)` computed where
+      the indices are built (`_compress_kv`, once per (ratio, k) per step, published with `sa.topk_idxs` for the
+      layers that reuse them). Rows #8/#9 leave every slot past that count -1, and whole -1 blocks are exact no-ops
+      in the kernel (kernel.py:358-380; the module docstring walks the ops), so the bound skips work, not values.
+      Ratio-0 layers (128 window indices = 2 blocks) keep the reference call. Self-checked at build against the
+      reference at the full and the narrow width (`attn_describe()`); a failing check leaves `ref` in force.
+      `attn_impl="ref"` (default) is exactly the T9b-2 step. MoE staging gather (#14/#17): 16-byte vector copies
+      (runtime/static_kernels.py), so every source row address must be 16-B aligned: checked at build.
 
 Not computed: `main_hiddens` (model.py:1267-1269) -- MTP-only, never feeds the logits; the loader's overlay sets
 dspark_target_layer_ids=() and `StaticStep` refuses a model that has target layers.
@@ -62,6 +72,7 @@ dspark_target_layer_ids=() and `StaticStep` refuses a model that has target laye
 from __future__ import annotations
 
 import contextlib
+import os
 import sys
 from typing import Dict, List, Optional, Tuple
 
@@ -74,6 +85,9 @@ SUPPORTED_RATIOS = (0, 1, 2)
 MOE_IMPLS = ("ref", "dg-masked")  # T9a-1: "ref" = StaticMoE (bit-identical), "dg-masked" = runtime/dg_moe.py
 FP8_IMPLS = ("ref", "gemv")       # T9b-1: "ref" = reference fp8_gemm (bit-identical), "gemv" = runtime/gemv_mxfp8.py
 GLUE_IMPLS = ("ref", "fused")     # T9b-2: "ref" = the glue ops as below, "fused" = runtime/fused_glue.py (bit-identical)
+ATTN_IMPLS = ("ref", "bounded")   # T9b-3a: "ref" = reference sparse_attn, "bounded" = runtime/kernels (bit-identical)
+GATHER_ALIGN = 16                 # T9b-3a: the vectorized staging gather moves 16 B per lane (static_kernels.py)
+GATHER_IMPL_ENV = "DSV41_GATHER_IMPL"  # "u8" = the byte-per-lane gather of T8/T9b-2 (bisecting), default "vec"
 DUMMY_PROMPT = (0, 1)
 
 
@@ -190,6 +204,11 @@ class _StepScalars:
     def clen(self, r):  # compress_lens = end_pos // r (model.py:568)
         return self._get(("clen", r), lambda: torch.div(self.o.pos + 1, r, rounding_mode="floor"))
 
+    def nblk(self, r, k, win):  # #18: ceil((win + min(k, compress_lens)) / 64), int32 [1, 1]
+        from runtime.kernels.sparse_attn_bounded import nblk_static
+
+        return self._get(("nblk", r, k, win), lambda: nblk_static(self.clen(r), k, win))
+
     def unreach(self, r):  # arange(W_r) >= compress_lens
         return self._get(("unreach", r), lambda: self.o.ar[r] >= self.clen(r))
 
@@ -292,7 +311,7 @@ class StaticStep:
     def __init__(self, model: nn.Module, pool=None, *, max_pos: Optional[int] = None, marker: bool = False,
                  counters: bool = True, moe_impl: str = "ref", dg_deterministic: bool = True,
                  fp8_impl: str = "ref", glue_impl: str = "ref", glue_opts: Optional[dict] = None,
-                 _allow_cpu: bool = False):
+                 attn_impl: str = "ref", _allow_cpu: bool = False):
         R = _ref()
         from runtime import patches
 
@@ -302,6 +321,8 @@ class StaticStep:
             raise ValueError(f"fp8_impl {fp8_impl!r} not in {FP8_IMPLS}")
         if glue_impl not in GLUE_IMPLS:
             raise ValueError(f"glue_impl {glue_impl!r} not in {GLUE_IMPLS}")
+        if attn_impl not in ATTN_IMPLS:
+            raise ValueError(f"attn_impl {attn_impl!r} not in {ATTN_IMPLS}")
         if fp8_impl == "gemv" and ((R.fp8_block_size, R.scale_dtype) != (32, torch.float8_e8m0fnu)
                                     or R.scale_fmt is None):
             raise ValueError(f"fp8_impl gemv assumes MXFP8 (block 32, ue8m0) activations; the reference has "
@@ -309,6 +330,10 @@ class StaticStep:
         self.moe_impl, self.dg_deterministic = moe_impl, bool(dg_deterministic)
         self.fp8_impl = fp8_impl
         self.glue_impl = glue_impl
+        self.attn_impl = attn_impl
+        self.attn_bound: Optional[dict] = None  # #18: the self-check record when attn_impl == "bounded"
+        self._attn_on = False                   # #18: bounded kernel in force (self-check passed)
+        self._idx_nblk: Optional[torch.Tensor] = None  # #18: the block count published with sa.topk_idxs
         self.glue = None  # runtime.fused_glue.FusedGlue when glue_impl == "fused" (built after the MoE buffers)
         self.dg = None  # runtime.dg_moe.DGBuffers when moe_impl == "dg-masked"
         self.R, self.model, self.pool = R, model, pool
@@ -365,6 +390,49 @@ class StaticStep:
             from runtime.fused_glue import FusedGlue
 
             self.glue = FusedGlue(self, **(glue_opts or {}))
+        if self.attn_impl == "bounded":  # #18: install the routed wrapper, then the build-time self-check (eager)
+            patches.sparse_attn_bounded(True)
+            self._attn_selfcheck(attns)
+
+    def _attn_selfcheck(self, attns) -> None:
+        """#18: runtime/kernels/sparse_attn_bounded.self_check on this model's attention shapes (heads, head_dim,
+        softmax_scale and attn_sink of the first compressed layer; window + k index slots; window + W_max kv rows)
+        against the reference sparse_attn under the wrapper. Picks the first TileLang loop spelling that compiles and
+        is bit-equal; none -> the bounded path stays off (reason recorded) and the step is attn_impl "ref"'s."""
+        from runtime import patches
+        from runtime.kernels import sparse_attn_bounded as SAB
+
+        comp = [a for a in attns if a.compress_ratio]
+        rec = {"impl": "bounded", "on": False, "variant": None, "reason": None, "check": None}
+        if not comp:
+            rec["reason"] = "no compressed layers"
+        else:
+            a = comp[0]
+            ks = [min(x.indexer.index_topk, self.W[x.compress_ratio]) for x in comp if x.indexer is not None]
+            k = max(ks) if ks else max(self.W.values())
+            try:
+                chk = SAB.self_check(patches.original_sparse_attn(), self.dev, a.n_local_heads, a.head_dim,
+                                     a.softmax_scale, self.win, k, self.win + max(self.W.values()),
+                                     attn_sink=a.attn_sink)
+                rec["check"] = chk
+                if chk["variant"] is not None:
+                    rec.update(on=True, variant=chk["variant"])
+                else:
+                    rec["reason"] = "self-check: no variant compiled and matched (" + "; ".join(
+                        f"{v}: {r}" for v, r in chk["results"].items()) + ")"
+            except Exception as e:
+                rec["reason"] = f"self-check raised {type(e).__name__}: {e}"
+        if not rec["on"]:
+            print(f"[static_step] attn_impl bounded is OFF: {rec['reason']} (the reference sparse_attn runs)",
+                  file=sys.stderr, flush=True)
+        self._attn_on = rec["on"]
+        self.attn_bound = rec
+
+    def attn_describe(self) -> dict:
+        """#18: {"impl", "on", "variant", "reason", "check"} (`impl` "ref" -> nothing else)."""
+        if self.attn_impl != "bounded":
+            return {"impl": "ref", "on": False}
+        return dict(self.attn_bound or {}, impl="bounded")
 
     # ---------------------------------------------------------------- build
     def _build_moe(self, R, layers) -> None:
@@ -401,6 +469,12 @@ class StaticStep:
             moe_cls = DGMaskedMoE
         n_layers, n_exp = len(layers), moe0.n_routed_experts
         cold = torch.zeros(n_layers, n_exp, dtype=torch.long)
+        gather_vec = os.environ.get(GATHER_IMPL_ENV, "vec") != "u8"
+        if gather_vec:
+            bad = {k_: v for k_, v in self.row_bytes.items() if v % GATHER_ALIGN}
+            if bad:
+                raise ValueError(f"staging row bytes {bad} not multiples of {GATHER_ALIGN} (16-B vector gather); "
+                                 f"{GATHER_IMPL_ENV}=u8 uses the byte gather")
         self.moes: list = []  # StaticMoE (ref) or runtime.dg_moe.DGMaskedMoE (dg-masked), one per layer
         for l, layer in enumerate(layers):
             moe = layer.ffn
@@ -426,6 +500,9 @@ class StaticStep:
                             if src.data_ptr() != ptr:
                                 raise ValueError(f"L{l} E{e} {p}.{kind}: expert param is not bound to its pool slot")
                             ptr = src.data_ptr()
+                        if ptr % GATHER_ALIGN and gather_vec:
+                            raise ValueError(f"L{l} E{e} {p}.{kind}: source row at {ptr:#x} is not {GATHER_ALIGN}-B "
+                                             f"aligned (16-B vector gather); {GATHER_IMPL_ENV}=u8 uses the byte gather")
                         ptrs.append(ptr)
                     ptabs[(p, kind)] = torch.tensor(ptrs, dtype=torch.int64, device=d)
             sm = moe_cls(self, moe, l, ptabs)
@@ -486,6 +563,9 @@ class StaticStep:
         if attn.is_index_source:                                              # model.py:726-738 (len > 0, #7)
             idxs = self._indexer(attn.indexer, x, qr, latent, offset)
             sa.topk_idxs = idxs
+            if self._attn_on:                                                 # #18: count where idxs are built
+                ix = attn.indexer
+                self._idx_nblk = c.nblk(ix.compress_ratio, min(ix.index_topk, self.W[ix.compress_ratio]), offset)
         else:
             idxs = sa.topk_idxs
         if latent is not None:                                                # model.py:752-762
@@ -507,15 +587,26 @@ class StaticStep:
         attn.window_kv_cache[:1].index_copy_(1, c.p_win(), kv)               # #5 (model.py:719)
         kv = attn.window_kv_cache[:1]                                         # model.py:720
         topk_idxs = c.win_idx()                                               # #6
+        nblk = None
         if attn.compress_ratio:
             compress_kv, compress_idxs = self._compress_kv(attn, x, qr, parity, kv.size(1))
             kv = torch.cat([kv, compress_kv], dim=1)
             topk_idxs = torch.cat([topk_idxs, compress_idxs], dim=-1)
-        o = R.sparse_attn(q, kv, attn.attn_sink, topk_idxs, attn.softmax_scale)
+            nblk = self._idx_nblk if self._attn_on else None                  # #18 (None: reference call)
+        o = self._sparse_attn(q, kv, attn, topk_idxs, nblk)
         o = self._o_path(attn, o, freqs_cis)
         wo_a = attn.wo_a.weight.view(attn.n_local_groups, attn.o_lora_rank, -1)
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
         return attn.wo_b(o.flatten(2))
+
+    def _sparse_attn(self, q, kv, attn, topk_idxs, nblk):
+        """model.py:781 (#18: inside the bounded scope when a block count is published)."""
+        if nblk is None:
+            return self.R.sparse_attn(q, kv, attn.attn_sink, topk_idxs, attn.softmax_scale)
+        from runtime.patches import attn_bound_scope
+
+        with attn_bound_scope(nblk):
+            return self.R.sparse_attn(q, kv, attn.attn_sink, topk_idxs, attn.softmax_scale)
 
     def _q_proj(self, attn, qr, freqs_cis):
         """model.py:770-772: q = wq_b(qr) per head, RoPE on the last rope_head_dim (#17: in the GEMV's store)."""
@@ -571,6 +662,7 @@ class StaticStep:
         if m.temperature != 0:
             raise ValueError("StaticStep is greedy only (model.temperature must be 0)")
         self._c = _StepScalars(self)
+        self._idx_nblk = None
         if self.marker:
             from runtime.static_kernels import step_marker
             step_marker(self.marker_ctr)
@@ -591,6 +683,7 @@ class StaticStep:
         if self.counters:
             self.cold_acc.add_(self.cold_tab.gather(1, self.ids_step).sum(-1))
         self._c = None
+        self._idx_nblk = None
 
     # ---------------------------------------------------------------- public
     def forward_static(self, parity: int) -> torch.Tensor:

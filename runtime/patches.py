@@ -32,6 +32,16 @@ fp8_linear_gemv(enable):
     indexer wk/weights_proj, gate, head, mHC) -- calls the original `linear`. Installing it is idempotent and inert
     outside the scope; `fp8_gemv_stats()` counts routed and fallen-through calls (host side: eager calls and
     captures, not graph replays).
+
+sparse_attn_bounded(enable):
+    T9b-3a: `sparse_attn` (kernel.py:392-403, the TileLang `sparse_attn_kernel` at 310-389, imported into model.py and
+    called at model.py:781) -> runtime/kernels/sparse_attn_bounded.py, the same kernel text with its 64-index block
+    loop (kernel.py:358, bound `num_blocks = cdiv(topk, 64)` at 325) bounded by a per-row device block count. Routed
+    only inside `attn_bound_scope(nblk)` -- which `StaticStep(attn_impl="bounded")` opens around its compressed
+    layers' `sparse_attn` call with the count it computed where the indices are built -- and only when q is
+    [b, m, h, d] bf16, the indices int32 [b, m, topk] and nblk int32 [b, m] on q's device. Everything else (prefill,
+    the eager reference, ratio-0 layers, `attn_impl="ref"`) calls the original. Installing is idempotent and inert
+    outside the scope; `attn_bound_stats()` counts routed / fallen-through calls (host side).
 """
 import contextlib
 import sys
@@ -195,3 +205,81 @@ def fp8_linear_prequant(xq, s, weight):
         key = (why, weight.size(0), weight.size(1))
         _GEMV_STATS["fallthrough"][key] = _GEMV_STATS["fallthrough"].get(key, 0) + 1
     return ref.fp8_gemm(xq, s, weight, weight.scale, ref.scale_dtype, block_size=ref.fp8_block_size)
+
+
+# ------------------------------------------------------------------------------------------------ T9b-3a bounded attn
+_ATTN_SCOPE = {"nblk": None}
+_ATTN_STATS = {"routed": 0, "fallthrough": {}}
+
+
+@contextlib.contextmanager
+def attn_bound_scope(nblk):
+    """While open (and `sparse_attn_bounded` is installed), an eligible `sparse_attn` call runs the bounded kernel
+    with this per-row block count (int32 [b, m] device tensor). `nblk=None` is a no-op scope. Nests (inner wins)."""
+    prev = _ATTN_SCOPE["nblk"]
+    _ATTN_SCOPE["nblk"] = nblk if nblk is not None else prev
+    try:
+        yield
+    finally:
+        _ATTN_SCOPE["nblk"] = prev
+
+
+def attn_bound_stats(reset: bool = False) -> dict:
+    """{"routed": calls, "fallthrough": {reason: calls}} since the last reset (host side)."""
+    out = {"routed": _ATTN_STATS["routed"], "fallthrough": dict(_ATTN_STATS["fallthrough"])}
+    if reset:
+        _ATTN_STATS["routed"] = 0
+        _ATTN_STATS["fallthrough"].clear()
+    return out
+
+
+def attn_bound_reason(q, topk_idxs, nblk):
+    """None if `sparse_attn(q, kv, sink, topk_idxs, scale)` may take the bounded kernel with `nblk`, else why not."""
+    import torch
+
+    if q.dim() != 4 or q.dtype != torch.bfloat16:
+        return "q"
+    if topk_idxs.dim() != 3 or topk_idxs.dtype != torch.int32 or tuple(topk_idxs.shape[:2]) != tuple(q.shape[:2]):
+        return "idx"
+    if nblk.dtype != torch.int32 or tuple(nblk.shape) != tuple(q.shape[:2]) or nblk.device != q.device:
+        return "nblk"
+    return None
+
+
+def sparse_attn_bounded(enable: bool = True) -> None:
+    """Install (or restore) the model.sparse_attn wrapper (patches docstring). model.py looks `sparse_attn` up as a
+    module global at the call (model.py:781) and StaticStep calls `R.sparse_attn`, so the wrapper is what both
+    reach. The original is whatever `model.sparse_attn` is when this is first installed over it (the kernel.py
+    function, or a test's emulation)."""
+    ref = sys.modules.get("model") or __import__("model")
+    cur = ref.sparse_attn
+    if not getattr(cur, "__t9b3a_bounded__", False):
+        ref._orig_sparse_attn = cur
+    orig = ref._orig_sparse_attn
+
+    def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale):
+        nb = _ATTN_SCOPE["nblk"]
+        if nb is not None:
+            why = attn_bound_reason(q, topk_idxs, nb)
+            if why is None:
+                from runtime.kernels import sparse_attn_bounded as SAB
+
+                _ATTN_STATS["routed"] += 1
+                return SAB.sparse_attn_bounded(q, kv, attn_sink, topk_idxs, softmax_scale, nb)
+            _ATTN_STATS["fallthrough"][why] = _ATTN_STATS["fallthrough"].get(why, 0) + 1
+        return orig(q, kv, attn_sink, topk_idxs, softmax_scale)
+
+    sparse_attn.__t9b3a_bounded__ = True
+    ref.sparse_attn = sparse_attn if enable else orig
+
+
+def sparse_attn_bounded_enabled() -> bool:
+    ref = sys.modules.get("model")
+    return ref is not None and getattr(ref.sparse_attn, "__t9b3a_bounded__", False)
+
+
+def original_sparse_attn():
+    """The reference sparse_attn underneath the wrapper (or the current one when the wrapper is not installed)."""
+    ref = sys.modules.get("model") or __import__("model")
+    cur = ref.sparse_attn
+    return ref._orig_sparse_attn if getattr(cur, "__t9b3a_bounded__", False) else cur
