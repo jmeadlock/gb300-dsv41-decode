@@ -22,7 +22,8 @@ M1-T10-FIX (docs/HANDOFF-M1-T10-FIX.md):
     cache targets, the window indices under a CPU-seeded lru cache, one direct reference sparse_attn call on cuda.
     The final line counts the bit-equal comparisons that actually executed.
   * D row: 6-row dg-inplace == 6-row dg-masked (torch.equal: logits, main_hidden, caches; graph == eager);
-  * G row: 6-row fused glue (row-parallel clusters) == 6-row ref glue on the fast impls (dg-inplace and dg-masked).
+  * G row: 6-row fused glue == 6-row ref glue on the fast impls (dg-inplace and dg-masked); M1-T10-PORT: every
+    ported cluster on (fused_glue.ROWS_CLUSTERS), its build-time self-check at 6 rows equal, and each alone off.
 M1-T10-FIX2 (docs/HANDOFF-M1-T10-FIX2.md): the D row at spare_slots = 8 (compact cold index, the real Triton
   staging kernel), no overflow; forced overflow (spare_slots = 1): the device counter == the host expectation from
   each eager step's routing, and the graph replay trips it identically.
@@ -65,7 +66,7 @@ STATIC_KW = {}    # ... with {"_allow_cpu": True}
 FAST = dict(moe_impl="dg-masked", fp8_impl="gemv", glue_impl="fused", attn_impl="flashmla")
 FAST_INPLACE = dict(FAST, moe_impl="dg-inplace")  # M1-T10-FIX: the 6-row fast path
 # M1-T10-FIX: how many bit-equal comparisons actually executed (the round-1 run reached none of them)
-COUNTS = {"logit_rows": 0, "main_hidden": 0, "caches": 0, "gates": 0}
+COUNTS = {"logit_rows": 0, "main_hidden": 0, "caches": 0, "gates": 0, "g_clusters": 0}
 
 
 def _need_tilelang():
@@ -517,20 +518,42 @@ def test_static6_dg_inplace_forced_overflow_trips_counter():
         st.detach()
 
 
+def _rows_expected_on(moe, fp8="gemv"):
+    """M1-T10-PORT: the clusters that must be on at 6 rows with `moe` / `fp8`: every cluster but the two left off
+    (fused_glue.ROWS_WHY) and those n/a by impl (dg-inplace: gather; fp8 ref -- the CPU dry run --: the GEMV parts)."""
+    from runtime import fused_glue as FG
+
+    never = set(FG.ROWS_WHY) | ({"gather"} if moe == "dg-inplace" else set())
+    if fp8 != "gemv":
+        never |= {"q_rope_epilogue", "gemv_pair", "reduce_fold"}
+    return set(FG.CLUSTERS) - never
+
+
 def test_static6_fused_glue_equals_ref_glue():
-    """G row at 6 rows (M1-T10-FIX Part B 2): glue fused (row-parallel clusters on, self-checked at 6 rows; the
-    one-row clusters n/a with their reasons) == glue ref, torch.equal, on the fast impls (gemv, flashmla) with
-    dg-masked and dg-inplace; graph == static-eager."""
+    """G row at 6 rows (M1-T10-FIX Part B 2; M1-T10-PORT: EVERY ported cluster): glue fused -- all clusters
+    applicable to the fast impls on at 6 rows, each self-checked at build against the reference glue at 6 rows
+    (`verify_<cluster>` == "equal": the per-cluster G rows), only fused_glue.ROWS_WHY n/a -- == glue ref, torch.equal,
+    on the fast impls (gemv, flashmla) with dg-masked and dg-inplace; graph == static-eager. Then, dg-inplace, each
+    cluster alone OFF (DSV41_GLUE_DISABLE) == ref glue (bisects a cluster that breaks only in combination)."""
     _need_tilelang()
+    from runtime import fused_glue as FG
+
     with _model("mini4") as (model, pool):
         hid = (len(model.layers) - 1,)
         ids, toks = _toks(18, ROWS * 4, 77)
+        refs = {}
         for moe in ("dg-inplace", "dg-masked"):
             kw = dict(FAST, moe_impl=moe)
             f = _need_step(model, pool, rows=ROWS, hidden_layers=hid, **kw)
             d = f.glue.describe()
-            print(f"  G {moe}: {f.glue.glue_line()[:300]}")
-            assert d["on"], d["clusters"]
+            print(f"  G {moe}: {f.glue.glue_line()[:400]}")
+            want = _rows_expected_on(moe, f.fp8_impl)
+            assert set(d["on"]) == want, {c: d["clusters"][c] for c in want ^ set(d["on"])}
+            ver = {k_: v for k_, v in d["calibration"].items() if k_.startswith("verify_")}
+            ver.update({k_: v for k_, v in d["calibration"].get("r4", {}).items() if k_.startswith("verify_")})
+            assert all(v == "equal" for v in ver.values()), ver
+            print(f"  G {moe} per-cluster self-checks at {ROWS} rows: {', '.join(sorted(ver))} all equal")
+            COUNTS["g_clusters"] += len(ver)
             a = _static(model, f, ids, toks, 4)
             if DEV == "cuda":
                 f.capture()
@@ -540,8 +563,27 @@ def test_static6_fused_glue_equals_ref_glue():
             r = _need_step(model, pool, rows=ROWS, hidden_layers=hid, **dict(kw, glue_impl="ref"))
             b = _static(model, r, ids, toks, 4)
             r.detach()
+            refs[moe] = b
+            refs.setdefault("fp8", f.fp8_impl)
             _eq_runs(a, b, f"G {moe}: 6-row fused glue vs ref glue")
             print(f"  G {moe}: 6-row fused glue ({','.join(d['on'])}) == ref glue, {len(a[0])} rows; graph == eager")
+        moe = "dg-inplace"
+        prev = os.environ.get(FG.DISABLE_ENV)
+        fp8 = refs["fp8"]
+        try:
+            for c in sorted(_rows_expected_on(moe, fp8)):
+                os.environ[FG.DISABLE_ENV] = c
+                f = _need_step(model, pool, rows=ROWS, hidden_layers=hid, **dict(FAST, moe_impl=moe))
+                assert f.glue.status[c].startswith("off"), f.glue.status[c]
+                a = _static(model, f, ids, toks, 4)
+                f.detach()
+                _eq_runs(a, refs[moe], f"G {moe}: 6-row fused glue without {c} vs ref glue")
+            print(f"  G {moe}: each of {len(_rows_expected_on(moe, fp8))} clusters alone off == ref glue")
+        finally:
+            if prev is None:
+                os.environ.pop(FG.DISABLE_ENV, None)
+            else:
+                os.environ[FG.DISABLE_ENV] = prev
 
 
 # ------------------------------------------------------------------------------------------------ V0
@@ -651,6 +693,7 @@ if __name__ == "__main__":
         print(f"{results[t.__name__]:4s} {t.__name__} ({time.time() - t0:.1f}s)", flush=True)
     n_fail = sum(v == "FAIL" for v in results.values())
     print(f"bit-equal comparisons executed: {COUNTS['gates']} gate runs, {COUNTS['logit_rows']} fp32 logit rows, "
-          f"{COUNTS['main_hidden']} main_hidden, {COUNTS['caches']} cache tensors (torch.equal)")
+          f"{COUNTS['main_hidden']} main_hidden, {COUNTS['caches']} cache tensors (torch.equal); "
+          f"{COUNTS['g_clusters']} per-cluster 6-row self-checks equal")
     print(f"{len(results) - n_fail}/{len(results)} not failed; {n_fail} failed")
     sys.exit(1 if n_fail else 0)

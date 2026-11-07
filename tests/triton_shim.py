@@ -375,23 +375,29 @@ class JitFunction:
         def launch(*args, num_warps=None, num_stages=None, enable_fp_fusion=None, **constexprs):
             bufs = {}
             conv = []
-            for x in args:
+
+            def cv(x):
                 if isinstance(x, torch.Tensor):
                     key = (x.data_ptr(), x.dtype)
                     if key not in bufs:
                         bufs[key] = (x, _buffer(x))
-                    conv.append(P(bufs[key][1], 0))
-                elif isinstance(x, float):
-                    conv.append(np.float32(x))    # Triton passes a Python float as an fp32 scalar
-                else:
-                    conv.append(int(x))
+                    return P(bufs[key][1], 0)
+                if isinstance(x, float):
+                    return np.float32(x)          # Triton passes a Python float as an fp32 scalar
+                return int(x)
+
+            for x in args:
+                conv.append(cv(x))
+            # M1-T10-PORT: tensor (pointer) arguments passed by keyword, as the real launcher accepts them
+            kw = {k: (cv(v) if isinstance(v, torch.Tensor) else v) for k, v in constexprs.items()}
             g = tuple(grid) + (1,) * (3 - len(grid))
-            self.launches.append({"grid": tuple(grid), "constexprs": dict(constexprs),
+            self.launches.append({"grid": tuple(grid), "constexprs": {k: v for k, v in constexprs.items()
+                                                                      if not isinstance(v, torch.Tensor)},
                                   "enable_fp_fusion": enable_fp_fusion})
             DIRTY.clear()
             for pid in itertools.product(*(range(n) for n in g)):
                 _PID[:] = list(pid)
-                self.fn(*conv, **constexprs)
+                self.fn(*conv, **kw)
             for t, b in bufs.values():  # write back (untouched elements round-trip exactly)
                 if t.dtype in (torch.float32, torch.bfloat16) or id(b) in DIRTY:
                     _write_back(t, b)

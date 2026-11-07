@@ -93,11 +93,12 @@ compress_lens [R, 1] (the prefill spelling, model.py:564-566); MoE through runti
 (row, expert) pairs, U <= R*k slots, per-row ascending-id combine); head on all rows -> `logits[R, V]`, `t_out[R]`;
 `main_hidden[R, len(hidden_layers) * dim]` (model.py:1267-1269) when `hidden_layers` is given. One graph (no parity).
 M1-T10-FIX: `moe_impl="dg-inplace"` at R rows = runtime/moe_rows.py DGInplaceMoERows (contiguous grouped GEMM over the
-pool in place; M1-T10-FIX2: cold experts by a compact cold index into `spare_slots` spare slots per layer, default 8,
-overflows counted on the device -- `overflow_counts()`). `glue_impl="fused"` at R rows builds a FusedGlue whose row-parallel
-clusters (runtime/fused_glue.py ROWS_CLUSTERS: shared-expert SwiGLU, mHC post) are on and self-checked at R rows;
-every one-row cluster is n/a with its reason (`st.glue.describe()`, `glue_note`) and its call site runs the reference
-ops.
+pool in place; M1-T10-FIX2: cold experts by a compact cold index into `spare_slots` spare slots per layer, default 16
+since M1-T10-PORT (8 overflowed in 123 of 1,018 box steps), overflows counted on the device -- `overflow_counts()`).
+`glue_impl="fused"` at R rows (M1-T10-PORT) builds a FusedGlue whose clusters all have a row axis
+(runtime/fused_glue.py ROWS_CLUSTERS; the R-row MoE glue incl. the dedup through runtime/moe_rows.py) and are
+self-checked at R rows against the reference glue at R rows; the clusters not ported (fused_glue.ROWS_WHY) are n/a
+with their reason (`st.glue.describe()`, `glue_note`) and their call sites run the reference ops.
 
 `main_hiddens` at rows=1: computed only when `hidden_layers` is given (MTP-only, never feeds the logits); the loader's
 overlay sets dspark_target_layer_ids=() and `StaticStep` refuses a model that has target layers.
@@ -127,7 +128,7 @@ DUMMY_PROMPT = (0, 1)
 RING = 256                        # M1-T10 #20: window ring slots (>= 128 + 5, docs/M1-DSPARK-DESIGN.md 1.5)
 MAX_ROWS = 8                      # rows per step: the GEMV's M <= 8 (runtime/gemv_mxfp8.py)
 MOE_IMPLS_ROWS = ("ref", "dg-masked", "dg-inplace")  # MoE impls at rows > 1 (runtime/moe_rows.py)
-DEFAULT_SPARE_SLOTS_ROWS = 8     # M1-T10-FIX2: spare slots per layer of the R-row dg-inplace step (compact cold index)
+DEFAULT_SPARE_SLOTS_ROWS = 16    # M1-T10-PORT (was 8: 123/1018 box steps overflowed); M1-T10-FIX2: spare slots per layer of the R-row dg-inplace step (compact cold index)
 
 
 # ------------------------------------------------------------------------------------------------ pure index math
@@ -531,10 +532,11 @@ class StaticStep:
             from runtime.fused_glue import FusedGlue
 
             self.glue = FusedGlue(self, **(glue_opts or {}))
-            if rows > 1:  # M1-T10-FIX: only the row-parallel clusters run at R rows (fused_glue.ROWS_CLUSTERS)
+            if rows > 1:  # M1-T10-PORT: every ported cluster runs at R rows (fused_glue.ROWS_CLUSTERS)
                 on = [c for c, s in self.glue.status.items() if self.glue.on(c)]
-                self.glue_note = (f"rows={rows}: fused {','.join(on) or '-'} (row-parallel, self-checked at {rows} "
-                                  f"rows); the one-row clusters run the reference ops")
+                off = [c for c, s in self.glue.status.items() if not self.glue.on(c)]
+                self.glue_note = (f"rows={rows}: fused {','.join(on) or '-'} (self-checked at {rows} rows); "
+                                  f"reference ops for {','.join(off) or '-'}")
         if self.attn_impl == "bounded":  # #18: install the routed wrapper, then the build-time self-check (eager)
             patches.sparse_attn_bounded(True)
             self._attn_selfcheck(attns)
@@ -949,9 +951,9 @@ class StaticStep:
         kernel)."""
         R = self.R
         g = self.glue
-        if g is not None and g.on("o_rope_qdq"):
+        if g is not None and g.on("o_rope_qdq") and o.is_contiguous():
             g.o_path(attn, o, freqs_cis)
-            return o.view(1, 1, attn.n_local_groups, -1)
+            return o.view(1, self.rows, attn.n_local_groups, -1)
         R.apply_rotary_emb(o[..., -attn.rope_head_dim:], freqs_cis, True)
         o = o.view(1, self.rows, attn.n_local_groups, -1)
         R.act_quant(o, R.fp8_block_size, R.scale_fmt, R.scale_dtype, True)

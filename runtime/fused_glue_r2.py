@@ -321,12 +321,12 @@ def order_args(ordd: dict) -> dict:
 
 # ------------------------------------------------------------------------------------------------ torch mirrors
 def hc_pre_torch(x: torch.Tensor, pre: torch.Tensor, mode: int) -> torch.Tensor:
-    """Block.hc_pre (model.py:961-962) for one row: x [HC, D] bf16, pre [HC] fp32 -> bf16 [D], the 4-term sum in
-    fused_glue.HC_SUM_MODES order `mode` (0 = ((0 + a0) + a1) + ...)."""
-    HC, D = x.shape
-    a = [pre[i].float() * x[i].float() for i in range(HC)]
+    """Block.hc_pre (model.py:961-962): x [HC, D] (or M1-T10-PORT [R, HC, D]) bf16, pre [HC] ([R, HC]) fp32 ->
+    bf16 [D] ([R, D]), the 4-term sum in fused_glue.HC_SUM_MODES order `mode` (0 = ((0 + a0) + a1) + ...)."""
+    HC, D = x.shape[-2], x.shape[-1]
+    a = [pre[..., i:i + 1].float() * x[..., i, :].float() for i in range(HC)]
     if mode == 0:
-        acc = torch.zeros(D, dtype=torch.float32, device=x.device)
+        acc = torch.zeros_like(a[0])
         for t in a:
             acc = acc + t
     elif mode == 1:
@@ -349,7 +349,15 @@ def rms_apply_torch(v: torch.Tensor, r: torch.Tensor, w: torch.Tensor) -> torch.
 
 def router_post_torch(idx: torch.Tensor, sc: torch.Tensor, ordd: dict, eps: float, rs: float):
     """Gate.forward after the topk (model.py:825-828) + StaticMoE's ascending sort (static_step.py): idx [K] int64
-    (torch.topk's order), sc [E] fp32 -> (ids [K] int64 ascending, w [K] fp32 in that order)."""
+    (torch.topk's order), sc [E] fp32 -> (ids [K] int64 ascending, w [K] fp32 in that order). M1-T10-PORT: idx
+    [R, K], sc [R, E] -> ([R, K], [R, K]) per row (the weight sum over [R, K] as the reference's)."""
+    if idx.dim() == 2:
+        R_, K = idx.shape
+        wv = sc.gather(1, idx)
+        den = sum_torch(wv, ordd, (R_, K)).view(R_, 1) + eps
+        wn = (wv / den) * rs
+        ids, order = torch.sort(idx, dim=1)
+        return ids, wn.gather(1, order)
     wv = sc[idx].view(1, -1)
     den = sum_torch(wv, ordd, (1, wv.size(-1))).view(1, 1) + eps
     wn = (wv / den) * rs
@@ -360,13 +368,18 @@ def router_post_torch(idx: torch.Tensor, sc: torch.Tensor, ordd: dict, eps: floa
 def engram_gate_torch(h: torch.Tensor, key: torch.Tensor, wp: torch.Tensor, eps: float, ordd: dict, sordd: dict,
                       c: float, cmin: float) -> torch.Tensor:
     """Engram.forward's gate input (model.py:356-362, before the sigmoid): h, key fp32 [HC, D] (x.float(),
-    key.float()), wp fp32 [HC, D] = q_weight.float() * k_weight.float() -> [HC] fp32 copysign(sqrt(clamp(|dot|)))."""
-    HC, D = h.shape
-    shape = (1, 1, HC, D)
-    rh = torch.rsqrt(sqmean_torch(h, D, ordd, shape) + eps)
-    rk = torch.rsqrt(sqmean_torch(key, D, ordd, shape) + eps)
-    dot = sum_torch((h * wp) * key, sordd, shape) * (rh * rk) * c
-    return torch.copysign(dot.abs().clamp_min(cmin).sqrt(), dot)
+    key.float()), wp fp32 [HC, D] = q_weight.float() * k_weight.float() -> [HC] fp32 copysign(sqrt(clamp(|dot|))).
+    M1-T10-PORT: h, key [R, HC, D] -> [R, HC] (the statistics over [1, R, HC, D] as the reference's)."""
+    HC, D = wp.shape
+    R_ = h.numel() // (HC * D)
+    shape = (1, R_, HC, D)
+    hh, kk = h.reshape(R_ * HC, D), key.reshape(R_ * HC, D)
+    w = wp if R_ == 1 else wp.unsqueeze(0).expand(R_, HC, D).reshape(R_ * HC, D)
+    rh = torch.rsqrt(sqmean_torch(hh, D, ordd, shape) + eps)
+    rk = torch.rsqrt(sqmean_torch(kk, D, ordd, shape) + eps)
+    dot = sum_torch((hh * w) * kk, sordd, shape) * (rh * rk) * c
+    out = torch.copysign(dot.abs().clamp_min(cmin).sqrt(), dot)
+    return out if R_ == 1 else out.view(R_, HC)
 
 
 def indexer_post_torch(idx: torch.Tensor, clen: torch.Tensor, offset: int) -> torch.Tensor:
@@ -577,7 +590,18 @@ if HAVE_TRITON:
         r = rsqrt(var + eps). C, per 32-block: y = bf16(nw * (y0 * r)) -> y (bf16), yf (fp32, HAS_YF), and (QQ) its
         act_quant: q fp8 + s e8m0 code (HAS_Q), the same q into rows g*dq_gs of dq and fp32 scales into ds (HAS_DG:
         DeepGEMM's w1/w3 input, G groups; T9b-4 DG_PACK: e8m0 codes into DeepGEMM's packed SF, _t9b4_store_code).
-        T9b-4: t9b4_hc_norm is the same work over several programs (kept here for the fallback / A-B)."""
+        T9b-4: t9b4_hc_norm is the same work over several programs (kept here for the fallback / A-B).
+        M1-T10-PORT: grid axis 1 = token row t (1 at the one-row step): x / pre / y / yf / xf / mrs / q / s are row t
+        of [R, ...] buffers (the statistic is per row, in the order calibrated at R rows)."""
+        t = tl.program_id(1)
+        x = x + t * (HC * D)
+        pre = pre + t * HC
+        y = y + t * D
+        yf = yf + t * D
+        xf = xf + t * (HC * D)
+        mrs = mrs + t
+        q = q + t * D
+        s = s + t * (D // 32)
         if PASS_A:
             acc = tl.zeros([MT, MV], dtype=tl.float32)
             for k in range((HC * D + MT * MV - 1) // (MT * MV)):
@@ -684,8 +708,18 @@ if HAVE_TRITON:
         """t9b2r2_hc_norm's outputs, bit for bit, from NAP (+1 with PASS_A) programs: program p < NAP recomputes the
         norm statistic (identical code -> identical r) and writes the 32-blocks [p*BB, (p+1)*BB); program NAP (PASS_A)
         writes xf and the mix statistic. The reduction ORDER is the calibrated one, untouched: the work is split, the
-        sums are not (redundant statistic instead of a partitioned reduction + combine)."""
+        sums are not (redundant statistic instead of a partitioned reduction + combine). M1-T10-PORT: grid axis 1 =
+        token row t, as t9b2r2_hc_norm's."""
         pid = tl.program_id(0)
+        t = tl.program_id(1)
+        x = x + t * (HC * D)
+        pre = pre + t * HC
+        y = y + t * D
+        yf = yf + t * D
+        xf = xf + t * (HC * D)
+        mrs = mrs + t
+        q = q + t * D
+        s = s + t * (D // 32)
         if PASS_A:
             if pid >= NAP:
                 _t9b4_hc_mix(x, xf, mrs, meps, mfac, mwf, D, HC, MT, MV, MU, MDEC, MDIV, HAS_MIX, HAS_XF)
@@ -702,12 +736,19 @@ if HAVE_TRITON:
                         N: tl.constexpr, T: tl.constexpr, V: tl.constexpr, U: tl.constexpr, DEC: tl.constexpr,
                         DIV: tl.constexpr, HAS_SLOT: tl.constexpr, QQ: tl.constexpr, HAS_Q: tl.constexpr,
                         QDQ: tl.constexpr, RD: tl.constexpr, RE_MODE: tl.constexpr, IM_MODE: tl.constexpr,
-                        BB: tl.constexpr, XS=0, NS: tl.constexpr = 0):
+                        BB: tl.constexpr, XS=0, NS: tl.constexpr = 0, FS=0):
         """One program: RMSNorm of one bf16 row x [N] (model.py:288-293, statistic in order T/V/U/DEC/DIV), then per
         32-block as even/odd pairs: RoPE on the last RD columns (RD > 0; the forward rotation by freqs [RD/2, 2],
         contraction forms RE/IM_MODE, bf16), act_quant QDQ in place (QDQ) -> out (+ slot[0] * N: the window ring
         row, HAS_SLOT); and/or the act_quant of the row: q fp8 + s e8m0 (HAS_Q). T9b-4 (NS > 0): x is the GEMV's
-        fp32 split partials [NS, N] (split stride XS), reduced on load in the split-K reduce's order (_t9b4_ld)."""
+        fp32 split partials [NS, N] (split stride XS), reduced on load in the split-K reduce's order (_t9b4_ld).
+        M1-T10-PORT: program t = token row t of R (one program at the one-row step): x / q / s / out row t (out:
+        ring row slot[t] with HAS_SLOT), freqs row t (stride FS); split partials [NS, R, N]: row t inside each."""
+        t = tl.program_id(0)
+        x = x + t * N
+        q = q + t * N
+        s = s + t * (N // 32)
+        freqs = freqs + t * FS
         acc = tl.zeros([T, V], dtype=tl.float32)
         for k in range((N + T * V - 1) // (T * V)):
             e = _r2_offs(k, T, V, U)
@@ -716,9 +757,9 @@ if HAVE_TRITON:
             acc = acc + v * v
         r = libdevice.rsqrt(_r2_fin(_r2_finish(acc, T, V, DEC), fac, wf, DIV) + eps)
         if HAS_SLOT:
-            base = out + tl.load(slot) * N
+            base = out + tl.load(slot + t) * N
         else:
-            base = out
+            base = out + t * N
         for b0 in range(0, N // 32, BB):
             bi = b0 + tl.arange(0, BB)
             bok = bi < N // 32
@@ -763,20 +804,33 @@ if HAVE_TRITON:
 
     # --- #4
     @triton.jit
-    def t9b2r2_router_pre(sp, bias, sc, bsc, E, BLOCK_E: tl.constexpr):
-        """scores = sqrt(softplus) (IEEE sqrt), biased = scores + bias (model.py:819, 824)."""
+    def t9b2r2_router_pre(sp, bias, sc, bsc, E, BLOCK_E: tl.constexpr, NT=0, ROWS: tl.constexpr = False):
+        """scores = sqrt(softplus) (IEEE sqrt), biased = scores + bias (model.py:819, 824). M1-T10-PORT ROWS: R rows
+        of E scores flattened (NT = R*E elements, bias index i % E)."""
         i = tl.program_id(0) * BLOCK_E + tl.arange(0, BLOCK_E)
-        m = i < E
+        if ROWS:
+            m = i < NT
+            bi = i % E
+        else:
+            m = i < E
+            bi = i
         v = libdevice.sqrt_rn(tl.load(sp + i, mask=m, other=0.0))
         tl.store(sc + i, v, mask=m)
-        tl.store(bsc + i, v + tl.load(bias + i, mask=m, other=0.0), mask=m)
+        tl.store(bsc + i, v + tl.load(bias + bi, mask=m, other=0.0), mask=m)
 
     @triton.jit
     def t9b2r2_router_post(idx, sc, ids_out, w_out, K, rs, eps,
-                           T: tl.constexpr, V: tl.constexpr, U: tl.constexpr, DEC: tl.constexpr, KP: tl.constexpr):
+                           T: tl.constexpr, V: tl.constexpr, U: tl.constexpr, DEC: tl.constexpr, KP: tl.constexpr,
+                           SE=0):
         """One program: weights = scores[idx] (torch.topk's order), w = weights / (sum + eps) * route_scale
         (model.py:825-828, the sum in order T/V/U/DEC), then ascending by id (distinct ids: rank = how many are
-        smaller) -> ids_out int64, w_out fp32."""
+        smaller) -> ids_out int64, w_out fp32. M1-T10-PORT: program t = token row t (idx / ids_out / w_out row t of
+        [R, K], sc row t of [R, E], row stride SE); one program at the one-row step."""
+        t = tl.program_id(0)
+        idx = idx + t * K
+        sc = sc + t * SE
+        ids_out = ids_out + t * K
+        w_out = w_out + t * K
         acc = tl.zeros([T, V], dtype=tl.float32)
         for kk in range((K + T * V - 1) // (T * V)):
             e = _r2_offs(kk, T, V, U)
@@ -797,11 +851,16 @@ if HAVE_TRITON:
     def t9b2r2_engram_gate(x, kv, wp, z, eps, fac, wf, c, cmin,
                            D: tl.constexpr, T: tl.constexpr, V: tl.constexpr, U: tl.constexpr, DEC: tl.constexpr,
                            DIV: tl.constexpr, ST: tl.constexpr, SV: tl.constexpr, SU: tl.constexpr,
-                           SDEC: tl.constexpr):
+                           SDEC: tl.constexpr, HC: tl.constexpr = 0):
         """Program i (hc copy): h = x[i].float(), key = kv[i*D:(i+1)*D].float(); rstd = rsqrt(mean(h^2) + eps) *
         rsqrt(mean(key^2) + eps) (order T/V/U/DEC/DIV); dot = sum((h * wp[i]) * key) (order S*) * rstd * c;
-        z[i] = copysign(sqrt(max(|dot|, cmin)), dot) (model.py:357-362 up to the sigmoid)."""
+        z[i] = copysign(sqrt(max(|dot|, cmin)), dot) (model.py:357-362 up to the sigmoid). M1-T10-PORT: grid axis 1
+        = token row t (x row t of [R, HC, D], kv row t of [R, (HC+1)*D], z row t of [R, HC]; HC given)."""
         i = tl.program_id(0)
+        t = tl.program_id(1)
+        x = x + t * (HC * D)
+        kv = kv + t * ((HC + 1) * D)
+        z = z + t * HC
         ah = tl.zeros([T, V], dtype=tl.float32)
         ak = tl.zeros([T, V], dtype=tl.float32)
         for k in range((D + T * V - 1) // (T * V)):
@@ -831,9 +890,15 @@ if HAVE_TRITON:
 
     @triton.jit
     def t9b2r2_engram_out(x, kv, gate, out, D: tl.constexpr, HC: tl.constexpr, BLOCK_C: tl.constexpr):
-        """Program (pb, i): out[i] = bf16(h[i] + gate[i] * value) (model.py:365), value = kv[HC*D:]."""
+        """Program (pb, i): out[i] = bf16(h[i] + gate[i] * value) (model.py:365), value = kv[HC*D:]. M1-T10-PORT:
+        grid axis 2 = token row t (x / out row t of [R, HC, D], kv row t of [R, (HC+1)*D], gate row t of [R, HC])."""
         pb = tl.program_id(0)
         i = tl.program_id(1)
+        t = tl.program_id(2)
+        x = x + t * (HC * D)
+        out = out + t * (HC * D)
+        kv = kv + t * ((HC + 1) * D)
+        gate = gate + t * HC
         e = pb * BLOCK_C + tl.arange(0, BLOCK_C)
         m = e < D
         h = tl.load(x + i * D + e, mask=m, other=0.0).to(tl.float32)
@@ -845,8 +910,13 @@ if HAVE_TRITON:
     @triton.jit
     def t9b2r2_topk_post(idx, clen, out, K, offset, KP: tl.constexpr, RB: tl.constexpr):
         """Program p: the ascending position (rank among the K distinct topk indices) of indices [p*RB, (p+1)*RB),
-        and out[rank] = idx < clen ? idx + offset : -1 as int32 (model.py:580-581)."""
+        and out[rank] = idx < clen ? idx + offset : -1 as int32 (model.py:580-581). M1-T10-PORT: grid axis 1 =
+        token row t (idx / out row t of [R, K], clen[t] -- the [R, 1] compress_lens of the R-row step)."""
         p = tl.program_id(0)
+        t = tl.program_id(1)
+        idx = idx + t * K
+        out = out + t * K
+        clen = clen + t
         i = p * RB + tl.arange(0, RB)
         mi = i < K
         ii = tl.load(idx + i, mask=mi, other=0)
@@ -886,8 +956,13 @@ def launch_hc_norm(x, pre, nw, y, *, eps: float, norm_ord: dict, hc_mode: int, c
     """x [HC, D] bf16 contiguous, pre [HC] fp32, nw [D]; y [D] bf16; yf [D] fp32; xf [HC*D] fp32; mrs [1] fp32;
     q [D] fp8, s [D/32] e8m0; dq [G, D] fp8 rows (unit inner stride), ds [G, D/32] fp32 or (T9b-4) a
     runtime.dg_inplace.PackedRows (the codes go straight into DeepGEMM's packed activation SF). split (T9b-4 lever
-    1): t9b4_hc_norm over 1 + ceil(D/32 / HC_SPLIT_BB) programs instead of t9b2r2_hc_norm's one (same outputs)."""
-    HC, D = x.shape
+    1): t9b4_hc_norm over 1 + ceil(D/32 / HC_SPLIT_BB) programs instead of t9b2r2_hc_norm's one (same outputs).
+    M1-T10-PORT: x [R, HC, D], pre [R, HC] and every output R rows of the above (row-major, contiguous), one launch
+    (grid axis 1 = row); the statistics' orders are the ones calibrated at R rows; no DeepGEMM rows at R > 1."""
+    HC, D = x.shape[-2], x.shape[-1]
+    R_ = x.numel() // (HC * D)
+    if R_ > 1 and dq is not None:
+        raise ValueError("launch_hc_norm: the DeepGEMM rows (dq/ds) are one-row only")
     if _kern(x):
         na = order_args(norm_ord)
         ma = order_args(mix_ord) if mrs is not None else dict(T=128, V=4, U=False, DEC=True, DIV=False)
@@ -907,29 +982,29 @@ def launch_hc_norm(x, pre, nw, y, *, eps: float, norm_ord: dict, hc_mode: int, c
                   PASS_A=pass_a, HAS_MIX=mrs is not None, HAS_XF=xf is not None,
                   HAS_YF=yf is not None, QQ=q is not None or dq is not None, HAS_Q=q is not None, HAS_DG=dq is not None,
                   DG_PACK=packed)
+        rows = (R_,) if R_ > 1 else ()
         if split:
             nap = -(-(D // BLOCK) // HC_SPLIT_BB)
-            t9b4_hc_norm[(nap + (1 if pass_a else 0),)](*args, nap, **ce, BB=HC_SPLIT_BB, num_warps=HC_SPLIT_WARPS,
-                                                        **LAUNCH)
+            t9b4_hc_norm[(nap + (1 if pass_a else 0),) + rows](*args, nap, **ce, BB=HC_SPLIT_BB,
+                                                               num_warps=HC_SPLIT_WARPS, **LAUNCH)
         else:
-            t9b2r2_hc_norm[(1,)](*args, **ce, BB=8, num_warps=NORM_WARPS, **LAUNCH)
+            t9b2r2_hc_norm[(1,) + rows](*args, **ce, BB=8, num_warps=NORM_WARPS, **LAUNCH)
         return
-    xv = x.float()
+    xv = x.float().reshape(R_, HC * D)
     if xf is not None:
-        xf.copy_(xv.reshape(-1))
+        xf.copy_(xv.reshape(xf.shape))
     if mrs is not None:
-        src = xf.view(1, -1) if xf is not None else xv.reshape(1, -1)
-        mrs.copy_(rms_rsqrt_torch(src, mix_eps, mix_ord, (1, 1, HC * D)).view(-1))
-    y0 = hc_pre_torch(x, pre, hc_mode).float().view(1, D)
-    o = rms_apply_torch(y0, rms_rsqrt_torch(y0, eps, norm_ord, (1, 1, D)), nw)
-    y.copy_(o.view(-1))
+        mrs.copy_(rms_rsqrt_torch(xv, mix_eps, mix_ord, (1, R_, HC * D)).view(mrs.shape))
+    y0 = hc_pre_torch(x.reshape(R_, HC, D), pre.reshape(R_, HC), hc_mode).float().view(R_, D)
+    o = rms_apply_torch(y0, rms_rsqrt_torch(y0, eps, norm_ord, (1, R_, D)), nw)
+    y.copy_(o.view(y.shape))
     if yf is not None:
-        yf.copy_(o.float().view(-1))
+        yf.copy_(o.float().view(yf.shape))
     if q is not None or dq is not None:
         qv, code = act_quant_torch(o.float(), code_tab)
         if q is not None:
-            q.copy_(qv.view(-1))
-            s.view(torch.uint8).copy_(code.view(-1).to(torch.uint8))
+            q.copy_(qv.view(q.shape))
+            s.view(torch.uint8).copy_(code.to(torch.uint8).view(s.shape))
         if dq is not None:
             for gi in range(dq.size(0)):
                 dq[gi].copy_(qv.view(-1))
@@ -939,117 +1014,146 @@ def launch_hc_norm(x, pre, nw, y, *, eps: float, norm_ord: dict, hc_mode: int, c
                     ds[gi].copy_(pow2_code(code.view(-1)))
 
 
-def _row_src(x):
-    """(tensor, N, NS, XS): a bf16 row [N], or (T9b-4 reduce fold) a gemv_mxfp8.SplitK of one row -> its fp32
-    partials, nsplit and split stride."""
+def _row_src(x, N: int):
+    """(tensor, R, NS, XS): R bf16 rows of N ([N] or [R, N] contiguous), or (T9b-4 reduce fold) a gemv_mxfp8.SplitK
+    of R rows -> its fp32 partials [nsplit, R, N], nsplit and split stride (M1-T10-PORT: any R <= 8)."""
     if hasattr(x, "nsplit") and hasattr(x, "ws"):
-        if x.M != 1:
-            raise ValueError(f"norm row: SplitK of {x.M} rows (one row expected)")
-        return x.ws, x.N, x.nsplit, x.split_stride
-    return x, x.numel(), 0, 0
+        if x.N != N:
+            raise ValueError(f"norm row: SplitK of width {x.N}, norm width {N}")
+        return x.ws, x.M, x.nsplit, x.split_stride
+    if x.numel() % N:
+        raise ValueError(f"norm row: {x.numel()} elements is not a whole number of {N}-rows")
+    return x, x.numel() // N, 0, 0
 
 
 def launch_norm_row(x, nw, out, *, eps: float, ordd: dict, code_tab=None, slot=None, q=None, s=None,
                     qdq: bool = False, rope=None):
     """x [N] bf16 (or, T9b-4, a one-row gemv_mxfp8.SplitK: the GEMV's partials, reduced in the kernel's load), nw [N];
     out bf16 [N] (or the ring [win, N] with slot [1] int64); q [N] fp8 + s [N/32] e8m0;
-    rope = (freqs fp32 [RD/2, 2], RD, (re, im) modes)."""
-    xt, N, NS, XS = _row_src(x)
+    rope = (freqs fp32 [RD/2, 2], RD, (re, im) modes). M1-T10-PORT: R rows ([R, N] contiguous or an R-row SplitK):
+    out / q / s [R, ...] (or the ring with slot [R]), freqs [R, RD/2, 2] (row t rotated by its own position); one
+    launch, one program per row."""
+    N = nw.numel()
+    xt, R_, NS, XS = _row_src(x, N)
     RD = int(rope[1]) if rope is not None else 0
     modes = tuple(rope[2]) if rope is not None else (0, 0)
+    fr = rope[0] if rope is not None else None
     if _kern(xt):
         a = order_args(ordd)
         dummy = out
-        t9b2r2_norm_row[(1,)](
+        fs = {"FS": int(fr.stride(0))} if fr is not None and fr.dim() == 3 else {}
+        t9b2r2_norm_row[(R_,)](
             xt, nw, out, slot if slot is not None else xt, q if q is not None else dummy,
-            s.view(torch.uint8) if s is not None else dummy, rope[0] if rope is not None else nw,
+            s.view(torch.uint8) if s is not None else dummy, fr if fr is not None else nw,
             code_tab if code_tab is not None else dummy, float(eps), fac_of(N), float(N),
             N=N, T=a["T"], V=a["V"], U=a["U"], DEC=a["DEC"], DIV=a["DIV"], HAS_SLOT=slot is not None,
             QQ=q is not None or qdq, HAS_Q=q is not None, QDQ=bool(qdq), RD=RD, RE_MODE=int(modes[0]),
-            IM_MODE=int(modes[1]), BB=min(16, _np2(N // 32)), XS=int(XS), NS=int(NS), num_warps=NORM_WARPS, **LAUNCH)
+            IM_MODE=int(modes[1]), BB=min(16, _np2(N // 32)), XS=int(XS), NS=int(NS), **fs, num_warps=NORM_WARPS,
+            **LAUNCH)
         return
     if NS:
-        x = x.reduce_torch().view(-1)
-    v = x.float().view(1, N)
-    o = rms_apply_torch(v, rms_rsqrt_torch(v, eps, ordd, (1, 1, N)), nw).view(-1)
+        x = x.reduce_torch()
+    v = x.float().reshape(R_, N)
+    o = rms_apply_torch(v, rms_rsqrt_torch(v, eps, ordd, (1, R_, N)), nw)
     if RD:
         from runtime.fused_glue import rope_rows_torch
 
-        o = rope_rows_torch(o, rope[0], N, RD, modes, inverse=False)
+        o = torch.stack([rope_rows_torch(o[t], fr[t] if fr.dim() == 3 else fr, N, RD, modes, inverse=False)
+                         for t in range(R_)])
     if q is not None or qdq:
         qv, code = act_quant_torch(o.float(), code_tab)
         if q is not None:
-            q.copy_(qv)
-            s.view(torch.uint8).copy_(code.to(torch.uint8))
+            q.copy_(qv.view(q.shape))
+            s.view(torch.uint8).copy_(code.to(torch.uint8).view(s.shape))
         if qdq:
             o = (qv.float().unflatten(-1, (-1, BLOCK)) * pow2_code(code).unsqueeze(-1)).flatten(-2).to(torch.bfloat16)
-    dst = out.view(-1, N)[int(slot.reshape(-1)[0])] if slot is not None else out.view(-1)
-    dst.copy_(o)
+    if slot is not None:
+        out.view(-1, N).index_copy_(0, slot.reshape(-1), o.view(R_, N))
+    else:
+        out.view(R_, N).copy_(o.view(R_, N))
 
 
 def launch_router_pre(sp, bias, sc, bsc):
-    """sp, bias, sc, bsc: [E] fp32 contiguous."""
-    E = sp.numel()
+    """sp, bias, sc, bsc: [E] fp32 contiguous. M1-T10-PORT: sp / sc / bsc R rows of E ([R*E]), bias [E]."""
+    E = bias.numel()
+    NT = sp.numel()
     if _kern(sp):
         BLOCK_E = min(1024, _np2(E))
-        t9b2r2_router_pre[(triton.cdiv(E, BLOCK_E),)](sp, bias, sc, bsc, E, BLOCK_E=BLOCK_E, **LAUNCH)
+        rk = dict(NT=int(NT), ROWS=True) if NT != E else {}
+        t9b2r2_router_pre[(triton.cdiv(NT, BLOCK_E),)](sp, bias, sc, bsc, E, BLOCK_E=BLOCK_E, **rk, **LAUNCH)
         return
     v = sp.sqrt()
     sc.copy_(v)
-    bsc.copy_(v + bias)
+    bsc.copy_((v.view(-1, E) + bias).view(bsc.shape))
 
 
 def launch_router_post(idx, sc, ids_out, w_out, *, ordd: dict, eps: float, rs: float):
-    """idx [K] int64 (topk's order), sc [E] fp32 -> ids_out [K] int64 ascending, w_out [K] fp32."""
-    K = idx.numel()
+    """idx [K] int64 (topk's order), sc [E] fp32 -> ids_out [K] int64 ascending, w_out [K] fp32. M1-T10-PORT: idx
+    [R, K], sc [R, E] -> ids_out / w_out [R, K] (ascending per row), one launch (one program per row)."""
+    rows = idx.dim() == 2
+    R_ = idx.size(0) if rows else 1
+    K = idx.size(-1)
     if _kern(idx):
         a = order_args(ordd)
-        t9b2r2_router_post[(1,)](idx, sc, ids_out, w_out, K, float(rs), float(eps), T=a["T"], V=a["V"], U=a["U"],
-                                 DEC=a["DEC"], KP=_np2(K), **LAUNCH)
+        se = {"SE": int(sc.stride(0))} if rows else {}
+        t9b2r2_router_post[(R_,)](idx, sc, ids_out, w_out, K, float(rs), float(eps), T=a["T"], V=a["V"], U=a["U"],
+                                  DEC=a["DEC"], KP=_np2(K), **se, **LAUNCH)
         return
     ids, w = router_post_torch(idx, sc, ordd, eps, rs)
-    ids_out.copy_(ids)
-    w_out.copy_(w)
+    ids_out.copy_(ids.view(ids_out.shape))
+    w_out.copy_(w.view(w_out.shape))
 
 
 def launch_engram_gate(x, kv, wp, z, *, eps: float, ordd: dict, sordd: dict, c: float, cmin: float):
-    """x [HC, D] bf16, kv [(HC+1)*D] bf16, wp [HC, D] fp32 -> z [HC] fp32."""
-    HC, D = x.shape
+    """x [HC, D] bf16, kv [(HC+1)*D] bf16, wp [HC, D] fp32 -> z [HC] fp32. M1-T10-PORT: x [R, HC, D], kv R rows of
+    (HC+1)*D, z [R*HC]; grid (HC, R)."""
+    HC, D = x.shape[-2], x.shape[-1]
+    R_ = x.numel() // (HC * D)
     if _kern(x):
         a, sa = order_args(ordd), order_args(sordd)
-        t9b2r2_engram_gate[(HC,)](x, kv, wp, z, float(eps), fac_of(D), float(D), float(c), float(cmin), D=D,
-                                  T=a["T"], V=a["V"], U=a["U"], DEC=a["DEC"], DIV=a["DIV"], ST=sa["T"], SV=sa["V"],
-                                  SU=sa["U"], SDEC=sa["DEC"], num_warps=NORM_WARPS, **LAUNCH)
+        t9b2r2_engram_gate[(HC,) + ((R_,) if R_ > 1 else ())](
+            x, kv, wp, z, float(eps), fac_of(D), float(D), float(c), float(cmin), D=D, T=a["T"], V=a["V"], U=a["U"],
+            DEC=a["DEC"], DIV=a["DIV"], ST=sa["T"], SV=sa["V"], SU=sa["U"], SDEC=sa["DEC"],
+            **({"HC": HC} if R_ > 1 else {}), num_warps=NORM_WARPS, **LAUNCH)
         return
-    key = kv[: HC * D].float().view(HC, D)
-    z.copy_(engram_gate_torch(x.float(), key, wp, eps, ordd, sordd, c, cmin))
+    key = kv.reshape(R_, (HC + 1) * D)[:, : HC * D].float().reshape(R_, HC, D)
+    zz = engram_gate_torch(x.float().reshape(R_, HC, D) if R_ > 1 else x.float(), key if R_ > 1 else key[0], wp,
+                           eps, ordd, sordd, c, cmin)
+    z.copy_(zz.reshape(z.shape))
 
 
 ENGRAM_BLOCK = 1024
 
 
 def launch_engram_out(x, kv, gate, out):
-    """x [HC, D] bf16, kv [(HC+1)*D] bf16, gate [HC] fp32 -> out [HC, D] bf16."""
-    HC, D = x.shape
+    """x [HC, D] bf16, kv [(HC+1)*D] bf16, gate [HC] fp32 -> out [HC, D] bf16. M1-T10-PORT: R rows of each (x / out
+    [R, HC, D], kv [R*(HC+1)*D], gate [R*HC]); grid axis 2 = row."""
+    HC, D = x.shape[-2], x.shape[-1]
+    R_ = x.numel() // (HC * D)
     if _kern(x):
-        t9b2r2_engram_out[(triton.cdiv(D, ENGRAM_BLOCK), HC)](x, kv, gate, out, D=D, HC=HC, BLOCK_C=ENGRAM_BLOCK,
-                                                             **LAUNCH)
+        t9b2r2_engram_out[(triton.cdiv(D, ENGRAM_BLOCK), HC) + ((R_,) if R_ > 1 else ())](
+            x, kv, gate, out, D=D, HC=HC, BLOCK_C=ENGRAM_BLOCK, **LAUNCH)
         return
-    v = kv[HC * D:].float().view(1, D)
-    out.copy_((x.float() + gate.view(HC, 1) * v).to(torch.bfloat16))
+    v = kv.reshape(R_, (HC + 1) * D)[:, HC * D:].float().view(R_, 1, D)
+    res = (x.float().reshape(R_, HC, D) + gate.reshape(R_, HC, 1) * v).to(torch.bfloat16)
+    out.copy_(res.view(out.shape))
 
 
 TOPK_RB = 16      # [RB, next_pow2(K)] compare tile per program: 16 x 512 = 64 values per thread at 4 warps
 
 
 def launch_topk_post(idx, clen, out, offset: int):
-    """idx [K] int64 distinct, clen [1] int64 -> out [K] int32 ascending, -1 past clen, + offset."""
-    K = idx.numel()
+    """idx [K] int64 distinct, clen [1] int64 -> out [K] int32 ascending, -1 past clen, + offset. M1-T10-PORT: idx /
+    out [R, K] (distinct per row), clen [R] (the R-row step's [R, 1] compress_lens); grid axis 1 = row."""
+    rows = idx.dim() == 2
+    R_ = idx.size(0) if rows else 1
+    K = idx.size(-1)
     if _kern(idx):
         RB = min(TOPK_RB, _np2(K))
-        t9b2r2_topk_post[(triton.cdiv(K, RB),)](idx, clen, out, K, int(offset), KP=_np2(K), RB=RB, **LAUNCH)
+        t9b2r2_topk_post[(triton.cdiv(K, RB),) + ((R_,) if rows else ())](idx, clen, out, K, int(offset), KP=_np2(K),
+                                                                         RB=RB, **LAUNCH)
         return
-    out.copy_(indexer_post_torch(idx, clen, offset))
+    out.copy_(indexer_post_torch(idx, clen.reshape(R_, 1) if rows else clen, offset).view(out.shape))
 
 
 # ------------------------------------------------------------------------------------------------ the R2 glue
@@ -1111,11 +1215,12 @@ class R2Glue:
             return {"order": o_, "fin": "mul", "exact": True, "name": order_name(o_, "mul")}
 
         D = l0.attn_norm.dim
-        self.orders.update(norm_D=d(D), mix=d(self.hc * D), kv=d(l0.attn.head_dim), q=d(l0.attn.q_lora_rank),
-                           router=d(l0.ffn.gate.topk))
+        Rr = self.rows   # M1-T10-PORT: the reference reduces R rows together (its launch configuration's rows)
+        self.orders.update(norm_D=d(D, Rr), mix=d(self.hc * D, Rr), kv=d(l0.attn.head_dim, Rr),
+                           q=d(l0.attn.q_lora_rank, Rr), router=d(l0.ffn.gate.topk, Rr))
         eng = next((l.engram for l in model.layers if l.engram is not None), None)
         if eng is not None:
-            self.orders.update(engram=d(eng.dim, eng.hc_mult), engram_sum=d(eng.dim, eng.hc_mult))
+            self.orders.update(engram=d(eng.dim, eng.hc_mult * Rr), engram_sum=d(eng.dim, eng.hc_mult * Rr))
 
     def _applicable_r2(self, c: str, layers, mx: bool) -> Optional[str]:
         o = self.o
@@ -1206,31 +1311,32 @@ class R2Glue:
         l0 = layers[0]
         D = l0.attn_norm.dim
         dev = self.dev
+        Rr = self.rows   # M1-T10-PORT: orders of the R-row reference reductions (each row reduced alike)
         r2 = cal.setdefault("r2", {})
         if self.on("hc_norm"):
-            rec = self.orders["norm_D"] = pick_order(dev, D, 1, "sqmean")
+            rec = self.orders["norm_D"] = pick_order(dev, D, Rr, "sqmean")
             self._set_outcome(("hc_norm", "mix_stat"), rec, f"RMSNorm[{D}]")
             self._pick_hc_pre(r2, g)
         if self.on("mix_stat"):
-            rec = self.orders["mix"] = pick_order(dev, self.hc * D, 1, "sqmean")
+            rec = self.orders["mix"] = pick_order(dev, self.hc * D, Rr, "sqmean")
             self._set_outcome(("mix_stat",), rec, f"hc_mixes[{self.hc * D}]")
         if self.on("kv_path"):
             HD = l0.attn.head_dim
-            rec = self.orders["kv"] = pick_order(dev, HD, 1, "sqmean")
+            rec = self.orders["kv"] = pick_order(dev, HD, Rr, "sqmean")
             self._set_outcome(("kv_path",), rec, f"kv_norm[{HD}]")
         if self.on("q_path"):
             QL = l0.attn.q_lora_rank
-            rec = self.orders["q"] = pick_order(dev, QL, 1, "sqmean")
+            rec = self.orders["q"] = pick_order(dev, QL, Rr, "sqmean")
             self._set_outcome(("q_path",), rec, f"q_norm[{QL}]")
         if self.on("router"):
             K = l0.ffn.gate.topk
-            rec = self.orders["router"] = pick_order(dev, K, 1, "possum")
+            rec = self.orders["router"] = pick_order(dev, K, Rr, "possum")
             self._set_outcome(("router",), rec, f"topk-weight sum[{K}]")
         if self.on("engram"):
             eng = next(l.engram for l in layers if l.engram is not None)
-            rec = self.orders["engram"] = pick_order(dev, eng.dim, eng.hc_mult, "sqmean")
+            rec = self.orders["engram"] = pick_order(dev, eng.dim, eng.hc_mult * Rr, "sqmean")
             self._set_outcome(("engram",), rec, f"Engram mean[{eng.hc_mult}x{eng.dim}]")
-            rec2 = self.orders["engram_sum"] = pick_order(dev, eng.dim, eng.hc_mult, "sum")
+            rec2 = self.orders["engram_sum"] = pick_order(dev, eng.dim, eng.hc_mult * Rr, "sum")
             self._set_outcome(("engram",), rec2, f"Engram dot[{eng.hc_mult}x{eng.dim}]")
         if not self.on("hc_norm"):
             self._off("mix_stat", "needs hc_norm (its statistic rides in the hc_norm launch)")
@@ -1259,6 +1365,16 @@ class R2Glue:
         for c in R2_CLUSTERS:
             if self.on(c) and c not in self.numerics:
                 self.numerics[c] = {"outcome": "(i) bit-identical", "orders": {}}
+
+    def _cat_rows(self, make):
+        """M1-T10-PORT: self.rows independent draws of a one-row builder (tensors or tuples of [1, 1, ...]),
+        concatenated along the token dim 1. One row: the builder's own draw (the one-row self-check unchanged)."""
+        outs = [make() for _ in range(self.rows)]
+        if len(outs) == 1:
+            return outs[0]
+        if isinstance(outs[0], (tuple, list)):
+            return tuple(torch.cat([o_[i] for o_ in outs], 1) for i in range(len(outs[0])))
+        return torch.cat(outs, 1)
 
     @_cpu_default
     def _stream(self, g, HC: int, D: int, scale_lo: int = -6, scale_hi: int = 7):
@@ -1335,13 +1451,13 @@ class R2Glue:
         o, R = self.o, self.R
         model = o.model
         layer = model.layers[0]
-        D, HC = layer.attn_norm.dim, self.hc
+        D, HC, Rr = layer.attn_norm.dim, self.hc, self.rows
         apn = self.status.get("hc_norm") == "approx"
         apm = apn or self.status.get("mix_stat") == "approx"
         out = {}
         for side in ("attn", "ffn"):
             for i in range(4):
-                x, pre = self._hc_inputs(g, HC, D, i)
+                x, pre = self._cat_rows(lambda: self._hc_inputs(g, HC, D, i))
                 fn, sc, bs = self._mix_params(layer, side)
                 norm = layer.attn_norm if side == "attn" else layer.ffn_norm
                 pr, po, cb = layer.hc_mixes(x, fn, sc, bs)
@@ -1354,7 +1470,7 @@ class R2Glue:
                     pairs += [("q", xq[0], q_r), ("s", xq[1], s_r)]
                 if side == "ffn" and ctx is not None:
                     if ctx.get("xf") is not None:
-                        pairs.append(("yf", ctx["xf"], y_r.float().view(1, -1)))
+                        pairs.append(("yf", ctx["xf"], y_r.float().view(Rr, -1)))
                     if ctx.get("q") is not None:
                         pairs += [("ffn q", ctx["q"], q_r), ("ffn s", ctx["s"], s_r)]
                     if ctx.get("dg"):
@@ -1371,8 +1487,11 @@ class R2Glue:
                 if r.get("mismatch"):
                     out["mismatch"] = max(out.get("mismatch", 0.0), r["mismatch"])
         # the head: hc_pre + model.norm + head (model.py:1273-1274)
-        x, pre = self._hc_inputs(g, HC, D, 1)
-        ref = model.head(model.norm(layer.hc_pre(x, pre)))
+        x, pre = self._cat_rows(lambda: self._hc_inputs(g, HC, D, 1))
+        if Rr > 1:   # the R-row step's head: logits of every row (static_step._head, model.py:1010-1014)
+            ref = model.head(model.norm(layer.hc_pre(x, pre)), full_logits=True)
+        else:
+            ref = model.head(model.norm(layer.hc_pre(x, pre)))
         got = self.head(layer, x, pre)
         r = self._cmp([("head logits", got, ref)], apn)
         if r.get("why"):
@@ -1387,7 +1506,7 @@ class R2Glue:
         QL = attn.q_lora_rank
         ap = self.status.get("q_path") == "approx"
         for _ in range(4):
-            qa = self._stream(g, 1, QL, -4, 6).view(1, 1, QL).to(self.dev)
+            qa = self._cat_rows(lambda: self._stream(g, 1, QL, -4, 6).view(1, 1, QL)).to(self.dev)
             qr_r = attn.q_norm(qa)
             q_r, s_r = R.act_quant(qr_r, R.fp8_block_size, R.scale_fmt, R.scale_dtype)
             qr, (q, s) = self._q_norm_quant(attn, qa)
@@ -1402,18 +1521,19 @@ class R2Glue:
         HD, rd, win = attn.head_dim, attn.rope_head_dim, attn.window_size
         ap = self.status.get("kv_path") == "approx"
         S = attn.freqs_cis.size(0)
+        Rr = self.rows   # M1-T10-PORT: R rows at positions pos .. pos+R-1 -> R ring slots
         for t in range(4):
-            kvr = self._stream(g, 1, HD, -4, 6).view(1, 1, HD).to(self.dev)
-            pos = int(torch.randint(1, max(2, S), (1,), generator=g, device="cpu"))
-            f = attn.freqs_cis[pos:pos + 1]
+            kvr = self._cat_rows(lambda: self._stream(g, 1, HD, -4, 6).view(1, 1, HD)).to(self.dev)
+            pos = int(torch.randint(1, max(2, S - Rr + 1), (1,), generator=g, device="cpu"))
+            f = attn.freqs_cis[pos:pos + Rr]
             kv = attn.kv_norm(kvr)
             R.apply_rotary_emb(kv[..., -rd:], f)
             R.act_quant(kv, R.fp8_block_size, R.scale_fmt, R.scale_dtype, True)
             ring = torch.zeros(1, win, HD, dtype=torch.bfloat16, device=self.dev)
-            slot = torch.tensor([pos % win], dtype=torch.long, device=self.dev)
+            slot = torch.remainder(torch.arange(pos, pos + Rr, dtype=torch.long), win).to(self.dev)
             self._kv_norm_write(attn, kvr, f, ring, slot)
             want = torch.zeros_like(ring)
-            want[0, pos % win] = kv.view(-1)
+            want[0, slot] = kv.view(Rr, HD)
             r = self._cmp([("ring row", ring, want)], ap)
             if r:
                 return r
@@ -1435,27 +1555,38 @@ class R2Glue:
             moe = sm.moe
             gate = moe.gate
             E, D = gate.weight.shape
+            Rr = self.rows   # M1-T10-PORT: the R-row gate ([R, D] -> [R, k]) and the R-row post kernel
             for _ in range(3):
-                x, sc, bias = self._router_inputs(g, D, E)
-                x = x.to(self.dev)
+                draws = [self._router_inputs(g, D, E) for _ in range(Rr)]
+                x = torch.cat([d_[0] for d_ in draws], 0).to(self.dev)
+                sc = torch.stack([d_[1] for d_ in draws]) if Rr > 1 else draws[0][1]
+                bias = draws[0][2]
                 w_r, i_r = gate(x, None)
-                ids_r, order = torch.sort(i_r[0])
-                ids, w = self.route(moe, x)
-                r = self._cmp([("ids", ids, ids_r), ("w", w, w_r[0, order])], ap)
+                ids_r, order = torch.sort(i_r, dim=-1)
+                if Rr > 1:
+                    ids, w = self.route_rows(moe, x)
+                    r = self._cmp([("ids", ids, ids_r), ("w", w, w_r.gather(1, order))], ap)
+                else:
+                    ids, w = self.route(moe, x)
+                    r = self._cmp([("ids", ids, ids_r[0]), ("w", w, w_r[0, order[0]])], ap)
                 if r:
                     return r
                 # the post kernel on tie-heavy scores, against the reference ops on the same topk indices
                 sc, bias = sc.to(self.dev), bias.to(self.dev)
-                idx = (sc + bias).view(1, -1).topk(gate.topk, dim=-1)[1]
-                wt = sc.view(1, -1).gather(1, idx)
+                idx = (sc + bias).view(Rr, -1).topk(gate.topk, dim=-1)[1]
+                wt = sc.view(Rr, -1).gather(1, idx)
                 wt /= wt.sum(dim=-1, keepdim=True) + 1e-20
                 wt *= gate.route_scale
-                ids_r2, order2 = torch.sort(idx[0])
+                ids_r2, order2 = torch.sort(idx, dim=-1)
                 ids2 = torch.empty_like(ids_r2)
-                w2 = torch.empty(gate.topk, dtype=torch.float32, device=self.dev)
-                launch_router_post(idx.view(-1), sc, ids2, w2, ordd=self.orders["router"], eps=1e-20,
-                                   rs=float(gate.route_scale))
-                r = self._cmp([("tie ids", ids2, ids_r2), ("tie w", w2, wt[0, order2])], ap)
+                w2 = torch.empty(Rr, gate.topk, dtype=torch.float32, device=self.dev)
+                if Rr > 1:
+                    launch_router_post(idx, sc.contiguous(), ids2, w2, ordd=self.orders["router"], eps=1e-20,
+                                       rs=float(gate.route_scale))
+                else:
+                    launch_router_post(idx.view(-1), sc, ids2.view(-1), w2.view(-1), ordd=self.orders["router"],
+                                       eps=1e-20, rs=float(gate.route_scale))
+                r = self._cmp([("tie ids", ids2, ids_r2), ("tie w", w2, wt.gather(1, order2))], ap)
                 if r:
                     return r
         return {}
@@ -1465,9 +1596,9 @@ class R2Glue:
         eng = next(l.engram for l in self.o.model.layers if l.engram is not None)
         HC, D = eng.hc_mult, eng.dim
         ap = self.status.get("engram") == "approx"
-        for t in range(4):
-            x = self._stream(g, HC, D).to(self.dev)
-            kv = self._stream(g, 1, (HC + 1) * D, -4, 4).view(1, 1, -1).to(self.dev)
+        for t in range(4):   # M1-T10-PORT: [1, R, HC, D] / [1, R, (HC+1)*D] at R rows
+            x = self._cat_rows(lambda: self._stream(g, HC, D)).to(self.dev)
+            kv = self._cat_rows(lambda: self._stream(g, 1, (HC + 1) * D, -4, 4).view(1, 1, -1)).to(self.dev)
             if t == 0:   # a dot of exactly 0 and one below the clamp: the copysign / clamp_min edges
                 kv[..., :D] = 0
             stub = SimpleNamespace(wkv=lambda _x, kv=kv: kv, embed=lambda _h: torch.zeros(1, 1, 1, 1),
@@ -1497,9 +1628,14 @@ class R2Glue:
             if ix is None:
                 continue
             k = min(ix.index_topk, W)
+            Rr = self.rows   # M1-T10-PORT: [1, R, W] scores, compress_lens [R, 1] (a different length per row)
             for clen_v in (1, max(1, W // 3), W):
-                sc = self._index_scores(g, W).to(self.dev)
-                clen = torch.tensor([clen_v], dtype=torch.long, device=self.dev)
+                sc = self._cat_rows(lambda: self._index_scores(g, W)).to(self.dev)
+                if Rr > 1:
+                    clen = torch.tensor([max(1, clen_v - r_) for r_ in range(Rr)], dtype=torch.long,
+                                        device=self.dev).view(Rr, 1)
+                else:
+                    clen = torch.tensor([clen_v], dtype=torch.long, device=self.dev)
                 ref = indexer_topk_static(sc, clen, k, 128)
                 got = self.indexer_topk(sc, clen, k, 128)
                 if not _same(got, ref):
@@ -1525,26 +1661,32 @@ class R2Glue:
         gate) are left for the MoE in `_ffn_ctx`."""
         o, R = self.o, self.R
         HC, D = x.size(-2), x.size(-1)
+        T_ = x.numel() // (HC * D)          # M1-T10-PORT: T token rows (1, or the R-row step's R), one launch
         dev = x.device
         norm = layer.attn_norm if side == "attn" else layer.ffn_norm
-        y = torch.empty(1, 1, D, dtype=x.dtype, device=dev)
-        xf = torch.empty(1, 1, HC * D, dtype=torch.float32, device=dev)
+        y = torch.empty(1, T_, D, dtype=x.dtype, device=dev)
+        xf = torch.empty(1, T_, HC * D, dtype=torch.float32, device=dev)
         mix_on = self.on("mix_stat")
-        mrs = torch.empty(1, 1, 1, dtype=torch.float32, device=dev) if mix_on else None
-        q = torch.empty(1, 1, D, dtype=FP8, device=dev)
-        s = torch.empty(1, 1, D // BLOCK, dtype=E8, device=dev)
+        mrs = torch.empty(1, T_, 1, dtype=torch.float32, device=dev) if mix_on else None
+        q = torch.empty(1, T_, D, dtype=FP8, device=dev)
+        s = torch.empty(1, T_, D // BLOCK, dtype=E8, device=dev)
         yf = dq = ds = None
         dg = False
         if side == "ffn":
             if self.on("router"):
-                yf = torch.empty(1, D, dtype=torch.float32, device=dev)
-            if o.dg is not None and self.on("dg_act"):
+                yf = torch.empty(T_, D, dtype=torch.float32, device=dev)
+            if T_ == 1 and o.dg is not None and self.on("dg_act"):   # R rows: dg_act_rows scatters by the dedup
                 dq, ds, dg = o.dg.xq[1][:, 0], self.dg_scale_dst(1), True
-        launch_hc_norm(x.reshape(HC, D), pre_mix.reshape(HC).contiguous(), norm.weight, y.view(-1), eps=norm.eps,
+        one = T_ == 1
+        launch_hc_norm(x.reshape(HC, D) if one else x.reshape(T_, HC, D),
+                       pre_mix.reshape(HC).contiguous() if one else pre_mix.reshape(T_, HC).contiguous(),
+                       norm.weight, y.view(-1) if one else y.view(T_, D), eps=norm.eps,
                        norm_ord=self.orders["norm_D"], hc_mode=self.hc_pre_mode, code_tab=self.code_tab,
-                       yf=yf.view(-1) if yf is not None else None, xf=xf.view(-1),
+                       yf=(yf.view(-1) if one else yf) if yf is not None else None,
+                       xf=xf.view(-1) if one else xf.view(T_, HC * D),
                        mrs=mrs.view(-1) if mrs is not None else None, mix_ord=self.orders.get("mix"),
-                       mix_eps=layer.norm_eps, q=q.view(-1), s=s.view(-1), dq=dq, ds=ds, split=self.on("hc_split"))
+                       mix_eps=layer.norm_eps, q=q.view(-1) if one else q.view(T_, D),
+                       s=s.view(-1) if one else s.view(T_, D // BLOCK), dq=dq, ds=ds, split=self.on("hc_split"))
         if mrs is None:   # mix_stat off: the reference statistic, on the same fp32 values (one launch fewer: .float())
             mrs = torch.rsqrt(xf.square().mean(-1, keepdim=True) + layer.norm_eps)
         pre, post, comb = self.mix_tail(layer, xf, mrs, side)
@@ -1571,25 +1713,36 @@ class R2Glue:
         return fp8_linear_prequant(xq[0], xq[1], lin.weight)
 
     def head(self, layer, h, pre_mix):
-        """hc_pre + model.norm + ParallelHead (model.py:1273-1274; world_size 1) -> logits [1, V] fp32."""
+        """hc_pre + model.norm + ParallelHead (model.py:1273-1274; world_size 1) -> logits [1, V] fp32. M1-T10-PORT:
+        T rows -> [1, T, V] (the R-row step's full_logits, model.py:1010-1014), one hc_norm launch."""
         model = self.o.model
         HC, D = h.size(-2), h.size(-1)
-        y = torch.empty(1, 1, D, dtype=h.dtype, device=h.device)
-        yf = torch.empty(1, D, dtype=torch.float32, device=h.device)
+        T_ = h.numel() // (HC * D)
+        y = torch.empty(1, T_, D, dtype=h.dtype, device=h.device)
+        yf = torch.empty(T_, D, dtype=torch.float32, device=h.device)
+        if T_ > 1:
+            launch_hc_norm(h.reshape(T_, HC, D), pre_mix.reshape(T_, HC).contiguous(), model.norm.weight,
+                           y.view(T_, D), eps=model.norm.eps, norm_ord=self.orders["norm_D"],
+                           hc_mode=self.hc_pre_mode, yf=yf, split=self.on("hc_split"))
+            return F.linear(yf.view(1, T_, D), model.head.weight)   # = F.linear(x.float(), weight) at [1, T, D]
         launch_hc_norm(h.reshape(HC, D), pre_mix.reshape(HC).contiguous(), model.norm.weight, y.view(-1),
                        eps=model.norm.eps, norm_ord=self.orders["norm_D"], hc_mode=self.hc_pre_mode, yf=yf.view(-1),
                        split=self.on("hc_split"))
         return F.linear(yf, model.head.weight)          # = F.linear(x[:, -1].float(), weight) (model.py:1013-1014)
 
     def _q_norm_quant(self, attn, qa):
-        """qa: wq_a's output [1, 1, QL] bf16, or (T9b-4) its one-row gemv_mxfp8.SplitK."""
+        """qa: wq_a's output [1, T, QL] bf16, or (T9b-4) its T-row gemv_mxfp8.SplitK (T = 1, or M1-T10-PORT R)."""
         sk = hasattr(qa, "nsplit")
         QL = qa.N if sk else qa.size(-1)
-        qr = torch.empty(1, 1, QL, dtype=torch.bfloat16, device=qa.device)
-        q = torch.empty(1, 1, QL, dtype=FP8, device=qa.device)
-        s = torch.empty(1, 1, QL // BLOCK, dtype=E8, device=qa.device)
-        launch_norm_row(qa if sk else qa.reshape(-1), attn.q_norm.weight, qr.view(-1), eps=attn.q_norm.eps,
-                        ordd=self.orders["q"], code_tab=self.code_tab, q=q.view(-1), s=s.view(-1))
+        T_ = qa.M if sk else qa.numel() // QL
+        qr = torch.empty(1, T_, QL, dtype=torch.bfloat16, device=qa.device)
+        q = torch.empty(1, T_, QL, dtype=FP8, device=qa.device)
+        s = torch.empty(1, T_, QL // BLOCK, dtype=E8, device=qa.device)
+        one = T_ == 1
+        launch_norm_row(qa if sk else (qa.reshape(-1) if one else qa.reshape(T_, QL)), attn.q_norm.weight,
+                        qr.view(-1) if one else qr.view(T_, QL), eps=attn.q_norm.eps, ordd=self.orders["q"],
+                        code_tab=self.code_tab, q=q.view(-1) if one else q.view(T_, QL),
+                        s=s.view(-1) if one else s.view(T_, QL // BLOCK))
         return qr, (q, s)
 
     # T9b-4 lever 2: the GEMVs that feed these fused consumers --------------------------------------------------
@@ -1634,7 +1787,7 @@ class R2Glue:
         """wq_a(x) for the fused q path: with gemv_pair (and the fused kv path) wq_a || wkv in one launch -- wkv's
         result is held for this layer's kv_path --, else wq_a alone (reduce folded with reduce_fold)."""
         self._kv_pend = None
-        one = xq is not None and self._rows(xq) == 1
+        one = xq is not None   # M1-T10-PORT: any row count the GEMV takes (M <= 8); the consumers are row-generic
         if one and self.on("gemv_pair") and self.on("kv_path") and self._gemv_ok(xq, attn.wq_a, attn.wkv):
             qa, kvr = self._gemv_pair(xq, attn.wq_a, attn.wkv, ("wq_a", "wkv"))
             self._kv_pend = (id(attn), kvr)
@@ -1648,10 +1801,16 @@ class R2Glue:
         return self._q_norm_quant(attn, self._q_input(attn, x, xq))
 
     def _kv_norm_write(self, attn, kvr, freqs_cis, ring, slot):
+        """kv_norm + RoPE + QDQ + the ring write of T rows (slot [T]; M1-T10-PORT: freqs_cis [T, rd/2], row t at its
+        own position) in one launch."""
         HD, rd = attn.head_dim, attn.rope_head_dim
-        launch_norm_row(kvr if hasattr(kvr, "nsplit") else kvr.reshape(-1), attn.kv_norm.weight, ring, eps=attn.kv_norm.eps, ordd=self.orders["kv"],
-                        code_tab=self.code_tab, slot=slot, qdq=True,
-                        rope=(torch.view_as_real(freqs_cis).reshape(-1, 2), rd, self.rope_fwd) if rd else None)
+        T_ = slot.numel()
+        sk = hasattr(kvr, "nsplit")
+        fr = torch.view_as_real(freqs_cis)
+        fr = fr.reshape(-1, 2) if T_ == 1 else fr.reshape(T_, -1, 2).contiguous()
+        launch_norm_row(kvr if sk else (kvr.reshape(-1) if T_ == 1 else kvr.reshape(T_, HD)), attn.kv_norm.weight,
+                        ring, eps=attn.kv_norm.eps, ordd=self.orders["kv"], code_tab=self.code_tab,
+                        slot=slot.reshape(-1), qdq=True, rope=(fr, rd, self.rope_fwd) if rd else None)
 
     def kv_path(self, attn, x, xq, freqs_cis, slot, ring=None):
         """_window_kv's kv (model.py:706-708) into the ring slot (model.py:719): wkv, then kv_norm + RoPE + QDQ +
@@ -1660,7 +1819,7 @@ class R2Glue:
         pend, self._kv_pend = getattr(self, "_kv_pend", None), None
         if pend is not None and pend[0] == id(attn):                 # T9b-4: made by this layer's q path (pair)
             kvr = pend[1]
-        elif xq is not None and self._rows(xq) == 1 and self.on("reduce_fold") and self._gemv_ok(xq, attn.wkv):
+        elif xq is not None and self.on("reduce_fold") and self._gemv_ok(xq, attn.wkv):
             kvr = self._gemv_fold(xq, attn.wkv, "wkv")
         else:
             kvr = self.linear_pre(xq, attn.wkv, x)
@@ -1687,15 +1846,46 @@ class R2Glue:
         launch_router_post(idx.view(-1), sc, ids, w, ordd=self.orders["router"], eps=1e-20, rs=float(gate.route_scale))
         return ids, w
 
+    def route_rows(self, moe, x):
+        """M1-T10-PORT: Gate.forward at R rows (x [R, D]) -> (ids [R, k] int64 ascending per row, w [R, k] fp32):
+        the mm on the cached fp32 weight, F.softplus, one kernel (sqrt, +bias) over R*E, torch.topk, one kernel (one
+        program per row: gather, sum, +eps, /, *route_scale, sort). The R-row dedup is indifferent to the order of
+        a row's k choices (runtime/moe_rows.dedup_routes), so ascending ids feed it as is."""
+        gate = moe.gate
+        D = x.size(-1)
+        T_ = x.numel() // D
+        if T_ == 1:
+            ids, w = self.route(moe, x)
+            return ids.view(1, -1), w.view(1, -1)
+        ctx = self.ffn_pre(x)
+        xf = ctx["xf"] if ctx is not None and ctx.get("xf") is not None else x.float()
+        raw = F.linear(xf.view(T_, D), self.gate_w[id(gate)])
+        if gate.gate_temp != 1.0:
+            raw = raw / gate.gate_temp
+        sp = F.softplus(raw).contiguous()
+        E = sp.size(-1)
+        sc = torch.empty(T_, E, dtype=torch.float32, device=x.device)
+        bsc = torch.empty(T_, E, dtype=torch.float32, device=x.device)
+        launch_router_pre(sp.view(-1), gate.bias, sc.view(-1), bsc.view(-1))
+        idx = bsc.topk(gate.topk, dim=-1)[1]
+        ids = torch.empty(T_, gate.topk, dtype=torch.long, device=x.device)
+        w = torch.empty(T_, gate.topk, dtype=torch.float32, device=x.device)
+        launch_router_post(idx.contiguous(), sc, ids, w, ordd=self.orders["router"], eps=1e-20,
+                           rs=float(gate.route_scale))
+        return ids, w
+
     def _engram_from_kv(self, eng, h, kv):
+        """h [1, T, HC, D], kv [1, T, (HC+1)*D] (T = 1, or M1-T10-PORT R): one gate launch, sigmoid, one out launch."""
         HC, D = eng.hc_mult, eng.dim
-        z = torch.empty(1, 1, HC, dtype=torch.float32, device=h.device)
-        launch_engram_gate(h.reshape(HC, D), kv.reshape(-1), self.engram_wp[id(eng)], z.view(-1), eps=eng.eps,
+        T_ = h.numel() // (HC * D)
+        hv = h.reshape(HC, D) if T_ == 1 else h.reshape(T_, HC, D)
+        z = torch.empty(1, T_, HC, dtype=torch.float32, device=h.device)
+        launch_engram_gate(hv, kv.reshape(-1).contiguous(), self.engram_wp[id(eng)], z.view(-1), eps=eng.eps,
                            ordd=self.orders["engram"], sordd=self.orders["engram_sum"],
                            c=f32(eng.dim ** -0.5), cmin=f32(eng.clamp_value))
         gate = torch.sigmoid(z)                                       # model.py:362 (torch's sigmoid)
         out = torch.empty(h.shape, dtype=h.dtype, device=h.device)
-        launch_engram_out(h.reshape(HC, D), kv.reshape(-1), gate.view(-1), out.view(HC, D))
+        launch_engram_out(hv, kv.reshape(-1).contiguous(), gate.view(-1), out.view(hv.shape))
         return out
 
     def engram(self, eng, h, hash_ids):
@@ -1708,6 +1898,10 @@ class R2Glue:
         """static_step.indexer_topk_static with the sort + where in one launch (torch.topk kept)."""
         idx = index_score.topk(k, dim=-1, sorted=False).indices
         out = torch.empty(idx.shape, dtype=torch.int32, device=idx.device)
+        T_ = idx.numel() // idx.size(-1)
+        if T_ > 1:   # M1-T10-PORT: [1, R, k] indices, compress_lens [R, 1]: one launch, grid axis 1 = row
+            launch_topk_post(idx.reshape(T_, -1), compress_lens.reshape(T_).contiguous(), out.view(T_, -1), offset)
+            return out
         launch_topk_post(idx.reshape(-1), compress_lens.reshape(-1), out.view(-1), offset)
         return out
 

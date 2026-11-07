@@ -243,6 +243,15 @@ def install(R):
                       ("launch_engram_gate", "t9b2r2_engram_gate"), ("launch_engram_out", "t9b2r2_engram_out"),
                       ("launch_topk_post", "t9b2r2_topk_post")):
         setattr_saved(fused_glue_r2, fn, kernel(getattr(fused_glue_r2, fn), kname, lambda *a, **k: []))
+    # M1-T10-PORT: the R-row MoE's fused dedup is one launch (its CPU mirror's ops are not counted); regions for the
+    # R-row MoE classes (the reference dedup's torch ops land in moe.dedup)
+    from runtime import moe_rows
+
+    setattr_saved(moe_rows, "dedup_fused", kernel(moe_rows.dedup_fused, "m1_dedup_routes", lambda *a, **k: []))
+    for cls, attr, name in [(moe_rows.StaticMoERows, "__call__", "moe"), (moe_rows.DGMaskedMoERows, "__call__", "moe"),
+                            (moe_rows._RowsMoEBase, "_route", "moe.route")]:
+        setattr_saved(cls, attr, tagged(getattr(cls, attr), name))
+    setattr_saved(moe_rows, "dedup_routes", tagged(moe_rows.dedup_routes, "moe.dedup"))
     # regions (innermost wins in the report)
     for cls, attr, name in [
         (R.Block, "hc_mixes", "mhc.mixes"), (R.Block, "hc_pre", "mhc.pre"), (R.Block, "hc_post", "mhc.post"),
@@ -385,11 +394,15 @@ def summarize(events, n_steps: int, model) -> dict:
     return out
 
 
-def run_path(path: str, R, model, pool, ids: List[int], steps: int) -> dict:
+def run_path(path: str, R, model, pool, ids: List[int], steps: int, rows: int = 1) -> dict:
+    """rows > 1 (M1-T10-PORT): the static paths are built as StaticStep(rows=R) and counted on teacher-forced R-row
+    steps (R tokens per step, P0 advancing by R); eager-ref is one-row only."""
     from runtime.static_step import StaticStep
     from runtime import patches
 
     st = None
+    if rows > 1 and path == "eager-ref":
+        raise ValueError("--rows > 1: eager-ref is the one-row reference decode (drop it from --paths)")
     if path != "eager-ref":
         kw = {"static-ref": {}, "static-dg-gemv": {"moe_impl": "dg-masked", "fp8_impl": "gemv"},
               "static-dg-gemv-fused": {"moe_impl": "dg-masked", "fp8_impl": "gemv", "glue_impl": "fused"},
@@ -398,6 +411,8 @@ def run_path(path: str, R, model, pool, ids: List[int], steps: int) -> dict:
               # T9b-4: R1 + R2 without the T9b-4 parts (fused_glue.R4_PARTS) -- the "before" of the T9b-4 table
               "static-dg-gemv-fused-r2": {"moe_impl": "dg-masked", "fp8_impl": "gemv", "glue_impl": "fused",
                                           "glue_opts": {"disable": list(R4_NAMES)}}}[path]
+        if rows > 1:
+            kw["rows"] = int(rows)
         st = StaticStep(model, pool, max_pos=127, _allow_cpu=True, **kw)  # (fused: self-check runs here, uncounted)
     import engram
 
@@ -423,6 +438,17 @@ def run_path(path: str, R, model, pool, ids: List[int], steps: int) -> dict:
                         out_ids, logits, _ = fwd(model, x, pos)  # the reference decode call (generate.py:69-78)
                     finally:
                         C.on = False
+                elif rows > 1:                                 # teacher-forced R-row step at P0 = len(ids) + k*R
+                    p0 = len(ids) + k * rows
+                    st.set_inputs([(tok + j) % 97 + 2 for j in range(rows)], p0)
+                    C.on = True
+                    try:
+                        with st._active():
+                            st._body(0)                        # the one R-row graph's body
+                    finally:
+                        C.on = False
+                    st._dev_pos = p0 + rows
+                    out_ids = st.t_out.view(-1)[-1:]
                 else:
                     st.set_inputs(tok, pos)                    # outside the graph in graph mode too
                     C.on = True
@@ -505,6 +531,24 @@ def t9b2_r2_table(r1: dict, fused: dict) -> dict:
                                   "static-dg-gemv-fused": fused["launches_per_step"]}}
 
 
+def rows_table(ref: dict, fused: dict, rows: int) -> dict:
+    """M1-T10-PORT: the R-row step's launches per step with the reference glue vs the fused glue, per region (the
+    regions where the count changed), and the fused glue's R-row statuses."""
+    regs = sorted(set(ref["regions"]) | set(fused["regions"]))
+    per = {}
+    for r in regs:
+        b, a = region_launches(ref, r), region_launches(fused, r)
+        if round(b - a, 2):
+            per[r] = {"before": round(b, 1), "after": round(a, 1), "removed": round(b - a, 1)}
+    per = dict(sorted(per.items(), key=lambda kv: -kv[1]["removed"]))
+    cl = fused.get("fused_glue", {}).get("clusters", {})
+    return {"rows": int(rows), "launches_per_step": {"ref glue": ref["launches_per_step"],
+                                                     "fused glue": fused["launches_per_step"]},
+            "removed": round(ref["launches_per_step"] - fused["launches_per_step"], 1), "per_region": per,
+            "on": sorted(c for c, v in cl.items() if v in ("on", "approx")),
+            "off": {c: v for c, v in cl.items() if v not in ("on", "approx")}}
+
+
 def _print_table(title: str, t: dict, k_before: str, k_after: str) -> None:
     print(f"{title}: launches/step {t['launches_per_step'][k_before]:.1f} -> "
           f"{t['launches_per_step'][k_after]:.1f}, removed {t['removed_total']:.1f} "
@@ -519,9 +563,15 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="per-step torch-op census of the decode paths (CPU)")
     ap.add_argument("--json", default=os.path.join(REPO, "scratch", "glue-census.json"))
     ap.add_argument("--steps", type=int, default=2, help="decode steps counted (2 = one per pos parity)")
-    ap.add_argument("--paths", default="eager-ref,static-ref,static-dg-gemv,static-dg-gemv-fused-r1,"
-                                        "static-dg-gemv-fused-r2,static-dg-gemv-fused")
+    ap.add_argument("--paths", default=None, help="default: eager-ref,static-ref,static-dg-gemv,"
+                    "static-dg-gemv-fused-r1,static-dg-gemv-fused-r2,static-dg-gemv-fused (rows > 1: the static "
+                    "paths static-dg-gemv,static-dg-gemv-fused)")
+    ap.add_argument("--rows", type=int, default=1, help="M1-T10-PORT: count the R-row teacher-forced step (e.g. 6)")
     a = ap.parse_args(argv)
+    if a.paths is None:
+        a.paths = ("static-dg-gemv,static-dg-gemv-fused" if a.rows > 1 else
+                   "eager-ref,static-ref,static-dg-gemv,static-dg-gemv-fused-r1,static-dg-gemv-fused-r2,"
+                   "static-dg-gemv-fused")
     import types
 
     from test_dg_moe_cpu import _fake_deep_gemm
@@ -531,6 +581,12 @@ def main(argv=None) -> int:
         R, model, pool, cfg = build(tmp)
         fake = _fake_deep_gemm()
         fn = fake.m_grouped_fp8_fp4_gemm_nt_masked
+        if a.rows > 1:   # the R-row DG buffers (unused slots: masked_m 0) -> the rows tests' row-wise masked fake
+            from test_dg_inplace_cpu import _fake_dg_contig
+            from test_static_rows_cpu import _masked_rowwise
+
+            fake = _fake_dg_contig()
+            fn = _masked_rowwise(fake)
         fake.m_grouped_fp8_fp4_gemm_nt_masked = kernel(fn, "dg_masked_gemm", lambda *x, **y: [])
         sys.modules["deep_gemm"] = fake
         restore = install(R)
@@ -539,7 +595,7 @@ def main(argv=None) -> int:
             ids = list(range(40, 56))
             res = {}
             for path in a.paths.split(","):
-                res[path] = run_path(path, R, model, pool, ids, a.steps)
+                res[path] = run_path(path, R, model, pool, ids, a.steps, rows=a.rows)
                 print(f"{path:16s} launches/step {res[path]['launches_per_step']:8.1f} "
                       f"(+allocs with fills on: {res[path]['launches_per_step_fills_on']:8.1f}); "
                       f"classes {res[path]['per_step']}", flush=True)
@@ -548,9 +604,17 @@ def main(argv=None) -> int:
             torch.set_default_dtype(prev)
     report = {"date": time.strftime("%Y-%m-%d %H:%M:%S %Z"), "config": {k: cfg[k] for k in (
         "n_layers", "kv_source_layers", "index_source_layers", "candidate_source_layer", "engram_layer_ids",
-        "n_activated_experts", "hc_mult", "hc_sinkhorn_iters")}, "steps": a.steps, "paths": res,
+        "n_activated_experts", "hc_mult", "hc_sinkhorn_iters")}, "steps": a.steps, "rows": a.rows, "paths": res,
         "wall_s": round(time.time() - t0, 1)}
-    if "static-dg-gemv" in res and ("static-dg-gemv-fused-r1" in res or "static-dg-gemv-fused" in res):
+    if a.rows > 1:
+        if "static-dg-gemv" in res and "static-dg-gemv-fused" in res:
+            t = report["rows_port"] = rows_table(res["static-dg-gemv"], res["static-dg-gemv-fused"], a.rows)
+            print(f"M1-T10-PORT rows {a.rows}: launches/step ref glue {t['launches_per_step']['ref glue']:.1f} -> "
+                  f"fused {t['launches_per_step']['fused glue']:.1f}, removed {t['removed']:.1f}")
+            for r, v in list(t["per_region"].items())[:25]:
+                print(f"  {r:38s}{v['before']:9.1f}{v['after']:9.1f}{v['removed']:9.1f}")
+            print(f"  fused at rows {a.rows}: on {','.join(t['on'])}; off {t['off']}")
+    elif "static-dg-gemv" in res and ("static-dg-gemv-fused-r1" in res or "static-dg-gemv-fused" in res):
         # round 1's table measures round 1 alone (ref glue -> fused with the R2 clusters off) when that path ran:
         # R2 also removes launches inside R1's regions (moe, expert, moe.act), which are not R1's
         r1_key = "static-dg-gemv-fused-r1" if "static-dg-gemv-fused-r1" in res else "static-dg-gemv-fused"
