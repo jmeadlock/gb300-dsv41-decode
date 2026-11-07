@@ -267,7 +267,7 @@ def test_gather_tables_vs_six_gathers():
             assert st.glue.on("gather"), st.glue.describe()["clusters"]
             for li, sm in enumerate(st.moes):
                 E = sm.moe.n_routed_experts
-                ids = torch.randperm(E, generator=torch.Generator().manual_seed(li))[: st.topk].sort().values.cuda()
+                ids = torch.randperm(E, generator=torch.Generator(device="cpu").manual_seed(li), device="cpu")[: st.topk].sort().values.cuda()
                 ref = {}
                 for key, tab in sm.ptabs.items():
                     gather_rows(tab, ids, st.staging[key], st.row_bytes[key])
