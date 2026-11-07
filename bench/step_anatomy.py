@@ -27,6 +27,11 @@ if "NVTX_EVENTS" in tables:
     for s, e, txt, tid in q("select start, end, coalesce(text, (select value from StringIds where id=textId)), globalTid from NVTX_EVENTS where end is not null"):
         nvtx.append((s, e, txt or "", tid))
 steps = sorted([(s, e) for s, e, t, _ in nvtx if t == "decode_step"])
+if not steps:
+    # graph replay: NVTX ranges do not survive; T8's per-step marker kernel (static_kernels.t8_step_marker) delimits steps
+    marks = [k[0] for k in kern if "t8_step_marker" in (k[3] or "")]
+    steps = [(marks[i], marks[i + 1]) for i in range(len(marks) - 1)]
+    print(f"no decode_step NVTX; using {len(marks)} marker kernels -> {len(steps)} steps")
 layers = sorted([(s, e, t) for s, e, t, _ in nvtx if t.startswith("L") and t[1:].isdigit()])
 roles = sorted([(s, e, t) for s, e, t, _ in nvtx if t in ("engram", "attn", "moe", "head")])
 print(f"kernels {len(kern)}  runtime-api {len(rt)}  nvtx {len(nvtx)}  decode_step ranges {len(steps)}  layer ranges {len(layers)}  role ranges {len(roles)}")
