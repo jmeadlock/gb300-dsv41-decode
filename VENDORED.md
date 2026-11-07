@@ -1,0 +1,1 @@
+Also from the vllm/vllm-openai:v0.31.0 image: `deep_gemm/` (vllm/third_party/deep_gemm, DeepGEMM 2.8.0 Python wrappers; `.so` and `include/cute,cutlass` stripped), `flashmla/`, `utils_deep_gemm.py` (vllm/utils/deep_gemm.py), `config_kernel.py` (vllm/config/kernel.py). Study only.
