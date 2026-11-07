@@ -18,6 +18,7 @@ Standalone: no vllm import anywhere (charter decision 3). The reference `model.p
 | `kernels/sparse_attn_bounded.py` | T9b-3a (`--attn-impl bounded`): a copy of the reference TileLang `sparse_attn` (kernel.py:310-403) whose 64-index block loop is bounded by a device per-row valid-block count; three loop spellings, build-time self-check vs the reference; the count math (`nblk_static`, `valid_blocks`, `ref_width`) |
 | `attn_flashmla.py` | T9b-3c (`--attn-impl flashmla`, A3-class): every layer's `sparse_attn` on FlashMLA's `sparse_prefill_fwd` over our bf16 caches; the op loaded from vllm's `_flashmla_C` .so with `torch.ops.load_library` (no vllm Python, asserted before and after); head / head-dim / topk padding for small shapes; per-row `topk_length`; fp64 oracle and build-time self-check |
 | `dg_moe.py` | T9a-1: `DGMaskedMoE` (`--moe-impl dg-masked`): the static MoE's routed GEMMs as 3 DeepGEMM masked grouped GEMMs over the same staging; `import_deep_gemm` (no vllm import); exact e8m0 → fp32 |
+| `dg_inplace.py` | T9a-2: `DGInplaceMoE` (`--moe-impl dg-inplace`): 3 DeepGEMM contiguous grouped GEMMs over each layer's whole hot pool + spare slots; packed-SF layout, staging contract, HBM plan |
 | `fused_glue.py` | T9b-2 round 1 (`--glue-impl fused`): Triton kernels for the zero/low-risk glue clusters (gather, DG act, SwiGLU+act_quant, MoE combine, mHC post, o-path RoPE+QDQ, q RoPE in the GEMV store), table-driven act_quant/silu, build-time self-check, per-cluster switches; torch mirrors on CPU |
 | `fused_glue_r2.py` | T9b-2 round 2 (same flag; `FusedGlue` inherits `R2Glue`): hc_pre+RMSNorm+act_quant, the mHC mixes statistic, kv/q paths, router and indexer glue around torch.topk, Engram gate; the reduction-order family + device calibration (outcome (i) on / (ii) off unless `--glue-approx`) |
 | `gemv_mxfp8.py` | T9b-1: Triton MXFP8 GEMV `mxfp8_gemv(xq, xs, w, s, out)` for the fp8 Linears at <= 8 rows (`--fp8-impl gemv`); exact e8m0 pair scale; per-(N,K,M) tuning cache; `gemv_torch` = the same algorithm in torch (CPU) |
@@ -310,6 +311,61 @@ divergence + mean |Δlogit|, reported); then the reps graded vs Pg61 by bench/pa
         --max-new 256 --reps 2 --step-cell 512 --no-fill-uninit --json docs/first-light-dg-<date>.json
 
 `--levels-ref` x-proc rows compare runs with the same label, so point it at a report made with the same `--moe-impl`.
+
+## T9a-2: in-place hot MoE (`--moe-impl dg-inplace`, `dg_inplace.py`)
+
+Spec: `docs/HANDOFF-T9A2-INPLACE-MOE.md`; design `docs/T8-T9A-DESIGN.md` §0.6/§3.2/§3.3. dg-masked copies the 6 selected
+experts (113 MB/layer, ~1.5 ms/step at the HBM ceiling) into staging before its masked GEMMs, because the masked API
+offsets B by group index. The contiguous API offsets B by the group id it reads from `m_indices` at each BLOCK_M head
+and skips `-1` blocks, so it can read a layer's whole pool in place. Per layer:
+1. **pool:** at StaticStep build, `ExpertPool.add_spare_slots(topk, model)` grows every layer's per-projection weight
+   pool `[H, N, K/2]` → `[H+S, N, K/2]` (S = 6 spare slots; hot slots, the e8m0 scale pools, the eager prefill,
+   `ref` and `dg-masked` are untouched; hot Experts are rebound to the new storage). +3.96 GiB on the real model.
+2. **one staging launch** (`static_kernels.t9a2_stage_inplace`): group = hot pool slot, or `H + j` for a cold slot j;
+   cold weight rows (UVA host addresses, the same pointer tables as dg-masked) → spare slot; scales → the packed SF;
+   `m_indices[j*ALIGN] = group` (all other rows stay −1); ids_step. At the seed map ~0.05 cold experts/layer/step.
+3. **3 contiguous calls** `m_grouped_fp8_fp4_gemm_nt_contiguous((xq [k*ALIGN,K], xs fp32), (W [H+S,N,K/2], SF),
+   d [k*ALIGN,N], m_indices, recipe_a=(1,32), recipe_b=(1,32))`. The A/d buffers are dg-masked's `[k, ALIGN, ·]`
+   (ALIGN = 128 = max_m), so row `j*ALIGN` is slot j and the act_quant / SwiGLU / combine glue (fused or not) is
+   dg-masked's, unchanged. `set_mk_alignment_for_contiguous_layout(ALIGN)` at build pins BLOCK_M ≤ ALIGN.
+
+**Scale storage (the HBM decision).** sm100 DeepGEMM consumes weight scales as int32 words of 4 UE8M0 codes, MN-major
+(`[G, N, K/128]`, strides `(N·K/128, 1, N)`); fp32 SF is converted by the library on every call, which over a pool is
+1.3 GB/layer of work, and fp32 resident scales would be 49.6 GiB: no. The packed word is the checkpoint's 4 e8m0 bytes
+read little-endian (DeepGEMM's `pack_ue8m0_to_int` = `fp32_bits >> 23`), so packing is an int32 transpose of the
+pool's bytes, no value change. `$DSV41_DG_SF_STORE`:
+- `step` (default): one shared packed SF per projection, `[max H + S, N, K/128]` = **0.31 GiB**; the staging launch
+  writes the k selected experts' scales each step (6.6 MB read + write per layer; the kernel reads SF only for groups
+  named in m_indices). **Total HBM added: 4.27 GiB** (spare slots + SF).
+- `resident`: a packed copy of every layer's hot scales built once (12.4 GiB; total 16.4 GiB); only cold scales are
+  written per step. For the A/B on the box; it must still leave ≥ 8 GiB for KV at 32K.
+`$DSV41_DG_ALIGN` (default 128) overrides the block alignment. `report["dg_moe"]` (first_light) records the store,
+the alignment the library reports, the HBM added and `hbm_after_build` (mem_get_info after the build).
+
+Numerics: same kernel family, same bytes, same scale values as dg-masked → expected bit-identical to dg-masked (at
+worst its 1-ulp class); first_light adds the drift row "dg-inplace vs dg-masked (same other impls)".
+
+**Mac:** `tests/test_dg_inplace_cpu.py`: packed SF == DeepGEMM's packing semantics on every code; index math; HBM plan;
+the staging contract, and the real `t9a2_stage_inplace` body run under `tests/triton_shim.py` (pointer tables
+resolved through registered tensors) == the contract; `add_spare_slots`; the whole dg-inplace StaticStep == the
+reference forward with both DeepGEMM calls emulated (the contiguous fake reads groups at BLOCK_M heads, unpacks the
+int32 SF, NaN-poisons −1 rows), both stores, ALIGN 128 and 64, then dg-masked/ref on the grown pool; fused glue.
+
+**Box, probe first** (`bench/dg_contiguous_spike.py`, real layer-0 bytes, whole hot pool; JSON is the evidence:
+SF packing vs DeepGEMM's own, contiguous vs masked mismatch/ulp for 6 hot / 5+1 cold / 6 cold, alignment sweep,
+graph-replayed per-layer µs at M=1 and M=6 with 6 and 22 distinct experts, masked over strided pool views, HBM):
+
+    docker run --rm --device nvidia.com/gpu=GPU-1c1855c8-dd10-0247-583e-3c3880ddbf55 --ipc=host --ulimit memlock=-1:-1 \
+      -v "$W":/work -w /work -e CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+      -v /models/DeepSeek-V4.1-Flash-1017-1bae0e1088993b9b82de08f59de5be5a34e42170:/ref:ro \
+      -v "$HOME/dsv41/w0/jit-cache/tilelang":/root/.tilelang -v "$HOME/dsv41/w0/jit-cache/triton":/root/.triton \
+      -v "$HOME/dsv41/w0/jit-cache/nv":/root/.nv \
+      -v "$HOME/dsv41/w0/jit-cache/dg":/root/.deep_gemm -e DG_JIT_CACHE_DIR=/root/.deep_gemm \
+      --entrypoint python3 vllm/vllm-openai:v0.31.0 bench/dg_contiguous_spike.py --out docs/dg-contiguous-spike-<date>.json
+
+then `tests/gpu/test_dg_inplace_gpu.py` (same line, the /ref mount optional: real-bytes check), then first light with
+`--moe-impl dg-inplace --fp8-impl gemv --glue-impl fused --attn-impl bounded --map docs/maps/hot-v26ar-seed-295.json
+--mode graph --parity-levels` (the T9b-3a line with the moe impl swapped).
 
 ## T9b-1: fp8 Linear layers on a Triton MXFP8 GEMV (`--fp8-impl gemv`, `gemv_mxfp8.py`)
 

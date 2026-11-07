@@ -641,7 +641,7 @@ class FusedGlue(R2Glue):
 
     def _applicable(self, c, layers, mx) -> Optional[str]:
         o, R = self.o, self.R
-        dg = o.moe_impl == "dg-masked"
+        dg = o.moe_impl in ("dg-masked", "dg-inplace")  # T9a-2: dg-inplace reuses dg-masked's act/SwiGLU/combine
         if c in R2_CLUSTER_NAMES:
             return self._applicable_r2(c, layers, mx)
         if c in ACT_CLUSTERS and not mx:
@@ -649,6 +649,8 @@ class FusedGlue(R2Glue):
         if c == "concat_free":
             return CONCAT_FREE_WHY
         if c == "gather":
+            if o.moe_impl == "dg-inplace":
+                return "dg-inplace stages cold rows + packed scales in its own launch (runtime/dg_inplace.py)"
             rb = o.row_bytes
             if not (rb[("w1", "weight")] == rb[("w3", "weight")] == rb[("w2", "weight")]
                     and rb[("w1", "scale")] == rb[("w3", "scale")] == rb[("w2", "scale")]):

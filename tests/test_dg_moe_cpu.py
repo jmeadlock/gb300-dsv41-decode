@@ -85,7 +85,7 @@ def test_contract_constants():
 
     assert dg_moe.MAX_M == 128 and dg_moe.EXPECTED_M == 8
     assert dg_moe.RECIPE_A == (1, 32) and dg_moe.RECIPE_B == (1, 32)
-    assert dg_moe.MOE_IMPLS == static_step.MOE_IMPLS == generate.MOE_IMPLS == ("ref", "dg-masked")
+    assert dg_moe.MOE_IMPLS == static_step.MOE_IMPLS == generate.MOE_IMPLS == ("ref", "dg-masked", "dg-inplace")
 
 
 # ------------------------------------------------------------------------------------------------ deep_gemm import

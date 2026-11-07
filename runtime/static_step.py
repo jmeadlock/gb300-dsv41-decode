@@ -40,7 +40,9 @@ host-side ints become device tensors and dynamic lengths become fixed lengths (c
       k fixed reference `Expert` evaluations on the staging slots, fp32 sum in slot order -> + shared expert.
       T9a-1: `moe_impl="dg-masked"` swaps StaticMoE for runtime/dg_moe.py `DGMaskedMoE` (same gate/sort/gather, then
       3 DeepGEMM masked grouped GEMMs over the same staging instead of 3k fp4_gemm; not bit-identical by design).
-      `moe_impl="ref"` (default) is exactly the T8 step.
+      `moe_impl="ref"` (default) is exactly the T8 step. T9a-2: `moe_impl="dg-inplace"` (runtime/dg_inplace.py)
+      grows the pool's weight tensors by topk spare slots per layer, then runs DeepGEMM's contiguous grouped GEMM
+      over [H+S, N, K/2] in place: one staging launch per layer moves only cold rows (+ the packed scales).
   #15 kernel.py wrapper allocations -> the graph's private pool; capture runs with fill_uninitialized_memory off
       unless `capture(fills=True)` (the L2 uninitialized-read detector records the NaN fills as kernels).
   #16 T9b-1, model.py:196-205 (`linear()`'s fp8 branch: act_quant + `fp8_gemm` at block 32) -> with
@@ -89,7 +91,8 @@ from torch import nn
 
 PARITIES = (0, 1)
 SUPPORTED_RATIOS = (0, 1, 2)
-MOE_IMPLS = ("ref", "dg-masked")  # T9a-1: "ref" = StaticMoE (bit-identical), "dg-masked" = runtime/dg_moe.py
+MOE_IMPLS = ("ref", "dg-masked", "dg-inplace")  # T9a-1: "ref" = StaticMoE (bit-identical), "dg-masked" =
+#                                               runtime/dg_moe.py; T9a-2: "dg-inplace" = runtime/dg_inplace.py
 FP8_IMPLS = ("ref", "gemv")       # T9b-1: "ref" = reference fp8_gemm (bit-identical), "gemv" = runtime/gemv_mxfp8.py
 GLUE_IMPLS = ("ref", "fused")     # T9b-2: "ref" = the glue ops as below, "fused" = runtime/fused_glue.py (bit-identical)
 ATTN_IMPLS = ("ref", "bounded", "flashmla")  # T9b-3a: "ref" = reference sparse_attn, "bounded" = runtime/kernels
@@ -522,6 +525,16 @@ class StaticStep:
 
             self.dg = DGBuffers(self, shapes, sshapes, swiglu_limit=lim, deterministic=self.dg_deterministic)
             moe_cls = DGMaskedMoE
+        elif self.moe_impl == "dg-inplace":  # T9a-2: contiguous grouped GEMM over the hot pool + spare slots
+            from runtime.dg_inplace import DGInplaceBuffers, DGInplaceMoE
+
+            if pool is None:
+                raise ValueError("moe_impl dg-inplace needs the model's ExpertPool")
+            added = pool.add_spare_slots(k, self.model)  # before the pointer tables below (storage moves)
+            self.dg = DGInplaceBuffers(self, shapes, sshapes, pool=pool, swiglu_limit=lim,
+                                       deterministic=self.dg_deterministic)
+            self.dg.spare_added_B = added
+            moe_cls = DGInplaceMoE
         n_layers, n_exp = len(layers), moe0.n_routed_experts
         cold = torch.zeros(n_layers, n_exp, dtype=torch.long)
         gather_vec = os.environ.get(GATHER_IMPL_ENV, "vec") != "u8"
