@@ -284,7 +284,7 @@ def test_first_light_and_headline_flags(monkeypatch):
         monkeypatch.setenv(v, "x")                                        # bench writes into os.environ below
         monkeypatch.delenv(v)
     a = fl.build_parser().parse_args(["--model-dir", "/x"])
-    assert a.moe_rowmatch == "on"
+    assert a.moe_rowmatch == "off"   # default off: box 2026-11-07 showed +1.7 ms at 1 row and no stream gain (LEDGER)
     a = fl.build_parser().parse_args(["--model-dir", "/x", "--moe-rowmatch", "off"])
     env = fl.rows_moe_env(a)
     assert env[DI.ROWMATCH_ENV] == "off" and os.environ[DI.ROWMATCH_ENV] == "off"
