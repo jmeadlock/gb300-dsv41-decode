@@ -796,7 +796,7 @@ class StaticStep:
         0's real pool bytes) or the build falls back to it (the record says why: describe()["layout_check"])."""
         from runtime import dg_inplace as DI
 
-        spec = self._rows_gemm_req or os.environ.get(DI.ROWS_GEMM_ENV) or "contiguous"
+        spec = self._rows_gemm_req or os.environ.get(DI.ROWS_GEMM_ENV) or "contiguous16"  # probe 2026-11-07: fastest bit-equal
         layout, align = DI.parse_rows_gemm(spec)
         store = self._rows_sf_req or os.environ.get(DI.ROWS_SF_STORE_ENV) or DI.ROWS_SF_STORE_DEFAULT
         kw = dict(pool=self.pool, swiglu_limit=lim, deterministic=self.dg_deterministic, slots=ns,

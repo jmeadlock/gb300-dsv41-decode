@@ -1026,7 +1026,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="--rows with dg-inplace: spare pool slots per layer for the R-row step's cold experts "
                          "(compact cold index, M1-T10-FIX2; default 8); a layer-step with more cold unique experts "
                          "overflows (counted: `overflow steps` in the rows summary; those steps' logits are wrong)")
-    ap.add_argument("--rows-moe-gemm", default=None,
+    ap.add_argument("--rows-moe-gemm", default="contiguous16",
                     choices=["contiguous", "contiguous64", "contiguous32", "contiguous16", "psum", "masked"],
                     help="M1-T10-MOE: the R-row dg-inplace routed GEMM call shape (default contiguous = ALIGN 128; "
                          "anything else is checked bitwise at build vs that call on layer 0's real bytes, falling "
