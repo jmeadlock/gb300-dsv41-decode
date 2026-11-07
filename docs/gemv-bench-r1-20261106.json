@@ -1,0 +1,1024 @@
+{
+ "date": "2026-11-07 02:49:04 UTC",
+ "argv": [
+  "--model-dir",
+  "/ref",
+  "--tune-cache",
+  "scratch/gemv-tune.json"
+ ],
+ "env": {
+  "torch": "2.13.0+cu130",
+  "cuda": "13.0",
+  "device": "NVIDIA GB300",
+  "capability": [
+   10,
+   3
+  ],
+  "sms": 152,
+  "triton": "3.7.1"
+ },
+ "roles": {
+  "attn.wkv": {
+   "shape": [
+    512,
+    5120
+   ],
+   "calls_per_step": 40
+  },
+  "attn.wo_b": {
+   "shape": [
+    5120,
+    8192
+   ],
+   "calls_per_step": 40
+  },
+  "attn.wq_a": {
+   "shape": [
+    1280,
+    5120
+   ],
+   "calls_per_step": 40
+  },
+  "attn.wq_b": {
+   "shape": [
+    32768,
+    1280
+   ],
+   "calls_per_step": 40
+  },
+  "ffn.shared_experts.w1": {
+   "shape": [
+    2304,
+    5120
+   ],
+   "calls_per_step": 40
+  },
+  "ffn.shared_experts.w2": {
+   "shape": [
+    5120,
+    2304
+   ],
+   "calls_per_step": 40
+  },
+  "ffn.shared_experts.w3": {
+   "shape": [
+    2304,
+    5120
+   ],
+   "calls_per_step": 40
+  },
+  "engram.wkv": {
+   "shape": [
+    25600,
+    6144
+   ],
+   "calls_per_step": 2
+  },
+  "attn.indexer.wq_b": {
+   "shape": [
+    4096,
+    1280
+   ],
+   "calls_per_step": 8
+  }
+ },
+ "calls_per_step": 290,
+ "unknown_roles": [],
+ "missing_roles": [],
+ "skipped": [
+  "attn.wo_a: dequantized to bf16 by the loader (einsum, model.py:785-789)",
+  "engram.embed: scale F8_E8M0 [rows, 8] is not 32x32 blocks"
+ ],
+ "shapes": [
+  {
+   "shape": [
+    25600,
+    6144
+   ],
+   "roles": [
+    "engram.wkv"
+   ],
+   "calls_per_step": 2,
+   "weight_MiB": 150.0,
+   "real_layers": [
+    "L1.engram.wkv",
+    "L14.engram.wkv"
+   ],
+   "timing_copies": 4,
+   "timing_stream_MiB": 600.0,
+   "per_m": {
+    "1": {
+     "config": {
+      "block_n": 64,
+      "ku": 4,
+      "num_warps": 8,
+      "num_stages": 1
+     },
+     "us_gemv": 55.848,
+     "us_ref": 81.74,
+     "speedup": 1.46,
+     "GBps_gemv": 2820.1,
+     "GBps_ref": 1926.8,
+     "mismatch": 0.0,
+     "outputs_compared": 51200,
+     "max_abs": 0.0,
+     "max_ulp": 0,
+     "n_gt1ulp": 0,
+     "mismatch_per_layer": {
+      "L1.engram.wkv": 0.0,
+      "L14.engram.wkv": 0.0
+     },
+     "mean_abs_err_vs_f64": null,
+     "config_invariant": true,
+     "configs_differing": []
+    },
+    "6": {
+     "config": {
+      "block_n": 64,
+      "ku": 4,
+      "num_warps": 8,
+      "num_stages": 1
+     },
+     "us_gemv": 217.248,
+     "us_ref": 82.109,
+     "speedup": 0.38,
+     "GBps_gemv": 726.3,
+     "GBps_ref": 1921.7,
+     "mismatch": 3.2552083333333335e-06,
+     "outputs_compared": 307200,
+     "max_abs": 0.0078125,
+     "max_ulp": 1,
+     "n_gt1ulp": 0,
+     "mismatch_per_layer": {
+      "L1.engram.wkv": 7e-06,
+      "L14.engram.wkv": 0.0
+     },
+     "mean_abs_err_vs_f64": null,
+     "config_invariant": true,
+     "configs_differing": []
+    }
+   },
+   "gates": {
+    "speedup_ge_2x_m1": false,
+    "bw_ge_3TBps_m1": false,
+    "mismatch_le_0p5pct": true
+   },
+   "wall_s": 33.4
+  },
+  {
+   "shape": [
+    5120,
+    8192
+   ],
+   "roles": [
+    "attn.wo_b"
+   ],
+   "calls_per_step": 40,
+   "weight_MiB": 40.0,
+   "real_layers": [
+    "L0.attn.wo_b",
+    "L13.attn.wo_b",
+    "L18.attn.wo_b",
+    "L22.attn.wo_b",
+    "L27.attn.wo_b",
+    "L31.attn.wo_b",
+    "L36.attn.wo_b",
+    "L5.attn.wo_b"
+   ],
+   "timing_copies": 13,
+   "timing_stream_MiB": 520.0,
+   "per_m": {
+    "1": {
+     "config": {
+      "block_n": 64,
+      "ku": 4,
+      "num_warps": 8,
+      "num_stages": 1
+     },
+     "us_gemv": 68.951,
+     "us_ref": 94.602,
+     "speedup": 1.37,
+     "GBps_gemv": 609.2,
+     "GBps_ref": 444.0,
+     "mismatch": 2.44140625e-05,
+     "outputs_compared": 40960,
+     "max_abs": 0.0001220703125,
+     "max_ulp": 1,
+     "n_gt1ulp": 0,
+     "mismatch_per_layer": {
+      "L0.attn.wo_b": 0.0,
+      "L13.attn.wo_b": 0.0,
+      "L18.attn.wo_b": 0.0,
+      "L22.attn.wo_b": 0.0,
+      "L27.attn.wo_b": 0.0,
+      "L31.attn.wo_b": 0.0,
+      "L36.attn.wo_b": 0.0,
+      "L5.attn.wo_b": 0.000195
+     },
+     "mean_abs_err_vs_f64": {
+      "gemv": 0.03782033810834724,
+      "ref": 0.03782033810834724
+     },
+     "config_invariant": true,
+     "configs_differing": []
+    },
+    "6": {
+     "config": {
+      "block_n": 64,
+      "ku": 4,
+      "num_warps": 8,
+      "num_stages": 1
+     },
+     "us_gemv": 220.607,
+     "us_ref": 94.672,
+     "speedup": 0.43,
+     "GBps_gemv": 190.8,
+     "GBps_ref": 444.7,
+     "mismatch": 8.138020833333333e-06,
+     "outputs_compared": 245760,
+     "max_abs": 0.03125,
+     "max_ulp": 1,
+     "n_gt1ulp": 0,
+     "mismatch_per_layer": {
+      "L0.attn.wo_b": 0.0,
+      "L13.attn.wo_b": 0.0,
+      "L18.attn.wo_b": 3.3e-05,
+      "L22.attn.wo_b": 0.0,
+      "L27.attn.wo_b": 0.0,
+      "L31.attn.wo_b": 0.0,
+      "L36.attn.wo_b": 3.3e-05,
+      "L5.attn.wo_b": 0.0
+     },
+     "mean_abs_err_vs_f64": {
+      "gemv": 0.038292529740446946,
+      "ref": 0.038292529740446946
+     },
+     "config_invariant": true,
+     "configs_differing": []
+    }
+   },
+   "gates": {
+    "speedup_ge_2x_m1": false,
+    "bw_ge_3TBps_m1": false,
+    "mismatch_le_0p5pct": true
+   },
+   "wall_s": 8.0
+  },
+  {
+   "shape": [
+    32768,
+    1280
+   ],
+   "roles": [
+    "attn.wq_b"
+   ],
+   "calls_per_step": 40,
+   "weight_MiB": 40.0,
+   "real_layers": [
+    "L0.attn.wq_b",
+    "L13.attn.wq_b",
+    "L18.attn.wq_b",
+    "L22.attn.wq_b",
+    "L27.attn.wq_b",
+    "L31.attn.wq_b",
+    "L36.attn.wq_b",
+    "L5.attn.wq_b"
+   ],
+   "timing_copies": 13,
+   "timing_stream_MiB": 520.0,
+   "per_m": {
+    "1": {
+     "config": {
+      "block_n": 64,
+      "ku": 4,
+      "num_warps": 8,
+      "num_stages": 1
+     },
+     "us_gemv": 14.249,
+     "us_ref": 19.165,
+     "speedup": 1.34,
+     "GBps_gemv": 2951.1,
+     "GBps_ref": 2194.1,
+     "mismatch": 0.0,
+     "outputs_compared": 262144,
+     "max_abs": 0.0,
+     "max_ulp": 0,
+     "n_gt1ulp": 0,
+     "mismatch_per_layer": {
+      "L0.attn.wq_b": 0.0,
+      "L13.attn.wq_b": 0.0,
+      "L18.attn.wq_b": 0.0,
+      "L22.attn.wq_b": 0.0,
+      "L27.attn.wq_b": 0.0,
+      "L31.attn.wq_b": 0.0,
+      "L36.attn.wq_b": 0.0,
+      "L5.attn.wq_b": 0.0
+     },
+     "mean_abs_err_vs_f64": {
+      "gemv": 0.021728698674087443,
+      "ref": 0.021728698674087443
+     },
+     "config_invariant": true,
+     "configs_differing": []
+    },
+    "6": {
+     "config": {
+      "block_n": 64,
+      "ku": 4,
+      "num_warps": 8,
+      "num_stages": 1
+     },
+     "us_gemv": 46.878,
+     "us_ref": 19.217,
+     "speedup": 0.41,
+     "GBps_gemv": 904.1,
+     "GBps_ref": 2205.6,
+     "mismatch": 0.0,
+     "outputs_compared": 1572864,
+     "max_abs": 0.0,
+     "max_ulp": 0,
+     "n_gt1ulp": 0,
+     "mismatch_per_layer": {
+      "L0.attn.wq_b": 0.0,
+      "L13.attn.wq_b": 0.0,
+      "L18.attn.wq_b": 0.0,
+      "L22.attn.wq_b": 0.0,
+      "L27.attn.wq_b": 0.0,
+      "L31.attn.wq_b": 0.0,
+      "L36.attn.wq_b": 0.0,
+      "L5.attn.wq_b": 0.0
+     },
+     "mean_abs_err_vs_f64": {
+      "gemv": 0.018241123240609454,
+      "ref": 0.018241123240609454
+     },
+     "config_invariant": true,
+     "configs_differing": []
+    }
+   },
+   "gates": {
+    "speedup_ge_2x_m1": false,
+    "bw_ge_3TBps_m1": false,
+    "mismatch_le_0p5pct": true
+   },
+   "wall_s": 25.3
+  },
+  {
+   "shape": [
+    2304,
+    5120
+   ],
+   "roles": [
+    "ffn.shared_experts.w1",
+    "ffn.shared_experts.w3"
+   ],
+   "calls_per_step": 80,
+   "weight_MiB": 11.25,
+   "real_layers": [
+    "L0.ffn.shared_experts.w1",
+    "L13.ffn.shared_experts.w1",
+    "L18.ffn.shared_experts.w1",
+    "L22.ffn.shared_experts.w1",
+    "L27.ffn.shared_experts.w1",
+    "L31.ffn.shared_experts.w1",
+    "L36.ffn.shared_experts.w1",
+    "L5.ffn.shared_experts.w1",
+    "L0.ffn.shared_experts.w3",
+    "L13.ffn.shared_experts.w3",
+    "L18.ffn.shared_experts.w3",
+    "L22.ffn.shared_experts.w3",
+    "L27.ffn.shared_experts.w3",
+    "L31.ffn.shared_experts.w3",
+    "L36.ffn.shared_experts.w3",
+    "L5.ffn.shared_experts.w3"
+   ],
+   "timing_copies": 46,
+   "timing_stream_MiB": 517.5,
+   "per_m": {
+    "1": {
+     "config": {
+      "block_n": 64,
+      "ku": 4,
+      "num_warps": 8,
+      "num_stages": 1
+     },
+     "us_gemv": 43.463,
+     "us_ref": 61.776,
+     "speedup": 1.42,
+     "GBps_gemv": 271.9,
+     "GBps_ref": 191.3,
+     "mismatch": 0.0,
+     "outputs_compared": 36864,
+     "max_abs": 0.0,
+     "max_ulp": 0,
+     "n_gt1ulp": 0,
+     "mismatch_per_layer": {
+      "L0.ffn.shared_experts.w1": 0.0,
+      "L13.ffn.shared_experts.w1": 0.0,
+      "L18.ffn.shared_experts.w1": 0.0,
+      "L22.ffn.shared_experts.w1": 0.0,
+      "L27.ffn.shared_experts.w1": 0.0,
+      "L31.ffn.shared_experts.w1": 0.0,
+      "L36.ffn.shared_experts.w1": 0.0,
+      "L5.ffn.shared_experts.w1": 0.0,
+      "L0.ffn.shared_experts.w3": 0.0,
+      "L13.ffn.shared_experts.w3": 0.0,
+      "L18.ffn.shared_experts.w3": 0.0,
+      "L22.ffn.shared_experts.w3": 0.0,
+      "L27.ffn.shared_experts.w3": 0.0,
+      "L31.ffn.shared_experts.w3": 0.0,
+      "L36.ffn.shared_experts.w3": 0.0,
+      "L5.ffn.shared_experts.w3": 0.0
+     },
+     "mean_abs_err_vs_f64": {
+      "gemv": 0.03001094875843238,
+      "ref": 0.03001094875843238
+     },
+     "config_invariant": true,
+     "configs_differing": []
+    },
+    "6": {
+     "config": {
+      "block_n": 64,
+      "ku": 4,
+      "num_warps": 8,
+      "num_stages": 1
+     },
+     "us_gemv": 134.636,
+     "us_ref": 61.848,
+     "speedup": 0.46,
+     "GBps_gemv": 88.1,
+     "GBps_ref": 191.9,
+     "mismatch": 0.0,
+     "outputs_compared": 221184,
+     "max_abs": 0.0,
+     "max_ulp": 0,
+     "n_gt1ulp": 0,
+     "mismatch_per_layer": {
+      "L0.ffn.shared_experts.w1": 0.0,
+      "L13.ffn.shared_experts.w1": 0.0,
+      "L18.ffn.shared_experts.w1": 0.0,
+      "L22.ffn.shared_experts.w1": 0.0,
+      "L27.ffn.shared_experts.w1": 0.0,
+      "L31.ffn.shared_experts.w1": 0.0,
+      "L36.ffn.shared_experts.w1": 0.0,
+      "L5.ffn.shared_experts.w1": 0.0,
+      "L0.ffn.shared_experts.w3": 0.0,
+      "L13.ffn.shared_experts.w3": 0.0,
+      "L18.ffn.shared_experts.w3": 0.0,
+      "L22.ffn.shared_experts.w3": 0.0,
+      "L27.ffn.shared_experts.w3": 0.0,
+      "L31.ffn.shared_experts.w3": 0.0,
+      "L36.ffn.shared_experts.w3": 0.0,
+      "L5.ffn.shared_experts.w3": 0.0
+     },
+     "mean_abs_err_vs_f64": {
+      "gemv": 0.03125569875119722,
+      "ref": 0.03125569875119722
+     },
+     "config_invariant": true,
+     "configs_differing": []
+    }
+   },
+   "gates": {
+    "speedup_ge_2x_m1": false,
+    "bw_ge_3TBps_m1": null,
+    "mismatch_le_0p5pct": true
+   },
+   "wall_s": 2.3
+  },
+  {
+   "shape": [
+    5120,
+    2304
+   ],
+   "roles": [
+    "ffn.shared_experts.w2"
+   ],
+   "calls_per_step": 40,
+   "weight_MiB": 11.25,
+   "real_layers": [
+    "L0.ffn.shared_experts.w2",
+    "L13.ffn.shared_experts.w2",
+    "L18.ffn.shared_experts.w2",
+    "L22.ffn.shared_experts.w2",
+    "L27.ffn.shared_experts.w2",
+    "L31.ffn.shared_experts.w2",
+    "L36.ffn.shared_experts.w2",
+    "L5.ffn.shared_experts.w2"
+   ],
+   "timing_copies": 46,
+   "timing_stream_MiB": 517.5,
+   "per_m": {
+    "1": {
+     "config": {
+      "block_n": 64,
+      "ku": 4,
+      "num_warps": 8,
+      "num_stages": 1
+     },
+     "us_gemv": 20.275,
+     "us_ref": 27.636,
+     "speedup": 1.36,
+     "GBps_gemv": 583.0,
+     "GBps_ref": 427.7,
+     "mismatch": 0.0,
+     "outputs_compared": 40960,
+     "max_abs": 0.0,
+     "max_ulp": 0,
+     "n_gt1ulp": 0,
+     "mismatch_per_layer": {
+      "L0.ffn.shared_experts.w2": 0.0,
+      "L13.ffn.shared_experts.w2": 0.0,
+      "L18.ffn.shared_experts.w2": 0.0,
+      "L22.ffn.shared_experts.w2": 0.0,
+      "L27.ffn.shared_experts.w2": 0.0,
+      "L31.ffn.shared_experts.w2": 0.0,
+      "L36.ffn.shared_experts.w2": 0.0,
+      "L5.ffn.shared_experts.w2": 0.0
+     },
+     "mean_abs_err_vs_f64": {
+      "gemv": 0.02351832740221198,
+      "ref": 0.02351832740221198
+     },
+     "config_invariant": true,
+     "configs_differing": []
+    },
+    "6": {
+     "config": {
+      "block_n": 64,
+      "ku": 4,
+      "num_warps": 8,
+      "num_stages": 1
+     },
+     "us_gemv": 63.557,
+     "us_ref": 27.682,
+     "speedup": 0.44,
+     "GBps_gemv": 187.0,
+     "GBps_ref": 429.3,
+     "mismatch": 4.069010416666667e-06,
+     "outputs_compared": 245760,
+     "max_abs": 0.00390625,
+     "max_ulp": 1,
+     "n_gt1ulp": 0,
+     "mismatch_per_layer": {
+      "L0.ffn.shared_experts.w2": 0.0,
+      "L13.ffn.shared_experts.w2": 0.0,
+      "L18.ffn.shared_experts.w2": 0.0,
+      "L22.ffn.shared_experts.w2": 0.0,
+      "L27.ffn.shared_experts.w2": 0.0,
+      "L31.ffn.shared_experts.w2": 0.0,
+      "L36.ffn.shared_experts.w2": 3.3e-05,
+      "L5.ffn.shared_experts.w2": 0.0
+     },
+     "mean_abs_err_vs_f64": {
+      "gemv": 0.023162636835508794,
+      "ref": 0.023162636835508794
+     },
+     "config_invariant": true,
+     "configs_differing": []
+    }
+   },
+   "gates": {
+    "speedup_ge_2x_m1": false,
+    "bw_ge_3TBps_m1": null,
+    "mismatch_le_0p5pct": true
+   },
+   "wall_s": 1.5
+  },
+  {
+   "shape": [
+    1280,
+    5120
+   ],
+   "roles": [
+    "attn.wq_a"
+   ],
+   "calls_per_step": 40,
+   "weight_MiB": 6.25,
+   "real_layers": [
+    "L0.attn.wq_a",
+    "L13.attn.wq_a",
+    "L18.attn.wq_a",
+    "L22.attn.wq_a",
+    "L27.attn.wq_a",
+    "L31.attn.wq_a",
+    "L36.attn.wq_a",
+    "L5.attn.wq_a"
+   ],
+   "timing_copies": 82,
+   "timing_stream_MiB": 512.5,
+   "per_m": {
+    "1": {
+     "config": {
+      "block_n": 64,
+      "ku": 4,
+      "num_warps": 8,
+      "num_stages": 1
+     },
+     "us_gemv": 43.38,
+     "us_ref": 60.605,
+     "speedup": 1.4,
+     "GBps_gemv": 151.4,
+     "GBps_ref": 108.4,
+     "mismatch": 0.0,
+     "outputs_compared": 10240,
+     "max_abs": 0.0,
+     "max_ulp": 0,
+     "n_gt1ulp": 0,
+     "mismatch_per_layer": {
+      "L0.attn.wq_a": 0.0,
+      "L13.attn.wq_a": 0.0,
+      "L18.attn.wq_a": 0.0,
+      "L22.attn.wq_a": 0.0,
+      "L27.attn.wq_a": 0.0,
+      "L31.attn.wq_a": 0.0,
+      "L36.attn.wq_a": 0.0,
+      "L5.attn.wq_a": 0.0
+     },
+     "mean_abs_err_vs_f64": {
+      "gemv": 0.033467182390339904,
+      "ref": 0.033467182390339904
+     },
+     "config_invariant": true,
+     "configs_differing": []
+    },
+    "6": {
+     "config": {
+      "block_n": 64,
+      "ku": 4,
+      "num_warps": 8,
+      "num_stages": 1
+     },
+     "us_gemv": 132.999,
+     "us_ref": 60.886,
+     "speedup": 0.46,
+     "GBps_gemv": 49.7,
+     "GBps_ref": 108.5,
+     "mismatch": 0.0,
+     "outputs_compared": 61440,
+     "max_abs": 0.0,
+     "max_ulp": 0,
+     "n_gt1ulp": 0,
+     "mismatch_per_layer": {
+      "L0.attn.wq_a": 0.0,
+      "L13.attn.wq_a": 0.0,
+      "L18.attn.wq_a": 0.0,
+      "L22.attn.wq_a": 0.0,
+      "L27.attn.wq_a": 0.0,
+      "L31.attn.wq_a": 0.0,
+      "L36.attn.wq_a": 0.0,
+      "L5.attn.wq_a": 0.0
+     },
+     "mean_abs_err_vs_f64": {
+      "gemv": 0.03376196617785352,
+      "ref": 0.03376196617785352
+     },
+     "config_invariant": true,
+     "configs_differing": []
+    }
+   },
+   "gates": {
+    "speedup_ge_2x_m1": false,
+    "bw_ge_3TBps_m1": null,
+    "mismatch_le_0p5pct": true
+   },
+   "wall_s": 2.5
+  },
+  {
+   "shape": [
+    4096,
+    1280
+   ],
+   "roles": [
+    "attn.indexer.wq_b"
+   ],
+   "calls_per_step": 8,
+   "weight_MiB": 5.0,
+   "real_layers": [
+    "L14.attn.indexer.wq_b",
+    "L2.attn.indexer.wq_b",
+    "L20.attn.indexer.wq_b",
+    "L24.attn.indexer.wq_b",
+    "L28.attn.indexer.wq_b",
+    "L32.attn.indexer.wq_b",
+    "L36.attn.indexer.wq_b",
+    "L8.attn.indexer.wq_b"
+   ],
+   "timing_copies": 103,
+   "timing_stream_MiB": 515.0,
+   "per_m": {
+    "1": {
+     "config": {
+      "block_n": 64,
+      "ku": 4,
+      "num_warps": 8,
+      "num_stages": 1
+     },
+     "us_gemv": 11.593,
+     "us_ref": 16.1,
+     "speedup": 1.39,
+     "GBps_gemv": 453.5,
+     "GBps_ref": 326.6,
+     "mismatch": 0.0,
+     "outputs_compared": 32768,
+     "max_abs": 0.0,
+     "max_ulp": 0,
+     "n_gt1ulp": 0,
+     "mismatch_per_layer": {
+      "L14.attn.indexer.wq_b": 0.0,
+      "L2.attn.indexer.wq_b": 0.0,
+      "L20.attn.indexer.wq_b": 0.0,
+      "L24.attn.indexer.wq_b": 0.0,
+      "L28.attn.indexer.wq_b": 0.0,
+      "L32.attn.indexer.wq_b": 0.0,
+      "L36.attn.indexer.wq_b": 0.0,
+      "L8.attn.indexer.wq_b": 0.0
+     },
+     "mean_abs_err_vs_f64": {
+      "gemv": 0.04617963452900575,
+      "ref": 0.04617963452900575
+     },
+     "config_invariant": true,
+     "configs_differing": []
+    },
+    "6": {
+     "config": {
+      "block_n": 64,
+      "ku": 4,
+      "num_warps": 8,
+      "num_stages": 1
+     },
+     "us_gemv": 34.139,
+     "us_ref": 16.113,
+     "speedup": 0.47,
+     "GBps_gemv": 155.4,
+     "GBps_ref": 329.2,
+     "mismatch": 0.0,
+     "outputs_compared": 196608,
+     "max_abs": 0.0,
+     "max_ulp": 0,
+     "n_gt1ulp": 0,
+     "mismatch_per_layer": {
+      "L14.attn.indexer.wq_b": 0.0,
+      "L2.attn.indexer.wq_b": 0.0,
+      "L20.attn.indexer.wq_b": 0.0,
+      "L24.attn.indexer.wq_b": 0.0,
+      "L28.attn.indexer.wq_b": 0.0,
+      "L32.attn.indexer.wq_b": 0.0,
+      "L36.attn.indexer.wq_b": 0.0,
+      "L8.attn.indexer.wq_b": 0.0
+     },
+     "mean_abs_err_vs_f64": {
+      "gemv": 0.049892194030459816,
+      "ref": 0.049892194030459816
+     },
+     "config_invariant": true,
+     "configs_differing": []
+    }
+   },
+   "gates": {
+    "speedup_ge_2x_m1": false,
+    "bw_ge_3TBps_m1": null,
+    "mismatch_le_0p5pct": true
+   },
+   "wall_s": 1.0
+  },
+  {
+   "shape": [
+    512,
+    5120
+   ],
+   "roles": [
+    "attn.wkv"
+   ],
+   "calls_per_step": 40,
+   "weight_MiB": 2.5,
+   "real_layers": [
+    "L0.attn.wkv",
+    "L13.attn.wkv",
+    "L18.attn.wkv",
+    "L22.attn.wkv",
+    "L27.attn.wkv",
+    "L31.attn.wkv",
+    "L36.attn.wkv",
+    "L5.attn.wkv"
+   ],
+   "timing_copies": 205,
+   "timing_stream_MiB": 512.5,
+   "per_m": {
+    "1": {
+     "config": {
+      "block_n": 64,
+      "ku": 4,
+      "num_warps": 8,
+      "num_stages": 1
+     },
+     "us_gemv": 43.134,
+     "us_ref": 61.355,
+     "speedup": 1.42,
+     "GBps_gemv": 61.0,
+     "GBps_ref": 42.9,
+     "mismatch": 0.0,
+     "outputs_compared": 4096,
+     "max_abs": 0.0,
+     "max_ulp": 0,
+     "n_gt1ulp": 0,
+     "mismatch_per_layer": {
+      "L0.attn.wkv": 0.0,
+      "L13.attn.wkv": 0.0,
+      "L18.attn.wkv": 0.0,
+      "L22.attn.wkv": 0.0,
+      "L27.attn.wkv": 0.0,
+      "L31.attn.wkv": 0.0,
+      "L36.attn.wkv": 0.0,
+      "L5.attn.wkv": 0.0
+     },
+     "mean_abs_err_vs_f64": {
+      "gemv": 0.04329446580354812,
+      "ref": 0.04329446580354812
+     },
+     "config_invariant": true,
+     "configs_differing": []
+    },
+    "6": {
+     "config": {
+      "block_n": 64,
+      "ku": 4,
+      "num_warps": 8,
+      "num_stages": 1
+     },
+     "us_gemv": 130.88,
+     "us_ref": 61.5,
+     "speedup": 0.47,
+     "GBps_gemv": 20.3,
+     "GBps_ref": 43.3,
+     "mismatch": 0.0,
+     "outputs_compared": 24576,
+     "max_abs": 0.0,
+     "max_ulp": 0,
+     "n_gt1ulp": 0,
+     "mismatch_per_layer": {
+      "L0.attn.wkv": 0.0,
+      "L13.attn.wkv": 0.0,
+      "L18.attn.wkv": 0.0,
+      "L22.attn.wkv": 0.0,
+      "L27.attn.wkv": 0.0,
+      "L31.attn.wkv": 0.0,
+      "L36.attn.wkv": 0.0,
+      "L5.attn.wkv": 0.0
+     },
+     "mean_abs_err_vs_f64": {
+      "gemv": 0.03955731675871717,
+      "ref": 0.03955731675871717
+     },
+     "config_invariant": true,
+     "configs_differing": []
+    }
+   },
+   "gates": {
+    "speedup_ge_2x_m1": false,
+    "bw_ge_3TBps_m1": null,
+    "mismatch_le_0p5pct": true
+   },
+   "wall_s": 5.8
+  }
+ ],
+ "gates": {
+  "every_shape_ge_2x_m1": false,
+  "big_shapes_ge_3TBps_m1": false,
+  "drift_1ulp_class": true,
+  "shapes_over_0p5pct": [],
+  "config_invariant_all": true
+ },
+ "per_step_m1": {
+  "ms_gemv": 11.281,
+  "ms_ref": 15.769,
+  "saved_ms": 4.488
+ },
+ "tuned": {
+  "impl": "gemv",
+  "triton": "3.7.1",
+  "tune": true,
+  "cache_file": "scratch/gemv-tune.json",
+  "cache_loaded": "scratch/gemv-tune.json",
+  "configs": {
+   "512x5120/m1": {
+    "block_n": 64,
+    "ku": 4,
+    "num_warps": 8,
+    "num_stages": 1
+   },
+   "512x5120/m8": {
+    "block_n": 64,
+    "ku": 4,
+    "num_warps": 8,
+    "num_stages": 1
+   },
+   "1280x5120/m1": {
+    "block_n": 64,
+    "ku": 4,
+    "num_warps": 8,
+    "num_stages": 1
+   },
+   "1280x5120/m8": {
+    "block_n": 64,
+    "ku": 4,
+    "num_warps": 8,
+    "num_stages": 1
+   },
+   "2304x5120/m1": {
+    "block_n": 64,
+    "ku": 4,
+    "num_warps": 8,
+    "num_stages": 1
+   },
+   "2304x5120/m8": {
+    "block_n": 64,
+    "ku": 4,
+    "num_warps": 8,
+    "num_stages": 1
+   },
+   "4096x1280/m1": {
+    "block_n": 64,
+    "ku": 4,
+    "num_warps": 8,
+    "num_stages": 1
+   },
+   "4096x1280/m8": {
+    "block_n": 64,
+    "ku": 4,
+    "num_warps": 8,
+    "num_stages": 1
+   },
+   "5120x2304/m1": {
+    "block_n": 64,
+    "ku": 4,
+    "num_warps": 8,
+    "num_stages": 1
+   },
+   "5120x2304/m8": {
+    "block_n": 64,
+    "ku": 4,
+    "num_warps": 8,
+    "num_stages": 1
+   },
+   "5120x8192/m1": {
+    "block_n": 64,
+    "ku": 4,
+    "num_warps": 8,
+    "num_stages": 1
+   },
+   "5120x8192/m8": {
+    "block_n": 64,
+    "ku": 4,
+    "num_warps": 8,
+    "num_stages": 1
+   },
+   "25600x6144/m1": {
+    "block_n": 64,
+    "ku": 4,
+    "num_warps": 8,
+    "num_stages": 1
+   },
+   "25600x6144/m8": {
+    "block_n": 64,
+    "ku": 4,
+    "num_warps": 8,
+    "num_stages": 1
+   },
+   "32768x1280/m1": {
+    "block_n": 64,
+    "ku": 4,
+    "num_warps": 8,
+    "num_stages": 1
+   },
+   "32768x1280/m8": {
+    "block_n": 64,
+    "ku": 4,
+    "num_warps": 8,
+    "num_stages": 1
+   }
+  },
+  "tuned_us": {
+   "512x5120/m1": 43.133,
+   "512x5120/m8": 129.992,
+   "1280x5120/m1": 43.387,
+   "1280x5120/m8": 132.201,
+   "2304x5120/m1": 43.407,
+   "2304x5120/m8": 136.687,
+   "4096x1280/m1": 11.568,
+   "4096x1280/m8": 34.398,
+   "5120x2304/m1": 20.233,
+   "5120x2304/m8": 61.014,
+   "5120x8192/m1": 68.948,
+   "5120x8192/m8": 224.255,
+   "25600x6144/m1": 55.76,
+   "25600x6144/m8": 217.575,
+   "32768x1280/m1": 14.216,
+   "32768x1280/m8": 46.855
+  }
+ },
+ "tune_cache": "scratch/gemv-tune.json",
+ "wall_s": 80.4
+}
