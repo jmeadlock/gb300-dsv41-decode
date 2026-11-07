@@ -65,7 +65,7 @@ def _n(fn):
 
 # ================================================================================ 0. status
 def test_rows_clusters_are_every_cluster_but_the_two_left_off():
-    assert set(FG.ROWS_WHY) == {"concat_free", "dg_sf_pack"}
+    assert set(FG.ROWS_WHY) == {"concat_free"}      # M1-T10-MOE: dg_sf_pack ported to R rows
     assert set(FG.ROWS_CLUSTERS) == set(FG.CLUSTERS) - set(FG.ROWS_WHY)
 
 
@@ -80,7 +80,10 @@ def _routing(g, R_, k, E, hot_frac):
 
 @pytest.mark.parametrize("R_,k", [(6, 6), (1, 6), (8, 8), (2, 3), (7, 4)])
 @pytest.mark.parametrize("inpl", [False, True])
-def test_dedup_kernel_equals_torch_mapping(KM, R_, k, inpl):
+@pytest.mark.parametrize("impl", ["warp", "matrix"])   # M1-T10-MOE: m1_dedup_warp (default) and m1_dedup_routes
+def test_dedup_kernel_equals_torch_mapping(KM, R_, k, inpl, impl, monkeypatch):
+    monkeypatch.setenv(MR.DEDUP_IMPL_ENV, impl)
+    kern = KM.m1_dedup_warp if impl == "warp" else KM.m1_dedup_routes
     g = torch.Generator().manual_seed(100 * R_ + k + inpl)
     for t in range(25):
         E = int(torch.randint(k, 3 * k + 2, (1,), generator=g))       # small E: many cross-row repeats
@@ -95,9 +98,9 @@ def test_dedup_kernel_equals_torch_mapping(KM, R_, k, inpl):
             buf = mod.DedupBuffers(R_, k, "cpu")
             ctr = (torch.full((R_ * k,), -7, dtype=torch.int32), torch.full((R_ * k,), -7, dtype=torch.long),
                    torch.full((R_ * k,), -7, dtype=torch.long))
-            n0 = _n(KM.m1_dedup_routes)
+            n0 = _n(kern)
             m = mod.dedup_fused(buf, idx, w, br, mm=ctr[0], ids_step=ctr[1], uval=ctr[2], inpl=ex)
-            assert _n(KM.m1_dedup_routes) - n0 == (1 if mod is KM else 0)
+            assert _n(kern) - n0 == (1 if mod is KM else 0)
             res.append((m, ctr))
         (mk, ck), (mt, ct) = res
         ref = MR.dedup_routes(idx, w, br)

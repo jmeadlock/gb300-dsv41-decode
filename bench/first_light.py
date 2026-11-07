@@ -333,6 +333,14 @@ def build_report(gen, label: str, report: Dict) -> Optional[dict]:
            "spare_slots": getattr(pool, "spare", None), "spare_limit": getattr(st, "spare_slots", None),
            "spare_added_B": added, "spare_added_GiB": None if added is None else round(added / 2**30, 3),
            "hbm": _hbm(gen)}
+    if getattr(dg, "layout", None) is not None and getattr(st, "rows", 1) > 1:   # M1-T10-MOE: the R-row call shape
+        rec["rows_moe"] = {"gemm": getattr(dg, "rows_gemm", None), "layout": dg.layout, "align": dg.align,
+                           "sf_store": dg.sf_store, "sf_store_why": dg.sf_store_why,
+                           "layout_check": dg.layout_check, "dedup": st.describe().get("dedup_impl")}
+        print(f"[rows-moe] gemm {dg.layout} align {dg.align} sf_store {dg.sf_store}"
+              f"{'' if dg.layout_check is None else ' check equal=' + str(dg.layout_check.get('equal'))}"
+              f"{'' if not (dg.layout_check or {}).get('fallback') else ' FALLBACK ' + dg.layout_check['fallback']}",
+              flush=True)
     h = rec["hbm"] or {}
     f = lambda x, d=2: "-" if x is None else f"{x:.{d}f}"  # noqa: E731
     print(f"[hbm] {label} build (moe {rec['moe_impl']}"
@@ -1018,7 +1026,28 @@ def build_parser() -> argparse.ArgumentParser:
                     help="--rows with dg-inplace: spare pool slots per layer for the R-row step's cold experts "
                          "(compact cold index, M1-T10-FIX2; default 8); a layer-step with more cold unique experts "
                          "overflows (counted: `overflow steps` in the rows summary; those steps' logits are wrong)")
+    ap.add_argument("--rows-moe-gemm", default=None,
+                    choices=["contiguous", "contiguous64", "contiguous32", "contiguous16", "psum", "masked"],
+                    help="M1-T10-MOE: the R-row dg-inplace routed GEMM call shape (default contiguous = ALIGN 128; "
+                         "anything else is checked bitwise at build vs that call on layer 0's real bytes, falling "
+                         "back to it on a mismatch; sets $DSV41_ROWS_MOE_GEMM)")
+    ap.add_argument("--rows-sf-store", default=None, choices=["step", "resident", "pool"],
+                    help="M1-T10-MOE: where the R-row dg-inplace step's hot packed weight SF live (default pool: one "
+                         "pre-packed copy owned by the expert pool, cold-only staging; sets $DSV41_ROWS_SF_STORE)")
     return ap
+
+
+def rows_moe_env(a) -> Dict[str, str]:
+    """M1-T10-MOE: --rows-moe-gemm / --rows-sf-store -> the environment StaticStep's R-row dg-inplace build reads."""
+    from runtime import dg_inplace as DI
+
+    env = {}
+    if getattr(a, "rows_moe_gemm", None):
+        env[DI.ROWS_GEMM_ENV] = a.rows_moe_gemm
+    if getattr(a, "rows_sf_store", None):
+        env[DI.ROWS_SF_STORE_ENV] = a.rows_sf_store
+    os.environ.update(env)
+    return env
 
 
 def hidden_layers_arg(a) -> List[int]:
@@ -1052,6 +1081,7 @@ def main(argv=None) -> int:
         fixture2 = None
     report: Dict = {"date": time.strftime("%Y-%m-%d %H:%M:%S %Z"), "argv": sys.argv[1:] if argv is None else argv,
                     "errors": []}
+    report["rows_moe_env"] = rows_moe_env(a)
     from runtime.loader import build_and_load
 
     t0 = time.time()

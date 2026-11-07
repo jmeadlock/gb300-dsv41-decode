@@ -773,12 +773,15 @@ def test_fused_glue_rows_equals_ref_glue_emulated(rows_glue, monkeypatch, moe_im
         never |= {"dg_act", "swiglu_routed", "moe_combine"}
     if moe_impl == "dg-inplace":
         never |= {"gather"}
+    else:                                              # M1-T10-MOE: dg_sf_pack is dg-inplace's (ported to R rows)
+        never |= {"dg_sf_pack"}
     if fp8_impl == "ref":
         never |= {"q_rope_epilogue", "gemv_pair", "reduce_fold"}
     assert set(d["on"]) == set(FG.CLUSTERS) - never, d["clusters"]
     assert all(s.startswith("n/a") for c, s in d["clusters"].items() if c in never), d["clusters"]
-    if moe_impl == "dg-inplace":
-        assert d["clusters"]["dg_sf_pack"].startswith("n/a: rows=6"), d["clusters"]
+    if moe_impl == "dg-inplace":   # M1-T10-MOE: on at 6 rows after its R-row self-check; the GEMMs took packed SF
+        assert d["clusters"]["dg_sf_pack"] == "on" and st.dg.sf_pack, d["clusters"]
+        assert d["calibration"]["r4"]["verify_dg_sf_pack"] == "equal", d["calibration"]
     assert all(v == "equal" for k_, v in d["calibration"].items() if k_.startswith("verify_")), d["calibration"]
     assert all(v == "equal" for v in d["calibration"].get("r4", {}).values()), d["calibration"]
     assert d["calibration"]["hc_post"]["picked"] is not None

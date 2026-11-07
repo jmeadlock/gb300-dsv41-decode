@@ -120,10 +120,11 @@ DISABLE_ENV = "DSV41_GLUE_DISABLE"
 # SwiGLU / combine kernels). Not ported, with the reason: ROWS_WHY.
 ROWS_WHY = {
     "concat_free": CONCAT_FREE_WHY,
-    "dg_sf_pack": ("the R-row writers address arbitrary pair A rows (dedup arow), the packed-SF writer row r = A row "
-                   "r*align; needs a PackedRows over every A row plus an R-row GEMM A/B self-check -- left off "
-                   "(fp32 activation SF; DeepGEMM converts it in the GEMM)"),
 }
+# M1-T10-MOE: dg_sf_pack is ported to R rows -- the R-row writers (dg_act_rows, routed_swiglu_rows) store the codes
+# through a PackedRows over EVERY A row (dg_inplace.DGInplaceBuffers.xsp_all: row r = A row r, the dedup's arow), and
+# fused_glue_r2._verify_sf_pack runs the R-row A/B self-check (codes == the fp32 scales' codes on the pairs' rows,
+# then the layout's GEMM with packed vs fp32 SF, bitwise). The masked call shape keeps fp32 SF (n/a there).
 ROWS_CLUSTERS = tuple(c for c in CLUSTERS if c not in ROWS_WHY)
 NBF16 = 65536                   # bf16 bit patterns (table rows)
 SILU_LIM = NBF16                # silu table entry holding silu(swiglu_limit)
@@ -951,8 +952,16 @@ class FusedGlue(R2Glue):
         prow[t] (fp8 + fp32 scales), one launch (the reference: act_quant, 2 index_select, e8m0_to_f32, 2 index_copy)."""
         b = self.o.dg
         D = x.size(-1)
-        launch_act_quant_bcast(x.reshape(-1, D), b.xq[1].view(-1, D), b.xs[1].view(-1, D // BLOCK), self.code_tab, 1,
-                               src_rows=m["prow"], dst_rows=m["arow"])
+        launch_act_quant_bcast(x.reshape(-1, D), b.xq[1].view(-1, D), self.dg_scale_rows(1, D // BLOCK), self.code_tab,
+                               1, src_rows=m["prow"], dst_rows=m["arow"])
+
+    def dg_scale_rows(self, which: int, kb: int):
+        """M1-T10-MOE: where the R-row writers' scales of DeepGEMM input `which` go -- the fp32 xs as [A rows, K/32],
+        or (dg_sf_pack ported to R rows) the packed activation SF addressed by A row."""
+        b = self.o.dg
+        if getattr(b, "sf_pack", False) and getattr(b, "xsp_all", None):
+            return b.xsp_all[which]
+        return b.xs[which].view(-1, kb)
 
     def routed_swiglu_rows(self, gate_rows: torch.Tensor, up_rows: torch.Tensor, m: dict) -> None:
         """The pairs' SwiGLU (model.py:845-853) on the w1/w3 GEMM outputs [A, I] at rows arow, weights pw, then
@@ -960,7 +969,7 @@ class FusedGlue(R2Glue):
         bf16, act_quant, e8m0_to_f32, 2 index_copy)."""
         b = self.o.dg
         I = gate_rows.size(-1)
-        launch_swiglu_quant(gate_rows, up_rows, m["pw"], b.xq[2].view(-1, I), b.xs[2].view(-1, I // BLOCK),
+        launch_swiglu_quant(gate_rows, up_rows, m["pw"], b.xq[2].view(-1, I), self.dg_scale_rows(2, I // BLOCK),
                             self.silu_tab, self.code_tab, b.swiglu_limit, rows_idx=m["arow"])
 
     def combine_rows(self, out_rows: torch.Tensor, posmat: torch.Tensor, shared: torch.Tensor,
@@ -1512,18 +1521,40 @@ class FusedGlue(R2Glue):
             idx = (idx + int(torch.randint(0, E - span + 1, (1,), generator=g, device="cpu"))).to(self.dev)
             w = torch.rand(T_, k, generator=g, device="cpu").float().to(self.dev)
             br = T_ + (t % 3)
+            if inpl is not None and inpl.get("v2"):   # M1-T10-MOE: private m_indices / gl / counter (live ones stay)
+                lay = inpl.get("layout", "contiguous")
+                if lay == "masked":
+                    br = int(o.dg.block_rows)
+                inpl = dict(inpl, mi=torch.full((P * br,), -1, dtype=torch.int32, device=self.dev)
+                            if lay == "contiguous" else None,
+                            gl=torch.zeros(max(int(inpl.get("G") or 0), 1), dtype=torch.int32, device=self.dev),
+                            ovf=torch.zeros(1, dtype=torch.int32, device=self.dev))
             buf = MR.DedupBuffers(T_, k, self.dev)
             mm = torch.full((P,), -7, dtype=torch.int32, device=self.dev)
             ids = torch.full((P,), -7, dtype=torch.long, device=self.dev)
             uv = torch.full((P,), -7, dtype=torch.long, device=self.dev)
             got = MR.dedup_fused(buf, idx, w, br, mm=mm, ids_step=ids, uval=uv, inpl=inpl)
             ref = MR.dedup_routes(idx, w, br)
+            ext = MR.rows_layout(ref, inpl, br, T_, k) if inpl is not None and inpl.get("v2") else None
             for key, v in ref.items():
+                if ext is not None and key in ("arow", "posmat"):
+                    v = ext[key]
                 if not torch.equal(got[key], v):
                     return f"dedup {key} differs from dedup_routes"
             if not (torch.equal(mm, ref["counts"].int()) and torch.equal(ids, ref["uniq"])
                     and torch.equal(uv, ref["valid"])):
                 return "dedup masked_m / counter rows differ"
+            if ext is not None:
+                if inpl["mi"] is not None:
+                    got_tags = inpl["mi"].view(P, br)[:, :T_]
+                    if not (torch.equal(got_tags, ext["tags"]) and bool((inpl["mi"].view(P, br)[:, T_:] == -1).all())):
+                        return "dedup's m_indices tags differ"
+                if ext["gl"] is not None and not torch.equal(inpl["gl"][: ext["gl"].numel()], ext["gl"]):
+                    return "dedup's psum / masked_m vector differs"
+                if not (torch.equal(got["wl"], ext["wl"]) and int(inpl["ovf"]) == int(ext["n_over"])
+                        and torch.equal(got["sidx"], ext["sidx"]) and torch.equal(got["ids_stage"], ext["ids_stage"])):
+                    return "dedup's work list / overflow count / stage ids differ"
+                continue
             if inpl is not None:
                 gq = inpl["gtab"].index_select(0, ref["uniq"]).long()
                 cold, ok, grp, sidx = MR.compact_cold(gq, ref["counts"], int(inpl["H"]), int(inpl["S"]))

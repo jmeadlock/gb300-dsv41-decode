@@ -523,8 +523,8 @@ def _rows_expected_on(moe, fp8="gemv"):
     (fused_glue.ROWS_WHY) and those n/a by impl (dg-inplace: gather; fp8 ref -- the CPU dry run --: the GEMV parts)."""
     from runtime import fused_glue as FG
 
-    never = set(FG.ROWS_WHY) | ({"gather"} if moe == "dg-inplace" else set())
-    if fp8 != "gemv":
+    never = set(FG.ROWS_WHY) | ({"gather"} if moe == "dg-inplace" else {"dg_sf_pack"})   # M1-T10-MOE: dg_sf_pack
+    if fp8 != "gemv":                                                                      # ported (dg-inplace's)
         never |= {"q_rope_epilogue", "gemv_pair", "reduce_fold"}
     return set(FG.CLUSTERS) - never
 

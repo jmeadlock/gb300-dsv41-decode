@@ -45,20 +45,50 @@ scales identical); expected bit-identical to dg-masked, at worst its 1-ulp class
 """
 from __future__ import annotations
 
+import contextlib
 import os
+import sys
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
-from runtime.dg_moe import ACT_BLOCK, PROJS, RECIPE_A, RECIPE_B, WEIGHT_BLOCK, DGBuffers, DGMaskedMoE
+from runtime.dg_moe import (ACT_BLOCK, PROJS, RECIPE_A, RECIPE_B, WEIGHT_BLOCK, DGBuffers, DGMaskedMoE,
+                            import_deep_gemm)
 
 MK_ALIGN = 128                     # contiguous-layout rows per group block (= BLOCK_M cap); $DSV41_DG_ALIGN
 ALIGN_ENV = "DSV41_DG_ALIGN"
-SF_STORES = ("step", "resident")
+SF_STORES = ("step", "resident", "pool")
 SF_STORE_ENV = "DSV41_DG_SF_STORE"
 SF_PACK = 4                        # e8m0 codes per int32 word
 ORDER6 = (("w1", "weight"), ("w3", "weight"), ("w2", "weight"), ("w1", "scale"), ("w3", "scale"), ("w2", "scale"))
 GiB = 2 ** 30
+# M1-T10-MOE (the R-row dg-inplace step): how the routed GEMM is called, and where the hot experts' packed SF live
+ROWS_LAYOUTS = ("contiguous", "psum", "masked")      # = runtime/moe_rows.LAYOUT_IDS
+ROWS_GEMMS = ("contiguous", "contiguous64", "contiguous32", "contiguous16", "psum", "masked")
+ROWS_GEMM_ENV = "DSV41_ROWS_MOE_GEMM"                # first_light --rows-moe-gemm
+ROWS_SF_STORE_ENV = "DSV41_ROWS_SF_STORE"            # first_light --rows-sf-store
+ROWS_SF_STORE_DEFAULT = "pool"
+PSUM_ALIGN_ENV = "DSV41_ROWS_PSUM_ALIGN"             # psum: group-start alignment (= the kernel's BLOCK_M)
+EXPECTED_M_ENV = "DSV41_ROWS_EXPECTED_M"             # psum / masked: the heuristic's expected rows per group
+SF_POOL_HEADROOM_ENV = "DSV41_SF_POOL_HEADROOM_GIB"  # pool / resident SF: keep this much HBM free, else "step"
+SF_POOL_HEADROOM_GIB = 6.0      # pool SF = hbm_plan's sf_packed_resident_B (12.8 GiB real model, S 16); the 6-row
+                                # receipts had 17.1 (S 16) / 22.7 (S 8) GiB free after build: capture needs margin
+LAYOUT_CHECK_ENV = "DSV41_ROWS_LAYOUT_CHECK"         # "0": skip the build-time layout self-check
+MASKED_MAX_M = 128                                   # masked: max_m >= BLOCK_M (ABI memo)
+
+
+def parse_rows_gemm(spec: Optional[str]) -> Tuple[str, Optional[int]]:
+    """--rows-moe-gemm -> (layout, contiguous alignment or None = $DSV41_DG_ALIGN / 128):
+    "contiguous" (today: R*k blocks of ALIGN rows, m_indices tags), "contiguousNN" (the same at ALIGN = NN, the
+    kernel's BLOCK_M cap: fewer padded MMA rows per block), "psum" (contiguous with use_psum_layout over the WHOLE
+    pool's groups: empty groups cost nothing, the swap-AB kernels' effective M is the real rows aligned to 16),
+    "masked" (masked grouped GEMM with the pool itself as B, G = H+S groups, masked_m[g] = rows of group g)."""
+    s = spec or "contiguous"
+    if s not in ROWS_GEMMS:
+        raise ValueError(f"rows moe gemm {s!r} not in {ROWS_GEMMS}")
+    if s.startswith("contiguous"):
+        return "contiguous", (int(s[len("contiguous"):]) if len(s) > len("contiguous") else None)
+    return s, None
 
 
 # ------------------------------------------------------------------------------------------------ packed SF layout
@@ -155,6 +185,12 @@ class PackedRows:
     def codes(self) -> torch.Tensor:
         """uint8 [rows, KS]: the codes the writers stored (tests, the self-check)."""
         return torch.stack([self.u8[self._index(r)] for r in range(self.rows)])
+
+    def codes_at(self, rows: torch.Tensor) -> torch.Tensor:
+        """M1-T10-MOE: uint8 [len(rows), KS], the codes of output rows `rows` (one gather; the R-row self-check)."""
+        b = torch.arange(self.kb, device=self.u8.device)
+        off = rows.to(self.u8.device).view(-1, 1) * self.row_stride + ((b // 4) * self.col_stride + b % 4).view(1, -1)
+        return self.u8[off]
 
 
 # ------------------------------------------------------------------------------------------------ index math
@@ -283,55 +319,148 @@ def stage_inplace_emulated(resolve, ptab6, ids, gtab, dtab, dsts, mi, H: int, al
     assert k * align == mi.numel()
 
 
+def stage_rows_emulated(resolve, ptab6, uniq, gtab, dtab, dsts, sidx, wl, H: int, row_w: int, sf_dims,
+                        n_work: int) -> None:
+    """M1-T10-MOE: the contract of runtime/static_kernels.py `stage_rows` (m1_stage_rows) in torch: for j <
+    n_work with u = wl[j] >= 0, e = uniq[u], g = gtab[e]: cold (g < 0) -> its weight rows of w1/w3/w2 into slot
+    H + sidx[u] of dsts[0..2] and its scales into that group of the packed SF dsts[3..5]; hot -> its scales into
+    group g. Nothing else is written (m_indices, overflow and stage ids are the dedup's)."""
+    assert [int(a) for a in dtab.tolist()] == [t.data_ptr() for t in dsts] and ptab6.shape[0] == 6
+    wll, ul, sl = [int(v) for v in wl.tolist()], [int(v) for v in uniq.tolist()], [int(v) for v in sidx.tolist()]
+    for j in range(int(n_work)):
+        u = wll[j]
+        if u < 0:
+            continue
+        e = ul[u]
+        g = int(gtab[e])
+        cold = g < 0
+        grp = H + sl[u] if cold else g
+        for p in range(3):
+            if cold:
+                dsts[p][grp].view(torch.uint8).view(-1).copy_(resolve(int(ptab6[p, e])).view(-1)[:row_w])
+            N, C = sf_dims[1] if p == 2 else sf_dims[0]
+            src = resolve(int(ptab6[3 + p, e]))
+            dsts[3 + p][grp].copy_(src.view(-1)[:N * C * SF_PACK].view(N, C * SF_PACK).view(torch.int32))
+
+
+# ------------------------------------------------------------------------------------------------ pool SF store
+def pool_sf_key(pool) -> tuple:
+    """What a pool-owned packed SF copy is valid for: the storage generation, the spare count and the hot sets."""
+    return (getattr(pool, "generation", None), int(pool.spare),
+            tuple(tuple(int(e) for e in pool.hot[l]) for l in range(pool.n_layers)),
+            tuple(pool.hbm_full[l]["w1"].data_ptr() for l in range(pool.n_layers)))
+
+
+def pool_sf_bytes(pool, N: Dict[str, int], C: Dict[str, int]) -> int:
+    """Bytes of a whole-pool packed SF copy (every layer's H + S groups, three projections)."""
+    per = sum(N[p] * C[p] * 4 for p in PROJS)
+    return sum(int(pool.hbm_full[l]["w1"].size(0)) * per for l in range(pool.n_layers))
+
+
+def pool_packed_sf(pool, layer: int, N: Dict[str, int], C: Dict[str, int], device) -> Dict[str, torch.Tensor]:
+    """M1-T10-MOE sf_store "pool": ONE packed MN-major copy of every layer's hot scales, owned by the pool and shared
+    by every dg-inplace build on it (the 1-row and the R-row steps alike), built per layer on first use; the spare
+    groups start zero (code 0 = 2^-127, finite) and are written by the staging launches. Keyed by pool_sf_key: a
+    storage move (add_spare_slots) or a different hot set rebuilds it (the old copy goes with the stale builds)."""
+    key = pool_sf_key(pool)
+    cache = getattr(pool, "_dg_packed_sf", None)
+    if cache is None or cache["key"] != key:
+        cache = pool._dg_packed_sf = {"key": key, "layers": {}}
+    if layer not in cache["layers"]:
+        H = len(pool.hot[layer])
+        G = int(pool.hbm_full[layer]["w1"].size(0))
+        sf = {}
+        with torch.inference_mode(False), torch.no_grad():
+            for p in PROJS:
+                t = packed_sf_zeros(G, N[p], C[p], device)
+                if H:
+                    t[:H].copy_(pack_words(pool.hbm[layer][p][1]))
+                sf[p] = t
+        cache["layers"][layer] = sf
+    return cache["layers"][layer]
+
+
 # ------------------------------------------------------------------------------------------------ static buffers
 class DGInplaceBuffers(DGBuffers):
     """dg-masked's buffers with max_m = ALIGN (the activation buffers ARE the contiguous A: [k, ALIGN, K] viewed as
-    [k*ALIGN, K]), no fp32 weight-scale staging, plus m_indices, the packed SF storage and per-layer tables."""
+    [k*ALIGN, K]), no fp32 weight-scale staging, plus m_indices, the packed SF storage and per-layer tables.
+    M1-T10-MOE (the R-row step, runtime/moe_rows.py DGInplaceMoERows): `layout` -- "contiguous" (the above, any
+    power-of-two ALIGN >= rows), "psum" (the same A [k*ALIGN, K], groups by the use_psum_layout prefix sums over
+    the pool's groups in `gl`), "masked" (A [G_max + 1, 128, K]: block g = pool group g, masked_m in `gl`, block
+    G_max = the scratch block of overflowing pairs) -- and sf_store "pool" (pool_packed_sf)."""
 
     def __init__(self, owner, shapes, sshapes, *, pool, swiglu_limit: float, deterministic: bool = True, dg=None,
                  align: Optional[int] = None, sf_store: Optional[str] = None, slots: Optional[int] = None,
-                 spare_slots: Optional[int] = None):
+                 spare_slots: Optional[int] = None, layout: str = "contiguous", expected_m: Optional[int] = None):
         """slots: A blocks (default topk; M1-T10-FIX's R-row MoE, runtime/moe_rows.py DGInplaceMoERows, uses R*topk:
         block u holds slot u's count <= R rows). spare_slots (M1-T10-FIX2): spare pool slots per layer the cold
         experts of one step may use (default = slots: the 1-row contract, spare j for slot j; the R-row MoE passes
-        its compact-index budget S, default 8, and counts overflows)."""
-        align = check_align(align if align is not None else int(os.environ.get(ALIGN_ENV, MK_ALIGN)))
-        if align < int(getattr(owner, "rows", 1)):
-            raise ValueError(f"contiguous alignment {align} < {owner.rows} rows per block")
+        its compact-index budget S, default 8, and counts overflows). layout / expected_m: M1-T10-MOE (R rows)."""
+        if pool is None:
+            raise ValueError("dg-inplace needs the ExpertPool (it reads the hot pool in place)")
+        if layout not in ROWS_LAYOUTS:
+            raise ValueError(f"layout {layout!r} not in {ROWS_LAYOUTS}")
+        rows = int(getattr(owner, "rows", 1))
+        if layout != "contiguous" and rows == 1:
+            raise ValueError(f"layout {layout!r} is the R-row step's (rows > 1)")
+        dg = dg if dg is not None else import_deep_gemm()
+        pairs = int(slots or owner.topk)
+        rem = int(expected_m or os.environ.get(EXPECTED_M_ENV, 0) or rows)   # (DGBuffers' expected_m is masked's 8)
+        hot = [len(pool.hot[l]) for l in range(pool.n_layers)]
+        G_max = max(hot) + pool.spare
+        if layout == "masked":
+            align = check_align(align if align is not None else MK_ALIGN)
+            blocks, brows = G_max + 1, MASKED_MAX_M
+        else:
+            if align is None and layout == "psum":
+                align = self._psum_align(dg, rem)
+            align = check_align(align if align is not None else int(os.environ.get(ALIGN_ENV, MK_ALIGN)))
+            if align < rows:   # one block of ALIGN rows per used slot / group holds its <= R rows
+                raise ValueError(f"{layout} alignment {align} < {rows} rows per block")
+            blocks, brows = pairs, align
         super().__init__(owner, shapes, sshapes, swiglu_limit=swiglu_limit, deterministic=deterministic, dg=dg,
-                         rows=align, sf32=False, slots=slots)
-        self.align = align
+                         rows=brows, sf32=False, slots=blocks)
+        self.layout, self.align, self.pairs, self.G_max = layout, align, pairs, G_max
+        self.rows_expected_m = rem              # masked layout: the heuristic's rows per group (handoff: R)
+        self.block_rows = brows                 # A rows per block (the dedup's block_rows)
+        self.gscr = G_max                       # masked: the scratch block of overflowing pairs
         self.sf_store = sf_store or os.environ.get(SF_STORE_ENV, "step")
         if self.sf_store not in SF_STORES:
             raise ValueError(f"sf_store {self.sf_store!r} not in {SF_STORES} (${SF_STORE_ENV})")
-        if pool is None:
-            raise ValueError("dg-inplace needs the ExpertPool (it reads the hot pool in place)")
-        self.spare_limit = self.k if spare_slots is None else int(spare_slots)
-        if not 1 <= self.spare_limit <= self.k:
-            raise ValueError(f"spare_slots {self.spare_limit} outside [1, {self.k}] (A blocks per layer)")
+        self.spare_limit = pairs if spare_slots is None else int(spare_slots)
+        if not 1 <= self.spare_limit <= pairs:
+            raise ValueError(f"spare_slots {self.spare_limit} outside [1, {pairs}] (A blocks per layer)")
         if pool.spare < self.spare_limit:
             raise ValueError(f"pool has {pool.spare} spare slots per layer, dg-inplace needs {self.spare_limit} "
                              f"(ExpertPool.add_spare_slots, done by StaticStep before this)")
         self.pool = pool
         self.fn = getattr(self.dg, "m_grouped_fp8_fp4_gemm_nt_contiguous")
+        self.fn_masked = getattr(self.dg, "m_grouped_fp8_fp4_gemm_nt_masked", None)
         self.alignment = self._set_alignment(align)
         d, k = self.dev, self.k
-        self.mi = torch.full((k * align,), -1, dtype=torch.int32, device=d)
+        self.mi = torch.full((k * align,), -1, dtype=torch.int32, device=d) if layout == "contiguous" else None
+        self.gl = torch.zeros(G_max, dtype=torch.int32, device=d) if layout != "contiguous" else None
         # T9b-4 lever 4: packed activation SF (A [k*ALIGN, K]) for the w1/w3 input (1) and the w2 input (2); used
         # instead of the fp32 xs only once runtime/fused_glue.py's self-check turned `sf_pack` on (it owns every
-        # writer of row 0 of each block then)
+        # writer of row 0 of each block then). M1-T10-MOE: `xsp_all` = the same SF addressed by ANY A row (the R-row
+        # writers scatter to the pairs' rows, dedup arow); the masked layout has no packed SF (fp32 only).
         self.sf_pack = False
         self.sf_pack_why: Optional[str] = "not enabled (needs glue_impl fused: dg_act + swiglu_routed + self-check)"
-        self.xsp = {w: packed_act_sf(k * align, (self.dim if w == 1 else self.inter) // ACT_BLOCK, d) for w in (1, 2)}
-        self.xsp_rows = {w: PackedRows(self.xsp[w], align, k) for w in (1, 2)}
+        self.xsp, self.xsp_rows, self.xsp_all = {}, {}, {}
+        if layout != "masked":
+            M = k * align
+            self.xsp = {w: packed_act_sf(M, (self.dim if w == 1 else self.inter) // ACT_BLOCK, d) for w in (1, 2)}
+            self.xsp_rows = {w: PackedRows(self.xsp[w], align, k) for w in (1, 2)}
+            self.xsp_all = {w: PackedRows(self.xsp[w], 1, M) for w in (1, 2)}
         self.C = {p: sf_words(self.K[p] // WEIGHT_BLOCK) for p in PROJS}
         self.sf_dims = ((self.N["w1"], self.C["w1"]), (self.N["w2"], self.C["w2"]))
         rw = {p: self.N[p] * self.K[p] // 2 for p in PROJS}
         if len(set(rw.values())) != 1:
             raise ValueError(f"dg-inplace staging assumes equal weight rows across projections, got {rw}")
         self.row_w = rw["w1"]
-        hot = [len(pool.hot[l]) for l in range(pool.n_layers)]
-        self.G_max = max(hot) + pool.spare
+        self.sf_store_why: Optional[str] = None
+        if self.sf_store in ("pool", "resident"):
+            self._check_sf_hbm()
         self.sf_shared: Dict[str, torch.Tensor] = {}
         if self.sf_store == "step":
             self.sf_shared = {p: packed_sf_zeros(self.G_max, self.N[p], self.C[p], d) for p in PROJS}
@@ -339,6 +468,42 @@ class DGInplaceBuffers(DGBuffers):
         self.plan = hbm_plan(pool.n_layers, hot, pool.spare, {p: shapes[p] for p in PROJS},
                              {p: sshapes[p] for p in PROJS})
         self.spare_added_B = 0  # set by StaticStep (what add_spare_slots returned on this build)
+        self.layout_check: Optional[dict] = None
+
+    @staticmethod
+    def _psum_align(dg, expected_m: int) -> int:
+        """psum: the group-start alignment = the kernel's BLOCK_M. $DSV41_ROWS_PSUM_ALIGN, else the library's
+        theoretical value for `expected_m` rows per group, else 32."""
+        env = os.environ.get(PSUM_ALIGN_ENV)
+        if env:
+            return int(env)
+        f = getattr(dg, "get_theoretical_mk_alignment_for_contiguous_layout", None)
+        if f is not None:
+            try:
+                return int(f(int(expected_m)))
+            except Exception:  # pragma: no cover - library dependent
+                pass
+        return 32
+
+    def _check_sf_hbm(self) -> None:
+        """pool / resident SF: refuse to allocate if it would leave less than $DSV41_SF_POOL_HEADROOM_GIB of HBM
+        free (the store falls back to "step", the reason in sf_store_why). A pool copy that already exists (another
+        build made it) costs nothing."""
+        pool = self.pool
+        if self.sf_store == "pool":
+            c = getattr(pool, "_dg_packed_sf", None)
+            if c is not None and c["key"] == pool_sf_key(pool) and len(c["layers"]) == pool.n_layers:
+                return
+        need = pool_sf_bytes(pool, self.N, self.C)
+        if self.dev.type != "cuda":
+            return
+        free, _ = torch.cuda.mem_get_info(self.dev)
+        head = float(os.environ.get(SF_POOL_HEADROOM_ENV, SF_POOL_HEADROOM_GIB)) * GiB
+        if free - need < head:
+            self.sf_store_why = (f"{self.sf_store} needs {need / GiB:.2f} GiB, {free / GiB:.2f} GiB free < "
+                                 f"{head / GiB:.1f} GiB headroom: using step")
+            print(f"[dg-inplace] sf_store {self.sf_store_why}", file=sys.stderr, flush=True)
+            self.sf_store = "step"
 
     def _set_alignment(self, align: int) -> dict:
         """DeepGEMM's global BLOCK_M cap for contiguous layouts := ALIGN (utils_deep_gemm.py:398-413: a mismatch
@@ -351,7 +516,26 @@ class DGInplaceBuffers(DGBuffers):
         now = g() if g else None
         if now is not None and int(now) != align:
             raise RuntimeError(f"deep_gemm contiguous alignment is {now} after setting {align}")
+        if f is not None and prev is not None and int(prev) != align:   # M1-T10-MOE: leave the global as found
+            f(int(prev))
         return {"prev": prev, "set": align, "now": now, "settable": f is not None}
+
+    @contextlib.contextmanager
+    def _align_now(self):
+        """M1-T10-MOE: the cap is process-global and other builds share it (the 1-row step, the R-row step in another
+        call shape, the draft graph's DraftDGBuffers, which sets it once at init): each of OUR GEMM calls runs with
+        our ALIGN and puts the previous value back after (host calls only; under capture the launch records the
+        kernel picked inside)."""
+        f = getattr(self.dg, "set_mk_alignment_for_contiguous_layout", None)
+        g = getattr(self.dg, "get_mk_alignment_for_contiguous_layout", None)
+        prev = g() if g is not None else None
+        if f is not None and prev != self.align:
+            f(self.align)
+        try:
+            yield
+        finally:
+            if f is not None and prev is not None and prev != self.align:
+                f(prev)
 
     # ---------------------------------------------------------------- per-layer tables (build time)
     def layer_tables(self, layer: int, ptabs: Dict[Tuple[str, str], torch.Tensor]) -> dict:
@@ -366,6 +550,8 @@ class DGInplaceBuffers(DGBuffers):
             raise ValueError(f"L{layer}: {G} pool slots < H {H} + spare slots {self.spare_limit}")
         if self.sf_store == "step":
             sf = {p: self.sf_shared[p][:G] for p in PROJS}
+        elif self.sf_store == "pool":
+            sf = pool_packed_sf(pool, layer, self.N, self.C, d)
         else:
             sf = {}
             with torch.inference_mode(False), torch.no_grad():
@@ -396,29 +582,193 @@ class DGInplaceBuffers(DGBuffers):
         stage_inplace(t["ptab6"], ids, t["gtab"], t["dtab"], t["dsts"], self.mi, t["H"], self.align, self.row_w,
                       self.sf_dims, self.sf_store == "step", ids_out, **kw)
 
+    def stage_n_work(self) -> int:
+        """Work-list entries the R-row staging launch scans: staged cold slots only (<= spare budget) when the hot
+        scales are pre-packed, the used slots (<= R*k) under sf_store "step"."""
+        return self.pairs if self.sf_store == "step" else self.spare_limit
+
+    def stage_rows(self, t: dict, m: Dict[str, torch.Tensor]) -> None:
+        """M1-T10-MOE: the R-row staging launch from the dedup's work list (cold weight rows + their scales; hot
+        scales too under sf_store "step", once per unique expert)."""
+        from runtime.static_kernels import stage_rows
+
+        stage_rows(t["ptab6"], m["uniq"], t["gtab"], t["dtab"], t["dsts"], m["sidx"], m["wl"], t["H"], self.row_w,
+                   self.sf_dims, self.stage_n_work())
+
+    def _sfa(self, which: int, M: int):
+        return self.xsp[which] if self.sf_pack else self.xs[which].view(M, -1)   # T9b-4: pre-packed (no DG convert)
+
     def gemm_inplace(self, p: str, t: dict, which: int) -> torch.Tensor:
         """d[p] [k, ALIGN, N] <- contiguous grouped GEMM of A = xq[which] as [k*ALIGN, K] (+ fp32 scales) against the
-        layer's whole pool W [G, N, K/2] with packed SF, groups from m_indices. Row j*ALIGN = sorted slot j."""
+        layer's whole pool W [G, N, K/2] with packed SF, groups from m_indices. Row j*ALIGN = sorted slot j.
+        M1-T10-MOE: psum / masked layouts go through gemm_rows."""
+        if self.layout != "contiguous":
+            return self.gemm_rows(p, t, which)
         M = self.k * self.align
-        sfa = self.xsp[which] if self.sf_pack else self.xs[which].view(M, -1)   # T9b-4: pre-packed (no DG convert)
-        self.fn((self.xq[which].view(M, -1), sfa), (t["w"][p], t["sf"][p]),
-                self.d[p].view(M, -1), self.mi, recipe_a=RECIPE_A, recipe_b=RECIPE_B)
+        with self._align_now():
+            self.fn((self.xq[which].view(M, -1), self._sfa(which, M)), (t["w"][p], t["sf"][p]),
+                    self.d[p].view(M, -1), self.mi, recipe_a=RECIPE_A, recipe_b=RECIPE_B)
         self.n_calls += 1
         return self.d[p]
 
+    def gemm_rows(self, p: str, t: dict, which: int) -> torch.Tensor:
+        """M1-T10-MOE: the routed GEMM of projection p in this build's layout over the layer's pool (B = W [G, N, K/2],
+        packed SF): contiguous (m_indices), psum (gl[:G] = each group's END row; group g starts at gl[g-1] aligned
+        up to the mk alignment = ALIGN, reference/deepgemm-tests generate_m_grouped_contiguous + scheduler/gemm.cuh;
+        empty groups have end == start: no blocks) or masked (A, d [G, 128, .] prefixes of the G_max + 1 blocks,
+        masked_m = gl[:G])."""
+        if self.layout == "contiguous":
+            return self.gemm_inplace(p, t, which)
+        G = int(t["G"])
+        if self.layout == "psum":
+            M = self.k * self.align
+            with self._align_now():
+                self.fn((self.xq[which].view(M, -1), self._sfa(which, M)), (t["w"][p], t["sf"][p]),
+                        self.d[p].view(M, -1), self.gl[:G], recipe_a=RECIPE_A, recipe_b=RECIPE_B,
+                        use_psum_layout=True)
+        else:
+            if self.fn_masked is None:
+                raise RuntimeError("deep_gemm has no m_grouped_fp8_fp4_gemm_nt_masked")
+            self.fn_masked((self.xq[which][:G], self.xs[which][:G]), (t["w"][p], t["sf"][p]), self.d[p][:G],
+                           self.gl[:G], int(self.rows_expected_m), recipe_a=RECIPE_A, recipe_b=RECIPE_B)
+        self.n_calls += 1
+        return self.d[p]
+
+    def _fill_layout_probe(self, G: int, n: int) -> None:
+        """warmup: n valid groups 0..n-1 with one row each in the layout's terms (m_indices heads / psum / masked_m)."""
+        if self.layout == "contiguous":
+            self.mi.view(self.k, self.align)[:, 0] = torch.arange(self.k, dtype=torch.int32, device=self.dev) % G
+        elif self.layout == "psum":
+            g = torch.arange(G, dtype=torch.int32, device=self.dev)
+            self.gl[:G] = torch.where(g < n, g * self.align + 1, torch.full_like(g, n * self.align))
+        else:
+            g = torch.arange(G, dtype=torch.int32, device=self.dev)
+            self.gl[:G] = (g < n).to(torch.int32)
+
+    def _reset_layout(self) -> None:
+        if self.mi is not None:
+            self.mi.fill_(-1)
+        if self.gl is not None:
+            self.gl.zero_()
+
     def warmup(self) -> None:
-        """First-call JIT of both GEMM shapes for every distinct group count, on real block heads (slots 0..k-1),
-        before any capture; m_indices is reset to all -1 afterwards (the next stage writes the heads)."""
+        """First-call JIT of both GEMM shapes for every distinct group count, on real block heads, before any
+        capture; m_indices / gl are reset afterwards (the next dedup writes them)."""
         seen = set()
         for l in sorted(self.layers):
             t = self.layers[l]
             if t["G"] in seen:
                 continue
             seen.add(t["G"])
-            self.mi.view(self.k, self.align)[:, 0] = torch.arange(self.k, dtype=torch.int32, device=self.dev) % t["G"]
+            self._fill_layout_probe(t["G"], min(self.pairs, t["G"]))
             for p in PROJS:
                 self.gemm_inplace(p, t, 2 if p == "w2" else 1)
-        self.mi.fill_(-1)
+        self._reset_layout()
+
+    # ---------------------------------------------------------------- M1-T10-MOE build-time layout self-check
+    def check_layout(self, seed: int = 20261107, n_groups: Optional[int] = None) -> dict:
+        """This build's GEMM call shape (layout + alignment) against the T9a-2 contiguous call at ALIGN = 128 on
+        layer 0's REAL pool bytes: `n_groups` (default min(R*k, 22, H)) distinct hot groups with 1..R rows each,
+        random fp8 activations with power-of-two per-32 scales, both GEMM shapes (w1: K = dim, w2: K = inter);
+        every real output row bitwise. Uses temporary reference buffers and a temporary packed SF of layer 0;
+        restores this build's A / m_indices / gl. Returns {"equal": bool, ...}; the caller falls back on False."""
+        pool, d = self.pool, self.dev
+        R_ = int(getattr(self.owner, "rows", 1))
+        H0 = len(pool.hot[0])
+        W = {p: pool.hbm_full[0][p] for p in ("w1", "w2")}
+        G0 = W["w1"].size(0)
+        U = int(n_groups or min(self.pairs, 22, H0))
+        if U < 1:
+            return {"equal": True, "skipped": "layer 0 has no hot experts"}
+        g = torch.Generator(device="cpu").manual_seed(seed)
+        groups = sorted(torch.randperm(H0, generator=g)[:U].tolist())
+        counts = torch.randint(1, R_ + 1, (U,), generator=g).tolist()
+        sfp = {}
+        with torch.inference_mode(False), torch.no_grad():
+            for p in W:
+                t_ = packed_sf_zeros(G0, self.N[p], self.C[p], d)
+                t_[:H0].copy_(pack_words(pool.hbm[0][p][1]))
+                sfp[p] = t_
+        tt = {"w": W, "sf": sfp, "G": G0}
+        res = {"layout": self.layout, "align": self.align, "groups": U, "rows": sum(counts), "projs": {}}
+        try:
+            for p, which in (("w1", 1), ("w2", 2)):
+                K = self.dim if which == 1 else self.inter
+                n = sum(counts)
+                xq = (torch.randn(n, K, generator=g) * 2).clamp(-448, 448).to(torch.float8_e4m3fn).to(d)
+                xs = torch.exp2(torch.randint(-3, 4, (n, K // ACT_BLOCK), generator=g).float()).to(d)
+                # reference: contiguous, ALIGN 128, U blocks
+                Ar = torch.zeros(U * MK_ALIGN, K, dtype=torch.float8_e4m3fn, device=d)
+                Sr = torch.ones(U * MK_ALIGN, K // ACT_BLOCK, dtype=torch.float32, device=d)
+                mir = torch.full((U * MK_ALIGN,), -1, dtype=torch.int32, device=d)
+                dr = torch.zeros(U * MK_ALIGN, self.N[p], dtype=torch.bfloat16, device=d)
+                rows_ref, rows_got = [], []
+                i = 0
+                for b, (gr, c) in enumerate(zip(groups, counts)):
+                    for r in range(c):
+                        Ar[b * MK_ALIGN + r] = xq[i]
+                        Sr[b * MK_ALIGN + r] = xs[i]
+                        mir[b * MK_ALIGN + r] = gr
+                        rows_ref.append(b * MK_ALIGN + r)
+                        i += 1
+                setf = getattr(self.dg, "set_mk_alignment_for_contiguous_layout", None)
+                getf = getattr(self.dg, "get_mk_alignment_for_contiguous_layout", None)
+                prev_al = getf() if getf is not None else None
+                if setf is not None:
+                    setf(MK_ALIGN)
+                try:
+                    self.fn((Ar, Sr), (W[p], sfp[p]), dr, mir, recipe_a=RECIPE_A, recipe_b=RECIPE_B)
+                finally:
+                    if setf is not None and prev_al is not None:
+                        setf(prev_al)
+                # this build's layout, in its own buffers
+                self._reset_layout()
+                xqb = self.xq[which].view(-1, K)
+                xsb = self.xs[which].view(-1, K // ACT_BLOCK)
+                prev_pack, self.sf_pack = self.sf_pack, False
+                order = sorted(range(U), key=lambda b_: groups[b_])          # psum: blocks by ascending group
+                pblk = {b_: j for j, b_ in enumerate(order)}
+                i = 0
+                for b, (gr, c) in enumerate(zip(groups, counts)):
+                    for r in range(c):
+                        if self.layout == "contiguous":
+                            a = b * self.align + r
+                            self.mi[a] = gr
+                        elif self.layout == "psum":
+                            a = pblk[b] * self.align + r
+                        else:
+                            a = gr * self.block_rows + r
+                        xqb[a] = xq[i]
+                        xsb[a] = xs[i]
+                        rows_got.append(a)
+                        i += 1
+                if self.layout == "psum":
+                    gg = torch.arange(G0, device=d).view(-1, 1)
+                    gv = torch.tensor(groups, device=d).view(1, -1)
+                    cv = torch.tensor(counts, device=d).view(1, -1)
+                    self.gl[:G0] = ((gv < gg).sum(1) * self.align + torch.where(gv == gg, cv, 0).sum(1)).int()
+                elif self.layout == "masked":
+                    for gr, c in zip(groups, counts):
+                        self.gl[gr] = c
+                try:
+                    out = self.gemm_inplace(p, tt, which)
+                finally:
+                    self.sf_pack = prev_pack
+                got = out.view(-1, self.N[p])[torch.tensor(rows_got, device=d)]
+                want = dr[torch.tensor(rows_ref, device=d)]
+                res["projs"][p] = compare_bf16(got, want)
+            res["equal"] = all(v["equal"] for v in res["projs"].values())
+        except Exception as e:
+            res["equal"] = False
+            res["error"] = f"{type(e).__name__}: {str(e)[:300]}"
+        finally:
+            self._reset_layout()
+            for w_ in (1, 2):
+                self.xq[w_].zero_()
+                self.xs[w_].fill_(1.0)
+            del sfp
+        self.layout_check = res
+        return res
 
     def describe(self) -> dict:
         r = super().describe()
@@ -427,20 +777,29 @@ class DGInplaceBuffers(DGBuffers):
             f, tot = torch.cuda.mem_get_info(self.dev)
             free = {"free_GiB": round(f / GiB, 3), "total_GiB": round(tot / GiB, 3),
                     "allocated_GiB": round(torch.cuda.memory_allocated(self.dev) / GiB, 3)}
-        sf_b = sum(t.untyped_storage().nbytes() for t in self.sf_shared.values()) if self.sf_store == "step" else \
-            sum(t["sf"][p].untyped_storage().nbytes() for t in self.layers.values() for p in PROJS)
+        if self.sf_store == "step":
+            sf_b = sum(t.untyped_storage().nbytes() for t in self.sf_shared.values())
+        elif self.sf_store == "pool":
+            c = getattr(self.pool, "_dg_packed_sf", None) or {"layers": {}}
+            sf_b = sum(t.untyped_storage().nbytes() for sf in c["layers"].values() for t in sf.values())
+        else:
+            sf_b = sum(t["sf"][p].untyped_storage().nbytes() for t in self.layers.values() for p in PROJS)
         pool = self.pool
         spare_b = sum((pool.hbm_full[l][p].numel() - pool.hbm[l][p][0].numel()) * pool.hbm_full[l][p].element_size()
                       for l in range(pool.n_layers) for p in PROJS)
-        r.update({"impl": "dg-inplace", "align": self.align, "alignment": self.alignment, "sf_store": self.sf_store,
+        extra = (self.mi.numel() * 4 if self.mi is not None else 0) + (self.gl.numel() * 4 if self.gl is not None else 0)
+        r.update({"impl": "dg-inplace", "layout": self.layout, "align": self.align, "alignment": self.alignment,
+                  "rows_expected_m": self.rows_expected_m if self.layout != "contiguous" else None,
+                  "block_rows": self.block_rows, "a_blocks": self.k, "layout_check": self.layout_check,
+                  "sf_store": self.sf_store, "sf_store_why": self.sf_store_why, "stage_n_work": self.stage_n_work(),
                   "act_sf_packed": self.sf_pack, "act_sf_packed_why": None if self.sf_pack else self.sf_pack_why,
                   "spare_slots": self.pool.spare, "spare_limit": self.spare_limit, "G_max": self.G_max,
-                  "max_m": self.align,
+                  "max_m": self.block_rows,
                   "groups_per_layer": sorted({t["G"] for t in self.layers.values()}),
                   "hbm_added_B": {"spare_weight_slots": spare_b, "packed_sf": sf_b,
                                   "spare_grown_by_this_build": self.spare_added_B},
                   "hbm_added_GiB": round((spare_b + sf_b) / GiB, 3), "hbm_after_build": free,
-                  "plan": self.plan, "buffer_bytes": r["buffer_bytes"] + self.mi.numel() * 4})
+                  "plan": self.plan, "buffer_bytes": r["buffer_bytes"] + extra})
         return r
 
 

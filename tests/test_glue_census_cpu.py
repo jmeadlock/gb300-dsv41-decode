@@ -60,7 +60,7 @@ def test_census_rows6_fused_glue_one_launch_per_cluster(tmp_path):
     assert rep["rows"] == 6 and set(rep["paths"]) == {"static-dg-gemv", "static-dg-gemv-fused"}
     k = _kernel_counts(rep["paths"])["static-dg-gemv-fused"]
     L = rep["config"]["n_layers"]
-    for name in ("m1_dedup_routes", "t9b2r2_router_pre", "t9b2r2_router_post", "t9b2_act_quant_bcast",
+    for name in ("m1_dedup_warp", "t9b2r2_router_pre", "t9b2r2_router_post", "t9b2_act_quant_bcast",
                  "t9b2_moe_combine", "t9b2_o_rope_qdq"):
         assert k[name] == L, (name, k[name])
     assert k["t9b2_swiglu_quant"] == 2 * L and k["t9b2r2_norm_row"] == 2 * L and k["t9b2r2_hc_norm"] == 2 * L + 1

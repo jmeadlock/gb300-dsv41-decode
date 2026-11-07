@@ -392,3 +392,66 @@ def stage_inplace(ptab6: torch.Tensor, ids: torch.Tensor, gtab: torch.Tensor, dt
 def step_marker(ctr: torch.Tensor) -> None:
     """One program, one warp: `ctr[0] += 1`. Fixed kernel name `t8_step_marker` for nsys."""
     t8_step_marker[(1,)](ctr, num_warps=1)
+
+
+# ------------------------------------------------------------------------------------------------ M1-T10-MOE (rows)
+@triton.jit
+def m1_stage_rows(ptab, uniq, gtab, sidx, wl, dtab, E, H, N13, C13, N2, C2,
+                  ROW_W: tl.constexpr, BW: tl.constexpr, NBW: tl.constexpr, BN: tl.constexpr, BC: tl.constexpr,
+                  NPROG: tl.constexpr, EVEN_W: tl.constexpr):
+    """M1-T10-MOE: the R-row dg-inplace staging launch, driven by the dedup's work list. Program (j, q, p): slot
+    u = wl[j] (-1: nothing to do -- the program exits at once), expert e = uniq[u], g = gtab[e]. A cold slot (g < 0;
+    the dedup lists only staged ones, compact index c = sidx[u] < spare budget) copies 8-KiB weight blocks q,
+    q+NPROG, ... of row ptab[p, e] (HBM or UVA) into pool slot H + c (int64 words, 16-B vectors), then packs its
+    scales into group H + c of the packed SF; a hot slot (listed only under sf_store "step") packs its scales into
+    group g. So the scale work is once per unique expert (<= U slots, not R*k blocks) and, with the hot SF
+    pre-packed (sf_store "pool" / "resident"), only cold experts are touched at all. m_indices, the overflow count
+    and the stage ids are the dedup's (moe_rows.m1_dedup_warp). Contract: dg_inplace.stage_rows_emulated."""
+    j = tl.program_id(0)
+    q = tl.program_id(1)
+    p = tl.program_id(2)
+    u = tl.load(wl + j)
+    if u >= 0:
+        e = tl.load(uniq + u)
+        g = tl.load(gtab + e).to(tl.int64)
+        c = tl.load(sidx + u).to(tl.int64)
+        cold = g < 0
+        grp = tl.where(cold, c + H, g)
+        if cold:
+            r_src = tl.multiple_of(tl.load(ptab + p * E + e).to(tl.pointer_type(tl.int64)), 16)
+            r_dst = tl.multiple_of(tl.load(dtab + p).to(tl.pointer_type(tl.int64)), 16)
+            r_row = r_dst + grp * ROW_W
+            if EVEN_W:
+                for it in range(0, NBW // NPROG):
+                    re_off = (q + it * NPROG) * BW + tl.arange(0, BW)
+                    tl.store(r_row + re_off, tl.load(r_src + re_off))
+            else:
+                for it2 in range(0, (NBW + NPROG - 1) // NPROG):
+                    rm_off = (q + it2 * NPROG) * BW + tl.arange(0, BW)
+                    rm_m = rm_off < ROW_W
+                    tl.store(r_row + rm_off, tl.load(r_src + rm_off, mask=rm_m), mask=rm_m)
+        _t9a2_pack_scales(ptab, dtab, e, E, p, grp, q, N13, C13, N2, C2, BN, BC, NPROG)
+
+
+def stage_rows(ptab6: torch.Tensor, uniq: torch.Tensor, gtab: torch.Tensor, dtab: torch.Tensor, dsts,
+               sidx: torch.Tensor, wl: torch.Tensor, H: int, row_w: int, sf_dims, n_work: int,
+               block_bytes: Optional[int] = None, nprog: Optional[int] = None,
+               num_warps: Optional[int] = None) -> None:
+    """M1-T10-MOE: ONE launch per layer of the R-row dg-inplace step (m1_stage_rows) over the first `n_work` entries
+    of the dedup's work list `wl` (the spare budget S when only cold experts are listed, R*k with sf_store "step").
+    ptab6 / gtab / dtab / dsts / sf_dims as stage_inplace; uniq / sidx / wl int64 [R*k] from the dedup."""
+    (n13, c13), (n2, c2) = sf_dims
+    if row_w % VEC_ALIGN or any(t.data_ptr() % VEC_ALIGN for t in dsts):
+        raise ValueError(f"stage_rows: weight row {row_w} B or a destination not {VEC_ALIGN}-B aligned")
+    nw = int(n_work)
+    if not 1 <= nw <= wl.numel():
+        raise ValueError(f"stage_rows: n_work {nw} outside [1, {wl.numel()}]")
+    bw = _block_bytes(block_bytes) // 8
+    ww = row_w // 8
+    nbw = triton.cdiv(ww, bw)
+    npg = int(nprog or STAGE_NPROG)
+    bc = triton.next_power_of_2(max(int(c13), int(c2)))
+    even = ww % bw == 0 and nbw % npg == 0
+    m1_stage_rows[(nw, npg, 3)](ptab6, uniq, gtab, sidx, wl, dtab, ptab6.size(1), int(H), int(n13), int(c13),
+                                int(n2), int(c2), ww, bw, nbw, STAGE_BN, bc, npg, even,
+                                num_warps=int(num_warps or VEC_WARPS))

@@ -34,9 +34,19 @@ arow / prow / pw / posmat, masked_m, the counters, and for dg-inplace the compac
 m_indices tags -- in ONE Triton launch, `m1_dedup_routes`, CPU mirror = the torch functions here), dg_act (the R rows'
 act_quant scattered to the pair A rows in one launch), swiglu_routed (gather + SwiGLU + weight + act_quant + scatter
 in one launch), moe_combine (per-row ascending-id combine + shared + bf16 in one launch), swiglu_shared.
+
+M1-T10-MOE (docs/HANDOFF-M1-T10-MOE.md): the dedup is `m1_dedup_warp` by default -- one program of ONE warp (bitonic
+tl.sort of id*KP + i keys, neighbour compare + cumsum for slots, one scratch row for the run starts), the matrix kernel
+`m1_dedup_routes` kept as $DSV41_DEDUP_IMPL=matrix and as the automatic fallback if the warp kernel fails to compile;
+for the R-row dg-inplace step it also writes the GEMM call shape's inputs (m_indices tags / psum ends / masked_m), the
+overflow count and the staging work list, and lays arow / posmat out for the call shape (`rows_layout` = its torch
+mirror); the staging is one launch over that work list (static_kernels.stage_rows: cold bytes + scales once per
+unique expert; hot scales pre-packed in the pool's SF copy, dg_inplace sf_store "pool").
 """
 from __future__ import annotations
 
+import os
+import sys
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -101,7 +111,9 @@ def dedup_routes_host(indices, weights) -> dict:
 
 # ------------------------------------------------------------------------------------------------ M1-T10-PORT dedup
 class DedupBuffers:
-    """One layer's static outputs of the fused dedup (graph-stable addresses; allocated at build). P = R*k pairs."""
+    """One layer's static outputs of the fused dedup (graph-stable addresses; allocated at build). P = R*k pairs.
+    M1-T10-MOE: `wl` = the staging work list (slot ids, -1 padded), `scr` = the warp kernel's int32 scratch row
+    (sorted ids [KP], first positions [KP + 1], per-slot block [KP])."""
 
     def __init__(self, rows: int, k: int, device):
         P = int(rows) * int(k)
@@ -114,6 +126,9 @@ class DedupBuffers:
         self.ids_stage = torch.zeros(P, **i64)
         self.sidx = torch.zeros(P, **i64)
         self.tags = torch.zeros(P, int(rows), dtype=torch.int32, device=device)
+        self.wl = torch.full((P,), -1, dtype=torch.long, device=device)
+        self.KP = _np2(P)
+        self.scr = torch.zeros(3 * self.KP + 1, dtype=torch.int32, device=device)
 
 
 if HAVE_TRITON:
@@ -188,16 +203,242 @@ if HAVE_TRITON:
             tag = tl.where(rr[None, :] < n_ok[:, None], grp[:, None], -1).to(tl.int32)
             tl.store(tags_o + ii[:, None] * NR + rr[None, :], tag, mask=okp[:, None] & (rr[None, :] < NR))
 
+    @triton.jit
+    def m1_dedup_warp(idx, w, uniq_o, counts_o, valid_o, slot_o, rank_o, prow_o, pw_o, arow_o, posmat_o,
+                      mm_o, ids_o, uval_o, gtab, stage_o, sidx_o, tags_o, wl_o, gl_o, ovf, scr, dummy,
+                      P, K, NR, BR, H, S, TS, G, GSCR,
+                      KP: tl.constexpr, NRP: tl.constexpr, HAS_MM: tl.constexpr, HAS_CTR: tl.constexpr,
+                      INPL: tl.constexpr, HAS_DUMMY: tl.constexpr, LAYOUT: tl.constexpr, HAS_TAGS: tl.constexpr,
+                      HAS_WL: tl.constexpr, STEP_SF: tl.constexpr, HAS_OVF: tl.constexpr):
+        """M1-T10-MOE: m1_dedup_routes' mapping in ONE program of ONE warp (num_warps=1: every 1-D op below is a
+        register / warp-shuffle op; the [KP, KP] compare matrices are gone except psum's group ranks). Keys
+        id * KP + i (unique, so the bitonic tl.sort is the stable sort-by-id of dedup_routes); run starts by
+        comparing each sorted id with its neighbour through the int32 scratch row `scr` (store, bar.sync, load);
+        slot = cumsum(first) - 1; each slot's first position -> rank, count (next first - this first) and id, now
+        laid out one slot per lane. INPL (dg-inplace): the compact cold index (cumsum), stage ids, sidx, and
+        (M1-T10-MOE) the overflow count (one atomic), the staging work list `wl` (staged cold slots c = 0.., then --
+        STEP_SF -- the used hot slots; -1 after), the m_indices tags of the contiguous layout straight into m_indices
+        (row stride TS; HAS_TAGS), and the per-slot A block of the psum (LAYOUT 1: ok slots by ascending group, the
+        G-entry psum written to gl) / masked (LAYOUT 2: block = group, masked_m [G] zeroed then scattered to gl)
+        layouts -> arow = block * BR + rank (masked: pairs of an overflowing slot -> scratch block GSCR). posmat by
+        a second sort of (row, sorted position) keys carrying arow in the low 16 bits."""
+        t = tl.arange(0, KP)
+        okt = t < P
+        v = tl.load(idx + t, mask=okt, other=0).to(tl.int32)
+        s = tl.sort(tl.where(okt, v * KP + t, (1 << 30) + t))
+        sid = s // KP                                         # expert id of sorted pair t (huge on padding lanes)
+        perm = s % KP                                         # its flat index r*K + j
+        tl.store(scr + t, sid)
+        tl.debug_barrier()
+        prev = tl.load(scr + t - 1, mask=t > 0, other=-1)
+        first = okt & ((t == 0) | (sid != prev))
+        fi = first.to(tl.int32)
+        slot = tl.cumsum(fi, 0) - 1
+        n_u = tl.sum(fi, 0)
+        vmax = tl.max(tl.where(okt, sid, -1), 0)
+        fp = scr + KP                                         # first sorted position of slot u; P from u = U on
+        tl.store(fp + slot, t, mask=first)
+        tl.store(fp + t, t * 0 + P, mask=t >= n_u)
+        tl.store(fp + KP, P)
+        tl.debug_barrier()
+        rank = t - tl.load(fp + tl.where(okt, slot, 0))
+        u = t                                                 # slot lanes from here on
+        oku = u < P
+        used = u < n_u
+        fpu = tl.load(fp + u)
+        counts = tl.where(used, tl.load(fp + u + 1) - fpu, 0)
+        uniq = tl.where(used, tl.load(scr + tl.where(used, fpu, 0)), vmax)
+        valid = (counts > 0).to(tl.int32)
+        tl.store(uniq_o + u, uniq, mask=oku)
+        tl.store(counts_o + u, counts, mask=oku)
+        tl.store(valid_o + u, valid, mask=oku)
+        if HAS_MM:
+            tl.store(mm_o + u, counts, mask=oku)
+        if HAS_CTR:
+            tl.store(ids_o + u, uniq, mask=oku)
+            tl.store(uval_o + u, valid, mask=oku)
+        if INPL:
+            gq = tl.load(gtab + uniq, mask=oku, other=0).to(tl.int32)
+            cold = (gq < 0) & (counts > 0)
+            ci = tl.cumsum(cold.to(tl.int32), 0) - 1
+            sidx = tl.where(cold, ci, -1)
+            grp = tl.where(cold, ci + H, gq)
+            okc = sidx < S
+            okused = okc & (counts > 0)
+            n_ok = tl.where(okc, counts, 0)
+            if HAS_DUMMY:
+                stage_ids = tl.where(counts > 0, uniq, tl.load(dummy).to(tl.int32))
+            else:
+                stage_ids = uniq
+            tl.store(stage_o + u, stage_ids, mask=oku)
+            tl.store(sidx_o + u, sidx, mask=oku)
+            if HAS_OVF:
+                n_over = tl.sum((cold & (sidx >= S)).to(tl.int32), 0)
+                if n_over > 0:
+                    tl.atomic_add(ovf, n_over)
+            if HAS_WL:
+                staged = cold & okc
+                n_st = tl.sum(staged.to(tl.int32), 0)
+                if STEP_SF:
+                    hu = (gq >= 0) & (counts > 0)
+                    wpos = tl.where(staged, ci, n_st + tl.cumsum(hu.to(tl.int32), 0) - 1)
+                    inw = staged | hu
+                    n_w = n_st + tl.sum(hu.to(tl.int32), 0)
+                else:
+                    wpos = ci
+                    inw = staged
+                    n_w = n_st
+                tl.store(wl_o + wpos, u, mask=inw)
+                tl.store(wl_o + u, u * 0 - 1, mask=oku & (u >= n_w))
+            if HAS_TAGS:
+                rr = tl.arange(0, NRP)
+                tag = tl.where(rr[None, :] < n_ok[:, None], grp[:, None], -1)
+                tl.store(tags_o + u[:, None] * TS + rr[None, :], tag, mask=oku[:, None] & (rr[None, :] < NR))
+            if LAYOUT == 1:
+                ga = tl.where(okused, grp, 1 << 30)
+                b_ok = tl.sum((ga[None, :] < ga[:, None]).to(tl.int32), 1)
+                nou = oku & (ga >= (1 << 30))
+                b_no = tl.sum(okused.to(tl.int32), 0) + tl.cumsum(nou.to(tl.int32), 0) - 1
+                blk = tl.where(okused, b_ok, b_no)
+                for g0 in range(0, G, KP):
+                    gg = g0 + tl.arange(0, KP)
+                    nb = tl.sum((ga[None, :] < gg[:, None]).to(tl.int32), 1)
+                    cg = tl.sum(tl.where(ga[None, :] == gg[:, None], counts[None, :], 0), 1)
+                    tl.store(gl_o + gg, nb * BR + cg, mask=gg < G)
+            elif LAYOUT == 2:
+                for g1 in range(0, G, KP):
+                    gz = g1 + tl.arange(0, KP)
+                    tl.store(gl_o + gz, gz * 0, mask=gz < G)
+                tl.debug_barrier()
+                tl.store(gl_o + tl.where(okused, grp, 0), counts, mask=okused)
+                blk = tl.where(okused, grp, -1)
+            else:
+                blk = u
+            tl.store(scr + 2 * KP + 1 + u, blk)
+            tl.debug_barrier()
+            bt = tl.load(scr + 2 * KP + 1 + tl.where(okt, slot, 0))
+            if LAYOUT == 2:
+                arow = tl.where(bt >= 0, bt * BR + rank, GSCR * BR + t)
+            else:
+                arow = bt * BR + rank
+        else:
+            arow = slot * BR + rank
+        prow = perm // K
+        tl.store(slot_o + t, slot, mask=okt)
+        tl.store(rank_o + t, rank, mask=okt)
+        tl.store(arow_o + t, arow, mask=okt)
+        tl.store(prow_o + t, prow, mask=okt)
+        tl.store(pw_o + t, tl.load(w + perm, mask=okt, other=0.0), mask=okt)
+        s2 = tl.sort(tl.where(okt, ((prow * KP + t) << 16) | arow, (1 << 30) + t))
+        tl.store(posmat_o + t, s2 & 0xFFFF, mask=okt)
+
 
 def _np2(n: int) -> int:
     return 1 if int(n) <= 1 else 1 << (int(n) - 1).bit_length()
 
 
+# ------------------------------------------------------------------------------------------------ M1-T10-MOE layouts
+LAYOUT_IDS = {"contiguous": 0, "psum": 1, "masked": 2}   # = runtime/dg_inplace.ROWS_LAYOUTS
+DEDUP_IMPLS = ("warp", "matrix")      # warp: m1_dedup_warp (default); matrix: the M1-T10-PORT m1_dedup_routes
+DEDUP_IMPL_ENV = "DSV41_DEDUP_IMPL"
+ARow_BITS = 16                        # posmat's second sort carries arow in the low 16 bits
+_WARP = {"error": None}               # first failure of a default-path warp launch: the process then uses matrix
+
+
+def dedup_impl() -> str:
+    v = os.environ.get(DEDUP_IMPL_ENV, "warp")
+    if v not in DEDUP_IMPLS:
+        raise ValueError(f"{DEDUP_IMPL_ENV}={v!r} not in {DEDUP_IMPLS}")
+    return v
+
+
+def dedup_describe() -> dict:
+    return {"impl": "matrix" if _WARP["error"] else dedup_impl(), "warp_error": _WARP["error"]}
+
+
+def rows_layout(m: Dict[str, torch.Tensor], inpl: dict, block_rows: int, R_: int, k: int) -> Dict[str, torch.Tensor]:
+    """The dg-inplace extras of a base mapping m (dedup_routes' keys) in torch device ops (no host sync, graph-
+    capturable): the CPU mirror of m1_dedup_warp's INPL part and the CUDA fallback behind the matrix kernel.
+    inpl: gtab, H, S, dummy, has_dummy, and (M1-T10-MOE) layout ("contiguous" | "psum" | "masked"), G, gscr,
+    step_sf. Returns sidx, ids_stage, tags [P, R] (contiguous), wl [P], n_over (0-d), gl [G] (psum / masked) or
+    None, and arow [P] / posmat [R, k] of the layout."""
+    uniq, counts, slot, rank, prow = m["uniq"], m["counts"], m["slot"], m["rank"], m["prow"]
+    P = uniq.numel()
+    dev = uniq.device
+    H, S, BR = int(inpl["H"]), int(inpl["S"]), int(block_rows)
+    lay = inpl.get("layout", "contiguous")
+    g = inpl["gtab"].index_select(0, uniq).long()
+    cold, ok, grp, sidx = compact_cold(g, counts, H, S)
+    used = counts > 0
+    okused = used & ok
+    ar = torch.arange(P, dtype=torch.long, device=dev)
+    out = {"sidx": sidx, "n_over": (cold & ~ok).sum(),
+           "ids_stage": torch.where(used, uniq, inpl["dummy"]) if inpl["has_dummy"] else uniq.clone()}
+    n_ok = torch.where(ok, counts, 0)
+    rr = torch.arange(R_, dtype=torch.long, device=dev).view(1, -1)
+    out["tags"] = torch.where(rr < n_ok.view(-1, 1), grp.view(-1, 1), -1).to(torch.int32)
+    staged = cold & ok
+    n_st = staged.sum()
+    c = torch.cumsum(cold.long(), 0) - 1
+    if inpl.get("step_sf"):
+        hu = used & (g >= 0)
+        pos = torch.where(staged, c, n_st + torch.cumsum(hu.long(), 0) - 1)
+        inw = staged | hu
+    else:
+        pos = c
+        inw = staged
+    wl = torch.full((P + 1,), -1, dtype=torch.long, device=dev)
+    wl.scatter_(0, torch.where(inw, pos, P), torch.where(inw, ar, -1))
+    out["wl"] = wl[:P]
+    G = int(inpl.get("G") or 0)
+    big = 1 << 30
+    if lay == "psum":
+        ga = torch.where(okused, grp, big)
+        b_ok = (ga.view(1, -1) < ga.view(-1, 1)).long().sum(1)
+        b_no = okused.long().sum() + torch.cumsum((~okused).long(), 0) - 1
+        blk = torch.where(okused, b_ok, b_no)
+        gg = torch.arange(G, dtype=torch.long, device=dev).view(-1, 1)
+        nb = (ga.view(1, -1) < gg).long().sum(1)
+        cg = torch.where(ga.view(1, -1) == gg, counts.view(1, -1), 0).sum(1)
+        out["gl"] = (nb * BR + cg).to(torch.int32)
+    elif lay == "masked":
+        blk = torch.where(okused, grp, -1)
+        gl = torch.zeros(G + 1, dtype=torch.long, device=dev)
+        gl.scatter_(0, torch.where(okused, grp, G), torch.where(okused, counts, 0))
+        out["gl"] = gl[:G].to(torch.int32)
+    else:
+        blk = ar
+        out["gl"] = None
+    bt = blk.index_select(0, slot)
+    if lay == "masked":
+        arow = torch.where(bt >= 0, bt * BR + rank, int(inpl["gscr"]) * BR + ar)
+    else:
+        arow = bt * BR + rank
+    out["arow"] = arow
+    order = torch.argsort(prow * P + ar)          # row-major, then sorted position (= ascending id within a row)
+    out["posmat"] = arow.index_select(0, order).view(R_, k)
+    return out
+
+
+def _check_arow_range(inpl: Optional[dict], block_rows: int, P: int) -> None:
+    lay = (inpl or {}).get("layout", "contiguous")
+    top = (int(inpl["gscr"]) + 1) * int(block_rows) if lay == "masked" else _np2(P) * int(block_rows)
+    if top > (1 << ARow_BITS):
+        raise ValueError(f"dedup: A rows up to {top} do not fit posmat's {ARow_BITS}-bit sort key")
+
+
 def dedup_fused(buf: DedupBuffers, indices: torch.Tensor, weights: torch.Tensor, block_rows: int, *, mm=None,
-                ids_step=None, uval=None, inpl: Optional[dict] = None) -> Dict[str, torch.Tensor]:
+                ids_step=None, uval=None, inpl: Optional[dict] = None, impl: Optional[str] = None
+                ) -> Dict[str, torch.Tensor]:
     """dedup_routes (+ masked_m `mm`, the counters' rows, and with `inpl` the dg-inplace staging inputs) into the
-    static buffers `buf`: ONE launch (m1_dedup_routes) on CUDA / under the shim, else the torch functions (CPU
-    mirror). Returns dedup_routes' dict (views of `buf`) + mm_written, and with inpl: ids_stage, sidx, tags."""
+    static buffers `buf`: ONE launch on CUDA / under the shim -- m1_dedup_warp (default, $DSV41_DEDUP_IMPL) or the
+    M1-T10-PORT m1_dedup_routes ("matrix") -- else the torch functions (CPU mirror). Returns dedup_routes' dict
+    (views of `buf`) + mm_written, and with inpl: ids_stage, sidx, tags.
+    M1-T10-MOE, inpl["v2"] (the R-row DGInplaceMoERows): also the staging work list `wl`, the overflow count added
+    to inpl["ovf"], the contiguous tags written straight into inpl["mi"] (row stride block_rows; else buf.tags),
+    the psum / masked_m vector into inpl["gl"][:G], and arow / posmat of inpl["layout"]; returns layout_done.
+    The matrix kernel (or a warp launch that fails to compile on the default path: reported once, then matrix for
+    the process) does the base mapping and rows_layout() the extras in torch device ops."""
     R_, k = indices.shape
     P = R_ * k
     if P != buf.P or P > DEDUP_MAX_PAIRS:
@@ -206,9 +447,30 @@ def dedup_fused(buf: DedupBuffers, indices: torch.Tensor, weights: torch.Tensor,
     wt = weights.reshape(-1).float().contiguous()
     out = {"uniq": buf.uniq, "counts": buf.counts, "valid": buf.valid, "slot": buf.slot, "rank": buf.rank,
            "prow": buf.prow, "pw": buf.pw, "arow": buf.arow, "posmat": buf.posmat, "mm_written": mm is not None}
+    v2 = bool(inpl is not None and inpl.get("v2"))
+    lay = inpl.get("layout", "contiguous") if v2 else "contiguous"
+    mi = inpl.get("mi") if v2 else None
     if inpl is not None:
-        out.update(ids_stage=buf.ids_stage, sidx=buf.sidx, tags=buf.tags)
-    if HAVE_TRITON and (idx.is_cuda or KERNELS_ON_CPU):
+        out.update(ids_stage=buf.ids_stage, sidx=buf.sidx)
+        if mi is None:
+            out["tags"] = buf.tags
+    if v2:
+        out.update(wl=buf.wl, layout_done=True)
+        _check_arow_range(inpl, block_rows, P)
+    kern = HAVE_TRITON and (idx.is_cuda or KERNELS_ON_CPU)
+    explicit = impl is not None or DEDUP_IMPL_ENV in os.environ
+    use = impl or ("matrix" if _WARP["error"] else dedup_impl())
+    if kern and use == "warp":
+        try:
+            _launch_warp(buf, idx, wt, R_, k, block_rows, mm, ids_step, uval, inpl, v2, lay, mi)
+            return out
+        except Exception as e:  # compile failure on this Triton: report once, fall back to the matrix kernel
+            if explicit:
+                raise
+            _WARP["error"] = f"{type(e).__name__}: {str(e).splitlines()[0][:300] if str(e) else ''}"
+            print(f"[moe_rows] m1_dedup_warp failed ({_WARP['error']}); using m1_dedup_routes from now on",
+                  file=sys.stderr, flush=True)
+    if kern:
         dmy = inpl["dummy"] if inpl is not None else idx
         m1_dedup_routes[(1,)](
             idx, wt, buf.uniq, buf.counts, buf.valid, buf.slot, buf.rank, buf.prow, buf.pw, buf.arow, buf.posmat,
@@ -219,6 +481,8 @@ def dedup_fused(buf: DedupBuffers, indices: torch.Tensor, weights: torch.Tensor,
             int(inpl["S"]) if inpl is not None else 0,
             KP=_np2(P), NRP=_np2(R_), HAS_MM=mm is not None, HAS_CTR=ids_step is not None,
             INPL=inpl is not None, HAS_DUMMY=bool(inpl is not None and inpl["has_dummy"]), num_warps=4)
+        if v2:
+            _apply_extras(buf, out, rows_layout(out, inpl, block_rows, R_, k), inpl, mi, block_rows, R_)
         return out
     m = dedup_routes(idx.view(R_, k), wt.view(R_, k), block_rows)
     for key in ("uniq", "counts", "valid", "slot", "rank", "prow", "pw", "arow", "posmat"):
@@ -229,15 +493,45 @@ def dedup_fused(buf: DedupBuffers, indices: torch.Tensor, weights: torch.Tensor,
         ids_step.copy_(m["uniq"])
         uval.copy_(m["valid"])
     if inpl is not None:
-        uniq, counts = m["uniq"], m["counts"]
-        g = inpl["gtab"].index_select(0, uniq).long()
-        cold, ok, grp, sidx = compact_cold(g, counts, int(inpl["H"]), int(inpl["S"]))
-        buf.ids_stage.copy_(torch.where(counts > 0, uniq, inpl["dummy"]) if inpl["has_dummy"] else uniq)
-        buf.sidx.copy_(sidx)
-        n_ok = torch.where(ok, counts, 0)
-        ar = torch.arange(R_, dtype=torch.long, device=idx.device).view(1, -1)
-        buf.tags.copy_(torch.where(ar < n_ok.view(-1, 1), grp.view(-1, 1), -1).to(torch.int32))
+        ext = rows_layout(m, dict(inpl, layout=lay) if v2 else dict(inpl, layout="contiguous"), block_rows, R_, k)
+        buf.ids_stage.copy_(ext["ids_stage"])
+        buf.sidx.copy_(ext["sidx"])
+        if v2:
+            _apply_extras(buf, out, ext, inpl, mi, block_rows, R_)
+        else:
+            buf.tags.copy_(ext["tags"])
     return out
+
+
+def _apply_extras(buf, out, ext, inpl, mi, block_rows: int, R_: int) -> None:
+    """rows_layout()'s results into the static buffers and the DeepGEMM inputs (device copies)."""
+    buf.wl.copy_(ext["wl"])
+    buf.arow.copy_(ext["arow"])
+    buf.posmat.copy_(ext["posmat"])
+    if mi is None:
+        buf.tags.copy_(ext["tags"])
+    _write_layout(ext, dict(inpl, mi=mi), block_rows, R_)
+
+
+def _launch_warp(buf, idx, wt, R_, k, block_rows, mm, ids_step, uval, inpl, v2, lay, mi) -> None:
+    P = R_ * k
+    has_in = inpl is not None
+    dmy = inpl["dummy"] if has_in else idx
+    tags_t, ts = (mi, int(block_rows)) if mi is not None else (buf.tags, R_)
+    gl = inpl.get("gl") if v2 else None
+    ovf = inpl.get("ovf") if v2 else None
+    m1_dedup_warp[(1,)](
+        idx, wt, buf.uniq, buf.counts, buf.valid, buf.slot, buf.rank, buf.prow, buf.pw, buf.arow, buf.posmat,
+        mm if mm is not None else buf.counts, ids_step if ids_step is not None else buf.uniq,
+        uval if uval is not None else buf.valid, inpl["gtab"] if has_in else idx,
+        buf.ids_stage, buf.sidx, tags_t, buf.wl, gl if gl is not None else buf.scr,
+        ovf if ovf is not None else buf.scr, buf.scr, dmy.reshape(-1),
+        P, k, R_, int(block_rows), int(inpl["H"]) if has_in else 0, int(inpl["S"]) if has_in else 0, ts,
+        int(inpl.get("G") or 0) if v2 else 0, int(inpl.get("gscr") or 0) if v2 else 0,
+        KP=buf.KP, NRP=_np2(R_), HAS_MM=mm is not None, HAS_CTR=ids_step is not None, INPL=has_in,
+        HAS_DUMMY=bool(has_in and inpl["has_dummy"]), LAYOUT=LAYOUT_IDS[lay] if v2 else 0,
+        HAS_TAGS=has_in and (not v2 or lay == "contiguous"), HAS_WL=v2, STEP_SF=bool(v2 and inpl.get("step_sf")),
+        HAS_OVF=ovf is not None, num_warps=1)
 
 
 def combine_rows(out_rows: torch.Tensor, posmat: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
@@ -247,6 +541,11 @@ def combine_rows(out_rows: torch.Tensor, posmat: torch.Tensor, x: torch.Tensor) 
     for j in range(posmat.size(1)):
         y += out_rows.index_select(0, posmat[:, j])
     return y
+
+
+def _rows2d(d: torch.Tensor) -> torch.Tensor:
+    """A GEMM output [blocks, rows, N] as its A rows [blocks*rows, N] (the layouts' arow index it)."""
+    return d.view(-1, d.size(-1))
 
 
 class _RowsMoEBase:
@@ -333,9 +632,9 @@ class DGMaskedMoERows(_RowsMoEBase):
         shape = x.size()
         x = x.view(-1, moe.dim)                                        # model.py:893
         glue = o.glue
-        S, M = b.k, self._block_rows()
+        M = self._block_rows()
         m = self._route(x, M, **self._route_kw())
-        self._weights(m)
+        m = self._weights(m) or m                                      # M1-T10-MOE: dg-inplace may re-lay arow
         arow, prow = m["arow"], m["prow"]
         if glue is not None and glue.on("dg_act"):                     # M1-T10-PORT: act_quant + scatter, 1 launch
             glue.dg_act_rows(x, m)
@@ -343,12 +642,12 @@ class DGMaskedMoERows(_RowsMoEBase):
             q, s = R.act_quant(x, R.fp8_block_size, R.scale_fmt, R.scale_dtype)   # model.py:187, the R rows once
             self._load(1, q.index_select(0, prow), s.index_select(0, prow), arow)
         if glue is not None and glue.on("swiglu_routed"):              # M1-T10-PORT: gather+glue+act_quant, 1 launch
-            g1 = self._gemm("w1", 1).view(S * M, -1)                               # model.py:845
-            g3 = self._gemm("w3", 1).view(S * M, -1)                               # model.py:846
+            g1 = _rows2d(self._gemm("w1", 1))                                      # model.py:845
+            g3 = _rows2d(self._gemm("w3", 1))                                      # model.py:846
             glue.routed_swiglu_rows(g1, g3, m)
         else:
-            gate = self._gemm("w1", 1).view(S * M, -1).index_select(0, arow).float()   # model.py:845
-            up = self._gemm("w3", 1).view(S * M, -1).index_select(0, arow).float()     # model.py:846
+            gate = _rows2d(self._gemm("w1", 1)).index_select(0, arow).float()          # model.py:845
+            up = _rows2d(self._gemm("w3", 1)).index_select(0, arow).float()            # model.py:846
             lim = b.swiglu_limit
             if lim > 0:                                                    # model.py:847-849
                 up = torch.clamp(up, min=-lim, max=lim)
@@ -358,7 +657,7 @@ class DGMaskedMoERows(_RowsMoEBase):
             h = h.to(x.dtype)                                              # model.py:853
             q2, s2 = R.act_quant(h, R.fp8_block_size, R.scale_fmt, R.scale_dtype)  # model.py:187 inside w2
             self._load(2, q2, s2, arow)
-        out = self._gemm("w2", 2).view(S * M, -1)                     # [S*M, D] bf16
+        out = _rows2d(self._gemm("w2", 2))                            # [A rows, D] bf16
         if glue is not None and glue.on("moe_combine"):                # M1-T10-PORT: combine + shared + bf16, 1 launch
             return glue.combine_rows(out, m["posmat"], self._shared(x), x).view(shape)
         y = combine_rows(out, m["posmat"], x)
@@ -417,7 +716,13 @@ class DGInplaceMoERows(DGMaskedMoERows):
     rest are NOT staged, their blocks are tagged -1 (the GEMM skips them: no out-of-bounds read) and the kernel adds
     one per such expert to the step's device counter `owner.ovf_step` -- that layer's results (hence the step's
     logits) are WRONG for that step, never silently: StaticStep.overflow_counts() / first_light's `overflow steps`.
-    Cost: S spare weight slots per layer (40 x 8 x 17.7 MB = 5.7 GB on the real model at S = 8)."""
+    Cost: S spare weight slots per layer (40 x 8 x 17.7 MB = 5.7 GB on the real model at S = 8).
+    M1-T10-MOE: the dedup (m1_dedup_warp, or its torch mirror rows_layout) also writes m_indices / the psum or
+    masked_m vector, the overflow count and the staging work list, and lays out arow / posmat for the build's GEMM
+    call shape (DGInplaceBuffers.layout: contiguous at any ALIGN >= R, psum, masked); the ONE staging launch
+    (static_kernels.stage_rows) then moves only the staged cold experts' bytes + scales (and, sf_store "step", the
+    used hot experts' scales once each). Same bytes into the same GEMM rows' groups: bit-equal by construction for
+    contiguous at ALIGN 128; the other call shapes are checked at build (DGInplaceBuffers.check_layout)."""
 
     def __init__(self, owner, moe, layer: int, ptabs: Dict[Tuple[str, str], torch.Tensor]):
         super().__init__(owner, moe, layer, ptabs)
@@ -434,30 +739,54 @@ class DGInplaceMoERows(DGMaskedMoERows):
         self.S = int(b.spare_limit)
 
     def _block_rows(self) -> int:
-        return self.owner.dg.align
+        return self.owner.dg.block_rows
 
-    def _weights(self, m: Dict[str, torch.Tensor]) -> None:
+    def _weights(self, m: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """M1-T10-MOE: the layout's m_indices / gl, the overflow count, arow / posmat and the work list are the
+        dedup's (dedup_fused, layout_done); the reference dedup (glue `dedup` off) gets them from rows_layout here.
+        Then ONE staging launch (cold bytes + scales from the work list)."""
         o, b, t = self.owner, self.owner.dg, self.t
-        if "tags" in m:   # M1-T10-PORT dedup_fused made the stage ids, the compact cold index and the tags
-            b.stage(t, m["ids_stage"], None, sidx=m["sidx"], ovf=o.ovf_step)   # 1 launch: cold c -> H + c, packed SF
-            b.mi.view(b.k, b.align)[:, : o.rows].copy_(m["tags"])             # after the launch's head writes
-            return
-        uniq, counts = m["uniq"], m["counts"]
-        ids = torch.where(counts > 0, uniq, self.dummy) if self.has_dummy else uniq
-        g = t["gtab"].index_select(0, uniq).long()
-        cold, ok, grp, sidx = compact_cold(g, counts, t["H"], self.S)
-        b.stage(t, ids, None, sidx=sidx, ovf=o.ovf_step)              # 1 launch: cold c -> H + c, packed SF
-        n_ok = torch.where(ok, counts, 0)                             # an overflowing block: every row -1
-        tags = torch.where(self.ar_rows < n_ok.view(-1, 1), grp.view(-1, 1), -1)
-        b.mi.view(b.k, b.align)[:, : o.rows].copy_(tags.to(torch.int32))  # after the launch's head writes
+        if not m.get("layout_done"):
+            inpl = self._inpl()
+            R_ = o.rows
+            ext = rows_layout(m, inpl, b.block_rows, R_, m["posmat"].size(1))
+            m = _with_extras(m, ext)
+            _write_layout(ext, inpl, b.block_rows, R_)
+            self.last = m
+        b.stage_rows(t, m)                                             # 1 launch: staged cold c -> H + c (+ SF)
+        return m
 
     def _gemm(self, p: str, which: int) -> torch.Tensor:
-        return self.owner.dg.gemm_inplace(p, self.t, which)
+        return self.owner.dg.gemm_rows(p, self.t, which)
+
+    def _inpl(self) -> dict:
+        o, b, t = self.owner, self.owner.dg, self.t
+        return {"gtab": t["gtab"], "H": int(t["H"]), "S": self.S, "dummy": self.dummy, "has_dummy": self.has_dummy,
+                "v2": True, "layout": b.layout, "mi": b.mi, "gl": b.gl, "G": int(t["G"]), "gscr": b.gscr,
+                "ovf": getattr(o, "ovf_step", None), "step_sf": b.sf_store == "step"}
 
     def _route_kw(self) -> dict:
-        """dedup_fused's dg-inplace extras: the layer's hot-slot table, H, the spare budget, the stand-in id."""
-        return {"inpl": {"gtab": self.t["gtab"], "H": int(self.t["H"]), "S": self.S, "dummy": self.dummy,
-                         "has_dummy": self.has_dummy}}
+        """dedup_fused's dg-inplace extras: the layer's hot-slot table, H, the spare budget, the stand-in id, and
+        (M1-T10-MOE, v2) the layout, m_indices / gl, the scratch block, the overflow counter, the store."""
+        return {"inpl": self._inpl()}
+
+
+def _with_extras(m: Dict[str, torch.Tensor], ext: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    out = dict(m)
+    out.update(arow=ext["arow"], posmat=ext["posmat"], wl=ext["wl"], sidx=ext["sidx"], ids_stage=ext["ids_stage"],
+               layout_done=True)
+    return out
+
+
+def _write_layout(ext: Dict[str, torch.Tensor], inpl: dict, block_rows: int, R_: int) -> None:
+    """rows_layout()'s m_indices tags / gl / overflow count into the DeepGEMM inputs (device ops)."""
+    if inpl.get("mi") is not None:
+        P = ext["tags"].size(0)
+        inpl["mi"].view(-1)[: P * int(block_rows)].view(P, int(block_rows))[:, :R_].copy_(ext["tags"])
+    if ext["gl"] is not None:
+        inpl["gl"][: ext["gl"].numel()].copy_(ext["gl"])
+    if inpl.get("ovf") is not None:
+        inpl["ovf"].add_(ext["n_over"].to(inpl["ovf"].dtype))
 
 
 def compact_cold(g: torch.Tensor, counts: torch.Tensor, H: int, S: int):

@@ -1277,6 +1277,8 @@ class R2Glue:
         if c == "dg_sf_pack":
             if o.moe_impl != "dg-inplace":
                 return "moe_impl is not dg-inplace (the contiguous GEMM is the one that converts the activation SF)"
+            if getattr(getattr(o, "dg", None), "layout", "contiguous") == "masked":   # M1-T10-MOE
+                return "the masked call shape takes fp32 activation SF (no packed form)"
             return None if mx else "needs the MXFP8 act_quant globals"
         return "unknown"
 
@@ -2063,6 +2065,8 @@ class R2Glue:
             return {"dg_sf_pack": "needs dg_act and swiglu_routed on (every writer of row 0's scales)"}
         from runtime.fused_glue import _rand_act, launch_act_quant_bcast, launch_swiglu_quant
 
+        if self.rows > 1:
+            return self._verify_sf_pack_rows(g)
         k = b.k
         x = _rand_act(g, 1, b.dim).to(self.dev)
         launch_act_quant_bcast(x, b.xq[1][:, 0], b.xs[1][:, 0], self.code_tab, k)
@@ -2090,6 +2094,58 @@ class R2Glue:
         finally:
             b.sf_pack = prev
             b.mi.fill_(-1)
+        return {"dg_sf_pack": None}
+
+    def _verify_sf_pack_rows(self, g) -> dict:
+        """M1-T10-MOE: dg_sf_pack at R rows. The R-row writers (act_quant scatter to the pairs' A rows, the routed
+        SwiGLU + act_quant at the same rows) into the packed SF via xsp_all == their fp32 scales' codes on exactly
+        those rows; then the layout's routed GEMM (gemm_rows on layer 0's real pool, the layout's probe groups) with
+        the packed activation SF == with the fp32 one, bitwise, w1 and w2 shapes."""
+        from runtime.fused_glue import _rand_act, launch_act_quant_bcast, launch_swiglu_quant
+
+        b = self.o.dg
+        if not getattr(b, "xsp_all", None):
+            return {"dg_sf_pack": "no packed activation SF in this call shape"}
+        Rr, k = self.rows, self.o.topk
+        P = Rr * k
+        M = b.k * b.align
+        dev = self.dev
+        D, I = b.dim, b.inter
+        heads = torch.arange(P, device="cpu") * b.align           # the GEMM probe's rows (one per block / group)
+        for arow_c in (torch.randperm(M, generator=g, device="cpu")[:P], heads[torch.randperm(P, generator=g)]):
+            arow = arow_c.to(dev)
+            prow = torch.randint(0, Rr, (P,), generator=g, device="cpu").to(dev)
+            x = _rand_act(g, Rr, D).to(dev)
+            launch_act_quant_bcast(x, b.xq[1].view(-1, D), b.xs[1].view(-1, D // BLOCK), self.code_tab, 1,
+                                   src_rows=prow, dst_rows=arow)
+            launch_act_quant_bcast(x, b.xq[1].view(-1, D), b.xsp_all[1], self.code_tab, 1, src_rows=prow,
+                                   dst_rows=arow)
+            gate, up = self._rand_gate_up(g, M, I)
+            w = (torch.rand(P, generator=g, device="cpu") * 2).float().to(dev)
+            launch_swiglu_quant(gate, up, w, b.xq[2].view(-1, I), b.xs[2].view(-1, I // BLOCK), self.silu_tab,
+                                self.code_tab, b.swiglu_limit, rows_idx=arow)
+            launch_swiglu_quant(gate, up, w, b.xq[2].view(-1, I), b.xsp_all[2], self.silu_tab, self.code_tab,
+                                b.swiglu_limit, rows_idx=arow)
+            for wi, K in ((1, D), (2, I)):
+                xs = b.xs[wi].view(-1, K // BLOCK).index_select(0, arow).contiguous()
+                want = ((xs.view(torch.int32) >> 23) & 0xFF).to(torch.uint8)
+                if not torch.equal(b.xsp_all[wi].codes_at(arow), want):
+                    return {"dg_sf_pack": f"R-row packed codes of DeepGEMM input {wi} differ from the fp32 scales"}
+        t = b.layers[min(b.layers)]
+        prev = b.sf_pack
+        try:
+            b._fill_layout_probe(t["G"], min(b.pairs, t["G"]))
+            for p_, wi in (("w1", 1), ("w2", 2)):
+                b.sf_pack = False
+                d32 = b.gemm_rows(p_, t, wi).clone()
+                b.sf_pack = True
+                dpk = b.gemm_rows(p_, t, wi).clone()
+                if not _same(dpk, d32):
+                    return {"dg_sf_pack": f"R-row {b.layout} GEMM ({p_}) with the packed activation SF differs from "
+                                          f"fp32 ({_mismatch(dpk, d32):.3e} of outputs)"}
+        finally:
+            b.sf_pack = prev
+            b._reset_layout()
         return {"dg_sf_pack": None}
 
     def describe_r4(self) -> dict:

@@ -402,6 +402,12 @@ class StaticMoE:
 
 
 # ------------------------------------------------------------------------------------------------ the step
+def _dedup_describe():
+    from runtime.moe_rows import dedup_describe
+
+    return dedup_describe()
+
+
 class StaticStep:
     """Fixed-shape 1-row decode step over the reference model (module docstring for the row-by-row mapping).
 
@@ -420,7 +426,8 @@ class StaticStep:
                  counters: bool = True, moe_impl: str = "ref", dg_deterministic: bool = True,
                  fp8_impl: str = "ref", glue_impl: str = "ref", glue_opts: Optional[dict] = None,
                  attn_impl: str = "ref", rows: int = 1, hidden_layers: Sequence[int] = (),
-                 spare_slots: Optional[int] = None, _allow_cpu: bool = False):
+                 spare_slots: Optional[int] = None, rows_moe_gemm: Optional[str] = None,
+                 rows_sf_store: Optional[str] = None, _allow_cpu: bool = False):
         R = _ref()
         from runtime import patches
 
@@ -432,6 +439,12 @@ class StaticStep:
             raise ValueError(f"spare_slots is the R-row dg-inplace step's budget (rows {rows}, moe_impl {moe_impl!r}: "
                              f"the 1-row dg-inplace step always uses topk spare slots)")
         self._spare_req = spare_slots
+        # M1-T10-MOE: the R-row dg-inplace step's GEMM call shape and SF store (runtime/dg_inplace.py ROWS_GEMMS /
+        # SF_STORES; defaults $DSV41_ROWS_MOE_GEMM or "contiguous", $DSV41_ROWS_SF_STORE or "pool")
+        if (rows_moe_gemm is not None or rows_sf_store is not None) and not (rows > 1 and moe_impl == "dg-inplace"):
+            raise ValueError(f"rows_moe_gemm / rows_sf_store configure the R-row dg-inplace step (rows {rows}, "
+                             f"moe_impl {moe_impl!r})")
+        self._rows_gemm_req, self._rows_sf_req = rows_moe_gemm, rows_sf_store
         if moe_impl not in MOE_IMPLS:
             raise ValueError(f"moe_impl {moe_impl!r} not in {MOE_IMPLS}")
         if rows > 1 and moe_impl not in MOE_IMPLS_ROWS:
@@ -709,9 +722,7 @@ class StaticStep:
                 if pool is None:
                     raise ValueError("moe_impl dg-inplace needs the model's ExpertPool")
                 added = pool.add_spare_slots(self.spare_slots, self.model)  # before the pointer tables (storage moves)
-                self.dg = DGInplaceBuffers(self, shapes, sshapes, pool=pool, swiglu_limit=lim,
-                                           deterministic=self.dg_deterministic, slots=ns,
-                                           spare_slots=self.spare_slots)
+                self.dg = self._build_rows_dg(shapes, sshapes, lim, ns)
                 self.dg.spare_added_B = added
                 self._ovf_on = True
                 moe_cls = moe_rows.DGInplaceMoERows
@@ -778,6 +789,30 @@ class StaticStep:
         self.uvalid_step = torch.ones(n_layers, ns, dtype=torch.long, device=d)  # rows > 1: 1 = a used unique slot
         self.cold_acc = torch.zeros(n_layers, dtype=torch.long, device=d)
         self.uniq_acc = torch.zeros(n_layers, dtype=torch.long, device=d)       # routed expert calls (unique/layer)
+
+    def _build_rows_dg(self, shapes, sshapes, lim: float, ns: int):
+        """M1-T10-MOE: the R-row dg-inplace buffers in the requested GEMM call shape and SF store; a call shape other
+        than the T9a-2 contiguous ALIGN 128 must pass DGInplaceBuffers.check_layout (bitwise vs that call on layer
+        0's real pool bytes) or the build falls back to it (the record says why: describe()["layout_check"])."""
+        from runtime import dg_inplace as DI
+
+        spec = self._rows_gemm_req or os.environ.get(DI.ROWS_GEMM_ENV) or "contiguous"
+        layout, align = DI.parse_rows_gemm(spec)
+        store = self._rows_sf_req or os.environ.get(DI.ROWS_SF_STORE_ENV) or DI.ROWS_SF_STORE_DEFAULT
+        kw = dict(pool=self.pool, swiglu_limit=lim, deterministic=self.dg_deterministic, slots=ns,
+                  spare_slots=self.spare_slots, sf_store=store)
+        b = DI.DGInplaceBuffers(self, shapes, sshapes, layout=layout, align=align, **kw)
+        if os.environ.get(DI.LAYOUT_CHECK_ENV, "1") != "0" and (layout != "contiguous" or b.align != DI.MK_ALIGN):
+            rec = b.check_layout()
+            if not rec.get("equal"):
+                print(f"[dg-inplace] rows moe gemm {spec!r} failed its build check ({rec.get('error') or rec}); "
+                      f"falling back to contiguous ALIGN {DI.MK_ALIGN}", file=sys.stderr, flush=True)
+                del b
+                b = DI.DGInplaceBuffers(self, shapes, sshapes, layout="contiguous", align=DI.MK_ALIGN, **kw)
+                b.layout_check = dict(rec, fallback=f"{spec} -> contiguous (align {DI.MK_ALIGN})")
+                spec = "contiguous"
+        b.rows_gemm = spec
+        return b
 
     # ---------------------------------------------------------------- body
     @contextlib.contextmanager
@@ -1249,7 +1284,9 @@ class StaticStep:
                 "moe_impl": self.moe_impl, "fp8_impl": self.fp8_impl, "glue_impl": self.glue_impl,
                 "glue_effective": "fused" if self.glue is not None else "ref", "glue_note": self.glue_note,
                 "attn_impl": self.attn_impl, "attn_on": bool(self._attn_on or self._fm_on),
-                "hidden_layers": list(self.hidden_layers), "n_slots": self.n_slots, "spare_slots": self.spare_slots}
+                "hidden_layers": list(self.hidden_layers), "n_slots": self.n_slots, "spare_slots": self.spare_slots,
+                "rows_moe_gemm": getattr(getattr(self, "dg", None), "rows_gemm", None),
+                "dedup_impl": _dedup_describe() if self.rows > 1 else None}
 
     def marker_count(self) -> int:
         return int(self.marker_ctr.item())

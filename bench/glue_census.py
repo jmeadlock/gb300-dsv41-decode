@@ -247,7 +247,9 @@ def install(R):
     # R-row MoE classes (the reference dedup's torch ops land in moe.dedup)
     from runtime import moe_rows
 
-    setattr_saved(moe_rows, "dedup_fused", kernel(moe_rows.dedup_fused, "m1_dedup_routes", lambda *a, **k: []))
+    # M1-T10-MOE: the dedup kernel's name follows $DSV41_DEDUP_IMPL (m1_dedup_warp by default, m1_dedup_routes)
+    dedup_name = "m1_dedup_warp" if moe_rows.dedup_impl() == "warp" else "m1_dedup_routes"
+    setattr_saved(moe_rows, "dedup_fused", kernel(moe_rows.dedup_fused, dedup_name, lambda *a, **k: []))
     for cls, attr, name in [(moe_rows.StaticMoERows, "__call__", "moe"), (moe_rows.DGMaskedMoERows, "__call__", "moe"),
                             (moe_rows._RowsMoEBase, "_route", "moe.route")]:
         setattr_saved(cls, attr, tagged(getattr(cls, attr), name))
