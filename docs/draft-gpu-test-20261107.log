@@ -1,0 +1,28 @@
+  mini L=17: DraftStep static-eager == reference forward_spec (first draft ctx 1/0, mid ctx [1, 3, 6], chained): drafts, logits, confidence, rings
+PASS test_draft_equals_reference_mini (22.7s)
+  mini3 L=17: DraftStep static-eager == reference forward_spec (first draft ctx 1/0, mid ctx [1, 3, 6], chained): drafts, logits, confidence, rings
+  mini3w L=18: DraftStep static-eager == reference forward_spec (first draft ctx 1/0, mid ctx [1, 3, 6]): drafts, logits, confidence, rings
+PASS test_draft_equals_reference_mini3 (5.8s)
+  mini3 L=150: DraftStep static-eager == reference forward_spec (first draft ctx 1/0, mid ctx [6], chained): drafts, logits, confidence, rings
+PASS test_draft_equals_reference_ring_wrapped (0.8s)
+/usr/local/lib/python3.12/dist-packages/torch/cuda/__init__.py:1333: UserWarning: Synchronization debug mode is a prototype feature and does not yet detect all synchronizing operations (Triggered internally at /__w/pytorch/pytorch/torch/csrc/cuda/Module.cpp:1028.)
+  torch._C._cuda_set_sync_debug_mode(debug_mode)
+  draft graph == static-eager (ctx 0/1/3/6); replay x2, fills-on recapture, relaunch equal; no host sync; staging 1.0 MiB
+PASS test_draft_graph_replay_relaunch_no_sync (0.8s)
+[transformers] You are using a model of type `deepseek_v41` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+[load] 96085 tensors in 48 shards, map /work/docs/maps/hot-v26ar-seed-295.json, config /ref/inference/config.json
+[load] linears with scale: 46370; wo_a dequantized: 40; widened: ['layers.14.attn.compressor.wgate.weight', 'layers.14.attn.compressor.wkv.weight', 'layers.2.attn.compressor.wgate.weight', 'layers.2.attn.compressor.wkv.weight', 'layers.8.attn.compressor.wgate.weight', 'layers.8.attn.compressor.wkv.weight', 'head.weight']
+[load-mtp] 3 stages, 2395 tensors, HBM 7.543 GiB (expert stacks 6.724, other 0.820); linears with scale 1174; wo_a dequantized 3; widened ['mtp.2.confidence_head.proj.weight', 'mtp.2.markov_head.head.weight']
+  real: mtp {'read': 7.3881, 'hbm_params': 0.8197, 'hbm_expert_stacks': 6.7236, 'hbm_total': 7.5434}; HBM free 22.55 GiB
+  real L=40: DraftStep static-eager == reference forward_spec (first draft ctx 1/0, mid ctx [1, 3, 6], chained): drafts, logits, confidence, rings
+PASS test_draft_equals_reference_real (72.3s)
+  note: mini L=17: reference re-write of slot (L-1)%128 at decode numerics is a byte no-op
+  note: mini L=17 ctx 6: ctx_rowwise (M=1 context GEMMs) == default (M=6): True
+  note: mini3 L=17: reference re-write of slot (L-1)%128 at decode numerics is a byte no-op
+  note: mini3 L=17 ctx 6: ctx_rowwise (M=1 context GEMMs) == default (M=6): True
+  note: mini3w L=18: reference re-write of slot (L-1)%128 at decode numerics is a byte no-op
+  note: mini3 L=150: reference re-write of slot (L-1)%128 at decode numerics is a byte no-op
+  note: real L=40: reference re-write of slot (L-1)%128 at decode numerics is a byte no-op
+  note: real L=40 ctx 6: ctx_rowwise (M=1 context GEMMs) == default (M=6): True
+bit-equal comparisons executed: 5 gate runs, 43 draft sets, 215 fp32 logit rows, 117 ring tensors, 1 graph runs
+5/5 not failed; 0 failed
