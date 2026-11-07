@@ -150,10 +150,12 @@ class DGBuffers:
     buffers are written only here (zeros / ones) and never again."""
 
     def __init__(self, owner, shapes: Dict[str, Tuple[int, int]], sshapes: Dict[str, Tuple[int, int]], *,
-                 swiglu_limit: float, deterministic: bool = True, dg=None, rows: int = MAX_M, sf32: bool = True):
+                 swiglu_limit: float, deterministic: bool = True, dg=None, rows: int = MAX_M, sf32: bool = True,
+                 slots: Optional[int] = None):
         """rows / sf32: T9a-2's DGInplaceBuffers (runtime/dg_inplace.py) reuses these buffers with `rows` = its
-        contiguous-layout alignment and no fp32 weight-scale staging; dg-masked uses the defaults (unchanged)."""
-        R, d, k = owner.R, owner.dev, owner.topk
+        contiguous-layout alignment and no fp32 weight-scale staging; dg-masked uses the defaults (unchanged).
+        slots: groups (default topk); M1-T10's R-row MoE (runtime/moe_rows.py) uses R*topk, masked_m per step."""
+        R, d, k = owner.R, owner.dev, int(slots or owner.topk)
         if (R.fp8_block_size, R.fp4_block_size, R.scale_fmt) != (ACT_BLOCK, WEIGHT_BLOCK, "ue8m0"):
             raise ValueError(f"dg-masked assumes per-32 ue8m0 activation and weight scales; the reference has "
                              f"fp8_block_size={R.fp8_block_size} fp4_block_size={R.fp4_block_size} {R.scale_fmt}")

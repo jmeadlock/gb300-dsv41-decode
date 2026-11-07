@@ -1653,9 +1653,10 @@ class R2Glue:
                         code_tab=self.code_tab, slot=slot, qdq=True,
                         rope=(torch.view_as_real(freqs_cis).reshape(-1, 2), rd, self.rope_fwd) if rd else None)
 
-    def kv_path(self, attn, x, xq, freqs_cis, slot):
+    def kv_path(self, attn, x, xq, freqs_cis, slot, ring=None):
         """_window_kv's kv (model.py:706-708) into the ring slot (model.py:719): wkv, then kv_norm + RoPE + QDQ +
-        the ring write in one launch."""
+        the ring write in one launch. ring: the static step's own 256-slot ring (M1-T10 #20; default the reference
+        window cache)."""
         pend, self._kv_pend = getattr(self, "_kv_pend", None), None
         if pend is not None and pend[0] == id(attn):                 # T9b-4: made by this layer's q path (pair)
             kvr = pend[1]
@@ -1663,7 +1664,7 @@ class R2Glue:
             kvr = self._gemv_fold(xq, attn.wkv, "wkv")
         else:
             kvr = self.linear_pre(xq, attn.wkv, x)
-        self._kv_norm_write(attn, kvr, freqs_cis, attn.window_kv_cache, slot)
+        self._kv_norm_write(attn, kvr, freqs_cis, attn.window_kv_cache if ring is None else ring, slot)
 
     def route(self, moe, x):
         """Gate.forward (model.py:811-829, text: no image mask) + the static step's ascending sort -> (ids [k] int64,

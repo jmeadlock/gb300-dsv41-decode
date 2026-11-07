@@ -63,6 +63,16 @@ and one timed step cell.
     static-eager run (same moe/fp8/glue) gives the drift row "flashmla vs ref attn (same other impls)" (level A,
     first token divergence + mean |delta logit|, not gated; `parity_levels.attn_drift`). `attn_bound` in the report
     holds the flashmla describe (on/off and why, the .so, the self-check's error ratios vs the reference).
+(l) M1-T10: `--rows 6 --teacher-forced` (docs/HANDOFF-M1-T10-VERIFY6.md 2-4): phase 1 at 1 row -- the fixture greedy
+    records (the teacher-forcing targets; parity vs Pg61 as (b)) and a 1-row step cell of 6 x --step-cell steps (its
+    tokens feed phase 2's cell; R1); phase 2 at 6 rows -- `Generator.teacher_forced` over every prompt, --reps times
+    (each step feeds the 1-row record's next 6 tokens; every row accepted), self-replay as (c), the records compared
+    position by position to the 1-row records (V0 at the step level: bit-equal positions, argmax agreement, first
+    divergence), and the 6-row step cell (--step-cell steps, stats from --stats-from, CUDA events around `step_rows`
+    only, the 6 tokens staged on the device) -> ms per 6-row step, ms per position, R6/R1 (over the same positions),
+    HBM after the 6-row build; then the V0 row-invariance census table (runtime/row_census.py). --moe-impl applies to
+    the 1-row step; the 6-row step runs --rows-moe-impl (auto: dg-inplace -> dg-masked, the R-row MoEs being ref /
+    dg-masked); --glue-impl fused runs the reference glue at 6 rows (not ported; recorded). Report key `rows_mode`.
 Writes docs/first-light-<YYYYMMDD>.json (or --json) and prints a 12-line summary. One prompt failing logs its
 traceback and the run continues.
 
@@ -275,6 +285,312 @@ def step_cell(gen: Generator, ids: List[int], n_steps: int, stats_from: int = 32
                        "cold_calls_per_layer": [b - a for a, b in zip(c_start[3], c_end[3])],
                        "cold_calls_by_step": [c for _, c in cold_steps]}
     return out
+
+
+# ------------------------------------------------------------------------------------------------ (l) M1-T10 rows
+ROWS_MOE = {"dg-inplace": "dg-masked"}  # 1-row MoE impls not ported to rows > 1 -> what the R-row step runs
+
+
+def rows_moe_impl(moe: str, rows_moe: str = "auto") -> str:
+    return ROWS_MOE.get(moe, moe) if rows_moe == "auto" else rows_moe
+
+
+def _hbm(gen) -> Optional[dict]:
+    if not gen.is_cuda:
+        return None
+    torch.cuda.synchronize(gen.device)
+    free, total = torch.cuda.mem_get_info(gen.device)
+    return {"allocated_GiB": round(torch.cuda.memory_allocated(gen.device) / 2**30, 3),
+            "max_allocated_GiB": round(torch.cuda.max_memory_allocated(gen.device) / 2**30, 3),
+            "free_GiB": round(free / 2**30, 3), "total_GiB": round(total / 2**30, 3)}
+
+
+@torch.inference_mode()
+def step_cell_rows(gen: Generator, ids: List[int], targets: List[int], n_steps: int, stats_from: int = 32) -> dict:
+    """The R-row teacher-forced step cell (R = gen.rows): prefill, then `n_steps` R-row steps, step s feeding
+    targets[R*s .. R*s+R-1] at positions L+R*s.. (staged on the device before the cell: no H2D copy inside the timed
+    window), each timed with CUDA events around `gen.step_rows` only. Row j's argmax is compared (after the cell) with
+    targets[R*s+j+1] -- with the 1-row cell's tokens as targets, that is the 6-row graph's agreement with greedy."""
+    R_ = gen.rows
+    cuda = gen.is_cuda
+    L = len(ids)
+    need = R_ * n_steps
+    if len(targets) < need + 1:
+        raise ValueError(f"{len(targets)} targets < {need + 1} for {n_steps} {R_}-row steps")
+    if L + need - 1 > gen.max_pos:
+        raise ValueError(f"step cell's last position {L + need - 1} > max_pos {gen.max_pos}")
+    gen._ensure_captured()
+    hbm = _hbm(gen)
+    t0 = time.perf_counter()
+    gen.prefill(ids)
+    if cuda:
+        torch.cuda.synchronize(gen.device)
+    prefill_s = time.perf_counter() - t0
+    feed = torch.tensor(targets[:need], dtype=torch.long, device=gen.device).view(n_steps, R_)
+    outs, evs, wall_ms = [], [], []
+    pos = L
+    t_cell = time.perf_counter()
+    for s_ in range(n_steps):
+        if cuda:
+            s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            s.record()
+        tw = time.perf_counter()
+        gen.step_rows(feed[s_], pos)
+        if cuda:
+            e.record()
+            evs.append((s, e))
+        else:
+            wall_ms.append((time.perf_counter() - tw) * 1e3)
+        outs.append(gen.next_token_tensor().reshape(-1).clone())
+        pos += R_
+    if cuda:
+        torch.cuda.synchronize(gen.device)
+    cell_s = time.perf_counter() - t_cell
+    ms = [s.elapsed_time(e) for s, e in evs] if cuda else wall_ms
+    own = torch.stack(outs).reshape(-1).tolist()
+    agree = [o == t for o, t in zip(own, targets[1:need + 1])]
+    window = ms[stats_from - 1:] if stats_from >= 1 else ms
+    st = _stats(window)
+    return {"rows": R_, "prompt_tokens": L, "n_steps": n_steps, "positions": need, "stats_from_step": stats_from,
+            "timer": "cuda_events" if cuda else "wall", "prefill_ms": prefill_s * 1e3, "cell_wall_s": cell_s,
+            "ms_per_step": st, "ms_per_position_mean": st["mean"] / R_ if st.get("mean") else None,
+            "positions_per_s_from_mean": (1e3 * R_ / st["mean"]) if st.get("mean") else None,
+            "step_ms": [round(x, 4) for x in ms], "argmax_agree": sum(agree), "argmax_compared": len(agree),
+            "first_disagreement": next((i for i, a in enumerate(agree) if not a), None), "hbm_after_build": hbm}
+
+
+def compare_to_r1(tf: dict, r1: dict) -> dict:
+    """A teacher-forced record vs the 1-row record that gave its targets: positions whose logprob entry is identical
+    (the chosen token's logprob and the top-k list, repr-exact floats), max |dlogprob| of the chosen token, the first
+    divergence (record_divergence)."""
+    la, lb = tf.get("logprobs") or [], r1.get("logprobs") or []
+    n = min(len(la), len(lb))
+    same = sum(1 for i in range(n) if la[i] == lb[i])
+    d = [abs(float(la[i]["logprob"]) - float(lb[i]["logprob"])) for i in range(n)]
+    return {"positions": n, "identical_positions": same, "max_abs_dlogprob_chosen": max(d) if d else 0.0,
+            "mean_abs_dlogprob_chosen": sum(d) / n if n else 0.0, "first_divergence": record_divergence(tf, r1)}
+
+
+def run_rep_tf(gen: Generator, rows: List[dict], targets: Dict[str, list], out_path: str, rep: int,
+               log=print) -> List[dict]:
+    """(a) at R rows: `gen.teacher_forced` per fixture prompt on the 1-row record's tokens -> JSONL at out_path."""
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    results = []
+    with open(out_path, "w") as f:
+        for row in rows:
+            tag = row["tag"]
+            res: Dict = {"tag": tag, "rep": rep}
+            try:
+                if tag not in targets:
+                    raise RuntimeError(f"{tag}: no 1-row record (phase 1 failed for it)")
+                ids = gen.encode([{"role": "user", "content": row["prompt"]}])
+                rec = gen.teacher_forced(ids, targets[tag], tag=tag, prompt=row["prompt"])
+                f.write(dump_record(rec) + "\n")
+                f.flush()
+                res.update({k: v for k, v in gen.last_meta.items() if k not in ("token_ids",)})
+                res.update(n_tokens=rec["n_tokens"], prompt_tokens=len(ids))
+                log(f"[tf{gen.rows} rep{rep}] {tag:6s} prompt {len(ids)} -> {rec['n_tokens']} positions in "
+                    f"{res['n_steps']} steps, {res['decode_ms_per_step']:.1f} ms/step (incl. logprob work), argmax "
+                    f"agree {res['argmax_agree']}/{rec['n_tokens']}", flush=True)
+            except Exception:
+                tb = traceback.format_exc()
+                print(f"[tf rep{rep}] {tag}: FAILED\n{tb}", file=sys.stderr, flush=True)
+                res["error"] = tb
+            results.append(res)
+    return results
+
+
+def measure_rows(gen: Generator, a, report: Dict, *, out: str, json_path: str, fixture2: Optional[str]) -> int:
+    """(l): phase 1 at 1 row, phase 2 at --rows rows, the census; report `rows_mode`, the 12-line rows summary."""
+    R_ = int(a.rows)
+    rm: Dict = {"rows": R_, "teacher_forced": True, "moe_impl_r1": gen.moe_impl, "hidden_layers": gen.hidden_layers,
+                "moe_impl_rows": rows_moe_impl(gen.moe_impl, a.rows_moe_impl)}
+    report["rows_mode"] = rm
+    rows = load_fixture(a.fixture)
+    if a.only:
+        keep = set(a.only.split(","))
+        rows = [r for r in rows if r["tag"] in keep]
+    try:
+        gen.enc
+        report.setdefault("generator", {})["encoding"] = gen.encoding_path
+    except Exception:
+        report["errors"].append({"stage": "encoding", "traceback": traceback.format_exc()})
+    stem, ext = os.path.splitext(out)
+    step_row = next((r for r in load_fixture(a.fixture) if r["tag"] == a.step_tag), None)
+
+    # phase 1: 1 row
+    gen.set_rows(1)
+    p1 = f"{stem}-r1{ext or '.jsonl'}"
+    t = time.time()
+    res1 = run_rep(gen, rows, a.max_new, p1, 1)
+    rm["r1"] = {"path": p1, "wall_s": time.time() - t, "prompts": res1}
+    report["errors"] += [{"stage": "r1", "tag": r["tag"], "traceback": r["error"]} for r in res1 if "error" in r]
+    if not a.skip_parity:
+        rm["parity_r1"] = run_parity(p1, a.fixture, fixture2, p1 + ".parity.json")
+    targets = {r["tag"]: r["token_ids"] for r in res1 if "token_ids" in r}
+    sc1 = None
+    if a.step_cell > 0 and step_row is not None:
+        try:
+            ids = gen.encode([{"role": "user", "content": step_row["prompt"]}])
+            sc1 = step_cell(gen, ids, R_ * a.step_cell, a.stats_from)
+            ms = sc1.pop("step_ms")
+            same = ms[R_ * a.stats_from - 1:]  # the 1-row steps at the 6-row window's positions
+            sc1["ms_per_step_same_positions"] = _stats(same)
+            sc1["ms_per_step_first_n"] = _stats(ms[a.stats_from - 1: a.step_cell])
+            rm["step_cell_r1"] = {k: v for k, v in sc1.items() if k != "token_ids"}
+        except Exception:
+            tb = traceback.format_exc()
+            print(f"[step-cell r1] FAILED\n{tb}", file=sys.stderr)
+            report["errors"].append({"stage": "step_cell_r1", "traceback": tb})
+    rm["hbm_1row"] = _hbm(gen)
+    # the 1-row cell again with the R-row step's MoE impl when it differs (dg-inplace -> dg-masked): R6/R1 at the same
+    # MoE impl separates "6 rows" from "staging copies of every routed expert" (dg-masked gathers, dg-inplace does not)
+    if sc1 is not None and rm["moe_impl_rows"] != gen.moe_impl:
+        try:
+            gen.set_moe_impl(rm["moe_impl_rows"])
+            ids = gen.encode([{"role": "user", "content": step_row["prompt"]}])
+            scm = step_cell(gen, ids, a.step_cell, a.stats_from)
+            scm.pop("token_ids", None)
+            scm.pop("step_ms", None)
+            rm["step_cell_r1_rows_moe"] = scm
+        except Exception:
+            tb = traceback.format_exc()
+            print(f"[step-cell r1 {rm['moe_impl_rows']}] FAILED\n{tb}", file=sys.stderr)
+            report["errors"].append({"stage": "step_cell_r1_rows_moe", "traceback": tb})
+
+    # phase 2: R rows, teacher-forced
+    gen.reset_static()
+    gen.set_moe_impl(rm["moe_impl_rows"])
+    gen.set_rows(R_)
+    reps: Dict[int, dict] = {}
+    for rep in range(1, a.reps + 1):
+        p = f"{stem}-tf{R_}{'' if rep == 1 else f'-replay{rep - 1}'}{ext or '.jsonl'}"
+        t = time.time()
+        res = run_rep_tf(gen, rows, targets, p, rep)
+        reps[rep] = {"path": p, "wall_s": time.time() - t, "prompts": res}
+        report["errors"] += [{"stage": f"tf rep{rep}", "tag": r["tag"], "traceback": r["error"]}
+                             for r in res if "error" in r]
+    rm["reps"] = reps
+    st = getattr(gen, "static", None)
+    if st is not None:
+        rm["static"] = st.describe() if hasattr(st, "describe") else None
+        rm["glue_note"] = getattr(st, "glue_note", None)
+    if 1 in reps and not a.skip_parity:
+        rm["parity_tf"] = run_parity(reps[1]["path"], a.fixture, fixture2, reps[1]["path"] + ".parity.json")
+    rm["self_replay"] = {}
+    for rep in range(2, a.reps + 1):
+        sr = self_replay(reps[1]["path"], reps[rep]["path"], reps[1]["prompts"], reps[rep]["prompts"])
+        rm["self_replay"][rep] = sr
+        print(f"[self-replay tf rep1 vs rep{rep}] {sr['identical']}/{sr['n']} byte-identical, "
+              f"{sr['logits_digest_equal']}/{sr['n']} logits digests equal, files equal {sr['files_byte_identical']}")
+    try:
+        with open(p1) as f1, open(reps[1]["path"]) as f2:
+            r1 = {json.loads(l)["tag"]: json.loads(l) for l in f1 if l.strip()}
+            tf = {json.loads(l)["tag"]: json.loads(l) for l in f2 if l.strip()}
+        per = {tag: compare_to_r1(tf[tag], r1[tag]) for tag in sorted(set(r1) & set(tf))}
+        agree = {r["tag"]: r.get("argmax_agree") for r in reps[1]["prompts"] if "argmax_agree" in r}
+        rm["vs_r1"] = {"per_prompt": per, "argmax_agree": agree,
+                       "positions": sum(v["positions"] for v in per.values()),
+                       "identical_positions": sum(v["identical_positions"] for v in per.values()),
+                       "prompts_identical": sum(1 for v in per.values() if v["first_divergence"] is None),
+                       "n": len(per)}
+        print(f"[tf{R_} vs 1-row records] {rm['vs_r1']['identical_positions']}/{rm['vs_r1']['positions']} positions "
+              f"identical, {rm['vs_r1']['prompts_identical']}/{len(per)} prompts byte-identical", flush=True)
+    except Exception:
+        report["errors"].append({"stage": "vs_r1", "traceback": traceback.format_exc()})
+    if sc1 is not None:
+        try:
+            ids = gen.encode([{"role": "user", "content": step_row["prompt"]}])
+            scr = step_cell_rows(gen, ids, sc1["token_ids"], a.step_cell, a.stats_from)
+            r6 = scr["ms_per_step"].get("mean")
+            r1m = sc1["ms_per_step_same_positions"].get("mean")
+            scr["r6_over_r1"] = (r6 / r1m) if r6 and r1m else None
+            scr["r6_over_r1_first_n"] = (r6 / sc1["ms_per_step_first_n"]["mean"]
+                                         if r6 and sc1["ms_per_step_first_n"].get("mean") else None)
+            scm = rm.get("step_cell_r1_rows_moe")
+            scr["r6_over_r1_same_moe"] = (r6 / scm["ms_per_step"]["mean"]
+                                          if scm and r6 and scm["ms_per_step"].get("mean") else None)
+            rm["step_cell_rows"] = scr
+            print(f"[step-cell {R_}-row] mean {r6:.3f} ms/step ({scr['ms_per_position_mean']:.3f} ms/position); "
+                  f"1-row same positions {r1m:.3f} ms -> R{R_}/R1 {scr['r6_over_r1']:.3f}", flush=True)
+        except Exception:
+            tb = traceback.format_exc()
+            print(f"[step-cell rows] FAILED\n{tb}", file=sys.stderr)
+            report["errors"].append({"stage": "step_cell_rows", "traceback": tb})
+    rm["hbm_rows"] = _hbm(gen)
+
+    # the V0 census (eager; layer-0 shapes; the GEMV with tuned vs pinned-M=1 configs)
+    if not a.skip_census:
+        try:
+            from runtime.row_census import census, census_table
+
+            recs = census(gen.model, rows=R_)
+            rm["v0_census"] = recs
+            for line in census_table(recs):
+                print(line, flush=True)
+        except Exception:
+            report["errors"].append({"stage": "v0_census", "traceback": traceback.format_exc()})
+
+    os.makedirs(os.path.dirname(os.path.abspath(json_path)), exist_ok=True)
+    with open(json_path, "w") as f:
+        json.dump(report, f, indent=1, default=str)
+    for line in summary_rows_lines(report, json_path):
+        print(line)
+    return 0 if not report["errors"] else 2
+
+
+def summary_rows_lines(r: dict, json_path: str) -> List[str]:
+    """Exactly 12 lines (the --rows summary)."""
+    f = lambda x, d=2: "-" if x is None else f"{x:.{d}f}"  # noqa: E731
+    rm = r.get("rows_mode", {})
+    g = r.get("generator", {})
+    b = r.get("boot", {})
+    R_ = rm.get("rows")
+    lines = [f"FIRST LIGHT {r['date']} | rows {R_} teacher-forced | mode {g.get('mode')} | moe {rm.get('moe_impl_r1')}"
+             f" (rows: {rm.get('moe_impl_rows')}) fp8 {g.get('fp8_impl')} glue {g.get('glue_impl')}"
+             f"{' (ref at rows>1)' if rm.get('glue_note') else ''} attn {g.get('attn_impl')} | HBM boot "
+             f"{f(b.get('cuda_allocated_GiB'))} GiB | {(r.get('env') or {}).get('device')}"]
+    p1 = (rm.get("r1") or {}).get("prompts", [])
+    ok1 = [x for x in p1 if "error" not in x]
+    lines.append(f"1-row records: {len(ok1)}/{len(p1)} prompts, {sum(x.get('n_tokens', 0) for x in ok1)} tokens; parity "
+                 f"vs Pg61: {(rm.get('parity_r1') or {}).get('verdict_line') or 'not run'}"[:200])
+    for rep in (1, 2):
+        ps = (rm.get("reps") or {}).get(rep, {}).get("prompts", [])
+        ok = [x for x in ps if "error" not in x]
+        dm = [x["decode_ms_per_step"] for x in ok if x.get("decode_ms_per_step")]
+        lines.append(f"tf{R_} rep{rep}: {len(ok)}/{len(ps)} prompts, {sum(x.get('n_tokens', 0) for x in ok)} positions, "
+                     f"mean {f(sum(dm) / len(dm) if dm else None, 1)} ms per {R_}-row step (incl. logprob work)")
+    lines.append(f"tf{R_} parity vs Pg61: {(rm.get('parity_tf') or {}).get('verdict_line') or 'not run'}"[:200])
+    sr = (rm.get("self_replay") or {}).get(2)
+    lines.append(f"self-replay tf rep1 vs rep2: {sr['identical']}/{sr['n']} byte-identical, {sr['logits_digest_equal']}/"
+                 f"{sr['n']} fp32-logit digests equal" if sr else "self-replay: not run")
+    v = rm.get("vs_r1")
+    lines.append(f"V0 (tf{R_} vs 1-row records): {v['identical_positions']}/{v['positions']} positions identical, "
+                 f"{v['prompts_identical']}/{v['n']} prompts byte-identical; argmax agree "
+                 f"{sum(x or 0 for x in v['argmax_agree'].values())}/{v['positions']}" if v else "V0 vs 1-row: not run")
+    cen = rm.get("v0_census") or []
+    yes = sorted({c["family"] for c in cen if c.get("equal") is True})
+    no = sorted({c["family"] for c in cen if c.get("equal") is False})
+    lines.append(f"census row-invariant: {', '.join(yes) or '-'}"[:240])
+    lines.append(f"census NOT row-invariant: {', '.join(no) or '-'}"[:240])
+    s1 = rm.get("step_cell_r1") or {}
+    sr_ = rm.get("step_cell_rows") or {}
+    m1 = (s1.get("ms_per_step_same_positions") or {})
+    lines.append(f"1-row cell: {s1.get('n_steps', '-')} steps, same positions mean {f(m1.get('mean'), 3)} / p50 "
+                 f"{f(m1.get('p50'), 3)} ms per step; first-{sr_.get('n_steps', '-')} mean "
+                 f"{f((s1.get('ms_per_step_first_n') or {}).get('mean'), 3)} ms")
+    ms = sr_.get("ms_per_step") or {}
+    lines.append(f"{R_}-row cell: steps {sr_.get('stats_from_step', '-')}..{sr_.get('n_steps', '-')} mean "
+                 f"{f(ms.get('mean'), 3)} / p50 {f(ms.get('p50'), 3)} / p90 {f(ms.get('p90'), 3)} ms per step, "
+                 f"{f(sr_.get('ms_per_position_mean'), 3)} ms/position; argmax agree {sr_.get('argmax_agree', '-')}/"
+                 f"{sr_.get('argmax_compared', '-')}")
+    hb = sr_.get("hbm_after_build") or {}
+    lines.append(f"R{R_}/R1 = {f(sr_.get('r6_over_r1'), 3)} (same positions; first-n {f(sr_.get('r6_over_r1_first_n'), 3)}; "
+                 f"vs 1-row {rm.get('moe_impl_rows')} {f(sr_.get('r6_over_r1_same_moe'), 3)})"
+                 f" | HBM after {R_}-row build {f(hb.get('allocated_GiB'))} GiB alloc, {f(hb.get('free_GiB'))} GiB free "
+                 f"| errors: {len(r['errors'])} | report {json_path}")
+    assert len(lines) == 12, len(lines)
+    return lines
 
 
 # ------------------------------------------------------------------------------------------------ (f) parity levels
@@ -616,11 +932,40 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--parity-levels", action="store_true", help="T8 L0/L1/L2 bit-identity levels before (a)-(e)")
     ap.add_argument("--level-steps", type=int, default=32, help="decode steps per prompt in --parity-levels")
     ap.add_argument("--levels-ref", default=None, help="earlier report JSON: compare its parity_levels runs")
+    ap.add_argument("--rows", type=int, default=1, help="M1-T10: rows per decode step (6: the verify step; needs "
+                                                         "--teacher-forced)")
+    ap.add_argument("--teacher-forced", action="store_true", help="M1-T10: feed the 1-row records' next tokens")
+    ap.add_argument("--rows-moe-impl", choices=["auto", "ref", "dg-masked"], default="auto",
+                    help="the R-row step's MoE (auto: --moe-impl, dg-inplace -> dg-masked)")
+    ap.add_argument("--hidden-layers", default="auto",
+                    help="main_hidden layers: comma list, 'none', or auto (--rows > 1: the checkpoint config's "
+                         "dspark_target_layer_ids, 37,38,39 on the real model -- the verify graph's T11 output)")
+    ap.add_argument("--skip-census", action="store_true", help="--rows: skip the V0 census")
     return ap
+
+
+def hidden_layers_arg(a) -> List[int]:
+    """--hidden-layers -> layer ids (auto: [] at 1 row; at --rows > 1 the checkpoint config's dspark_target_layer_ids,
+    which the loader's overlay blanks on the model itself)."""
+    v = (a.hidden_layers or "").strip()
+    if v in ("", "none"):
+        return []
+    if v != "auto":
+        return [int(x) for x in v.split(",") if x.strip()]
+    if a.rows == 1:
+        return []
+    path = a.config or os.path.join(a.model_dir, "config.json")
+    try:
+        with open(path) as f:
+            return [int(x) for x in json.load(f).get("dspark_target_layer_ids") or []]
+    except (OSError, ValueError):
+        return []
 
 
 def main(argv=None) -> int:
     a = build_parser().parse_args(argv)
+    if a.rows != 1 and not a.teacher_forced:
+        build_parser().error("--rows > 1 is the teacher-forced verify step: add --teacher-forced")
 
     date = time.strftime("%Y%m%d")
     out = a.out or os.path.join(REPO, "scratch", f"first-light-cand-{date}.jsonl")
@@ -649,13 +994,16 @@ def main(argv=None) -> int:
                      "capability": torch.cuda.get_device_capability() if torch.cuda.is_available() else None}
     gen = Generator(model, a.tokenizer_dir or a.model_dir, mode=a.mode, max_pos=a.max_pos, marker=a.marker,
                     moe_impl=a.moe_impl, fp8_impl=a.fp8_impl, glue_impl=a.glue_impl, attn_impl=a.attn_impl,
-                    glue_approx=a.glue_approx)
+                    glue_approx=a.glue_approx,
+                    hidden_layers=hidden_layers_arg(a))
     report["generator"] = {"eos_ids": gen.eos_ids, "top_k": gen.top_k, "max_seq_len": gen.max_seq_len,
                            "tokenizer_dir": gen.tokenizer_dir, "mode": gen.mode, "max_pos": gen.max_pos,
                            "marker": gen.marker, "moe_impl": gen.moe_impl, "fp8_impl": gen.fp8_impl,
                            "glue_impl": gen.glue_impl, "glue_approx": gen.glue_approx, "attn_impl": gen.attn_impl}
     if a.nvtx_layers:
         install_layer_nvtx(model)
+    if a.rows != 1:
+        return measure_rows(gen, a, report, out=out, json_path=json_path, fixture2=fixture2)
     return measure(gen, a, report, n_layers=len(model.layers), out=out, json_path=json_path, fixture2=fixture2)
 
 
