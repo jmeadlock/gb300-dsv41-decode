@@ -217,7 +217,7 @@ T1's remainder covers these, with real expert bytes for `fp4_gemm`. Fallback for
 | T6 | **First light:** 8 prompts, measurements 1–3 | 2 | T0, T2–T5 | parity report in `docs/`; self-replay 100% (target **Nov 24**) |
 | T7 | Extend path + two-source `sparse_attn`; 32K | 4 | T6 | 32K prompt prefills and decodes 256 tokens; needles pass; self-replay equal |
 | T8 | Graph-capturable step (device routing, fixed shapes, marker kernel) | 3 | T6 | full decode step from one CUDA graph; parity unchanged — **DONE 2026-11-06, 98.4 ms (T8-RESULT)** |
-| T9 | Borrowed kernels one at a time: MoE → attention → MXFP8 GEMM → mHC | 6 | T8 | each swap re-passes parity; ms/step logged per swap — **T9a-1 DONE 2026-11-06, 44.6 ms (T9A1-RESULT)** |
+| T9 | Borrowed kernels one at a time: MoE → attention → MXFP8 GEMM → mHC | 6 | T8 | each swap re-passes parity; ms/step logged per swap — **T9a-1 DONE 44.6 ms; T9b-1 DONE 32.2 ms (2026-11-06)** |
 | T10 | Trace + gap histogram + M0 verdict | 1.5 | T9 | nsys step table with named boundaries; histogram; verdict vs D2 bar |
 
 There are two days of slack. If T6 has not passed by Dec 1, Milo flags a projected miss at the Dec 4 week-4 check (decision 17). A second worker can run T7 in parallel with T8.
