@@ -1,7 +1,9 @@
 """M2-T15 (docs/HANDOFF-M2-T15-ROUTER-PLAN.md; docs/M2-FUSED-CHAIN-DESIGN.md section 2.2 row L2): the router and the
-R-row MoE plan in ONE launch per layer. Kernel: runtime/static_kernels.py `m2_router_plan` (section "M2-T15").
+R-row MoE plan in ONE launch per layer. Kernels: runtime/static_kernels.py `m2_router_rows` / `m2_gate_fp32` (section
+"M2-T15"; round 1's `m2_router_plan` is kept for the bench).
 
     $DSV41_ROUTER_IMPL = fused (default) | plan | plan-gemv          (bench/router_plan_bench.py --router-impl)
+    $DSV41_ROUTER_PLAN_LAUNCH = ticket (default) | split              (the R-row plan's launch form, M2-T15 fix)
 
   fused      today's path (T9b-2 R2 `route` / `route_rows` + M1-T10-MOE `dedup_fused`): the gate mm (cuBLAS fp32),
              F.softplus, t9b2r2_router_pre, torch.topk (gatherTopK + bitonicSort), t9b2r2_router_post, and at R rows
@@ -13,11 +15,19 @@ R-row MoE plan in ONE launch per layer. Kernel: runtime/static_kernels.py `m2_ro
              Numerics: bit-identical to `fused` when the build-time self-check passes (it gates the switch on the
              device: softplus probe, routing on random + tie-heavy scores vs torch.topk itself, plan tensors vs
              dedup_fused); a softplus probe mismatch keeps torch's F.softplus as a separate op (mm + 2).
-  plan-gemv  the gate GEMV inside the same launch (bf16 weight widened in registers, exact; fp32 FMA in the T9b-5
-             fixed order with KB = GATE_KB lanes; one output per program-lane, no split-K), last-arriving CTA runs
-             the tail. ONE launch per layer. Numerics: A3-class vs `fused` (cuBLAS's sum order is not ours); bit-equal
-             to its own oracle (fused_glue_r2.fixed_dot_torch for the scores + the fused tail) -- that is what the
-             self-check gates; its route vs cuBLAS's is reported, not gated (bench/router_plan_bench.py).
+  plan-gemv  the gate scores from our own GEMV (static_kernels.gate_dot = m2_gate_fp32: T9b-5's tuned fixed-order fp32
+             dot on the bf16 weight, widened exactly; KB = gate_kb(D) lanes, a function of D only), then the same
+             router kernel. 2 launches per layer (3 with F.softplus kept). Numerics: A3-class vs `fused` (cuBLAS's
+             sum order is not ours, and the V0 census shows cuBLAS's M=6 gate differs from its M=1 gate on 84 % of
+             elements -- docs/first-light-rows6-fast-20261107.json -- so no GEMV can be bit-equal to `fused` at both
+             R); bit-equal to its own oracle (fused_glue_r2.fixed_dot_torch + the fused tail) and row-invariant by
+             construction -- that is what the self-check gates; its route vs cuBLAS's is reported, not gated.
+
+M2-T15 fix (docs/HANDOFF-M2-T15-FIX.md; round 1 had R=6 at 42.6 us vs fused 39.5: one CTA did all R rows and the plan
+serially): the router kernel is now `m2_router_rows`, grid (R,), one program per row (the same per-row arithmetic --
+bit-equal to round 1's single CTA by construction); the plan runs either in the LAST row program to arrive (`ticket`:
+an acq_rel ticket, one launch) or as today's separate dedup launch (`split`: moe_rows.dedup_fused). The round-1 kernel
+(m2_router_plan, with its in-kernel GEMV) stays for the bench's before / after only.
 
 The 6-row plan reaches the MoE through a wrapper around moe_rows._RowsMoEBase._route (installed only when a glue
 with a non-default router impl is built at R > 1; moe_rows.py itself is not edited -- it belongs to another worker
@@ -50,7 +60,10 @@ SortUtils.cuh + SortingRadixSelect.cuh, the latter two shipped as headers with e
 Softplus: ATen's CUDA softplus_kernel computes `(x * beta) > threshold ? x : log1p(exp(x * beta)) / beta` in fp32
 with beta 1, threshold 20 (x * 1 and / 1 exact): the kernel uses libdevice log1p / exp; whether the device's
 libdevice equals the CUDA math library torch was built with is the softplus probe (10^6 values + edges), at build
-and in the GPU test.
+and in the GPU test. Round 1 on the box: 28,411 of 21M differ, every example an exp(x) below 2^-126 that Triton's
+FTZ-linked libdevice flushes to +0 where torch keeps the subnormal. The fix adds two candidate forms for that range
+only (SOFTPLUS_FORMS: exp in fp64, rounded once / via 24 bits); the probe picks the first exact form, else torch's
+F.softplus stays a separate op.
 
 Recording (the 10^5-input gate): $DSV41_ROUTER_DUMP=<dir> makes the FUSED path's `route` / `route_rows` (the
 reference: today's ops) save every eager call's gate scores (raw [T, E] fp32, the mm's output), the layer, the call's
@@ -71,10 +84,14 @@ import torch.nn.functional as F
 ROUTER_IMPL_ENV = "DSV41_ROUTER_IMPL"
 ROUTER_IMPLS = ("fused", "plan", "plan-gemv")
 ROUTER_IMPL_DEFAULT = "fused"      # until the box gate (HANDOFF-M2-T15)
+PLAN_LAUNCH_ENV = "DSV41_ROUTER_PLAN_LAUNCH"
+PLAN_LAUNCHES = ("ticket", "split")  # the R-row plan in the last row program / as today's separate dedup launch
 DUMP_ENV = "DSV41_ROUTER_DUMP"
-GATE_KB = 64                       # plan-gemv's fixed-order lanes (5120 = 80 tiles of 64)
+GATE_KB = 512                      # plan-gemv's fixed-order lanes (5120 = 10 tiles of 512; the mixes' KB)
+SOFTPLUS_FORMS = {"torch": 0, "fused": 1, "fused-sub": 2, "fused-sub24": 3}   # -> the kernel's SOFTPLUS mode
 NET = 32                           # SmallBitonicSort's sort size
 EPS = 1e-20                        # model.py:827
+FLT_MIN = np.float32(2.0 ** -126)
 KERNELS_ON_CPU = False             # tests set it with SK = the shim-loaded static_kernels
 SK = None                          # the kernel module (None: runtime.static_kernels, imported on first launch)
 
@@ -84,6 +101,20 @@ def router_impl() -> str:
     if v not in ROUTER_IMPLS:
         raise ValueError(f"{ROUTER_IMPL_ENV}={v!r} not in {ROUTER_IMPLS}")
     return v
+
+
+def plan_launch() -> str:
+    v = os.environ.get(PLAN_LAUNCH_ENV, "ticket") or "ticket"
+    if v not in PLAN_LAUNCHES:
+        raise ValueError(f"{PLAN_LAUNCH_ENV}={v!r} not in {PLAN_LAUNCHES}")
+    return v
+
+
+def gate_kb(D: int) -> int:
+    """plan-gemv's KB at reduction width D: GATE_KB, or the largest power of two dividing D if smaller (mini
+    checkpoints). A function of D only, never of R (fused_glue_r2.fixed_kb's rule)."""
+    D = int(D)
+    return max(1, min(GATE_KB, D & -D))
 
 
 def _sk():
@@ -174,13 +205,24 @@ def topk_cuda_torch(bsc: torch.Tensor, k: int) -> torch.Tensor:
 
 
 # ------------------------------------------------------------------------------------------------ mirrors
-def softplus_np(x: torch.Tensor) -> torch.Tensor:
-    """The kernel's softplus expression with numpy float32 exp / log1p (= tests/triton_shim.py's libdevice): the
-    mirror the shim-run kernel body is compared against (NOT the device's bits; that is the softplus probe)."""
+def softplus_np(x: torch.Tensor, mode: int = 1) -> torch.Tensor:
+    """The kernel's softplus expression (SOFTPLUS mode 1 / 2 / 3) with numpy float32 exp / log1p and float64 exp (=
+    tests/triton_shim.py's libdevice): the mirror the shim-run kernel body is compared against (NOT the device's bits;
+    that is the softplus probe)."""
     a = x.detach().float().cpu().numpy()
     with np.errstate(over="ignore", under="ignore"):
-        r = np.where(a > np.float32(20.0), a, np.log1p(np.exp(a)).astype(np.float32)).astype(np.float32)
-    return torch.from_numpy(r).to(x.device)
+        e = np.exp(a).astype(np.float32)
+        lp = np.log1p(e).astype(np.float32)
+        if int(mode) == 1:
+            r = np.where(a > np.float32(20.0), a, lp)
+        else:
+            ed = np.exp(np.minimum(a, np.float32(-80.0)).astype(np.float64))
+            if int(mode) == 2:
+                es = ed.astype(np.float32)
+            else:
+                es = ((ed * 2.0 ** 64).astype(np.float32).astype(np.float64) * 2.0 ** -64).astype(np.float32)
+            r = np.where(a > np.float32(20.0), a, np.where(e < FLT_MIN, es, lp))
+    return torch.from_numpy(np.ascontiguousarray(r, dtype=np.float32)).to(x.device)
 
 
 def route_tail_torch(raw: torch.Tensor, bias: torch.Tensor, k: int, ordd: dict, rs: float, *, softplus=None,
@@ -353,8 +395,9 @@ class RouterPlan:
         self.g = glue
         self.impl = impl
         self.status = "on"
-        self.softplus = "fused"          # "fused": libdevice in the kernel; "torch": F.softplus kept as its own op
-        self.rows_plan = "on"            # the R-row plan in the launch (R > 1)
+        self.softplus = "fused"          # a SOFTPLUS_FORMS key: "fused*": in the kernel; "torch": F.softplus kept
+        self.rows_plan = "on"            # the R-row plan with the launch (R > 1)
+        self.launch_form = plan_launch()  # "ticket": the plan in the last row program; "split": + dedup_fused
         self.checks: Dict[str, object] = {}
         self.verified = False            # the device self-check passed (CUDA launches need it; CPU: the fused path)
         self._checking = False
@@ -403,16 +446,23 @@ class RouterPlan:
         if self.impl == "plan-gemv":
             if any(gt.gate_temp != 1.0 for gt in gates):
                 return "gate_temp != 1 (torch's scalar-division form is not reproduced in the GEMV)"
-            if any(gt.weight.size(1) % GATE_KB for gt in gates):
-                return f"dim not a multiple of GATE_KB = {GATE_KB}"
         return None
 
     def describe(self) -> dict:
+        D = int(self.g.o.moes[0].moe.gate.weight.size(1)) if self.g.o.moes else 0
         return {"impl": self.impl, "status": self.status, "softplus": self.softplus, "rows_plan": self.rows_plan,
+                "launch": self.launch_form, "kernel": "m2_router_rows (grid R)",
                 "tie_rule": "gatherTopK set (radix key, lowest index) + SmallBitonicSort(32) order",
                 "gate": ("cuBLAS F.linear on the cached fp32 weight (today's op)" if self.impl == "plan" else
-                         f"in-kernel fixed-order fp32 FMA, KB = {GATE_KB} (A3 vs cuBLAS)"),
+                         f"m2_gate_fp32 (T9b-5 fixed-order fp32 dot), KB = {gate_kb(D)} (A3 vs cuBLAS)"),
+                "launches_per_layer": self.launches_per_layer(),
                 "checks": dict(self.checks), "hook": _HOOK["orig"] is not None}
+
+    def launches_per_layer(self, rows: Optional[int] = None) -> str:
+        """The launches of one layer's router (+ plan) under this configuration (for reports)."""
+        R_ = int(self.g.rows) if rows is None else int(rows)
+        n = 1 + (self.softplus == "torch") + (R_ > 1 and self.launch_form == "split" and self.rows_plan == "on")
+        return f"mm + {n}" if self.impl == "plan" else str(n + 1)
 
     # ---------------------------------------------------------------- launches
     def _ready(self, gate, x: torch.Tensor, T_: int) -> Optional[dict]:
@@ -423,31 +473,33 @@ class RouterPlan:
             return None
         return ws
 
-    def _launch(self, gate, xf2: torch.Tensor, T_: int, ids: torch.Tensor, w: torch.Tensor, plan=None,
+    def _launch(self, gate, xf2: Optional[torch.Tensor], T_: int, ids: torch.Tensor, w: torch.Tensor, plan=None,
                 raw_in: Optional[torch.Tensor] = None, bias: Optional[torch.Tensor] = None) -> None:
-        """The kernel on the T_ rows xf2 [T_, D] fp32 (or, raw_in [T_, E]: the gate scores themselves -- the
-        self-check / bench entry, plan impl only)."""
+        """The gate scores of the T_ rows xf2 [T_, D] fp32 (plan: today's F.linear; plan-gemv: gate_dot into
+        ws["raw"]) -- or raw_in [T_, E], the scores themselves (the self-check / bench entry) -- then (softplus
+        "torch": F.softplus) m2_router_rows; plan = dedup_args -> the plan in its last row program."""
         from runtime.fused_glue_r2 import order_args
 
         g = self.g
         ws = self.ws[id(gate)]
         E, k = ws["E"], ws["k"]
         b = gate.bias if bias is None else bias
-        kw = dict(R=T_, E=E, K=k, order=order_args(g.orders["router"]), rs=float(gate.route_scale), eps=EPS,
-                  plan=plan)
-        if self.impl == "plan-gemv" and raw_in is None:
-            _sk().router_plan_launch(ws["raw"], b, ws, ids, w, softplus=True, x=xf2, gw=gate.weight, kb=GATE_KB,
-                                     **kw)
-            return
         if raw_in is not None:
             raw = raw_in
+        elif self.impl == "plan-gemv":
+            assert xf2 is not None
+            raw = ws["raw"][:T_]
+            _sk().gate_dot(xf2, gate.weight, raw, kb=gate_kb(xf2.size(-1)))
         else:
+            assert xf2 is not None
             raw = F.linear(xf2, g.gate_w[id(gate)])
             if gate.gate_temp != 1.0:          # as route(): x / 1.0 skipped; else torch's own op
                 raw = raw / gate.gate_temp
         if self.softplus == "torch":
             raw = F.softplus(raw)
-        _sk().router_plan_launch(raw.contiguous(), b, ws, ids, w, softplus=self.softplus == "fused", **kw)
+        _sk().router_rows_launch(raw.contiguous(), b, ws, ids, w, R=T_, E=E, K=k, order=order_args(g.orders["router"]),
+                                 rs=float(gate.route_scale), eps=EPS, softplus=SOFTPLUS_FORMS[self.softplus],
+                                 plan=plan)
 
     def route(self, moe, x: torch.Tensor, rows: bool):
         """FusedGlue.route / route_rows under the plan impl: (ids, w) as theirs, or None (-> the fused path)."""
@@ -484,9 +536,10 @@ class RouterPlan:
     def route_plan_rows(self, sm, x: torch.Tensor, block_rows: int, mm=None, inpl: Optional[dict] = None,
                         raw_in: Optional[torch.Tensor] = None, bias: Optional[torch.Tensor] = None,
                         buf=None, ids_step=None, uval=None):
-        """moe_rows._RowsMoEBase._route under the plan impl: the gate + route + dedup in one launch -> dedup_fused's
-        dict (None: not applicable here -> the original _route). buf / ids_step / uval / raw_in / bias: the
-        self-check's private copies."""
+        """moe_rows._RowsMoEBase._route under the plan impl: the gate + route + dedup -> dedup_fused's dict (None: not
+        applicable here -> the original _route). launch form "ticket": the plan in the router kernel's last row
+        program (dedup_args); "split": the router kernel, then today's dedup launch (moe_rows.dedup_fused) on its
+        ids / w. buf / ids_step / uval / raw_in / bias: the self-check's private copies."""
         from runtime import moe_rows as MR
 
         if not self.plan_rows_ready(sm, x):
@@ -501,15 +554,19 @@ class RouterPlan:
             ids_step, uval = o.ids_step[sm.layer], o.uvalid_step[sm.layer]
         ids = torch.empty(T_, k, dtype=torch.long, device=x.device)
         w = torch.empty(T_, k, dtype=torch.float32, device=x.device)
-        a = dedup_args(buf, T_, k, block_rows, mm, ids_step, uval, inpl, ids)
-        if a["v2"]:
-            MR._check_arow_range(inpl, block_rows, T_ * k)
         if raw_in is None:
             ctx = self.g.ffn_pre(x)
             xf = ctx["xf"] if ctx is not None and ctx.get("xf") is not None else x.float()
             xf2 = xf.reshape(T_, D)
         else:
             xf2 = None
+        if self.launch_form == "split":
+            self._launch(gate, xf2, T_, ids, w, raw_in=raw_in, bias=bias)
+            return MR.dedup_fused(buf, ids, w, block_rows, mm=mm, ids_step=ids_step, uval=uval, inpl=inpl,
+                                  impl="warp")
+        a = dedup_args(buf, T_, k, block_rows, mm, ids_step, uval, inpl, ids)
+        if a["v2"]:
+            MR._check_arow_range(inpl, block_rows, T_ * k)
         self._launch(gate, xf2, T_, ids, w, plan=a, raw_in=raw_in, bias=bias)
         return plan_out_dict(buf, mm, inpl, a)
 
@@ -523,9 +580,10 @@ class RouterPlan:
         dev = raw.device
         cuda = dev.type == "cuda"
         # on the device: the fused path's own ops (F.softplus, torch.topk); under the Mac shim (no CUDA torch.topk,
-        # numpy libdevice): the kernel's documented mirrors (softplus_np when the kernel applies softplus, and the
-        # tie rule's host emulation topk_cuda_torch)
-        sp = (F.softplus(raw) if cuda or self.softplus == "torch" else softplus_np(raw)).contiguous()
+        # numpy libdevice): the kernel's documented mirrors (softplus_np of the chosen form when the kernel applies
+        # softplus, and the tie rule's host emulation topk_cuda_torch)
+        sp = (F.softplus(raw) if cuda or self.softplus == "torch" else
+              softplus_np(raw, SOFTPLUS_FORMS[self.softplus])).contiguous()
         topk = (lambda t, k: t.topk(k, dim=-1)[1]) if cuda else topk_cuda_torch
         if T_ == 1:
             sc = torch.empty(E, dtype=torch.float32, device=dev)
@@ -611,23 +669,30 @@ class RouterPlan:
         self.verified = self.on()
 
     def _check_softplus(self, gen) -> None:
+        """The in-kernel softplus forms (SOFTPLUS_FORMS 1, 2, 3, in that order) vs F.softplus on the probe values (on
+        the shim: vs each form's numpy mirror); the first exact form is used, none -> F.softplus as a torch op (both
+        impls: plan-gemv keeps its GEMV and adds the op). NaN vs NaN counts as equal (payloads are not a contract)."""
         dev = self.g.dev
         x = softplus_probe_inputs(gen, 1 << 20).to(dev)
-        if dev.type == "cuda":
-            got = _sk().softplus_probe(x)
-            ref = F.softplus(x)
-        else:                                  # the shim: the kernel body vs its numpy mirror
-            got = _sk().softplus_probe(x)
-            ref = softplus_np(x)
-        nbad = int((got.view(torch.int32) != ref.view(torch.int32)).sum())
-        self.checks["softplus"] = {"n": int(x.numel()), "mismatch": nbad}
-        if nbad:
-            if self.impl == "plan-gemv":
-                self.off(f"softplus probe: {nbad} of {x.numel()} values differ from F.softplus")
-            else:
-                self.softplus = "torch"
-                self.g.log(f"[router-plan] softplus: libdevice differs from F.softplus on {nbad} of {x.numel()} "
-                           f"values -> F.softplus kept as a torch op")
+        counts: Dict[str, int] = {}
+        chosen = None
+        for form in ("fused", "fused-sub", "fused-sub24"):
+            mode = SOFTPLUS_FORMS[form]
+            got = _sk().softplus_probe(x, mode)
+            ref = F.softplus(x) if dev.type == "cuda" else softplus_np(x, mode)   # shim: the body vs its mirror
+            bad = (got.view(torch.int32) != ref.view(torch.int32)) & ~(torch.isnan(got) & torch.isnan(ref))
+            counts[form] = int(bad.sum())
+            if counts[form] == 0:
+                chosen = form
+                break
+        self.checks["softplus"] = {"n": int(x.numel()), "mismatch": counts[chosen or "fused"], "forms": counts,
+                                   "form": chosen or "torch"}
+        self.softplus = chosen or "torch"
+        if chosen is None:
+            self.g.log(f"[router-plan] softplus: every in-kernel form differs from F.softplus ({counts} of "
+                       f"{x.numel()} values) -> F.softplus kept as a torch op")
+        elif chosen != "fused":
+            self.g.log(f"[router-plan] softplus: in-kernel form {chosen!r} exact ({counts})")
 
     def _check_route(self, gen) -> None:
         from runtime.fused_glue_r2 import fixed_dot_torch
@@ -641,23 +706,23 @@ class RouterPlan:
             E, D = gate.weight.shape
             ws = self.ws[id(gate)]
             for T_ in sorted({1, Rr}):
+                # the router kernel on given scores (both impls run the same kernel after their gate): == the fused tail
                 for raw, bias in self.raw_draws(gen, T_, E, 12):
                     raw, bias = raw.to(dev), bias.to(dev)
-                    if self.impl == "plan":
-                        want = self._fused_tail(gate, raw, bias)
-                        ids = torch.empty(T_, ws["k"], dtype=torch.long, device=dev)
-                        w = torch.empty(T_, ws["k"], dtype=torch.float32, device=dev)
-                        self._launch(gate, None, T_, ids, w, raw_in=raw, bias=bias)
-                        if dev.type == "cuda":
-                            ref_i = torch.sort((F.softplus(raw).sqrt() + bias).topk(gate.topk, dim=-1)[1], -1)[0]
-                            if not torch.equal(ref_i, want[0]):
-                                self.off("the fused path's ids are not torch.topk's (internal)")
-                                return
-                        if not (torch.equal(ids, want[0]) and torch.equal(w.view(torch.int32),
-                                                                           want[1].view(torch.int32))):
-                            self.off(f"route differs from the fused path (layer {sm.layer}, {T_} rows)")
+                    want = self._fused_tail(gate, raw, bias)
+                    ids = torch.empty(T_, ws["k"], dtype=torch.long, device=dev)
+                    w = torch.empty(T_, ws["k"], dtype=torch.float32, device=dev)
+                    self._launch(gate, None, T_, ids, w, raw_in=raw, bias=bias)
+                    if dev.type == "cuda":
+                        ref_i = torch.sort((F.softplus(raw).sqrt() + bias).topk(gate.topk, dim=-1)[1], -1)[0]
+                        if not torch.equal(ref_i, want[0]):
+                            self.off("the fused path's ids are not torch.topk's (internal)")
                             return
-                        n_eq += 1
+                    if not (torch.equal(ids, want[0]) and torch.equal(w.view(torch.int32),
+                                                                       want[1].view(torch.int32))):
+                        self.off(f"route differs from the fused path (layer {sm.layer}, {T_} rows)")
+                        return
+                    n_eq += 1
                 # the full launch from x (both impls): plan -> the fused route on the same x; plan-gemv -> its oracle
                 for t in range(3):
                     x = (torch.randn(T_, D, generator=gen, device="cpu", dtype=torch.float32) * 0.5).to(
@@ -670,7 +735,10 @@ class RouterPlan:
                         if gate.gate_temp != 1.0:
                             raw = raw / gate.gate_temp
                     else:
-                        raw = fixed_dot_torch(x, gate.weight, GATE_KB)
+                        raw = fixed_dot_torch(x, gate.weight, gate_kb(D))
+                        if not torch.equal(ws["raw"][:T_].view(torch.int32), raw.view(torch.int32)):
+                            self.off(f"gate GEMV differs from its fixed-order oracle (layer {sm.layer}, {T_} rows)")
+                            return
                     want = self._fused_tail(gate, raw, gate.bias)
                     if not (torch.equal(ids, want[0]) and torch.equal(w.view(torch.int32), want[1].view(torch.int32))):
                         self.off(f"launch from x differs from {'the fused path' if self.impl == 'plan' else 'its oracle'}"

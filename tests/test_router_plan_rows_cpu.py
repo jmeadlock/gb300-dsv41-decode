@@ -74,47 +74,86 @@ def test_six_row_plan_on_cpu_is_the_fused_path(rows_glue, monkeypatch, unhook):
     assert all(torch.equal(x, y) for x, y in zip(got[1], want[1]))
 
 
-@pytest.mark.parametrize("moe_impl", ["dg-inplace", "dg-masked", "ref"])
-def test_six_row_plan_kernel_through_the_hook_equals_fused(rows_glue, monkeypatch, unhook, SK, moe_impl):
+@pytest.mark.parametrize("moe_impl,form", [("dg-inplace", "ticket"), ("dg-masked", "ticket"), ("ref", "ticket"),
+                                           ("dg-inplace", "split"), ("dg-masked", "split")])
+def test_six_row_plan_kernel_through_the_hook_equals_fused(rows_glue, monkeypatch, unhook, SK, moe_impl, form):
     """The shim kernels inside the 6-row step: the build-time self-check passes (softplus probe, routing, plan
-    tensors vs dedup_fused), then every layer's MoE gets the plan kernel's mapping through the _route hook -- one plan
-    launch per layer per step, no dedup_fused / router_post / topk launch -- and the step == the fused step."""
+    tensors vs dedup_fused), then every layer's MoE gets the plan kernel's mapping through the _route hook -- one
+    router-rows launch per layer per step (ticket: the plan inside it, no dedup_fused; split: + one dedup_fused), no
+    router_post / topk launch -- and the step == the fused step."""
     model, pool, _, _ = rows_glue("mini4")
     ids, toks = _tf_tokens(18, 12, 31)
     order = _od(ORDERS[1])
     monkeypatch.setattr(RP, "SK", SK)
+    monkeypatch.setenv(RP.PLAN_LAUNCH_ENV, form)
     st = _six_row_step(model, pool, "plan", monkeypatch, moe_impl)
     rp = st.glue.rplan
+    assert rp.launch_form == form
     st.glue.orders["router"] = order                     # CPU's NATIVE sum -> an explicit order for both paths
     monkeypatch.setattr(RP, "KERNELS_ON_CPU", True)
     rp.calibrate(torch.Generator().manual_seed(0))
     assert rp.verified and rp.on() and rp.rows_plan == "on", rp.describe()
-    assert rp.checks["softplus"]["mismatch"] == 0 and rp.checks["route"].startswith("equal")
-    assert rp.checks["plan_rows"].startswith("equal")
+    assert rp.checks["softplus"]["mismatch"] == 0 and rp.checks["softplus"]["form"] == "fused"
+    assert rp.checks["route"].startswith("equal") and rp.checks["plan_rows"].startswith("equal")
+    assert rp.describe()["launches_per_layer"] == ("mm + 1" if form == "ticket" else "mm + 2")
     rp.softplus = "torch"                                # the probe-mismatch form: the step's F.softplus bits
-    calls = {"plan": 0, "dedup": 0, "post": 0}
-    real_l = SK.router_plan_launch
+    calls = {"rows": 0, "dedup": 0, "post": 0, "plan1cta": 0}
+    real_l = SK.router_rows_launch
+    monkeypatch.setattr(SK, "router_rows_launch", lambda *a, **k: (calls.__setitem__(
+        "rows", calls["rows"] + 1), real_l(*a, **k))[1])
+    real_1 = SK.router_plan_launch
     monkeypatch.setattr(SK, "router_plan_launch", lambda *a, **k: (calls.__setitem__(
-        "plan", calls["plan"] + 1), real_l(*a, **k))[1])
+        "plan1cta", calls["plan1cta"] + 1), real_1(*a, **k))[1])
     real_d = MR.dedup_fused
     monkeypatch.setattr(MR, "dedup_fused", lambda *a, **k: (calls.__setitem__("dedup", calls["dedup"] + 1),
                                                             real_d(*a, **k))[1])
     real_p = R2.launch_router_post
     monkeypatch.setattr(R2, "launch_router_post", lambda *a, **k: (calls.__setitem__("post", calls["post"] + 1),
                                                                    real_p(*a, **k))[1])
+    n_grid = len(SK.m2_router_rows.launches)
     got = _static_run(model, st, ids, toks, 2)
     L = len(model.layers)
-    assert calls == {"plan": 2 * L, "dedup": 0, "post": 0}, calls
+    assert calls == {"rows": 2 * L, "dedup": 0 if form == "ticket" else 2 * L, "post": 0, "plan1cta": 0}, calls
+    assert all(la["grid"] == (6,) and la["constexprs"]["PLAN"] == (form == "ticket")
+               for la in SK.m2_router_rows.launches[n_grid:])
     st.detach()
     monkeypatch.setattr(RP, "KERNELS_ON_CPU", False)
     ref = _six_row_step(model, pool, "fused", monkeypatch, moe_impl)
     ref.glue.orders["router"] = order
     want = _static_run(model, ref, ids, toks, 2)
     ref.detach()
-    _assert_rows_equal(got[0], want[0], f"6-row plan kernel (shim) vs fused ({moe_impl})")
+    _assert_rows_equal(got[0], want[0], f"6-row plan kernel (shim, {form}) vs fused ({moe_impl})")
     assert all(torch.equal(x, y) for x, y in zip(got[1], want[1]))
     for k_ in want[2]:
         assert torch.equal(got[2][k_], want[2][k_]), k_
+
+
+def test_six_row_plan_gemv_self_check_and_launches(rows_glue, monkeypatch, unhook, SK):
+    """plan-gemv in the 6-row step under the shim: the self-check passes (its GEMV == fixed_dot_torch at KB =
+    gate_kb(D), routing == the fused tail on its scores, plan tensors == dedup_fused), then per layer per step one
+    m2_gate_fp32 launch + one router-rows launch (the plan inside it) and nothing of the fused router."""
+    model, pool, _, _ = rows_glue("mini4")
+    ids, toks = _tf_tokens(18, 12, 31)
+    monkeypatch.setattr(RP, "SK", SK)
+    monkeypatch.delenv(RP.PLAN_LAUNCH_ENV, raising=False)
+    st = _six_row_step(model, pool, "plan-gemv", monkeypatch)
+    rp = st.glue.rplan
+    st.glue.orders["router"] = _od(ORDERS[2])
+    monkeypatch.setattr(RP, "KERNELS_ON_CPU", True)
+    rp.calibrate(torch.Generator().manual_seed(1))
+    assert rp.verified and rp.on() and rp.rows_plan == "on", rp.describe()
+    d = rp.describe()
+    assert d["launches_per_layer"] == "2" and "KB = " in d["gate"]
+    n_g, n_r = len(SK.m2_gate_fp32.launches), len(SK.m2_router_rows.launches)
+    calls = {"post": 0}
+    real_p = R2.launch_router_post
+    monkeypatch.setattr(R2, "launch_router_post", lambda *a, **k: (calls.__setitem__("post", calls["post"] + 1),
+                                                                   real_p(*a, **k))[1])
+    _static_run(model, st, ids, toks, 2)
+    L = len(model.layers)
+    assert len(SK.m2_gate_fp32.launches) - n_g == 2 * L and len(SK.m2_router_rows.launches) - n_r == 2 * L
+    assert calls["post"] == 0
+    st.detach()
 
 
 def test_self_check_turns_a_broken_plan_off(rows_glue, monkeypatch, unhook, SK):
@@ -123,12 +162,12 @@ def test_self_check_turns_a_broken_plan_off(rows_glue, monkeypatch, unhook, SK):
     st = _six_row_step(model, pool, "plan", monkeypatch)
     st.glue.orders["router"] = _od(ORDERS[0])
     monkeypatch.setattr(RP, "KERNELS_ON_CPU", True)
-    real = SK.router_plan_launch
+    real = SK.router_rows_launch
 
     def broken(raw, bias, ws, ids, w, **k):
         real(raw, bias, ws, ids, w, **k)
         w.mul_(1.0000001)
-    monkeypatch.setattr(SK, "router_plan_launch", broken)
+    monkeypatch.setattr(SK, "router_rows_launch", broken)
     rp = st.glue.rplan
     rp.calibrate(torch.Generator().manual_seed(0))
     assert not rp.on() and rp.status.startswith("off: route differs") and not rp.verified
