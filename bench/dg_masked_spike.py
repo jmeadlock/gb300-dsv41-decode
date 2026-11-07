@@ -45,15 +45,19 @@ for proj, N, Kd in (("w1", INTER, DIM), ("w2", DIM, INTER)):
             for g in range(G):
                 q, s = K.act_quant(x[g], 32, "ue8m0", E8); K.fp4_gemm(q, s, Wfp4[g], Se8[g], E8, act_block_size=32)
         # DeepGEMM path: activations fp8 with per-128 ue8m0 scales (the only sm100 fp8xfp4 recipe DG tests), padded to MAXM rows
-        xq = torch.zeros(G, MAXM, Kd, dtype=torch.float8_e4m3fn); xs = torch.ones(G, MAXM, Kd // 128, dtype=torch.float32)
+        GA = int(os.environ.get("GRAN_A", "32"))
+        xq = torch.zeros(G, MAXM, Kd, dtype=torch.float8_e4m3fn); xs = torch.ones(G, MAXM, Kd // GA, dtype=torch.float32)
         for g in range(G):
-            q, s = per_token_cast_to_fp8(x[g], use_ue8m0=True, gran_k=128); xq[g, :M] = q; xs[g, :M] = s
+            if GA == 32:   # the model's own activation quant (kernel.py act_quant, e8m0/32) -> fp32 scales, exact
+                q, s = K.act_quant(x[g], 32, "ue8m0", E8); xq[g, :M] = q; xs[g, :M] = torch.exp2(s.view(torch.uint8).to(torch.int32).float() - 127.0)
+            else:
+                q, s = per_token_cast_to_fp8(x[g], use_ue8m0=True, gran_k=GA); xq[g, :M] = q; xs[g, :M] = s
         S_f = torch.exp2(S.view(torch.uint8).to(torch.int32).float() - 127.0).contiguous()   # checkpoint e8m0 -> fp32 (exact)
         masked_m = torch.full((G,), M, dtype=torch.int32)
         def run(variant):
             d = torch.empty(G, MAXM, N, dtype=torch.bfloat16)
-            dg.m_grouped_fp8_fp4_gemm_nt_masked((xq, xs), (W, S_f), d, masked_m, 8, recipe_a=(1, 128), recipe_b=(1, 32))
-            torch.cuda.synchronize(); return d[:, :M], ("fp8+fp32/128", "int8+fp32/32")
+            dg.m_grouped_fp8_fp4_gemm_nt_masked((xq, xs), (W, S_f), d, masked_m, 8, recipe_a=(1, GA), recipe_b=(1, 32))
+            torch.cuda.synchronize(); return d[:, :M], (f"fp8+fp32/{GA}", "int8+fp32/32")
         # also: fp32 reference from the DG-quantized activations and exact-unpacked weights (isolates DG's own error)
         for variant in ("fp32_sf",):
             def probe(variant=variant):
