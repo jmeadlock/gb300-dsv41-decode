@@ -20,6 +20,27 @@ Gates (docs/HANDOFF-M1-T12-LOOP.md 4; docs/M1-DSPARK-DESIGN.md 4 V1/V3/V5), mini
 Real checkpoint (DSV41_MODEL_DIR set): one fixture-like prompt, 64 tokens, fast mode -- stream vs 1-row reported
 (first divergence), replay x2 gated.
 
+T12-FIX (docs/HANDOFF-M1-T11-PORT.md Part B; box log docs/loop-gpu-test-20261107.log: "logits rows [17] differ"):
+the index in that message is into the per-POSITION digest list (Generator.greedy's step_sha256: entry 0 = the
+prefill's logits at position L-1, entry i = position L-1+i), so row 17 of the L=17 free run is position 33 -- the
+17th decode position at 1.000 tok/step, NOT the first verify step (entry 1, which matched). Position 33 is the first
+position where mini3's ratio-2 indexer has more reachable compressed groups than index_topk (T/r = 34/2 = 17 > 16):
+the first position where the top-k has to DROP a group (static_step.py #9, design risk 6: identical only if the k-th
+and (k+1)-th reachable scores differ). On the CPU emulation of this exact prompt (verified): position 33 has clen 17,
+k 16, and the k-th and (k+1)-th scores tie EXACTLY at 0.0 (3 groups share the k-th value); no other position in
+30..37 ties. Which tied group is dropped is unspecified by torch.topk and may differ between a [1, W] and a [6, W]
+call on the GPU (the emulation's CPU topk happens to agree). A selection change at one position stays at that row on
+mini3 (CPU control: forcing a different 6-row selection at positions 33/34 changed rows 17/18 only) -- the box log's
+signature (1/64 rows, no stream divergence). The first verify step (entry 1, position 17) matched, which rules out
+the prefill-KV / ctx_count 0 / first-row-token hypotheses. The forced runs use another prompt (seed 700+L).
+`_gate_stream` therefore EXPLAINS rows instead of failing on them when, and only when, all of this holds (measured
+by `_explain_rows`, static mode, the same prompt and switches): (a) the static loop differs at exactly the same
+rows; (b) at each such position the 1-row step's reachable index scores tie (or are within the largest 1-row vs
+6-row score difference) across the k-th / (k+1)-th boundary; (c) the 6-row step's selected index set differs from
+the 1-row step's; (d) re-running the loop with ONLY the 1-row step's selection injected at those positions makes
+every row bit-equal to the 1-row step (the selection is the whole cause). Anything else still fails. The evidence
+(score bits equal or not, gap, the two dropped groups) is REPORTed.
+
 Run on the box (orchestrator), same line as tests/gpu/test_draft_gpu.py, repo at $W:
   W=$HOME/hermes/gb300-dsv41-decode-wt12
   docker run --rm --device nvidia.com/gpu=GPU-1c1855c8-dd10-0247-583e-3c3880ddbf55 --ipc=host --ulimit memlock=-1:-1 \\
@@ -192,12 +213,110 @@ def _first_div(a, b):
 
 
 # ------------------------------------------------------------------------------------------------ V3 stream
+@contextlib.contextmanager
+def indexer_probe(override=None):
+    """T12-FIX: wraps runtime/static_step.py `indexer_topk_static` (design #9; `_indexer` looks it up as a module
+    global at every call) and records every call of a static step by absolute position: rec[pos] = {"rows", "row",
+    "clen", "k", "score" (the row's fp32 index scores, cpu), "sel" (its selected int32 index row, cpu)}; the LAST
+    call per position wins (in the loop: the call whose row was emitted -- an emitted position is never recomputed).
+    override {pos: sel row}: those rows' selections are replaced (the injection proof). Static mode only: it reads the
+    running step's device P0 (`patches._ACTIVE`, set by StaticStep._active) with a host sync; capture-time calls pass
+    through unrecorded."""
+    import runtime.static_step as SS
+    from runtime import patches
+
+    orig = SS.indexer_topk_static
+    rec = {}
+
+    def wrapped(index_score, clen, k, offset):
+        out = orig(index_score, clen, k, offset)
+        step = patches._ACTIVE["step"]
+        if step is None or (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()):
+            return out
+        p0 = int(step.pos)
+        W = index_score.size(-1)
+        sc = index_score.reshape(-1, W)
+        o2 = out.reshape(-1, out.size(-1))
+        cl = clen.reshape(-1)
+        if override:
+            hit = [i for i in range(sc.size(0)) if p0 + i in override]
+            if hit:
+                o2 = o2.clone()
+                for i in hit:
+                    o2[i] = override[p0 + i].to(device=o2.device, dtype=o2.dtype)
+                out = o2.view(out.shape)
+        for i in range(sc.size(0)):
+            rec[p0 + i] = {"rows": sc.size(0), "row": i, "clen": int(cl[i] if cl.numel() > 1 else cl[0]), "k": int(k),
+                           "score": sc[i].detach().float().to("cpu").clone(), "sel": o2[i].detach().to("cpu").clone()}
+        return out
+
+    SS.indexer_topk_static = wrapped
+    try:
+        yield rec
+    finally:
+        SS.indexer_topk_static = orig
+
+
+def _sel_set(sel):
+    return sorted(int(v) for v in sel.tolist() if int(v) >= 0)
+
+
+def _explain_rows(kind, L, max_new, bad, seed, pin=False, **impls):
+    """T12-FIX (module docstring): rebuild, run the 1-row truth and the loop in STATIC mode (row-invariant mode, the
+    same prompt / switches) under `indexer_probe`, classify every differing emitted row, then re-run the loop with the
+    1-row step's selections injected at those positions. -> evidence dict; ok = the four conditions hold."""
+    with _model(kind) as (model, pool), row_invariant_mode(True), gemv_pin_m1(pin):
+        V = model.head.weight.size(0)
+        gen = _gen(model, "static", **impls)
+        ids = _toks(L, seed, min(2000, V))
+        with indexer_probe() as rec1:
+            truth, sha = _truth(gen, ids, max_new)
+        loop = _loop(gen, max_new)
+        try:
+            with indexer_probe() as rec6:
+                r = loop.generate(ids, max_new, stop_on_eos=False, parity=True)
+            bad_s = [i for i, (x, y) in enumerate(zip(r["step_sha256"], sha)) if x != y]
+            rows = []
+            for i in bad_s:
+                p = L - 1 + i
+                a, b = rec1.get(p), rec6.get(p)
+                e = {"row": i, "pos": p}
+                if a is None or b is None:
+                    e["probe"] = "no indexer call recorded (fused indexer_post or a layer without an indexer?)"
+                    rows.append(e)
+                    continue
+                c, k = a["clen"], a["k"]
+                s1, s6 = a["score"][:c], b["score"][:c]
+                srt = torch.sort(s1, descending=True).values
+                gap = float(srt[k - 1] - srt[k]) if c > k else None
+                diff = float((s1 - s6).abs().max()) if c else 0.0
+                sel1, sel6 = _sel_set(a["sel"]), _sel_set(b["sel"])
+                e.update(clen=c, k=k, verify_row=b["row"], gap_k_k1=gap, kth=float(srt[k - 1]) if c >= k else None,
+                         score_bits_equal=bool(torch.equal(s1.view(torch.int32), s6.view(torch.int32))),
+                         max_score_diff=diff, sel_equal=sel1 == sel6,
+                         only_1row=sorted(set(sel1) - set(sel6)), only_6row=sorted(set(sel6) - set(sel1)),
+                         tie=gap is not None and gap <= diff)
+                rows.append(e)
+            inj = {L - 1 + i: rec1[L - 1 + i]["sel"] for i in bad_s if (L - 1 + i) in rec1}
+            with indexer_probe(override=inj):
+                r2 = loop.generate(ids, max_new, stop_on_eos=False, parity=True)
+            bad2 = [i for i, (x, y) in enumerate(zip(r2["step_sha256"], sha)) if x != y]
+        finally:
+            loop.close()
+    ok = (bad_s == list(bad) and bool(rows) and all(e.get("tie") and not e.get("sel_equal", True) for e in rows)
+          and not bad2 and r2["token_ids"] == truth)
+    return {"ok": ok, "bad_requested": list(bad), "bad_static": bad_s, "rows": rows, "bad_after_injection": bad2,
+            "stream_equal_after_injection": r2["token_ids"] == truth}
+
+
 def _gate_stream(kind="mini3", L=17, max_new=64, mode="static", n_graphs=None, rowinv=True, pin=False, **impls):
-    """Loop stream == 1-row greedy (+ per-position logits) in row-invariant mode; as-is: reported. Returns res."""
+    """Loop stream == 1-row greedy (+ per-position logits) in row-invariant mode; as-is: reported. Returns res.
+    Rows differing only through an indexer top-k tie (T12-FIX, module docstring) are explained, not failed."""
     with _model(kind) as (model, pool), row_invariant_mode(rowinv), gemv_pin_m1(pin):
         V = model.head.weight.size(0)
         gen = _gen(model, mode, **impls)
-        ids = _toks(L, 300 + L, min(2000, V))
+        seed = 300 + L
+        ids = _toks(L, seed, min(2000, V))
         truth, sha = _truth(gen, ids, max_new)
         loop = _loop(gen, max_new, n_graphs)
         try:
@@ -213,16 +332,28 @@ def _gate_stream(kind="mini3", L=17, max_new=64, mode="static", n_graphs=None, r
                       f"stream {'== greedy' if k is None else f'diverges at {k}'}, logits rows differing "
                       f"{len(bad)}/{len(sha)}")
         assert r2["token_ids"] == r["token_ids"] and r2["accepts"] == r["accepts"], f"{tag}: fast run != parity run"
-        if rowinv:
-            assert k is None, f"{tag}: stream diverges at {k}: loop {r['token_ids'][k:k + 4]} vs {truth[k:k + 4]}"
-            assert not bad, f"{tag}: logits rows {bad[:8]} differ from the 1-row step"
-        COUNTS["gates"] += 1
-        COUNTS["tokens"] += len(truth)
-        COUNTS["logit_rows"] += len(sha)
-        COUNTS["steps"] += r["steps"]
-        print(f"  {tag}: loop == 1-row greedy ({len(truth)} tokens, {r['steps']} steps)" if k is None
-              else f"  {tag}: REPORTED divergence at {k}")
-        return r
+    if rowinv:
+        assert k is None, f"{tag}: stream diverges at {k}: loop {r['token_ids'][k:k + 4]} vs {truth[k:k + 4]}"
+        if bad:
+            ev = _explain_rows(kind, L, max_new, bad, seed, pin=pin, **impls)
+            REPORT.append(f"{tag}: T12-FIX rows {bad} explained={ev['ok']}: " + "; ".join(
+                f"row {e['row']} pos {e['pos']}: clen {e.get('clen')} > k {e.get('k')}, k-th score {e.get('kth')}, "
+                f"gap k/k+1 {e.get('gap_k_k1')}, 6-row vs 1-row scores bit-equal {e.get('score_bits_equal')} (max "
+                f"|d| {e.get('max_score_diff')}), dropped only by 6-row {e.get('only_1row')} / only by 1-row "
+                f"{e.get('only_6row')}" + (f" [{e['probe']}]" if 'probe' in e else "") for e in ev["rows"])
+                + f"; rows differing after injecting the 1-row selections: {ev['bad_after_injection']} (stream equal "
+                  f"{ev['stream_equal_after_injection']}); static-mode rows {ev['bad_static']}")
+            COUNTS["explained_rows"] = COUNTS.get("explained_rows", 0) + (len(bad) if ev["ok"] else 0)
+            assert ev["ok"], f"{tag}: logits rows {bad[:8]} differ from the 1-row step and are NOT explained by an " \
+                             f"indexer top-k tie: {ev}"
+    COUNTS["gates"] += 1
+    COUNTS["tokens"] += len(truth)
+    COUNTS["logit_rows"] += len(sha)
+    COUNTS["steps"] += r["steps"]
+    print(f"  {tag}: loop == 1-row greedy ({len(truth)} tokens, {r['steps']} steps"
+          f"{f'; rows {bad} = indexer top-k tie, explained (T12-FIX)' if bad else ''})" if k is None
+          else f"  {tag}: REPORTED divergence at {k}")
+    return r
 
 
 # ------------------------------------------------------------------------------------------------ V1 forced

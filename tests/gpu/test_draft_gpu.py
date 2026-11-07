@@ -22,6 +22,17 @@ Graph: graph == static-eager (ctx 0/1/3/6), replay twice, fills-on recapture, re
 no host sync in the eager step. Real checkpoint: set DSV41_MODEL_DIR (and DSV41_MAP, default the seed map) and the
 V2 gate also runs on the real model (`real`).
 
+M1-T11-PORT (runtime/draft_step.py impl switches), per switch the verify's own standard:
+  * P1 exact: fp8_impl "gemv" + glue_impl "fused" (moe / attn ref) == the reference forward_spec run INSIDE the same
+    fp8_gemv_scope (the GEMV patch routes the reference Linears too: same act_quant, same GEMV), torch.equal on
+    drafts, logits, confidences, rings -- the V2 cases above; the fused clusters must all self-check "on".
+  * P2 DG MoE: each stage's DraftDGMoE (DeepGEMM contiguous over the resident stack) vs the reference eager MoE
+    (model.py:891-906, the stage's own module) on the same x: bf16 ulp statistics REPORTED (the documented 1-ulp
+    class of dg_moe.py); gated: finite, the same routed experts, max ulp <= DG_MAX_ULP (a gross-error guard, not a
+    measured number). The full-impl draft vs the reference: drafts agreement and max |logit delta| REPORTED.
+  * P3 graph: all four switches on (gemv, dg-inplace, fused, flashmla): graph == static-eager, replay x2, relaunch,
+    no host sync, `describe()` printed (which clusters / attention arm are actually on).
+
 Run on the box (orchestrator), same line as tests/gpu/test_static_rows_gpu.py, repo at $W:
 
   W=$HOME/hermes/gb300-dsv41-decode-wt11
@@ -55,6 +66,8 @@ DEV = "cuda"       # tests/test_draft_cpu.py dry-runs the gates on the CPU emula
 STEP_KW = {}       # ... with {"_allow_cpu": True}
 COUNTS = {"gates": 0, "drafts": 0, "logit_rows": 0, "rings": 0, "graph": 0}
 REPORT = []        # lines printed at the end (rewrite no-op check, rowwise check)
+DG_MAX_ULP = 8     # P2 gross-error guard on the DG MoE vs the reference eager MoE (reported, see module docstring)
+FULL = {"fp8_impl": "gemv", "moe_impl": "dg-inplace", "glue_impl": "fused", "attn_impl": "flashmla"}
 
 
 def _need_tilelang():
@@ -144,10 +157,12 @@ def _verify6(model, toks, p0):
     return ids.reshape(-1).clone(), mh.clone()
 
 
-def _ref_run(model, a, mh_rows, toks):
+def _ref_run(model, a, mh_rows, toks, gemv=False):
     from runtime.draft_step import reference_draft, ring_snapshot
+    from runtime.patches import fp8_gemv_scope
 
-    out, lg, cf = reference_draft(model, a, mh_rows, toks)
+    with fp8_gemv_scope(gemv):     # P1: the reference Linears on the GEMV too (DraftStep(fp8_impl="gemv") installed it)
+        out, lg, cf = reference_draft(model, a, mh_rows, toks)
     _sync()
     return out.reshape(-1).clone(), lg.reshape(lg.size(1), -1).float().clone(), cf.reshape(-1).clone(), \
         ring_snapshot(model)
@@ -181,32 +196,44 @@ def _rings_equal(x, y):
 
 
 # ------------------------------------------------------------------------------------------------ the V2 gate
-def _gate_draft(kind="mini3", L=17, cs=(1, 3, 6), chain=True, rowwise=True):
+def _gate_draft(kind="mini3", L=17, cs=(1, 3, 6), chain=True, rowwise=True, impls=None):
+    """V2 (impls None) or P1 (impls: GEMV / fused glue, both bit-identical given the GEMV scope on the oracle)."""
     from runtime.draft_step import DraftStep, ring_restore, ring_snapshot
 
+    impls = dict(impls or {})
+    if impls.get("moe_impl", "ref") != "ref" or impls.get("attn_impl", "ref") != "ref":
+        raise ValueError("_gate_draft is the exact gate: DG MoE / FlashMLA are not bit-identical (P2 / P3)")
+    gv = impls.get("fp8_impl") == "gemv"
     with _model(kind) as model:
         V = model.head.weight.size(0)
         hi = min(2000, V)
         ids = _toks(L, 100 + L, hi)
         first, mh_pre = _prefill(model, ids)
         snap0 = ring_snapshot(model)
-        ds = DraftStep(model, **STEP_KW)
+        ds = DraftStep(model, **STEP_KW, **impls)
+        tag = f"{kind} L={L}{' ' + str(impls) if impls else ''}"
+        if impls.get("glue_impl") == "fused":
+            st = ds.glue.status
+            off = {c: s for c, s in st.items() if not (s == "on" or s.startswith("n/a"))}
+            assert not off, f"{tag}: fused draft clusters failed their self-check: {off}"
+            REPORT.append(f"{tag}: draft glue {ds.glue.describe()['on']} on (hc_mode {ds.glue.hc_mode}, rope_inv "
+                          f"{ds.glue.rope_inv})")
         # -- first draft after the prefill
-        ref1 = _ref_run(model, L - 1, mh_pre[0, L - 1:L], [first])
+        ref1 = _ref_run(model, L - 1, mh_pre[0, L - 1:L], [first], gv)
         noop = _rings_equal(ref1[3], snap0)
         ring_restore(model, snap0)
         got1 = _ds_run(model, ds, L - 1, 1, mh=mh_pre[0, L - 1:L], tok=first)
-        _eq(got1, ref1, f"{kind} L={L} first draft, ctx 1 (the reference decode call)")
+        _eq(got1, ref1, f"{tag} first draft, ctx 1 (the reference decode call)")
         ring_restore(model, snap0)
         got0 = _ds_run(model, ds, L - 1, 0, tok=first)
         assert _rings_equal(got0[3], snap0), "ctx_count 0 wrote a ring"
-        REPORT.append(f"{kind} L={L}: reference re-write of slot (L-1)%128 at decode numerics is "
+        REPORT.append(f"{tag}: reference re-write of slot (L-1)%128 at decode numerics is "
                       f"{'a byte no-op' if noop else 'NOT a byte no-op (design risk 7)'}")
         if noop:
-            _eq(got0, ref1, f"{kind} L={L} first draft, ctx 0 (no rewrite)")
+            _eq(got0, ref1, f"{tag} first draft, ctx 0 (no rewrite)")
         else:  # not gated: ctx 0 is the design's path (prefill-numerics slot), the reference re-writes it
             same = torch.equal(got0[0], ref1[0]) and torch.equal(got0[1], ref1[1])
-            REPORT.append(f"{kind} L={L}: ctx 0 drafts {got0[0].tolist()} vs reference {ref1[0].tolist()}; "
+            REPORT.append(f"{tag}: ctx 0 drafts {got0[0].tolist()} vs reference {ref1[0].tolist()}; "
                           f"logits equal {same}")
         # -- mid-sequence: a 6-row verify at P0 = L, then ctx_count rows
         ring_restore(model, snap0)
@@ -214,17 +241,17 @@ def _gate_draft(kind="mini3", L=17, cs=(1, 3, 6), chain=True, rowwise=True):
         for c in cs:
             a = L + c - 1
             ring_restore(model, snap0)
-            ref = _ref_run(model, a, mh6[:c], t6[:c])
+            ref = _ref_run(model, a, mh6[:c], t6[:c], gv)
             ring_restore(model, snap0)
             got = _ds_run(model, ds, a, c, mh=mh6, tok=t6)
-            _eq(got, ref, f"{kind} L={L} ctx {c} at A'={a}")
+            _eq(got, ref, f"{tag} ctx {c} at A'={a}")
             if rowwise and c == max(cs):
                 ring_restore(model, snap0)
-                dr = DraftStep(model, ctx_rowwise=True, **STEP_KW)
+                dr = DraftStep(model, ctx_rowwise=True, **STEP_KW, **impls)
                 gr = _ds_run(model, dr, a, c, mh=mh6, tok=t6)
                 same = (torch.equal(gr[0], got[0]) and torch.equal(gr[1], got[1]) and torch.equal(gr[2], got[2])
                         and _rings_equal(gr[3], got[3]))
-                REPORT.append(f"{kind} L={L} ctx {c}: ctx_rowwise (M=1 context GEMMs) == default (M=6): {same}")
+                REPORT.append(f"{tag} ctx {c}: ctx_rowwise (M=1 context GEMMs) == default (M=6): {same}")
                 if DEV == "cpu":
                     assert same, "rowwise context write differs on the row-invariant emulation"
         # -- chained: ctx 3 at A'=L+2, a second verify at P0'=L+3, ctx 6 at A'=L+8
@@ -232,17 +259,148 @@ def _gate_draft(kind="mini3", L=17, cs=(1, 3, 6), chain=True, rowwise=True):
             ring_restore(model, snap0)
             t6b, mh6b = _verify6(model, [int(t6[2])] + _toks(5, 9 + L, hi), L + 3)
             ring_restore(model, snap0)
-            _ref_run(model, L + 2, mh6[:3], t6[:3])
-            refc = _ref_run(model, L + 8, mh6b, t6b)
+            _ref_run(model, L + 2, mh6[:3], t6[:3], gv)
+            refc = _ref_run(model, L + 8, mh6b, t6b, gv)
             ring_restore(model, snap0)
             _ds_run(model, ds, L + 2, 3, mh=mh6, tok=t6)
             gotc = _ds_run(model, ds, L + 8, 6, mh=mh6b, tok=t6b)
-            _eq(gotc, refc, f"{kind} L={L} chained ctx 3 -> ctx 6")
+            _eq(gotc, refc, f"{tag} chained ctx 3 -> ctx 6")
         COUNTS["gates"] += 1
-        print(f"  {kind} L={L}: DraftStep static-eager == reference forward_spec (first draft ctx 1"
-              f"{'/0' if noop else ''}, mid ctx {list(cs)}{', chained' if chain else ''}): drafts, logits, "
+        print(f"  {tag}: DraftStep static-eager == reference forward_spec{' (GEMV scope)' if gv else ''} (first "
+              f"draft ctx 1{'/0' if noop else ''}, mid ctx {list(cs)}{', chained' if chain else ''}): drafts, logits, "
               f"confidence, rings")
         return ds
+
+
+# ------------------------------------------------------------------------------------------------ M1-T11-PORT
+def _gate_dg_moe(kind="mini3", n_x=3):
+    """P2: DraftDGMoE (DeepGEMM contiguous over the resident stack) vs the stage's reference eager MoE on the same x."""
+    from runtime.dg_inplace import compare_bf16
+    from runtime.draft_step import DraftStep
+    from runtime.refmodel import reference_device
+
+    with _model(kind) as model:
+        ds = DraftStep(model, moe_impl="dg-inplace", **STEP_KW)
+        D = ds.stages[0].attn_norm.dim
+        g = torch.Generator(device="cpu").manual_seed(11)
+        worst, lines = 0, []
+        for s, (st, moe) in enumerate(zip(ds.stages, ds.moes)):
+            for j in range(n_x):
+                x = (torch.randn(1, ds.block, D, generator=g, device="cpu") * (0.5 + j)).to(torch.bfloat16).to(DEV)
+                with torch.inference_mode():
+                    got = moe(x).clone()
+                    ids_dg = sorted(int(e) for e in moe.last["uniq"][moe.last["counts"] > 0].tolist())
+                    with reference_device(x.device):
+                        want = st.ffn(x)                                  # model.py:891-906, eager reference
+                    _, ind = st.ffn.gate(x.view(-1, D), None)
+                    ids_ref = sorted({int(e) for e in ind.reshape(-1).tolist()})
+                _sync()
+                assert ids_dg == ids_ref, f"{kind} stage {s}: DG routed {ids_dg} vs reference {ids_ref}"
+                assert bool(torch.isfinite(got.float()).all()), f"{kind} stage {s}: non-finite DG MoE output"
+                c = compare_bf16(got.reshape(-1), want.reshape(-1))
+                worst = max(worst, c["max_ulp"])
+                lines.append(f"s{s}x{j}: equal {c['equal']}, mismatch {100 * c['mismatch_frac']:.3f}%, max ulp "
+                             f"{c['max_ulp']}, max |d| {c['max_abs']:.3g}")
+                assert c["max_ulp"] <= DG_MAX_ULP, f"{kind} stage {s} x{j}: DG MoE vs reference {c}"
+        REPORT.append(f"{kind}: draft DG MoE vs reference eager MoE (bf16): " + "; ".join(lines))
+        COUNTS["gates"] += 1
+        print(f"  {kind}: draft DG MoE == reference eager MoE within the 1-ulp class (max ulp {worst}; "
+              f"{ds.dgm.describe()['bytes']})")
+
+
+def _gate_full_graph(kind="mini3", L=17, impls=None):
+    """P3: all switches: graph == static-eager, replay x2, relaunch, no host sync; drafts vs the reference reported."""
+    from runtime.draft_step import DraftStep, ring_restore, ring_snapshot
+
+    impls = dict(FULL if impls is None else impls)
+    with _model(kind) as model:
+        ids = _toks(L, 5)
+        first, mh_pre = _prefill(model, ids)
+        t6, mh6 = _verify6(model, [int(first)] + _toks(5, 6), L)
+        snap0 = ring_snapshot(model)
+        ds = DraftStep(model, **STEP_KW, **impls)
+        d = ds.describe()
+        REPORT.append(f"{kind} full impls {impls}: glue on {d['glue'].get('on')}, attn {d['attn']}, moe "
+                      f"{d['moe'].get('impl')} {d['moe'].get('bytes')}")
+        cases = [(L - 1, 0), (L, 1), (L + 2, 3), (L + 5, 6)]
+
+        def run(step, graph):
+            out = []
+            for a, c in cases:
+                ring_restore(model, snap0)
+                out.append(_ds_run(model, step, a, c, mh=mh6, tok=t6 if c else first, graph=graph))
+            return out
+
+        e = run(ds, False)
+        for x in e:
+            assert bool(torch.isfinite(x[1]).all()), f"{kind}: non-finite draft logits ({impls})"
+        agree, dmax = [], 0.0
+        for (a, c), x in zip(cases, e):
+            if c:
+                ring_restore(model, snap0)
+                r = _ref_run(model, a, mh6[:c], t6[:c], impls.get("fp8_impl") == "gemv")
+                agree.append(int(torch.equal(x[0], r[0])))
+                dmax = max(dmax, (x[1] - r[1]).abs().max().item())
+        REPORT.append(f"{kind} full impls: drafts == reference forward_spec (GEMV scope) in {sum(agree)}/{len(agree)} "
+                      f"cases; max |logit delta| {dmax:.4g} (DG / FlashMLA classes, reported)")
+        if DEV != "cuda":
+            COUNTS["gates"] += 1
+            return
+        ds.capture()
+        g1 = run(ds, True)
+        for (a, c), x, y in zip(cases, g1, e):
+            _eq(x, y, f"{kind} full: graph vs static-eager A'={a} ctx {c}")
+        g2 = run(ds, True)
+        for x, y in zip(g2, g1):
+            _eq(x, y, f"{kind} full: graph replay #2 vs #1")
+        ds2 = DraftStep(model, **STEP_KW, **impls)
+        ds2.capture()
+        g3 = run(ds2, True)
+        for x, y in zip(g3, g1):
+            _eq(x, y, f"{kind} full: relaunch vs replay #1")
+        ring_restore(model, snap0)
+        with torch.inference_mode():
+            ds.step(L + 5, 6, main_hidden=mh6, tok=t6)
+            torch.cuda.synchronize()
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                ds.forward_static()
+            finally:
+                torch.cuda.set_sync_debug_mode("default")
+        torch.cuda.synchronize()
+        COUNTS["graph"] += 1
+        COUNTS["gates"] += 1
+        print(f"  {kind} full impls {impls}: graph == static-eager (ctx 0/1/3/6); replay x2, relaunch equal; no host "
+              f"sync; draft buffers {ds.staging_bytes() / 2**20:.1f} MiB")
+
+
+def test_draft_port_exact_mini3():
+    """P1: GEMV + fused glue == forward_spec under the GEMV scope, bit for bit (V2's cases)."""
+    _need_tilelang()
+    _gate_draft("mini3", 17, impls={"fp8_impl": "gemv", "glue_impl": "fused"})
+    _gate_draft("mini3w", 18, chain=False, rowwise=False, impls={"glue_impl": "fused"})
+    _gate_draft("mini3", 150, cs=(6,), chain=True, rowwise=False, impls={"fp8_impl": "gemv", "glue_impl": "fused"})
+
+
+def test_draft_port_dg_moe_mini3():
+    _need_tilelang()
+    _gate_dg_moe("mini3")
+    _gate_dg_moe("mini3w")
+
+
+def test_draft_port_full_graph_mini3():
+    _need_tilelang()
+    _gate_full_graph("mini3", 17)
+
+
+def test_draft_port_real():
+    """P1 / P2 / P3 on the real checkpoint (DSV41_MODEL_DIR)."""
+    _need_tilelang()
+    if not os.environ.get("DSV41_MODEL_DIR"):
+        raise unittest.SkipTest("DSV41_MODEL_DIR not set")
+    _gate_draft("real", 40, cs=(1, 6), chain=False, rowwise=False, impls={"fp8_impl": "gemv", "glue_impl": "fused"})
+    _gate_dg_moe("real", n_x=2)
+    _gate_full_graph("real", 40)
 
 
 def test_draft_equals_reference_mini():
@@ -324,7 +482,9 @@ def test_draft_graph_replay_relaunch_no_sync():
 
 
 TESTS = [test_draft_equals_reference_mini, test_draft_equals_reference_mini3, test_draft_equals_reference_ring_wrapped,
-         test_draft_graph_replay_relaunch_no_sync, test_draft_equals_reference_real]
+         test_draft_graph_replay_relaunch_no_sync, test_draft_equals_reference_real,
+         test_draft_port_exact_mini3, test_draft_port_dg_moe_mini3, test_draft_port_full_graph_mini3,
+         test_draft_port_real]
 
 if __name__ == "__main__":
     import traceback

@@ -101,8 +101,11 @@ rejected row's value sits before it is read).
   with P0' after the body (the body's own `pos += 6` is the teacher-forced advance).
 * DraftStep aliases the verify step's `main_hidden` and `t_out` (its `tok`): context row i = verify row i = position
   P0+i = A'-n+i; the bonus is tok[ctx_count-1] = t_n. Its `a_pos`/`ctx_count` are written on the device.
-* the draft runs OUTSIDE the verify step's `_active()` scope (it is built on the reference Linear; the GEMV patch is
-  routed only inside that scope, static_step.py #16).
+* the draft runs OUTSIDE the verify step's `_active()` scope. M1-T11-PORT: it runs on the verify's fast kernels by
+  default (`draft_impls` None = runtime/draft_step.py `draft_impls_for(gen's impls)`: GEMV through its OWN
+  fp8_gemv_scope, DeepGEMM over the resident draft stacks, the fused glue at 5 rows, FlashMLA); `draft_impls="ref"`
+  keeps the T11 reference draft (bit-equal to forward_spec). The draft only proposes tokens: the emitted stream is
+  the verify's whatever the draft impls (design 1.4); they change accept counts, never emitted values.
 * GEMV row-invariance: set DSV41_GEMV_PIN_M1=1 before the build (runtime/gemv_mxfp8.py `pin_m1`) so the 6-row fp8
   Linears use the 1-row configs (M1-T10 census); the fp32 head (cuBLAS) stays M-dependent.
 * forced drafts (V1 scripted acceptor): `force_on`/`force_tok` replace d'1..d'5 after the draft (one `where` in the
@@ -315,11 +318,13 @@ class DSparkLoop:
     """The DSpark k=5 loop over a Generator's model (module docstring). Builds the 6-row VerifyStep through the
     Generator (`gen.static_cls`, `gen.hidden_layers` = the mtp target layers, `gen.set_rows(6)`) and a DraftStep that
     aliases its main_hidden / t_out. gen.mode "graph" -> `capture()` then replays; "static" -> the same ops eagerly.
-    max_new: buffer capacity (the per-call bound is a device tensor). poll_every: steps per async status poll."""
+    max_new: buffer capacity (the per-call bound is a device tensor). poll_every: steps per async status poll.
+    draft_impls: None = the verify's impls mapped by draft_step.draft_impls_for; "ref" = the reference draft; or a
+    dict of DraftStep impl kwargs."""
 
     def __init__(self, gen, max_new: int = 256, *, eos_ids: Optional[Sequence[int]] = None, poll_every: int = 8,
-                 lookahead: int = 1, _allow_cpu: bool = False):
-        from runtime.draft_step import DraftStep
+                 lookahead: int = 1, draft_impls=None, _allow_cpu: bool = False):
+        from runtime.draft_step import DraftStep, draft_impls_for
 
         model = gen.model
         mt = getattr(model, "runtime_mtp", None)
@@ -342,8 +347,14 @@ class DSparkLoop:
         self.st = st
         self.dev = st.dev
         self.is_cuda = self.dev.type == "cuda"
+        if draft_impls is None:
+            draft_impls = draft_impls_for(gen.moe_impl, gen.fp8_impl, gen.glue_impl, gen.attn_impl)
+        elif draft_impls == "ref":
+            draft_impls = {}
+        self.draft_impls = dict(draft_impls)
         with torch.inference_mode():
-            self.ds = DraftStep(model, main_hidden=st.main_hidden, tok=st.t_out, _allow_cpu=_allow_cpu)
+            self.ds = DraftStep(model, main_hidden=st.main_hidden, tok=st.t_out, _allow_cpu=_allow_cpu,
+                                **self.draft_impls)
         if self.ds.block != BLOCK or self.ds.C != ROWS:
             raise ValueError(f"draft block {self.ds.block} / ctx rows {self.ds.C}: the loop is k = {BLOCK}")
         self.max_pos = min(int(st.max_pos), int(self.ds.max_pos))
@@ -691,7 +702,7 @@ class DSparkLoop:
         return {"rows": ROWS, "block": BLOCK, "hidden_layers": list(self.hidden), "max_pos": self.max_pos,
                 "max_new_cap": self.b.cap, "poll_every": self.poll_every, "lookahead": self.lookahead,
                 "n_graphs": self.n_graphs, "ratio2_compressors": len(self.st._r2), "eos_ids": self.eos_ids,
-                "verify": self.st.describe(), "draft": self.ds.describe()}
+                "draft_impls": dict(self.draft_impls), "verify": self.st.describe(), "draft": self.ds.describe()}
 
     def close(self) -> None:
         """Drop the graphs and the verify step; restore the Generator's rows / hidden_layers / static_cls."""

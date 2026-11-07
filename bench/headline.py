@@ -190,6 +190,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--fp8-impl", choices=["ref", "gemv"], default="ref")
     ap.add_argument("--glue-impl", choices=["ref", "fused"], default="ref")
     ap.add_argument("--attn-impl", choices=["ref", "bounded", "flashmla"], default="ref")
+    ap.add_argument("--draft-impls", choices=["same", "ref"], default="same",
+                    help="M1-T11-PORT: same = the draft on the verify's impls (draft_step.draft_impls_for); ref = T11")
     ap.add_argument("--spare-slots", type=int, default=None, help="6-row dg-inplace spare slots/layer (default 8)")
     ap.add_argument("--no-gemv-pin", action="store_true", help="do not set DSV41_GEMV_PIN_M1=1")
     ap.add_argument("--reps", type=int, default=2, help="fast (async) runs per prompt at 2 graphs")
@@ -405,7 +407,7 @@ def main(argv=None) -> int:
     if a.profile:
         t_, f_, n_ = a.profile.split(":")
         profile = (t_, int(f_), int(n_))
-    loop = DSparkLoop(gen, a.max_new, poll_every=a.poll_every)
+    loop = DSparkLoop(gen, a.max_new, poll_every=a.poll_every, draft_impls=None if a.draft_impls == "same" else "ref")
     rep["loop"] = loop.describe()
     run_graphs = graphs if a.mode == "graph" else [0]
     results = run_cells(loop, prompts, a.max_new, run_graphs, reps=a.reps, parity_reps=a.parity_reps,

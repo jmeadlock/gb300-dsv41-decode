@@ -23,6 +23,11 @@ Then the draft graph is timed: CUDA events around `DraftStep.replay` (ctx_count 
 after warm-up -> mean / p50 / p90 ms per draft call; plus the in-loop replays' event times. No loop yet (M1-T12):
 the verify argmax is not used to accept anything here; truth is the 1-row record.
 
+M1-T11-PORT: `--draft-impls same` (default) builds the DraftStep on the verify's impls mapped by
+runtime/draft_step.py `draft_impls_for` (--fp8-impl gemv -> GEMV, --moe-impl dg-* -> DeepGEMM over the resident
+stacks, --glue-impl fused -> the draft's fused clusters, --attn-impl flashmla -> FlashMLA); `--draft-impls ref` keeps
+the T11 reference draft. The report's `draft_step` is DraftStep.describe() (which clusters / arm actually came on).
+
 Production's numbers for context (not ours): Pg61's stream delivered `completion_tokens / chunks` tokens per step on
 the W0 step prompt (`--pg61-step w0/results/phase1/step-pg61.json`, read and printed if the file exists; the design memo
 1.3 quotes 2.75 / 2.63 / 2.93), with probabilistic drafts -- greedy drafting here is a different policy.
@@ -206,6 +211,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--fp8-impl", choices=["ref", "gemv"], default="ref")
     ap.add_argument("--glue-impl", choices=["ref", "fused"], default="ref")
     ap.add_argument("--attn-impl", choices=["ref", "bounded", "flashmla"], default="ref")
+    ap.add_argument("--draft-impls", choices=["same", "ref"], default="same",
+                    help="same = the verify's impls mapped by draft_step.draft_impls_for; ref = the T11 reference draft")
     ap.add_argument("--time-replays", type=int, default=200)
     ap.add_argument("--pg61-step", default=os.path.join(REPO, "w0", "results", "phase1", "step-pg61.json"))
     ap.add_argument("--reserve-host-gib", type=float, default=16.0)
@@ -215,7 +222,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     a = build_parser().parse_args(argv)
-    from runtime.draft_step import DraftStep
+    from runtime.draft_step import DraftStep, draft_impls_for
     from runtime.generate import Generator, set_determinism
     from runtime.loader import build_and_load
 
@@ -268,7 +275,9 @@ def main(argv=None) -> int:
     free0 = torch.cuda.mem_get_info()[0]
     if st.main_hidden is None:
         raise RuntimeError("the 6-row StaticStep has no main_hidden (hidden_layers empty?)")
-    ds = DraftStep(model, main_hidden=st.main_hidden)  # the verify graph's output buffer IS the draft's input
+    dimpls = draft_impls_for(a.moe_impl, a.fp8_impl, a.glue_impl, a.attn_impl) if a.draft_impls == "same" else {}
+    report["draft_impls"] = dimpls
+    ds = DraftStep(model, main_hidden=st.main_hidden, **dimpls)  # the verify graph's output buffer IS the draft's input
     report["draft_step"] = ds.describe()
     if a.draft_mode == "graph":
         report["draft_capture"] = ds.capture()
@@ -312,7 +321,10 @@ def main(argv=None) -> int:
         json.dump(report, f, indent=1, default=str)
     at, dm = report["acceptance_total"], report.get("draft_ms") or {}
     f2 = lambda x, d=3: "-" if x is None else f"{x:.{d}f}"  # noqa: E731
-    print(f"DRAFT BENCH | mtp HBM {report['mtp']['bytes_GiB'].get('hbm_total')} GiB | draft graph "
+    print(f"DRAFT BENCH | draft impls {report.get('draft_impls') or 'ref'} (glue on "
+          f"{(report.get('draft_step') or {}).get('glue', {}).get('on')}, attn on "
+          f"{((report.get('draft_step') or {}).get('attn') or {}).get('on')}) | mtp HBM "
+          f"{report['mtp']['bytes_GiB'].get('hbm_total')} GiB | draft graph "
           f"{f2(dm.get('mean'))} ms/call (p50 {f2(dm.get('p50'))}, p90 {f2(dm.get('p90'))}, back-to-back "
           f"{f2(dm.get('back_to_back_wall_ms'))}) | acceptance {at['prompts']} prompts {at['positions']} positions: "
           f"{f2(at['mean_accepted_per_position'])} accepted drafts/position, loop "
