@@ -486,6 +486,9 @@ def _expected_status(moe, fp8):
         on |= {"dg_act", "swiglu_routed", "moe_combine"}
     if fp8 == "gemv":
         on.add("q_rope_epilogue")
+    # round 2 (runtime/fused_glue_r2.py): every cluster applies to the mini checkpoints on CPU (torch's own
+    # reduction order: outcome (i)); tests/test_fused_glue_r2_cpu.py covers them
+    on |= {"hc_norm", "mix_stat", "kv_path", "q_path", "router", "engram", "indexer_post"}
     return on
 
 
@@ -724,8 +727,10 @@ def test_census_fused_path_receipt(tmp_path):
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     out = tmp_path / "c.json"
-    assert mod.main(["--json", str(out), "--paths", "static-dg-gemv,static-dg-gemv-fused"]) == 0
-    t = json.loads(out.read_text())["t9b2"]
+    assert mod.main(["--json", str(out), "--paths", "static-dg-gemv,static-dg-gemv-fused-r1,static-dg-gemv-fused"]) == 0
+    rep = json.loads(out.read_text())
+    t = rep["t9b2"]
+    assert t["after_path"] == "static-dg-gemv-fused-r1"     # R1's table measures R1 alone (R2: test_fused_glue_r2)
     for cl, r in t["per_cluster"].items():
         want = 0 if cl.startswith("#16") else r["audit_predicted"]
         assert r["removed"] == want, (cl, r)

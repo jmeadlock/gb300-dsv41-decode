@@ -1,0 +1,84 @@
+  loaded /usr/local/lib/python3.12/dist-packages/vllm/_flashmla_C.abi3.so with no vllm module; ['_flashmla_C::sparse_prefill_fwd(Tensor q, Tensor kv, Tensor indices, float sm_scale, int d_v, Tensor? attn_sink, Tensor? topk_length, Tensor(a!)? out_) -> Tensor[]']
+PASS test_load_without_vllm (0.2s)
+    r=0 p= 300 b=1: width 128 mismatch  22.52% max|d| 3.91e-03 err fm 2.188e-03 ref 2.113e-03 ratio 1.0356 tlen==mask True rows-indep True
+    r=0 p= 300 b=6: width 128 mismatch  18.94% max|d| 3.91e-03 err fm 2.198e-03 ref 2.112e-03 ratio 1.0408 tlen==mask True rows-indep True
+    r=0 p=1100 b=1: width 128 mismatch  24.54% max|d| 3.91e-03 err fm 2.194e-03 ref 2.100e-03 ratio 1.0448 tlen==mask True rows-indep True
+    r=0 p=1100 b=6: width 128 mismatch  19.94% max|d| 3.91e-03 err fm 2.176e-03 ref 2.103e-03 ratio 1.0349 tlen==mask True rows-indep True
+    r=0 p=4000 b=1: width 128 mismatch  17.59% max|d| 3.91e-03 err fm 2.222e-03 ref 2.071e-03 ratio 1.0730 tlen==mask True rows-indep True
+    r=0 p=4000 b=6: width 128 mismatch  19.33% max|d| 3.91e-03 err fm 2.171e-03 ref 2.099e-03 ratio 1.0346 tlen==mask True rows-indep True
+    r=2 p= 300 b=1: width 640 mismatch  30.55% max|d| 1.95e-03 err fm 2.177e-03 ref 2.078e-03 ratio 1.0479 tlen==mask True rows-indep True
+    r=2 p= 300 b=6: width 640 mismatch  33.06% max|d| 1.95e-03 err fm 2.194e-03 ref 2.079e-03 ratio 1.0552 tlen==mask True rows-indep True
+    r=2 p=1100 b=1: width 640 mismatch  33.81% max|d| 9.77e-04 err fm 2.124e-03 ref 2.059e-03 ratio 1.0318 tlen==mask True rows-indep True
+    r=2 p=1100 b=6: width 640 mismatch  37.92% max|d| 1.95e-03 err fm 2.134e-03 ref 2.041e-03 ratio 1.0456 tlen==mask True rows-indep True
+    r=2 p=4000 b=1: width 640 mismatch  40.44% max|d| 1.95e-03 err fm 2.133e-03 ref 2.055e-03 ratio 1.0384 tlen==mask True rows-indep True
+    r=2 p=4000 b=6: width 640 mismatch  37.42% max|d| 1.95e-03 err fm 2.134e-03 ref 2.056e-03 ratio 1.0382 tlen==mask True rows-indep True
+    r=1 p= 300 b=1: width 640 mismatch  38.12% max|d| 1.95e-03 err fm 2.195e-03 ref 2.053e-03 ratio 1.0691 tlen==mask True rows-indep True
+    r=1 p= 300 b=6: width 640 mismatch  35.80% max|d| 3.91e-03 err fm 2.170e-03 ref 2.079e-03 ratio 1.0436 tlen==mask True rows-indep True
+    r=1 p=1100 b=1: width 640 mismatch  36.92% max|d| 1.95e-03 err fm 2.139e-03 ref 2.044e-03 ratio 1.0465 tlen==mask True rows-indep True
+    r=1 p=1100 b=6: width 640 mismatch  36.94% max|d| 1.95e-03 err fm 2.135e-03 ref 2.045e-03 ratio 1.0442 tlen==mask True rows-indep True
+    r=1 p=4000 b=1: width 640 mismatch  40.40% max|d| 1.95e-03 err fm 2.148e-03 ref 2.049e-03 ratio 1.0485 tlen==mask True rows-indep True
+    r=1 p=4000 b=6: width 640 mismatch  38.09% max|d| 1.95e-03 err fm 2.153e-03 ref 2.043e-03 ratio 1.0538 tlen==mask True rows-indep True
+  worst fp64-oracle ratio 1.0730 (gate 1.1); topk_length == -1-masked everywhere: True; rows independent everywhere: True
+PASS test_flashmla_vs_reference_real_shapes (3.6s)
+    b=1 p= 300: C flashmla 10.61 us/call (424 us/40) replay_eq True graph==eager True; ref@640 125.43 us/call (5017 us/40) replay_eq True graph==eager True; B decode 528/288 (info) 15.55 us/call (622 us/40) replay_eq True graph==eager True
+    b=1 p=1100: C flashmla 14.40 us/call (576 us/40) replay_eq True graph==eager True; ref@640 141.77 us/call (5671 us/40) replay_eq True graph==eager True
+    b=1 p=4000: C flashmla 14.41 us/call (577 us/40) replay_eq True graph==eager True; ref@640 141.90 us/call (5676 us/40) replay_eq True graph==eager True; B decode 528/288 (info) 21.48 us/call (859 us/40) replay_eq True graph==eager True
+    b=6 p= 300: C flashmla 10.56 us/call (422 us/40) replay_eq True graph==eager True; ref@640 126.09 us/call (5044 us/40) replay_eq True graph==eager True; B decode 528/288 (info) 15.42 us/call (617 us/40) replay_eq True graph==eager True
+    b=6 p=1100: C flashmla 14.47 us/call (579 us/40) replay_eq True graph==eager True; ref@640 154.22 us/call (6169 us/40) replay_eq True graph==eager True
+    b=6 p=4000: C flashmla 14.67 us/call (587 us/40) replay_eq True graph==eager True; ref@640 183.35 us/call (7334 us/40) replay_eq True graph==eager True; B decode 528/288 (info) 21.30 us/call (852 us/40) replay_eq True graph==eager True
+PASS test_flashmla_graph_capture_replay_and_speed (2.7s)
+/usr/local/lib/python3.12/dist-packages/torch/cuda/__init__.py:1333: UserWarning: Synchronization debug mode is a prototype feature and does not yet detect all synchronizing operations (Triggered internally at /__w/pytorch/pytorch/torch/csrc/cuda/Module.cpp:1028.)
+  torch._C._cuda_set_sync_debug_mode(debug_mode)
+  mini ref/ref/ref: flashmla on=True reason=None max_err_ratio=1.1203851675243204 tlen==mask True rows-indep True padded heads 64
+  mini L16: max relative logit difference flashmla vs ref attn 8.373e-03; top-1 equal True
+  mini L17: max relative logit difference flashmla vs ref attn 1.173e-03; top-1 equal True
+  mini ref/ref/ref: flashmla static-eager ran prefill + 10 steps (both parities); graph == static, replay x2, fills-on, relaunch; no host sync; top-1 == ref attn
+PASS test_flashmla_mini (9.3s)
+Traceback (most recent call last):
+  File "/work/tests/gpu/test_attn_flashmla_gpu.py", line 441, in <module>
+    t()
+  File "/work/tests/gpu/test_attn_flashmla_gpu.py", line 404, in test_flashmla_mini4
+    _flashmla_vs_ref("mini4")
+  File "/work/tests/gpu/test_attn_flashmla_gpu.py", line 394, in _flashmla_vs_ref
+    assert not top1_bad, f"{kind}: top-1 stream differs from attn ref at prompt lengths {top1_bad} (printed above)"
+           ^^^^^^^^^^^^
+AssertionError: mini4: top-1 stream differs from attn ref at prompt lengths [16] (printed above)
+  mini4 ref/ref/ref: flashmla on=True reason=None max_err_ratio=1.1087467501445318 tlen==mask True rows-indep True padded heads 64
+  mini4 L16: max relative logit difference flashmla vs ref attn 1.419e+00; top-1 equal False
+    flashmla top-1: [1679, 752, 1750, 1689, 300, 1308, 1734, 2033, 833, 1708, 130]
+    ref      top-1: [1679, 752, 1750, 1689, 300, 1308, 1734, 1356, 1873, 801, 1624]
+  mini4 L17: max relative logit difference flashmla vs ref attn 1.039e-01; top-1 equal True
+FAIL test_flashmla_mini4 (3.5s)
+Traceback (most recent call last):
+  File "/work/tests/gpu/test_attn_flashmla_gpu.py", line 441, in <module>
+    t()
+  File "/work/tests/gpu/test_attn_flashmla_gpu.py", line 408, in test_flashmla_mini4w
+    _flashmla_vs_ref("mini4w")
+  File "/work/tests/gpu/test_attn_flashmla_gpu.py", line 394, in _flashmla_vs_ref
+    assert not top1_bad, f"{kind}: top-1 stream differs from attn ref at prompt lengths {top1_bad} (printed above)"
+           ^^^^^^^^^^^^
+AssertionError: mini4w: top-1 stream differs from attn ref at prompt lengths [16] (printed above)
+  mini4w ref/ref/ref: flashmla on=True reason=None max_err_ratio=1.1036112216108942 tlen==mask True rows-indep True padded heads 64
+  mini4w L16: max relative logit difference flashmla vs ref attn 1.419e+00; top-1 equal False
+    flashmla top-1: [1679, 752, 1750, 1689, 300, 1308, 1734, 2033, 833, 1708, 130]
+    ref      top-1: [1679, 752, 1750, 1689, 300, 1308, 1734, 1356, 1873, 801, 1624]
+  mini4w L17: max relative logit difference flashmla vs ref attn 1.039e-01; top-1 equal True
+FAIL test_flashmla_mini4w (3.5s)
+Traceback (most recent call last):
+  File "/work/tests/gpu/test_attn_flashmla_gpu.py", line 441, in <module>
+    t()
+  File "/work/tests/gpu/test_attn_flashmla_gpu.py", line 412, in test_flashmla_mini4w_dg_gemv_fused
+    _flashmla_vs_ref("mini4w", "dg-masked", "gemv", "fused")
+  File "/work/tests/gpu/test_attn_flashmla_gpu.py", line 394, in _flashmla_vs_ref
+    assert not top1_bad, f"{kind}: top-1 stream differs from attn ref at prompt lengths {top1_bad} (printed above)"
+           ^^^^^^^^^^^^
+AssertionError: mini4w: top-1 stream differs from attn ref at prompt lengths [16] (printed above)
+  mini4w dg-masked/gemv/fused: flashmla on=True reason=None max_err_ratio=1.1036112216108942 tlen==mask True rows-indep True padded heads 64
+  mini4w L16: max relative logit difference flashmla vs ref attn 1.419e+00; top-1 equal False
+    flashmla top-1: [1679, 752, 1750, 1689, 300, 1308, 1734, 2033, 833, 1708, 130]
+    ref      top-1: [1679, 752, 1750, 1689, 300, 1308, 1734, 1356, 1873, 801, 1624]
+  mini4w L17: max relative logit difference flashmla vs ref attn 1.039e-01; top-1 equal True
+FAIL test_flashmla_mini4w_dg_gemv_fused (3.8s)
+  mini4w graph step cell p50: attn ref 2.412 ms, flashmla 2.435 ms
+PASS test_flashmla_step_cell_informative (1.2s)
+5/8 not failed; 3 failed

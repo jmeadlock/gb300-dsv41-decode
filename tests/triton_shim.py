@@ -227,6 +227,22 @@ def static_range(n):
     return range(n)
 
 
+# T9b-2 R2 (runtime/fused_glue_r2.py): `triton.language.extra.libdevice` -- rsqrt is torch.rsqrt on fp32 (what the
+# CPU mirrors call; on the device libdevice.rsqrt == torch.rsqrt was measured bit for bit, docs/flashmla-probe-
+# 20261106.json probe (c)), sqrt_rn / div_rn are IEEE (numpy float32 is correctly rounded).
+def _rsqrt(x):
+    a = np.asarray(_v(x), dtype=np.float32)
+    return T(torch.rsqrt(torch.from_numpy(np.ascontiguousarray(a).reshape(-1))).numpy().reshape(a.shape))
+
+
+def _sqrt_rn(x):
+    return T(np.sqrt(np.asarray(_v(x), dtype=np.float32)).astype(np.float32))
+
+
+def _div_rn(a, b):
+    return T((np.asarray(_v(a), dtype=np.float32) / np.asarray(_v(b), dtype=np.float32)).astype(np.float32))
+
+
 def load(ptr, mask=None, other=None):
     vals = ptr.buf[np.clip(ptr.off, 0, ptr.buf.size - 1)]
     if mask is None:
@@ -337,15 +353,24 @@ def _modules():
         setattr(tl, name, globals()[name])
     tr = types.ModuleType("triton")
     tr.jit, tr.cdiv, tr.language, tr.__version__ = jit, cdiv, tl, "numpy-shim"
+    ex = types.ModuleType("triton.language.extra")
+    ld = types.ModuleType("triton.language.extra.libdevice")
+    ld.rsqrt, ld.sqrt_rn, ld.div_rn = _rsqrt, _sqrt_rn, _div_rn
+    ex.libdevice = ld
+    tl.extra = ex
     return tr, tl
+
+
+_SHIM_KEYS = ("triton", "triton.language", "triton.language.extra", "triton.language.extra.libdevice")
 
 
 @contextlib.contextmanager
 def installed():
-    """sys.modules['triton'] / ['triton.language'] = the shim for the duration (restored after)."""
-    saved = {k: sys.modules.get(k) for k in ("triton", "triton.language")}
+    """sys.modules['triton'] / ['triton.language'] (+ .extra.libdevice) = the shim for the duration (restored after)."""
+    saved = {k: sys.modules.get(k) for k in _SHIM_KEYS}
     tr, tl = _modules()
     sys.modules["triton"], sys.modules["triton.language"] = tr, tl
+    sys.modules["triton.language.extra"], sys.modules["triton.language.extra.libdevice"] = tl.extra, tl.extra.libdevice
     try:
         yield tr
     finally:
