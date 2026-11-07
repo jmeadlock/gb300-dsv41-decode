@@ -216,7 +216,7 @@ T1's remainder covers these, with real expert bytes for `fp4_gemm`. Fallback for
 | T5 | Driver: greedy/TF/dumps/NVTX/profiler/determinism | 1.5 | — | runs on a 2-layer toy config |
 | T6 | **First light:** 8 prompts, measurements 1–3 | 2 | T0, T2–T5 | parity report in `docs/`; self-replay 100% (target **Nov 24**) |
 | T7 | Extend path + two-source `sparse_attn`; 32K | 4 | T6 | 32K prompt prefills and decodes 256 tokens; needles pass; self-replay equal |
-| T8 | Graph-capturable step (device routing, fixed shapes, marker kernel) | 3 | T6 | full decode step from one CUDA graph; parity unchanged |
+| T8 | Graph-capturable step (device routing, fixed shapes, marker kernel) | 3 | T6 | full decode step from one CUDA graph; parity unchanged — **DONE 2026-11-06, 98.4 ms (T8-RESULT)** |
 | T9 | Borrowed kernels one at a time: MoE → attention → MXFP8 GEMM → mHC | 6 | T8 | each swap re-passes parity; ms/step logged per swap |
 | T10 | Trace + gap histogram + M0 verdict | 1.5 | T9 | nsys step table with named boundaries; histogram; verdict vs D2 bar |
 
