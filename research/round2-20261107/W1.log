@@ -1,0 +1,20 @@
+The report is written. Bottom line: PDL works inside our captured graph and changes nothing numerically, but on its own it's worth about 0.5–1.5 ms. It can't get a 6-row step to 5.0 ms. Every saving number below is modeled from H100 and RTX PRO 6000 data; there are no published GB300 boundary numbers, so the first box probe measures them.
+
+1. **Where the time is:** there are no idle gaps between graph nodes. The step time equals the sum of kernel times, so the per-launch cost sits inside each of the ~2,000 short kernels (startup, first memory read, tail). Pure launch dispatch alone is about 0.74–1.1 ms of the 10.52 ms step (modeled).
+2. **PDL works in our graphs:** `torch.cuda.graph` records PDL launches as programmatic edges, and production vLLM 0.31.0 already runs this on this box. Our runtime uses it nowhere.
+3. **DeepGEMM PDL is off:** at our pin its PDL flag defaults to false and our runtime never calls `set_pdl`. One line, `set_pdl(True)` in `runtime/dg_moe.py`, saves about 0.04–0.12 ms.
+4. **The main lever is our own Triton kernels.**
+   - Add `launch_pdl=True` plus `gdc_wait()` and an early trigger to every owned kernel: about 0.07–0.26 ms.
+   - Have each GEMV prefetch its weights into L2 before `gdc_wait()`: about 0.17–0.42 ms. The biggest case is the GEMV after `hc_norm`, which runs as a single CTA for 6–21 µs while the GEMV could load its whole weight set on the other SMs.
+5. **Triton 3.7.1 trap:** it lacks the fix in PR #11906, which stops the compiler moving loads ahead of a `gdc_wait()` placed inside a loop. Keep the wait outside loops, and don't use `warp_specialize` on PDL kernels.
+6. **New trick for kernels we can't edit:** torch 2.13's `keep_graph=True` lets us rewrite captured edges before instantiation, so aten glue, cuBLAS, FlashMLA and TileLang kernels can feed PDL consumers early (LaunchCompletion edges). Modeled at 0.03–0.2 ms; it needs cuda-python in the image, which I haven't confirmed.
+7. **Graph-level knobs aren't levers.** Replay CPU cost is constant, device-side graph launch adds nothing per node, and a conditional node costs about 8 µs per dispatch, so skip cold staging with an in-kernel early exit instead.
+8. **What others measured:** turning PDL on gave about 3% TPOT in vLLM and TensorRT-LLM, which were already heavily fused. Writing it into an unfused H100 kernel chain gave about 2 µs per edge (−16% of the step body). SGLang's GB300 plugin for this exact model and 6-row shape cut a layer from 96.8 to 68.4 µs, but PDL isn't separated from their other changes there.
+9. **Why fusion still decides it:** each dependent edge costs at least 0.37–1.15 µs even with perfect PDL. With the M2 memo's 4.6 ms bandwidth floor, 5.0 ms allows only about 350–1,080 edges per step, so the node count has to drop 2–6× and every new fused kernel should be built with the prefetch-before-wait pattern.
+10. **Next:** the report lists nine probes of 30 minutes or less. P0 measures GB300 per-node and PDL floors with empty kernels; P1 is the DeepGEMM switch; P4 is the GEMV prefetch microbenchmark; P7 is a read-only SM-clock check. Any clock change would be system config and needs your approval.
+
+The report covers the six PDL correctness rules (including a fence-ordering hazard in cuBLAS ≥13.1.0), the full sourced numbers table with every figure labelled, and how its estimates map onto the M2 memo's L5 rung.
+
+Path: /Users/jamesmeadlock/hermes/gb300-dsv41-decode/research/round2-20261107/W1-launch-boundary.md
+
+W1: PDL inside our captured graph is bit-identical but worth only ~0.5–1.5 ms; 5.0 ms needs the node count cut 2–6× first, so the boundary is a fusion problem with PDL as a rebate.

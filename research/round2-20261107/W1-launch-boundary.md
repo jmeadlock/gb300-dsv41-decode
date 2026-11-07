@@ -6,7 +6,7 @@ Scope: making a kernel boundary cheaper *without* fusing. The fusion ladder is `
 
 ## 0. Verdict
 
-(written last — see bottom of file; kept here as a pointer)
+The boundary is not idle time between nodes — our graph step already equals the sum of kernel durations — it is the fixed ramp/first-DRAM/tail inside each of ≈ 2,000 short kernels, of which ≈ 0.74–1.1 ms is pure node dispatch [E from sm_120/Ampere rates]. Programmatic Dependent Launch is the only non-fusion tool that attacks it, it works inside `torch.cuda.graph` (stream capture records programmatic edges; vLLM 0.31.0 runs exactly this on our box), and every toolchain in the image exposes it (Triton 3.7.1 `launch_pdl` + `gdc_*`, DeepGEMM `set_pdl` — **off by default at our pin and never called by our runtime**, CuTe DSL `use_pdl`, TileLang `T.pdl_*`), while aten glue, FlashMLA's sparse op and most cuBLAS nodes cannot be PDL secondaries. Done properly — DeepGEMM PDL on, every owned Triton kernel PDL-chained, GEMVs prefetching their weights into L2 *before* `gdc_wait()` (outside loops: Triton 3.7.1 lacks the #11906 pipeliner fix), plus post-capture LaunchCompletion edges for producers we cannot edit — it is worth **≈ 0.45–1.5 ms at 1 row (central 0.8: 10.5 → ~9.7 ms) and about the same absolute at 6 rows**, bit-identical by construction. Published decode gains match that scale (+3 % TPOT where stacks were already fused; ≈ 2 µs/edge, −16 % body, on an unfused H100 chain). It cannot reach 5.0 ms on its own: even at the published PDL floor each dependent edge costs 0.37–1.15 µs, so 5.0 ms (≈ 0.4 ms above the 4.6 ms bandwidth floor) admits only ≈ 350–1,080 edges per step — the node count must fall 2–6× (M2 ladder / persistent stretch) and the PDL recipe must be built into every new kernel. Graph-level knobs are not levers: replay CPU cost is constant, device launch adds nothing per node, and conditional nodes cost ≈ 8 µs per dispatch (use in-kernel predicates instead).
 
 ## 1. Findings with citations
 
@@ -89,3 +89,100 @@ Reading: on production stacks that already fused heavily, turning PDL on is wort
 5. cuBLAS ≥ 13.1.0 device-pointer alpha/beta WAR hazard (CUB-10409) — keep alpha/beta on host for any cuBLAS node behind a PDL producer.
 6. Grading: PDL is scheduling only; with orders unchanged outputs are bit-identical (Ling 4/4 bitwise; TRT-LLM 0/20,000 mismatches). Grade every PDL change with **many-replay stress, new input per replay, bitwise vs PDL-off** (the #20634 method), not one replay.
 
+
+## 2. Numbers table
+
+| quantity | value | label | source |
+|---|---|---|---|
+| our 1-row step / kernels | 10.52 ms / ≈ 2,000 | M / E | `first-light-t9b4-20261107.json`; M2 memo §0.1 |
+| Σ kernel durations vs graph step (13.9 ms anatomy) | 13.91 vs 13.88 ms → no inter-node idle | M | `step-anatomy-r2-20261107.json` via M2 §0.3 |
+| aten glue kernels | ~700 × ~2 µs = 1.40 ms (13.9 anatomy) | M | `STEP-ANATOMY-R2-20261107.md:10` |
+| graph node-to-node gap, empty kernels | 428 ns (sm_120) | C | Bojie Li 2026-09-26 |
+| PDL chain boundary, empty kernels | 366 ns (sm_120) | C | same |
+| all-SM barrier / gather with data | 663 ns / 1.0–1.15 µs (sm_120) | C | same |
+| exposed per dependent GEMV boundary under DRAM stream | 0.74–1.06 µs (dynamic rows) / 1.2–2.3 µs (fixed tiles) / 2.85–3.23 µs (stream stops) | C | same |
+| graph repeat-launch device runtime, 1,025-node straight line | 567 µs ≈ 0.55 µs/node (Ampere, CUDA 12.6) | C | NVIDIA blog 2024-09-11 |
+| graph repeat-launch CPU cost | ≈ 2.5 µs + ~1 ns/node | C | same |
+| default-edge boundary cost, H100 81-kernel Llama-1B | 190 µs / ~80 edges ≈ 2.4 µs/edge | C | tie-pilot-qxw 2026-08 |
+| PDL recovery, same | 154–158 µs (82.8 %) ≈ 2.0 µs/edge; trigger "issued" vs "arrived" alone 34 µs | C | same |
+| vLLM PDL on DSA decode kernels | TPOT 1.94 → 1.88 ms (−3.1 %), 8×B300 | C | vLLM #50230, merged 2026-08-06 |
+| TRT-LLM `TRTLLM_ENABLE_PDL` | 168 → 173 TPS/user (+3.0 %), 8×B200 | C | TRT-LLM blog 1 |
+| TRT-LLM multi-stream RMSNorm overlap | 173 → 180 (+4.0 %) | C | same |
+| TRT-LLM clock/power (vboost 4) | 204 → 211 (+3.4 %) | C | same |
+| SGLang plugin, DSV4.1-Flash DSpark 6 rows, 4×GB300 | verify graph 1,205 kernels; layer 96.8 → 68.4 µs (−29 %, PDL + other) | C | LMSYS 2026-10-18 |
+| conditional-node dispatch overhead | 12.3 vs 4.1 µs fixed → ≈ 8.2 µs (B200) | C | arXiv 2607.23099v3 Table III |
+| nvjet small-N GEMV (1280×5120 bf16, M=1–6) | 6.64 µs (0.9–2 TB/s) vs tinygemm2 3.85 µs | C | TRT-LLM #20634, 2026-10-19 |
+| PDL bit-identity stress | 0 mismatches / 20,000 replays | C | TRT-LLM #20634 |
+| pure dispatch share of our step | 2,000 × 0.37–0.55 µs = **0.74–1.1 ms** | E | above rates; GB300 unmeasured |
+| edge budget for 5.0 ms | (5.0 − 4.6 ms bandwidth floor) / 0.37–1.15 µs per edge = **≈ 350–1,080 dependent edges/step maximum, even at the published PDL floor** | E | M2 §5.1 floor; Bojie rates |
+
+## 3. What this means for our runtime
+
+Ranked by ms saved per engineering day. All rows are **bit-identical** (scheduling only) when §1.9's rules hold; none changes a reduction order. Edge counts are at 10.52 ms [E, M2 §0–§1]; 6-row figures assume the same kernel count with per-kernel time ~flat (M2 §1) — the M1 fast-path 6-row anatomy will correct both.
+
+| # | lever | where (file / kernel) | how | ms saved, 1 row [E] | ms saved, 6 rows [E] | effort | numerics |
+|---|---|---|---|---|---|---|---|
+| B1 | **DeepGEMM PDL on** | `runtime/dg_moe.py` (next to the `use_deterministic_algorithms` call, :191) — affects the 120 DG launches/step (3/layer) | `self.dg.set_pdl(True)` before capture. DG's sm100 kernels already do barrier init + TMEM alloc + cluster sync before `cudaGridDependencySynchronize()` [L]; that prologue overlaps the predecessor's tail. No early trigger inside DG, so DG's successor gains nothing extra | 0.04–0.12 (120 × 0.3–1.0 µs) | 0.04–0.12 | 1 line + gate | bit-identical |
+| B2 | **Triton PDL, tier A** (mechanical) on every owned kernel | GEMV + reduce (`gemv_mxfp8.py:590, 662`; launch sites ~:816, 819, 905, 988), glue (`fused_glue.py` 18 `@triton.jit` functions, `fused_glue_r2.py` 30, incl. `t9b2r2_hc_norm`/`t9b4_hc_norm` :915, `norm_row` :963, router, Engram, topk_post), `static_kernels.py` (7 `@triton.jit`, incl. `t9b2_gather_tables` :252, stage) | add `USE_PDL: tl.constexpr`; at kernel entry `gdc_wait()` then `gdc_launch_dependents()` (vLLM `query_quant.py:44-46` pattern); `launch_pdl=True` via the shared `LAUNCH` dicts (`fused_glue.py:142`, `fused_glue_r2.py:119`) and the GEMV launch kwargs | 0.07–0.26 (~650 edges × 0.1–0.4 µs) | same | 1–2 d | bit-identical |
+| B3 | **Triton PDL, tier B: GEMV weight prefetch before the wait** | `t9b_mxfp8_gemv` (`gemv_mxfp8.py:605-621`): before the K loop at :621 | before `gdc_wait()`: issue an L2 prefetch of this program's weight slice (BLOCK_N rows × PER×32 B, contiguous per row) with inline PTX `cp.async.bulk.prefetch.L2.global` (or `prefetch.global.L2`), plus the weight-scale row; then `gdc_wait()` **outside the loop** (Triton 3.7.1 #11905); loop unchanged, so the same bytes feed the same FMAs. Producers (hc_norm, norm_row, q_norm, SwiGLU+quant — all ours) trigger right after their own wait. Biggest single case: `hc_norm` is a 1-CTA grid (`fused_glue_r2.py:915`) running 6–21 µs; the following pair GEMV (wq_a‖wkv 9.2 MB fp8; shared w1‖w3) can prefetch its *entire* weight set into L2 on the other SMs while it runs | 0.17–0.42 on ~210 GEMV edges (0.8–2.0 µs each, H100 evidence) — of which the 81 hc_norm→GEMV edges could reach 2–5 µs each | same (GEMV ~flat with rows) | 2–3 d | bit-identical (prefetch moves timing only) |
+| B4 | **post-capture LaunchCompletion edges** into PDL-aware consumers after producers we cannot edit (aten glue, cuBLAS, FlashMLA ×40, TileLang sinkhorn ×80, DG ×120) | `runtime/static_step.py:1173-1177`: `torch.cuda.CUDAGraph(keep_graph=True)`, walk `raw_cuda_graph()` edges, swap edges whose *destination* is a `USE_PDL` kernel for `{Programmatic, from_port=LaunchCompletion}`, then `g.instantiate()` | needs cuda-python in the image (unverified) | 0.03–0.2 (250–400 edges × 0.1–0.5 µs) | same | 1–2 d | bit-identical iff every destination waits before every dependent read (§1.9-1) |
+| B5 | cold-staging device predicate (non-fusion version of M2 L7/fold) | `t9a2_stage_inplace` (40 × 9.2 µs = 0.37 ms [M]) | early-exit when the layer has no cold rows (but keep m_indices if it is built there); **not** a conditional node (≈ 8.2 µs per dispatch [C]) | 0.1–0.3 (most layers have 0 cold at 1 row: 6.07 cold calls/step [M]) | 0.05–0.2 (P(any cold) per layer rises) | 0.5 d | bit-identical |
+| B6 | extra graph fork branches beyond M2 L1 | Engram L1/L14 lookup + projections at step start (SGLang plugin does this), shared-expert fork until L3, index-head weights at layer start | fork/join in `StaticStep.capture` | 0.05–0.2 | 0.05–0.2 | 1–2 d | bit-identical |
+| B7 | host-loop discipline (M1-T12) | the draft→verify→accept loop | no blocking D2H between graph replays; acceptance on device; enqueue next graph before reading results. Device graph launch / WHILE node only if the trace shows host gaps | 0 if right; protects 0.1–2 ms/step [C, LMSYS 47 % idle case] | same | design rule | n/a |
+| B8 | SM clock under decode (system config — **James's approval required**) | box | first only *measure* SM clock during the step; latency-bound kernels scale with clock | 0–0.5 (0–5 %) | 0–1.0 | probe only | n/a (no numerics change) |
+| — | nvjet/cuBLAS → own GEMV | M2 L1/L2/L4/L9 | also turns ~160 cuBLAS nodes (often 2 kernels per mm) into single PDL-capable nodes | counted in M2 | counted in M2 | — | A3 unless calibrated |
+
+**Sum of B1–B6: ≈ 0.45–1.5 ms at 1 row (central ≈ 0.8 ms, i.e. 10.5 → ~9.7 ms), ≈ 0.4–1.4 ms at 6 rows** [E]. That overlaps M2's L5 (0.35–1.0 ms) — B2+B3 *are* L5, now with a concrete kernel recipe and evidence; B1, B4, B5-as-predicate, B6-extra, B8 are new. Do not add B2+B3 to M2's total twice.
+
+What PDL cannot do: it keeps every node and every dependency. With ≈ 2,000 nodes the dependency floor alone is 0.74–2.3 ms (0.37–1.15 µs/edge, sm_120). Against the 5.0 ms bar and M2's 4.6 ms bandwidth floor, the step can afford only **≈ 350–1,080 dependent edges** even at the published floor (§2 last row). So: PDL is necessary and cheap, but the bar also requires the node count to fall ~2–6× (M2 ladder → ~700; persistent stretch → ~170). PDL's value *per remaining edge* grows as kernels get bigger (more producer-independent weight bytes to prefetch), so B3's recipe should be built into every M2 rung, not bolted on after.
+
+Numerics class for all of §3: **bit-identical**, graded by many-replay stress (new input per replay, bitwise vs PDL-off), never by one replay.
+
+## 4. What must be measured on the box (each ≤ 30 min)
+
+| probe | procedure | pass / decision |
+|---|---|---|
+| **P0 GB300 boundary floors** (10 min, no model) | graph of 2,000 empty kernels: (a) plain, (b) PDL attribute + `gdc_wait` at entry; graph of 2,000 1-CTA kernels each reading 4 KB written by the previous; replay 100×, time with events; report µs/node. Same with 148/152-CTA grids. | gives the missing sm_103 numbers (two-die L2). If plain > 0.6 µs/node, B2's estimate goes up; if PDL ≈ plain, tier A is worth ~0 and only B3/B4 matter |
+| **P1 DeepGEMM PDL** (10 min) | `set_pdl(True)` before capture; step cell 1 and 6 rows ×3; self-replay hash over 100 replays with changing inputs vs PDL-off | bitwise equal; keep if ≥ 0.03 ms, else harmless anyway |
+| **P2 edge census** (10 min) | capture with `keep_graph=True`; via cuda-python list every kernel node with its name and incoming edge types/ports (`cudaGraphGetEdges_v2`); print cuBLAS version (`nvidia-cublas` wheel / `cublasGetVersion`) | confirms programmatic edges appear for PDL launches under `torch.cuda.graph`; tells which cuBLAS nodes already carry programmatic edges (cuBLAS ≥ 13.0U1 "some kernels"); also confirms cuda-python exists (gates B4) |
+| **P3 tier-A Triton PDL** (30 min) | add `USE_PDL` + entry `gdc_wait(); gdc_launch_dependents()` to GEMV, reduce, hc_norm, norm_row, the R1/R2 clusters; `launch_pdl=True`; step cell 1/6 rows; 1,000-replay bitwise stress | bitwise; keep if ≥ 0.1 ms |
+| **P4 tier-B GEMV prefetch, micro then in-step** (30 min) | chain in one graph, real shapes and real weights rotated past L2: 40 × (`t9b4_hc_norm` → wq_a‖wkv pair GEMV → reduce → `q_norm`) — PDL off / tier A / tier A + pre-wait L2 bulk prefetch; then the same flag in the step cell | bitwise; target ≥ 2 µs saved per hc_norm→GEMV edge; if < 0.5 µs, the L2 prefetch is not landing (check `cp.async.bulk.prefetch` alignment, L2 residency) |
+| **P5 LaunchCompletion edges** (30 min, needs P2's cuda-python) | post-process edges into `USE_PDL` destinations whose source is non-PDL (aten, cuBLAS, FlashMLA, TileLang, DG); instantiate; step cell; 1,000-replay stress | bitwise; keep if ≥ 0.05 ms; drop at the first mismatch |
+| **P6 in-graph boundary histogram** (shared with M2-T13) | marker kernels stamping `%globaltimer` + `%smid` at CTA entry / wait-release / exit for one layer, PDL off vs P3/P4 | per-edge exposed time distribution; tells whether the remaining cost is dispatch, prologue, first-DRAM or tail |
+| **P7 clock** (10 min, read-only) | `nvidia-smi --query-gpu=clocks.sm,clocks.max.sm,clocks.mem,power.draw,temperature.gpu --format=csv -lms 100` during a 30 s step-cell loop | if SM clock < max during decode, bring a clock/power A/B to James (system config — not done without approval) |
+| **P8 host loop** (15 min, when T12 exists) | nsys (no CUDA-graph node trace, to avoid perturbation) of 50 steps; gaps between graph launches | no gap > 20 µs between draft and verify graphs; any blocking D2H in the loop is a bug |
+
+## 5. Sources (all fetched 2026-11-07 unless noted)
+
+- CUDA Programming Guide 13.5 §4.5 PDL incl. §4.5.3 "Use in CUDA Graphs": https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html
+- CUDA Runtime API types (ports `cudaGraphKernelNodePortProgrammatic` / `LaunchCompletion`): https://docs.nvidia.com/cuda/archive/13.3.1/cuda-runtime-api/group__CUDART__TYPES.html
+- CUDA 13.5 toolkit release notes (cuBLAS 13.0U1 PDL; CUB-10409 hazard): https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html
+- NVIDIA, Constant Time Launch for Straight-Line CUDA Graphs (2024-09-11): https://developer.nvidia.com/blog/constant-time-launch-for-straight-line-cuda-graphs-and-other-performance-enhancements
+- NVIDIA, Device Graph Launch blog: https://developer.nvidia.com/blog/enabling-dynamic-control-flow-in-cuda-graphs-with-device-graph-launch/
+- CUDA graphs conditional nodes: https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cuda-graphs.html
+- PyTorch `torch.cuda.CUDAGraph` (keep_graph/raw_cuda_graph): https://docs.pytorch.org/docs/2.15/generated/torch.cuda.CUDAGraph.html; v2.13.0 source `torch/cuda/graphs.py` via `gh api repos/pytorch/pytorch/contents/torch/cuda/graphs.py?ref=v2.13.0`
+- PyTorch CUDA-graph integration (stream capture only): https://docs.nvidia.com/dl-cuda-graph/latest/torch-cuda-graph/torch-integration.html
+- Triton PDL docs: https://triton-lang.org/main/python-api/triton.language.extra.cuda.html; tutorial: https://github.com/triton-lang/triton/blob/main/python/tutorials/11-programmatic-dependent-launch.py; PR #6394 (merged 2025-04-29); PR #11906 / issue #11905 (merged 2026-09-23); issue #12395; releases https://github.com/triton-lang/triton/releases
+- DeepGEMM README at our pin: https://github.com/deepseek-ai/DeepGEMM/blob/88965b078186ee7510ab9fc4f1d5ebc19adfa8d1/README.md; `csrc/jit/device_runtime.hpp` at the same commit (`enable_pdl = false`); DeepWiki DeepGEMM device runtime: https://deepwiki.com/sgl-project/DeepGEMM/2.2-device-runtime-and-kernel-handle
+- FlashMLA code search (PDL only in decode combine): `gh api search/code repo:deepseek-ai/FlashMLA`, 2026-11-07
+- TileLang PDL test at v0.1.12 and PR #2220 (2026-05-19): https://github.com/tile-ai/tilelang
+- vLLM PR #50230 (merged 2026-08-06): https://github.com/vllm-project/vllm/pull/50230
+- vLLM issue #40543 Dynamic PDL Enablement (2026-04-21): https://github.com/vllm-project/vllm/issues/40543
+- TensorRT-LLM DeepSeek-R1 B200 min-latency blog: https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html
+- TensorRT-LLM issue #20634 (2026-10-19): https://github.com/NVIDIA/TensorRT-LLM/issues/20634
+- LMSYS, SGLang Low-Latency Mode (2026-10-18): https://www.lmsys.org/blog/2026-10-18-sglang-low-latency-mode/
+- LMSYS, Ling-3.0-flash batch-1 floor (2026-08-21): https://www.lmsys.org/blog/2026-08-21-ling3-flash-spec-decode-blackwell/
+- Bojie Li, Blackwell sync latency notes (2026-09-26): https://github.com/bojieli/ai-infra-book/blob/main/calculations/sources/opentallas/blackwell-sync-latency-notes.md
+- PDL megakernel reconstruction (2026-08): https://github.com/tie-pilot-qxw/pdl-megakernel-reconstruction/blob/main/docs/reconstructing-a-megakernel-with-pdl.md
+- DA-MoE / conditional graph overhead, arXiv 2607.23099v3: https://arxiv.org/html/2607.23099v3
+- CUDA Handbook §6.9 (graph launch ~0.54 µs/kernel CPU, RTX 3060): https://www.cudahandbook.com/book/ch6/cuda-graphs
+- B200 launch-latency agent note (low quality): https://huggingface.co/datasets/Infatoshi/kernelbench-cuda-traces/raw/main/b200/20260719_190252_or-fable_anthropic_claude-fable-5_04_grid_mingru_sps.jsonl
+- vLLM #34302, onnxruntime #32289 (titles/summaries only): https://github.com/vllm-project/vllm/pull/34302, https://github.com/microsoft/onnxruntime/pull/32289
+- Local: `reference/vllm-0.31.0/{utils_deep_gemm.py, deepseek_v41/common/ops/query_quant.py, deepseek_v41/common/ops/fused_compress_quant_cache.py, deepseek_v41/nvidia/ops/fused_wo_a.py, deep_gemm/include/deep_gemm/impls/*.cuh}`; `docs/M2-FUSED-CHAIN-DESIGN.md`; `docs/STEP-ANATOMY-R2-20261107.md`; round-1 `~/hermes/research/dsv41-catchup-6000-20261027/r6-outside-view/W1-megakernels.md` (other lane, read for non-duplication).
+
+Unverified items, collected: GB300/sm_103 per-node and PDL floors (P0); cuBLAS version in the image and which cuBLAS kernels take PDL (P2); cuda-python in the image (P2); TileLang 0.1.12 default-launcher PDL attribute; whether Triton #11906 was backported to 3.7.x/3.8.x; FlashMLA sparse-prefill PDL (code search only); the per-edge savings in §3 (modeled from H100/sm_120 evidence).
+
+---
+Completed 2026-11-07 (CST). 
+
+W1: PDL inside our torch-captured graph is real and bit-identical but worth only ~0.5–1.5 ms (DG `set_pdl` + PDL-chained Triton with pre-wait weight prefetch); 5.0 ms needs the node count cut 2–6× first — the boundary is a fusion problem with a PDL tax rebate, not a launch-API problem.
