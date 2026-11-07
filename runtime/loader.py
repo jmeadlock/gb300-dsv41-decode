@@ -28,6 +28,14 @@ wkv/wgate at ratio > 1 model.py:444-448 -- what safetensors.load_model's copy_ d
 I8 -> float4_e2m1fn_x2 reinterpretation of expert weights (convert.py:181, zero-copy). Any other dtype or shape
 difference, and any missing or unexpected key, refuses the load and prints both lists.
 
+M2-T17 (`head_dtype="bf16"` / $DSV41_HEAD_DTYPE=bf16, default fp32 until the box gate passes): the head weight
+(`head.weight`, and the draft's `mtp.*.markov_head.head.weight`) stays bf16 -- its checkpoint dtype -- instead of
+being widened to fp32: half the bytes in HBM (1.32 GB instead of 2.65 GB for the 129280 x 5120 head), no widening path
+for those tensors (the bytes go straight to HBM like any same-dtype tensor), and every use goes through the fixed-order
+kernel that widens in registers (runtime/fused_glue_r2.py `install_bf16_head`; exact, bit-equal to the fp32-stored
+kernel). The reference module's ParallelHead.forward is replaced on those instances (its fp32 F.linear cannot take a
+bf16 weight); everything else is untouched.
+
 `verify=True` hashes every placed tensor (sha256) against an independent read of its shard bytes; wo_a against
 convert.py's formula applied to the re-read bytes; widened tensors after narrowing back (bf16 -> fp32 -> bf16 is
 exact). Host-tier parameters are additionally checked to alias their HostBuffer (data_ptr identity).
@@ -187,10 +195,12 @@ class LoadResult:
     dequantized: List[str] = field(default_factory=list)
     widened: List[str] = field(default_factory=list)
     verify: Optional[dict] = None
+    head_dtype: str = "fp32"      # M2-T17: the head weight's dtype in HBM ("bf16": kept as stored, fixed-order kernel)
+    head_bf16: List[str] = field(default_factory=list)   # the tensors kept bf16 (head, + the Markov head with load_mtp)
 
     def summary(self) -> dict:
         return {"model_dir": self.model_dir, "config": self.config_path, "device": self.device,
-                "map": self.plan.hot_map.source,
+                "map": self.plan.hot_map.source, "head_dtype": self.head_dtype, "head_bf16": list(self.head_bf16),
                 "bytes_GiB": {k: round(v / GiB, 3) for k, v in self.bytes.items()},
                 "timings_s": {k: round(v, 2) for k, v in self.timings.items()},
                 "mem_log": self.mem_log, "dequantized_wo_a": len(self.dequantized),
@@ -265,8 +275,20 @@ def _set_param(model: nn.Module, name: str, tensor: torch.Tensor) -> None:
     setattr(mod, attr, nn.Parameter(tensor, requires_grad=False))
 
 
+HEAD_DTYPE_ENV = "DSV41_HEAD_DTYPE"
+HEAD_DTYPES = ("fp32", "bf16")
+
+
+def resolve_head_dtype(head_dtype: Optional[str] = None) -> str:
+    """M2-T17: the head weight's dtype in HBM: the argument, else $DSV41_HEAD_DTYPE, else "fp32" (today's path)."""
+    v = head_dtype or os.environ.get(HEAD_DTYPE_ENV) or "fp32"
+    if v not in HEAD_DTYPES:
+        raise ValueError(f"head_dtype {v!r} (or ${HEAD_DTYPE_ENV}) not in {HEAD_DTYPES}")
+    return v
+
+
 def check_keys(index: ShardIndex, plan, expected: Dict[str, Tuple[Tuple[int, ...], torch.dtype]],
-               pcfg: PlacementConfig) -> List[str]:
+               pcfg: PlacementConfig, head_dtype: str = "fp32") -> List[str]:
     """Refuse on missing / unexpected keys, shape mismatch, or an undocumented dtype change. Returns the names
     to place (non-SKIP, excluding wo_a.scale, which the wo_a dequant consumes)."""
     provided = {}
@@ -290,6 +312,8 @@ def check_keys(index: ShardIndex, plan, expected: Dict[str, Tuple[Tuple[int, ...
             bad.append(f"{name}: shape {tuple(e.shape)} in checkpoint vs {tuple(shape)} in model")
             continue
         pd = placed_dtype(name, e.dtype, pcfg)
+        if name == "head.weight" and head_dtype == "bf16" and e.dtype == torch.bfloat16:
+            pd = torch.bfloat16     # M2-T17: kept in its checkpoint dtype (the model's expected dtype is overridden too)
         if pd != dt:
             bad.append(f"{name}: checkpoint {e.dtype} -> placement {pd} but model wants {dt}")
             continue
@@ -320,7 +344,7 @@ def build_and_load(model_dir: str, map=None, device: Union[str, torch.device] = 
                    stage_bytes: int = 256 * MiB, n_stage: int = 4, host_chunk_bytes: int = 256 * MiB,
                    reserve_host_gib: float = 16.0, register_host: Optional[bool] = None,
                    cpu_stubs: bool = False, install_counters: bool = True, load_mtp: bool = False,
-                   log: Callable = print) -> nn.Module:
+                   head_dtype: Optional[str] = None, log: Callable = print) -> nn.Module:
     """Construct the reference Transformer and load `model_dir` into it, tier by tier. Returns the model with
     `model.runtime_load` (a LoadResult: plan, pools, host buffers, timings, verify results) attached.
 
@@ -328,9 +352,12 @@ def build_and_load(model_dir: str, map=None, device: Union[str, torch.device] = 
     (runtime/mtp_loader.py `attach_mtp`: `model.mtp`, `model.runtime_mtp`); the backbone keeps the overlay.
 
     `map`: path to `{"<layer>": [hot ids]}` JSON, a dict, a HotMap, or None for `hot_per_layer` (default 295).
+    `head_dtype` (M2-T17): "fp32" (default: the loader widens head.weight and the Markov head, model.py:1008) or "bf16"
+    (kept bf16 in HBM, read through the fixed-order kernel; module docstring); None -> $DSV41_HEAD_DTYPE -> "fp32".
     `register_host`: cudaHostRegister the host tier (default: device is CUDA). On a CPU device the host tier is
     plain host memory and host-tier params are CPU views of it (the Mac test path)."""
     t_all = time.time()
+    head_dtype = resolve_head_dtype(head_dtype)
     device = torch.device(device)
     is_cuda = device.type == "cuda"
     register_host = is_cuda if register_host is None else register_host
@@ -353,9 +380,14 @@ def build_and_load(model_dir: str, map=None, device: Union[str, torch.device] = 
         tokenizer = load_tokenizer(model_dir)  # the Engram hash needs it (engram.py:145; asserts 99,092 classes)
     model = build_meta_model(ref, args, tokenizer, device)
     expected = {n: (tuple(p.shape), p.dtype) for n, p in model.named_parameters()}
+    if head_dtype == "bf16":   # M2-T17: head.weight stays in its checkpoint dtype (a same-dtype tensor: no widening)
+        hd = index["head.weight"].dtype if "head.weight" in index else None
+        if "head.weight" not in expected or hd != torch.bfloat16:
+            raise LoadRefused(f"head_dtype=bf16 needs head.weight stored as bf16 in the checkpoint (got {hd})")
+        expected["head.weight"] = (expected["head.weight"][0], torch.bfloat16)
     timings["construct"] = time.time() - t0
 
-    names = check_keys(index, plan, expected, pcfg)
+    names = check_keys(index, plan, expected, pcfg, head_dtype)
     by_tier: Dict[str, int] = {"HBM": 0, "HOST": 0}
 
     # ---- host-tier sizing + MemAvailable before allocating anything big
@@ -471,13 +503,20 @@ def build_and_load(model_dir: str, map=None, device: Union[str, torch.device] = 
 
     result = LoadResult(model_dir=index.model_dir, config_path=config_path, device=str(device), plan=plan, pool=pool,
                         host_buffers=host_buffers, index=index, timings=timings, mem_log=mem_log,
-                        dequantized=sorted(dequantized), widened=sorted(widened))
+                        dequantized=sorted(dequantized), widened=sorted(widened), head_dtype=head_dtype)
     result.bytes = {"read_HBM": by_tier["HBM"], "read_HOST": by_tier["HOST"],
                     "pool_HBM": pool.hbm_bytes(), "pool_HOST": pool.cold_bytes,
                     "engram_HOST": sum(host_buffers[n].nbytes for n in engram_names),
                     "hbm_params": sum(t.numel() * t.element_size() for t in hbm_params.values())}
     model.runtime_load = result
-    log(f"[load] linears with scale: {n_scale}; wo_a dequantized: {len(dequantized)}; widened: {widened}")
+    if head_dtype == "bf16":   # M2-T17: the bf16 head runs the fixed-order kernel (widened in registers)
+        from runtime.fused_glue_r2 import install_bf16_head
+
+        install_bf16_head(model.head)
+        result.head_bf16.append("head.weight")
+        result.bytes["head_HBM"] = model.head.weight.numel() * model.head.weight.element_size()
+    log(f"[load] linears with scale: {n_scale}; wo_a dequantized: {len(dequantized)}; widened: {widened}; "
+        f"head {head_dtype}")
     if verify:
         t0 = time.time()
         result.verify = verify_placement(model, result, io_threads)
@@ -493,8 +532,45 @@ def build_and_load(model_dir: str, map=None, device: Union[str, torch.device] = 
         attach_mtp(model, index, config_path, device, overlay=overlay, verify=verify, io_threads=io_threads,
                    stage_bytes=stage_bytes, n_stage=n_stage, cpu_stubs=cpu_stubs, log=log)
         timings["mtp"] = model.runtime_mtp.timings.get("total", 0.0)
+        if head_dtype == "bf16":
+            keep_markov_bf16(model, result, log)
     timings["total"] = time.time() - t_all
     return model
+
+
+def keep_markov_bf16(model: nn.Module, result: LoadResult, log: Callable = print) -> int:
+    """M2-T17: the draft's Markov head (`mtp.<last>.markov_head.head.weight`, [V, rank] -- 132 MB as fp32 at rank 256,
+    read once per draft position) kept bf16 like the backbone's head. attach_mtp loads it widened (and verifies the
+    widened bytes against the shard); here it is narrowed back -- bf16 -> fp32 -> bf16 is exact, so the stored bytes
+    are the checkpoint's -- and the module's forward is the fixed-order bf16 read. Returns the bytes freed."""
+    from runtime.fused_glue_r2 import install_bf16_head
+
+    freed = 0
+    for si, st in enumerate(model.mtp):
+        mk = getattr(st, "markov_head", None)
+        if mk is None:
+            continue
+        w = mk.head.weight
+        if w.dtype != torch.float32:
+            continue
+        nb = w.detach().to(torch.bfloat16)
+        if not torch.equal(nb.float(), w.detach()):    # the widened values must be exactly bf16-representable
+            raise LoadRefused(f"mtp.{si}.markov_head.head.weight is not bf16-representable; refusing to narrow")
+        mk.head.weight = nn.Parameter(nb, requires_grad=False)
+        install_bf16_head(mk.head)
+        freed += w.numel() * (w.element_size() - nb.element_size())
+        result.head_bf16.append(f"mtp.{si}.markov_head.head.weight")
+        del w
+    if freed:
+        mr = getattr(model, "runtime_mtp", None)
+        if mr is not None:
+            mr.bytes["hbm_params"] -= freed
+            mr.bytes["hbm_total"] -= freed
+        result.bytes["mtp_HBM"] = result.bytes.get("mtp_HBM", 0) - freed
+        if model.head.weight.is_cuda:
+            torch.cuda.empty_cache()
+        log(f"[load-mtp] Markov head kept bf16: {freed / (1 << 20):.1f} MiB freed")
+    return freed
 
 
 # ------------------------------------------------------------------------------------------------ verify
@@ -550,10 +626,12 @@ def main(argv=None) -> int:
     ap.add_argument("--reserve-host-gib", type=float, default=16.0)
     ap.add_argument("--json", default=None, help="write the load summary here")
     ap.add_argument("--load-mtp", action="store_true", help="M1-T11: also load the mtp.* draft stages into HBM")
+    ap.add_argument("--head-dtype", choices=HEAD_DTYPES, default=None,
+                    help="M2-T17: head weight dtype in HBM (default: $DSV41_HEAD_DTYPE, else fp32)")
     a = ap.parse_args(argv)
     model = build_and_load(a.model_dir, a.map, a.device, hot_per_layer=a.hot_per_layer, config_path=a.config,
                            verify=a.verify, io_threads=a.io_threads, reserve_host_gib=a.reserve_host_gib,
-                           load_mtp=a.load_mtp)
+                           load_mtp=a.load_mtp, head_dtype=a.head_dtype)
     s = model.runtime_load.summary()
     if a.load_mtp:
         s["mtp"] = model.runtime_mtp.summary()

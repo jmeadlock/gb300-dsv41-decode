@@ -403,7 +403,8 @@ def indexer_post_torch(idx: torch.Tensor, clen: torch.Tensor, offset: int) -> to
 # (the glue's self-check, static_step's reference-op path, the census): policy W4 4d option A.
 # The head's operands: x is bf16 (hc_norm's output) and the head weight holds bf16 checkpoint values widened to fp32
 # by runtime/loader.py (do_special: boot record widened_bf16_to_fp32 lists head.weight), so every product is exact in
-# fp32 and only the sum order is a choice. The kernel reads whatever dtype the weight has in HBM (fp32 today).
+# fp32 and only the sum order is a choice. The kernel reads whatever dtype the weight has in HBM: fp32 by default, or
+# bf16 with M2-T17's `head_dtype="bf16"` (widened in registers: the same products, the same sums; section below).
 FP32_IMPL_ENV = "DSV41_FP32_IMPL"
 FP32_IMPLS = ("cublas", "fixed")
 FP32_IMPL_DEFAULT = "cublas"      # until the box gate passes (HANDOFF-T9B5 step 3)
@@ -494,10 +495,10 @@ def hc_mixes_fixed(R, layer, x: torch.Tensor, hc_fn, hc_scale, hc_base):
     return R.hc_split_sinkhorn(mixes, hc_scale, hc_base, layer.hc_mult, layer.hc_sinkhorn_iters, layer.hc_eps)
 
 
-def head_fixed(model, x: torch.Tensor, full_logits: bool = False) -> torch.Tensor:
-    """ParallelHead.forward (model.py:1010-1014, world_size 1) with F.linear(x.float(), weight) in the T9b-5 order:
-    x [b, s, D] -> [b, V] (last position) or [b, s, V] (full_logits)."""
-    W = model.head.weight
+def head_fixed_w(W: torch.Tensor, x: torch.Tensor, full_logits: bool = False) -> torch.Tensor:
+    """ParallelHead.forward (model.py:1010-1014, world_size 1) with F.linear(x.float(), W) in the T9b-5 order:
+    x [b, s, D] -> [b, V] (last position) or [b, s, V] (full_logits). W is fp32 or bf16 (M2-T17: a bf16 weight is
+    widened in registers by the kernel -- exact, so the same fp32 products and the same sums as the widened copy)."""
     if not full_logits:
         x = x[:, -1]
     D = x.size(-1)
@@ -506,6 +507,52 @@ def head_fixed(model, x: torch.Tensor, full_logits: bool = False) -> torch.Tenso
     out = torch.empty(xr.size(0), W.size(0), dtype=torch.float32, device=x.device)
     launch_fixed_dot(xr, W, out, site="head")
     return out.view(*lead, W.size(0))
+
+
+def head_fixed(model, x: torch.Tensor, full_logits: bool = False) -> torch.Tensor:
+    """head_fixed_w on the backbone's head (model.head.weight, fp32- or bf16-stored)."""
+    return head_fixed_w(model.head.weight, x, full_logits)
+
+
+# ------------------------------------------------------------------------------------------------ M2-T17: bf16 head
+# docs/HANDOFF-M2-T17-BF16-HEAD.md. The checkpoint stores the head (and the draft's Markov head) in bf16; model.py:1008
+# declares the parameter fp32 only "so the logits come out in fp32 directly", and the loader widened it (2.65 GB read
+# per step). With `head_dtype="bf16"` (runtime/loader.py; $DSV41_HEAD_DTYPE) the weight stays bf16 in HBM (1.32 GB) and
+# every use goes through the fixed-order kernel, which widens each bf16 tile in registers: bf16 -> fp32 is exact, the
+# product of two bf16-valued fp32 numbers is exact, and the order is the same, so the logits are bit-equal to the
+# fp32-stored T9b-5 kernel's. cuBLAS cannot take a bf16 weight with an fp32 x (F.linear raises), so a bf16 head is a
+# fixed-order head by definition -- independent of $DSV41_FP32_IMPL, which keeps governing the mHC mixes.
+def head_weight_is_bf16(head_module) -> bool:
+    w = getattr(head_module, "weight", None)
+    return w is not None and w.dtype == torch.bfloat16
+
+
+def head_uses_fixed(model) -> bool:
+    """True when the backbone's head runs the fixed-order kernel: $DSV41_FP32_IMPL=fixed, or a bf16-stored weight."""
+    return fp32_fixed() or head_weight_is_bf16(model.head)
+
+
+def install_bf16_head(head_module) -> None:
+    """Replace ParallelHead.forward (an instance attribute; world_size 1) on a module whose weight is bf16 by the
+    fixed-order bf16 read: forward(x, full_logits=False) == F.linear(x.float(), weight.float()) up to the documented
+    sum order. Every user of the module -- the static step, the reference oracle (`model.head(...)`), the draft's
+    forward_head, the Markov head's calls -- therefore evaluates the same arithmetic."""
+    if not head_weight_is_bf16(head_module):
+        raise ValueError("install_bf16_head: the head weight is not bf16 "
+                         f"({getattr(getattr(head_module, 'weight', None), 'dtype', None)})")
+
+    orig_cls_forward = type(head_module).forward   # captured at install (the load, outside any oracle patch)
+
+    def forward(x: torch.Tensor, full_logits: bool = False) -> torch.Tensor:
+        if type(head_module).forward is not orig_cls_forward and x.dim() == 3 and x.size(1) > 1:
+            # runtime/ref_multirow.py patches ParallelHead.forward at call time (model.py:1010-1014: the logits of every
+            # row when the step has more than one); an instance attribute shadows that patch, so its rule is applied here
+            full_logits = True
+        return head_fixed_w(head_module.weight, x, full_logits)
+
+    forward.__qualname__ = "ParallelHead.forward[bf16 fixed-order, M2-T17]"
+    head_module.forward = forward
+    head_module._m2t17_bf16_head = True
 
 
 def describe_fp32() -> dict:
@@ -559,6 +606,7 @@ def fp32_fixed_census(model, rows: int = 6, seed: int = 0) -> List[dict]:
             return compare(full, parts), f"replay equal {bool(torch.equal(full, again))}"
 
         def f_cublas(x=x, w=w, sc=sc):
+            w = w.float() if w.dtype == torch.bfloat16 else w   # M2-T17: a bf16-stored head, widened (transient copy)
             mul = (lambda t, s_: t * s_.view(-1, 1)) if sc is not None else (lambda t, s_: t)
             full = mul(F.linear(x.float(), w), sc)
             parts = [mul(F.linear(x[i:i + 1].float(), w), sc[i:i + 1] if sc is not None else None)
@@ -1675,7 +1723,7 @@ class R2Glue:
                     out["mismatch"] = max(out.get("mismatch", 0.0), r["mismatch"])
         # the head: hc_pre + model.norm + head (model.py:1273-1274)
         x, pre = self._cat_rows(lambda: self._hc_inputs(g, HC, D, 1))
-        if fp32_fixed():   # T9b-5: the oracle's head in the fixed order
+        if head_uses_fixed(model):   # T9b-5 / M2-T17: the oracle's head in the fixed order
             ref = head_fixed(model, model.norm(layer.hc_pre(x, pre)), full_logits=Rr > 1)
         elif Rr > 1:   # the R-row step's head: logits of every row (static_step._head, model.py:1010-1014)
             ref = model.head(model.norm(layer.hc_pre(x, pre)), full_logits=True)
@@ -1917,7 +1965,8 @@ class R2Glue:
         T_ = h.numel() // (HC * D)
         y = torch.empty(1, T_, D, dtype=h.dtype, device=h.device)
         yf = torch.empty(T_, D, dtype=torch.float32, device=h.device)
-        fixed = fp32_fixed()   # T9b-5: the head in the fixed order (t9b5_head_fp32) on hc_norm's bf16 y (= yf's values)
+        fixed = head_uses_fixed(model)   # T9b-5 / M2-T17 (a bf16-stored weight): the head in the fixed order
+        #                                  (t9b5_head_fp32) on hc_norm's bf16 y (= yf's values)
         if T_ > 1:
             launch_hc_norm(h.reshape(T_, HC, D), pre_mix.reshape(T_, HC).contiguous(), model.norm.weight,
                            y.view(T_, D), eps=model.norm.eps, norm_ord=self.orders["norm_D"],
