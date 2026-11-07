@@ -612,7 +612,7 @@ class DSparkLoop:
                         break
             else:
                 nb = self.lookahead + 1
-                pins = [torch.zeros(3, dtype=torch.long, pin_memory=True) for _ in range(nb)]
+                pins = [torch.zeros(3, dtype=torch.long, device="cpu", pin_memory=True) for _ in range(nb)]
                 pending = collections.deque()
                 batch = 0
                 stop = False
