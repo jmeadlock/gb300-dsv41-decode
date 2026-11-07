@@ -55,9 +55,9 @@ for proj, N, Kd in (("w1", INTER, DIM), ("w2", DIM, INTER)):
                 sfb = dg.transform_sf_into_required_layout(S_f, mn=N, k=Kd, recipe=(1, 1, 32), num_groups=G, is_sfa=False)
             elif variant == "packed_mn_major":
                 sfa = dg.get_mn_major_tma_aligned_packed_ue8m0_tensor(xs_f); sfb = dg.get_mn_major_tma_aligned_packed_ue8m0_tensor(S_f)
-            dg.m_grouped_fp8_fp4_gemm_nt_masked((xq, sfa), (W, sfb), d, masked_m, M, recipe=(1, 1, 32))   # W: int8 packed, low nibble first
+            dg.m_grouped_fp8_fp4_gemm_nt_masked((xq, sfa), (W, sfb), d, masked_m, M, recipe_a=(1, 32), recipe_b=(1, 32))   # W: int8 packed, low nibble first; DG test convention
             torch.cuda.synchronize(); return d, (sfa.dtype, tuple(sfa.shape), sfb.dtype, tuple(sfb.shape))
-        for variant in ("fp32_sf", "transform_sf", "packed_mn_major"):
+        for variant in ("fp32_sf",):
             def probe(variant=variant):
                 d, layouts = run(variant)
                 diff = (d.float() - ref.float()); mism = (d != ref).float().mean().item()

@@ -28,7 +28,7 @@ ref = torch.einsum("gmk,gnk->gmn", A_d, B_d)
 masked_m = torch.full((G,), M, dtype=torch.int32)
 def run(variant):
     d = torch.empty(G, M, N, dtype=torch.bfloat16)
-    if variant == "fp32":
+    if variant in ("fp32", "fp32_ab"):
         sa, sb = asf, bsf
     elif variant == "packed":
         sa = dg.pack_ue8m0_to_int(asf); sb = dg.pack_ue8m0_to_int(bsf)
@@ -37,9 +37,12 @@ def run(variant):
         sb = dg.transform_sf_into_required_layout(bsf, mn=N, k=Kd, recipe=(1, 1, 32), num_groups=G, is_sfa=False)
     elif variant == "mnmajor":
         sa = dg.get_mn_major_tma_aligned_packed_ue8m0_tensor(asf); sb = dg.get_mn_major_tma_aligned_packed_ue8m0_tensor(bsf)
-    dg.m_grouped_fp8_fp4_gemm_nt_masked((aq, sa), (bq, sb), d, masked_m, M, recipe=(1, 1, 32))
+    if variant.endswith("_ab"):
+        dg.m_grouped_fp8_fp4_gemm_nt_masked((aq, sa), (bq, sb), d, masked_m, M, recipe_a=(1, 32), recipe_b=(1, 32))
+    else:
+        dg.m_grouped_fp8_fp4_gemm_nt_masked((aq, sa), (bq, sb), d, masked_m, M, recipe=(1, 1, 32))
     torch.cuda.synchronize(); return d, (str(sa.dtype), tuple(sa.shape), str(sb.dtype), tuple(sb.shape))
-for v in ("fp32", "packed", "transform", "mnmajor"):
+for v in ("fp32_ab", "fp32", "transform"):
     try:
         d, lay = run(v); rel = ((d.float() - ref).norm() / ref.norm()).item()
         out[v] = {"rel_err": round(rel, 6), "max_abs": round((d.float() - ref).abs().max().item(), 4), "layouts": lay}
