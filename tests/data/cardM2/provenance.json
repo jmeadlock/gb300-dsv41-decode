@@ -1,0 +1,31 @@
+{
+ "source_checkout": "/Users/jamesmeadlock/hermes/milo-moe-manager",
+ "arm": "C",
+ "bundle": "run2-armC.npz",
+ "bundle_sha256": "26b89ad835546f40bbb7d313551959188ca368026dcb7fbd39deccb2fc9212a1",
+ "files": {
+  "cards/M2/m3-hook/rowmap-mixed-ar-v1.json": "9b55d83aa2a83c8935d9812034cb768256252b5cf40ef06f54ea087ada15864b",
+  "cards/M2/results-run2/arm-C/snap/swaps.jsonl": "d4a3ee28b4fadd1b90d7bf4505715e2817377d2e7f55d2649073b46f6ae2a190",
+  "cards/M2/results-run2/arm-C/snap/telemetry.jsonl": "963293b78cf4a155cd893dcdc743baa8a8343db207a619ae62b57806bdcbdc94",
+  "cards/M2/results-run2/arm-C/snap/counts-post-C-01-20261025-203642.npz": "28a625f5a9aa9df12b6c71151dd85853da3822657b366a10f84a7c7f33e51532",
+  "cards/M2/results-run2/arm-C/snap/counts-post-C-02-20261025-203701.npz": "9acb6723ee2f26a9457dfe249f92603443cd602731f0c97c99b17e1083d7b861",
+  "cards/M2/results-run2/arm-C/snap/counts-post-C-03-20261025-203719.npz": "aeb914ea5377ec003a4dae684f1c1aacd7e579a7a1acd8f46a186e2ef9c1ab90",
+  "cards/M2/results-run2/arm-C/snap/counts-post-C-04-20261025-203737.npz": "647638fe9e491d46e126eeb6f8a4fd79a657be742dab91cd3fc967dd079729e5",
+  "cards/M2/results-run2/arm-C/snap/counts-post-C-05-20261025-203755.npz": "0120f5cce5ac40d63f82162d8201993aa1eb0bebf42bcff04b1ebc9df4d5dc78",
+  "cards/M2/results-run2/arm-C/snap/counts-post-C-06-20261025-203813.npz": "681270198d8d4d469fe223e60c6e3be4434be8fb568f0bef1976378429ebd779",
+  "cards/M2/results-run2/arm-C/snap/counts-post-C-07-20261025-203831.npz": "a31f3a3a8fb892bb62a1e708984b7b4f504b1d25f0ad3c2bd37af592208a75dc",
+  "cards/M2/results-run2/arm-C/snap/counts-post-C-08-20261025-203849.npz": "56dbd0cd1fc8e823eecc49e8df5c4a5fbcc365d25fcc8221bf824741445ba236",
+  "cards/M2/results-run2/arm-C/snap/counts-post-C-09-20261025-203907.npz": "61ecc41a83bc881bea02085f957face784f4f6f76c8241d22e1c138f374839de",
+  "cards/M2/results-run2/arm-C/snap/counts-post-C-10-20261025-203925.npz": "8c3d635e14f5d3971029650824aee7000d383b81eba917d2dd0d25ca8f616e88",
+  "cards/M2/results-run2/arm-C/snap/counts-post-C-11-20261025-203943.npz": "ac4537399431df157ecd4512e688326ec7c7dde24b0c03646379ee2a5b976147",
+  "cards/M2/results-run2/arm-C/snap/counts-post-C-12-20261025-204001.npz": "f9175e55cbdc590e629f0fa79b78fa33b439ebcc56b61c55466f103449509003",
+  "cards/M2/results-run2/arm-C/snap/counts-post-C-13-20261025-204019.npz": "59fd3208e0dd4bdd876f2392c3ac43d08096b6529dfc6102cab7634a3169690c",
+  "cards/M2/results-run2/arm-C/snap/counts-post-C-14-20261025-204037.npz": "4ba341b2ae1bcf0d788ced4a66e797abbaf0de6f8664213b2b601cc7a3da11e0",
+  "cards/M2/results-run2/arm-C/snap/counts-post-C-15-20261025-204055.npz": "e07855ebaa3f633f7fcc6f588fdcca68d0ef07d4046cc3f67ba6004ca607b1fe",
+  "cards/M2/results-run2/arm-C/snap/counts-post-C-final-20261025-204113.npz": "8577a2d875ce4384d9ffb53734c4a2575f193e61ec2e1d31db8feaf8668b8643"
+ },
+ "n_snapshots": 16,
+ "n_swaps": 2165,
+ "n_drains": 378,
+ "ctrl_go": "ctrl freeze=0 SWAPS_PER_DRAIN=2 SWAPS_PER_BARRIER=8 SWAP_HYST=1.5 SWAP_MIN_ABS=8.0 EWMA_HALFLIFE=500.0 DRAIN_N=64"
+}

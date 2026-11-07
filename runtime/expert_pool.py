@@ -92,6 +92,7 @@ class ExpertPool:
         self.hbm_full: Dict[int, Dict[str, torch.Tensor]] = {l: {p: self.hbm[l][p][0] for p in self.proj_nk}
                                                               for l in range(n_layers)}
         self.generation = 0  # bumped whenever pool storage moves (pointer tables built before are stale)
+        self.residency = None  # A2-2: runtime/residency.py ResidencyManager, the single writer of the tables + loc
 
     # --------------------------------------------------------------- byte sizes
     @property
@@ -114,6 +115,9 @@ class ExpertPool:
         S = int(S)
         if S <= self.spare:
             return 0
+        rm = getattr(self, "residency", None)
+        if rm is not None and rm.moved():  # A2-2: experts live in slots this copy would not carry over
+            raise RuntimeError("add_spare_slots while runtime/residency.py has moved experts: restore_boot() first")
         added = 0
         with torch.inference_mode(False), torch.no_grad():
             for l in range(self.n_layers):

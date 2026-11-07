@@ -75,6 +75,12 @@ T9b-3a: `attn_impl="ref"|"bounded"` selects the static step's compressed-layer `
 sparse_attn_bounded.py, bit-identical: the reference kernel with its block loop bounded by a device count), same
 rebuild-on-change rule; `last_meta["attn_impl"]`. T9b-3c: `attn_impl="flashmla"` runs every layer's `sparse_attn` on
 FlashMLA's sparse_prefill_fwd (runtime/attn_flashmla.py; A3-class, not bit-identical).
+A2-2: `residency=` ("on" / a runtime.residency.ResidencyConfig or its fields as a dict; default None = off) puts a
+runtime/residency.py ResidencyManager on the static step: built before the StaticStep (it grows the pool), attached
+after (it owns the pointer tables), `after_step()` after every static/graph step (hit counter, publish, drain every
+drain_n steps, one swap barrier) -- all between replays, outside the graph; `reset_static` restores the boot placement
+and closes it. The logits do not depend on it (bytes are the checkpoint's wherever they live); `last_meta["residency"]`
+counts a greedy call's swaps.
 """
 from __future__ import annotations
 
@@ -292,7 +298,7 @@ class Generator:
                  mode: str = "eager", max_pos: Optional[int] = None, marker: bool = False,
                  static_counters: bool = True, static_factory: Optional[Callable] = None, moe_impl: str = "ref",
                  fp8_impl: str = "ref", glue_impl: str = "ref", attn_impl: str = "ref", glue_approx: bool = False,
-                 rows: int = 1, hidden_layers: Sequence[int] = ()):
+                 rows: int = 1, hidden_layers: Sequence[int] = (), residency=None):
         self.model = model
         self.tokenizer_dir = tokenizer_dir
         self.tokenizer = tokenizer if tokenizer is not None else (load_tokenizer(tokenizer_dir) if tokenizer_dir else None)
@@ -342,6 +348,10 @@ class Generator:
         self.hidden_layers = tuple(int(i) for i in hidden_layers)
         self.main_hidden: Optional[torch.Tensor] = None  # the last R-row step's main_hidden (step_rows)
         self.set_rows(rows)
+        # A2-2: adaptive residency (runtime/residency.py) on the static step's pointer tables; None = off
+        self.residency = None
+        self.residency_mgr = None
+        self.set_residency(residency)
         self.logits_sink: Optional[Callable] = None  # greedy calls sink(i, fp32 CPU logits) per position (drift rows)
         self.mode = "eager"
         self.set_mode(mode)
@@ -408,6 +418,31 @@ class Generator:
             self.reset_static()
         self.rows = rows
 
+    def set_residency(self, residency) -> None:
+        """A2-2: adaptive residency for the static/graph step (None / "off" = the static map; "on" / True / a dict
+        of runtime.residency.ResidencyConfig fields / a config). A change drops the StaticStep (the manager grows the
+        pool BEFORE the step is built and owns its pointer tables). Eager mode never uses it."""
+        from runtime.residency import ResidencyConfig
+
+        cfg = ResidencyConfig.from_any(residency)
+        if (cfg is None) != (self.residency is None) or (cfg is not None and cfg != self.residency):
+            if self.static is not None:
+                self.reset_static()
+        self.residency = cfg
+
+    def _residency_build(self):
+        """The ResidencyManager for the step about to be built (grows the pool's weight storage first)."""
+        from runtime.residency import ResidencyManager, n_stage_for
+
+        if self.pool is None:
+            raise ValueError("residency needs the model's ExpertPool (model.runtime_load.pool)")
+        old = getattr(self.pool, "residency", None)
+        if old is not None and old.st is None:  # orphan of a build that failed before attach
+            old.close()
+        topk = int(self.model.layers[0].ffn.n_activated_experts)
+        return ResidencyManager(self.pool, self.model, self.residency,
+                                n_stage=n_stage_for(self.moe_impl, self.rows, topk))
+
     @property
     def max_pos(self) -> int:
         """Largest decode position this Generator can serve in its current mode."""
@@ -417,8 +452,10 @@ class Generator:
         return self.max_seq_len - 1 if mp is None else int(mp)
 
     def static_step(self):
-        """The StaticStep (built on first call: pointer tables, staging, static buffers; no capture)."""
+        """The StaticStep (built on first call: pointer tables, staging, static buffers; no capture). With residency
+        on, the ResidencyManager is built first (it grows the pool) and attached to the new step."""
         if self.static is None:
+            rm = self._residency_build() if self.residency is not None else None  # A2-2
             if self.static_factory is not None:
                 # factories predating T9a-1/T9b-1 take only the model; an impl is passed only when it is not "ref"
                 kw = {} if self.moe_impl == "ref" else {"moe_impl": self.moe_impl}
@@ -441,10 +478,23 @@ class Generator:
                                          fp8_impl=self.fp8_impl, glue_impl=self.glue_impl,
                                          glue_opts={"approx": True} if self.glue_approx else None,
                                          attn_impl=self.attn_impl, rows=self.rows, hidden_layers=self.hidden_layers)
+            if rm is not None:  # A2-2: the manager owns the new step's pointer tables from here on
+                try:
+                    rm.attach(self.static)
+                except BaseException:
+                    rm.close()
+                    self.static.detach()
+                    self.static = None
+                    raise
+                self.residency_mgr = rm
         return self.static
 
     def reset_static(self) -> None:
-        """Drop the StaticStep and its graphs (a "relaunch" of the static path; the next use rebuilds it)."""
+        """Drop the StaticStep and its graphs (a "relaunch" of the static path; the next use rebuilds it). With
+        residency on, the manager first restores the boot placement and is closed (the next build makes a new one)."""
+        if self.residency_mgr is not None:
+            self.residency_mgr.close()
+            self.residency_mgr = None
         if self.static is not None and hasattr(self.static, "detach"):
             self.static.detach()
         self.static = None
@@ -564,6 +614,8 @@ class Generator:
             if static:
                 logits = st.step(token, pos, graph=self.mode == "graph")
                 out_ids = st.tok.view(1)
+                if self.residency_mgr is not None:
+                    self.residency_mgr.after_step()  # A2-2: count, publish, drain, barrier (between replays)
             else:
                 self._marker_eager()
                 from runtime.refmodel import reference_forward
@@ -615,6 +667,7 @@ class Generator:
         digest = hashlib.sha256()
         step_digests: List[str] = []
         c0 = self.cold_totals()
+        r0 = dict(self.residency_mgr.stats) if self.residency_mgr is not None else None
         t0 = time.perf_counter()
         logits = self.prefill(ids)
         gen: List[int] = []
@@ -658,6 +711,9 @@ class Generator:
                 "moe_impl": self.moe_impl, "fp8_impl": self.fp8_impl, "glue_impl": self.glue_impl,
                 "glue_approx": self.glue_approx, "attn_impl": self.attn_impl,
                 "decode_ms_per_token": (wall - t_prefill) / max(1, len(gen) - 1) * 1e3 if len(gen) > 1 else None}
+        rm = self.residency_mgr
+        if rm is not None and r0 is not None:  # A2-2: swaps this call published / issued
+            meta["residency"] = {k: rm.stats[k] - r0[k] for k in ("issued", "published", "vetoed", "drains")}
         if c0 is not None and c1 is not None:
             hot, cold = c1[0] - c0[0], c1[1] - c0[1]
             meta["cold"] = {"hot_calls": hot, "cold_calls": cold, "cold_share": cold / (hot + cold) if hot + cold else 0.0,
@@ -690,6 +746,8 @@ class Generator:
                 logits = st.step(tokens, pos, graph=self.mode == "graph")
                 out_ids = st.t_out if R_ > 1 else st.tok.view(1)
                 self.main_hidden = getattr(st, "main_hidden", None)
+                if self.residency_mgr is not None:
+                    self.residency_mgr.after_step()  # A2-2
             else:
                 from runtime.ref_multirow import forward_rows
 

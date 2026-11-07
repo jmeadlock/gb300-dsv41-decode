@@ -19,6 +19,8 @@ Standalone: no vllm import anywhere (charter decision 3). The reference `model.p
 | `attn_flashmla.py` | T9b-3c (`--attn-impl flashmla`, A3-class): every layer's `sparse_attn` on FlashMLA's `sparse_prefill_fwd` over our bf16 caches; the op loaded from vllm's `_flashmla_C` .so with `torch.ops.load_library` (no vllm Python, asserted before and after); head / head-dim / topk padding for small shapes; per-row `topk_length`; fp64 oracle and build-time self-check |
 | `dg_moe.py` | T9a-1: `DGMaskedMoE` (`--moe-impl dg-masked`): the static MoE's routed GEMMs as 3 DeepGEMM masked grouped GEMMs over the same staging; `import_deep_gemm` (no vllm import); exact e8m0 → fp32 |
 | `dg_inplace.py` | T9a-2: `DGInplaceMoE` (`--moe-impl dg-inplace`): 3 DeepGEMM contiguous grouped GEMMs over each layer's whole hot pool + spare slots; packed-SF layout, staging contract, HBM plan |
+| `residency.py` | A2-2 (`residency=` / `--residency on`): `ResidencyManager` -- spare HBM slots after the step's staging slots, a Grace demotion pool, a copy stream + events, the single writer of every pointer table (`ptabs`, `_ptab6`, `t[ptab6]`, `gtab`, `cold_tab`, `loc`); one-hot hit counter after each step, m3's v26 policy every `drain_n` steps, promotions = H2D into a free slot then a table write after the copy event, demotions = a table write (+ one D2H the first time for a boot-hot expert); `audit()` (I1/I2, tables, sha256 vs the shards) |
+| `residency_policy.py` | A2-2: m3's `m3/control/policy.py` vendored byte-identically (provenance header + sha256; m3 is never imported) |
 | `fused_glue.py` | T9b-2 round 1 (`--glue-impl fused`): Triton kernels for the zero/low-risk glue clusters (gather, DG act, SwiGLU+act_quant, MoE combine, mHC post, o-path RoPE+QDQ, q RoPE in the GEMV store), table-driven act_quant/silu, build-time self-check, per-cluster switches; torch mirrors on CPU |
 | `fused_glue_r2.py` | T9b-2 round 2 (same flag; `FusedGlue` inherits `R2Glue`): hc_pre+RMSNorm+act_quant, the mHC mixes statistic, kv/q paths, router and indexer glue around torch.topk, Engram gate; the reduction-order family + device calibration (outcome (i) on / (ii) off unless `--glue-approx`) |
 | `gemv_mxfp8.py` | T9b-1: Triton MXFP8 GEMV `mxfp8_gemv(xq, xs, w, s, out)` for the fp8 Linears at <= 8 rows (`--fp8-impl gemv`); exact e8m0 pair scale; per-(N,K,M) tuning cache; `gemv_torch` = the same algorithm in torch (CPU) |
@@ -816,3 +818,49 @@ fused --attn-impl flashmla --map docs/maps/hot-v26ar-seed-295.json`); check `fus
 self-check's reason), `fused_glue.calibration.r4`, `dg_moe.act_sf_packed`, the G/D/L rows, and output bytes vs the
 13.88 run. A/B any part with `-e DSV41_GLUE_DISABLE=<part>`. nsys: `t9b4_hc_norm` replaces `t9b2r2_hc_norm`;
 `t9b4_mxfp8_gemv2` 80/step; `t9b_splitk_reduce` 250 -> 90; `transpose_and_pack_fp32_into_ue8m0` 120 -> 0.
+
+## A2-2: adaptive residency (`residency.py`, `residency_policy.py`; `--residency on`)
+
+Design: docs/A2-RESIDENCY-DESIGN.md 3.1-3.4, handoff docs/HANDOFF-A2-2-RESIDENCY.md. Off by default; with it off
+nothing in the step changes. With it on, `Generator` builds a `ResidencyManager` BEFORE the StaticStep (the pool's
+weight tensors grow to `H + n_stage + n_spare` slots per layer: dg-inplace's own `topk*rows` staging slots first,
+then `n_spare` residency slots; their scales live in the manager), then attaches it to the step (discovers every
+pointer table, checks it names the boot homes, refuses unknown copies). Every step: one-hot hit counter from
+`ids_step` (x `uvalid_step` at rows > 1), publish finished swaps, drain (vendored m3 policy) when a counter read has
+landed, one barrier (<= `swaps_per_barrier` = 4 swaps), every `drain_n` steps an async counter read. All of it runs
+between replays on the replay stream; copies run on a copy stream; the graph is never recaptured. Spare slots per
+layer default to min(4, headroom calc) -- the calc is printed: free HBM at build - staging - KV (rows x 150 MB x
+ctx/32K) - `--residency-reserve-gib` (8 [A]), over 40 layers x 17.93 MiB per spare slot.
+
+**Mac:** `tests/test_residency_cpu.py` (vendored policy sha + lockstep on Card M2 run-2 arm C: replay reproduces all
+16 dumps, `queue` on each dump's EWMA reproduces m3's live decisions bit-exactly, pair drains == the documented
+rules, mutations caught; with the m3 checkout also arms A/A2; T-R1 on == off (ref, dg-inplace x both SF stores),
+T-R2/T-R3 audit, the barrier == apply_pending, T-R4 mutations, unknown-table refusal, restore, Generator and
+first_light plumbing, the GPU test's main gate dry-run) and `tests/test_residency_rows_cpu.py` (6 rows, ref and
+dg-inplace; the counter counts unique used slots once).
+
+**Box, GPU test** (on == off over 64 graph steps x {ref, ref+fused glue, dg-inplace}; swaps racing queued replays
+with n_spare 1 behind ~1 GiB of dummy H2D per swap, plus the publish-before-copy negative control; no host sync in
+`after_step`; step time on/off on the mini model, report only):
+
+    docker run --rm --device nvidia.com/gpu=GPU-1c1855c8-dd10-0247-583e-3c3880ddbf55 --ipc=host --ulimit memlock=-1:-1 \
+      --cap-add IPC_LOCK -v "$W":/work -w /work -e CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+      -v "$HOME/dsv41/w0/jit-cache/tilelang":/root/.tilelang -v "$HOME/dsv41/w0/jit-cache/triton":/root/.triton \
+      -v "$HOME/dsv41/w0/jit-cache/nv":/root/.nv \
+      -v "$HOME/dsv41/w0/jit-cache/dg":/root/.deep_gemm -e DG_JIT_CACHE_DIR=/root/.deep_gemm \
+      --entrypoint python3 vllm/vllm-openai:v0.31.0 tests/gpu/test_residency_gpu.py
+
+**Box, first light** (the T9b-4 flags F = `--mode graph --moe-impl dg-inplace --fp8-impl gemv --glue-impl fused
+--attn-impl flashmla --max-pos 4095 --fixture w0/results/phase1/parity-A.jsonl --max-new 256 --reps 2 --step-cell 512
+--no-fill-uninit`):
+
+    (1) off:      bench/first_light.py --model-dir /ref --map docs/maps/hot-v26ar-seed-295.json F \
+                    --out scratch/fl-a22-off.jsonl --json docs/first-light-a22-off-<date>.json
+    (2) on:       ... same + --residency on --residency-ref docs/first-light-a22-off-<date>.json --residency-audit \
+                    --out scratch/fl-a22-on.jsonl --json docs/first-light-a22-on-<date>.json
+                  gate: residency.vs_off.rep1_files_byte_identical, step_cell_tokens_equal; swaps/step <= 4;
+                  step_ms_delta_pct (G3 <= 1 %); audit ok
+    (3) shifted:  --hot-per-layer 295 (no --map: first-295) F --residency on --out scratch/fl-a22-shift.jsonl \
+                    --json docs/first-light-a22-shift-<date>.json
+                  report: residency.cold_share_curve (per drain over reps + cell), cold_share_first_drain ->
+                  cold_share_last4_drains, step_cell_cold_share_first64 -> last64, rep_cold_share per prompt
