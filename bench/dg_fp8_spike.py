@@ -38,7 +38,7 @@ for nm in names:
         x = (torch.randn(M, Kd, dtype=torch.bfloat16).view(M, Kd // 32, 32) * torch.exp2(torch.randint(-6, 7, (M, Kd // 32, 1)).float())).view(M, Kd).to(torch.bfloat16)
         xq, xs = K.act_quant(x, 32, "ue8m0", E8); ref = K.fp8_gemm(xq, xs, w, s, E8, block_size=32)
         xs_f = e2f(xs).contiguous()
-        MAXM = 128; xq_p = torch.zeros(MAXM, Kd, dtype=torch.float8_e4m3fn); xq_p[:M] = xq; xs_p = torch.ones(MAXM, Kd // 32); xs_p[:M] = xs_f
+        MAXM = 128; xq_p = torch.zeros(MAXM, Kd, dtype=torch.float8_e4m3fn); xq_p[:M] = xq; xs_p = torch.ones(MAXM, Kd // 32, dtype=torch.float32); xs_p[:M] = xs_f
         res = {}
         for variant, (sb, rb) in {"b32x32": (s_f, (32, 32)), "b_row32": (s_row, (1, 32))}.items():
             try:
