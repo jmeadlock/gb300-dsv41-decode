@@ -61,6 +61,17 @@ from typing import Callable, Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+def _cpu_default(fn):
+    """Synthetic-input builders were written under a CPU default device; at runtime the default device is cuda.
+    Run them with a CPU default so every bare constructor (tensor/arange/zeros/rand) lands on the CPU; callers move."""
+    import functools
+    @functools.wraps(fn)
+    def w(*a, **k):
+        with torch.device("cpu"):
+            return fn(*a, **k)
+    return w
+
+
 try:  # GPU image only; the Mac uses the torch mirrors
     import triton
     import triton.language as tl
@@ -1103,16 +1114,6 @@ def _jsonable(v):
     return v
 
 
-
-def _cpu_default(fn):
-    """Synthetic-input builders were written under a CPU default device; at runtime the default device is cuda.
-    Run them with a CPU default so every bare constructor (tensor/arange/zeros/rand) lands on the CPU; callers move."""
-    import functools
-    @functools.wraps(fn)
-    def w(*a, **k):
-        with torch.device("cpu"):
-            return fn(*a, **k)
-    return w
 
 @_cpu_default
 def _rand_act(g, rows: int, K: int, lo: int = -6, hi: int = 7) -> torch.Tensor:
