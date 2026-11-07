@@ -1,0 +1,407 @@
+{
+ "steps": [
+  {
+   "step": 0,
+   "wall_ms": 315.275072,
+   "busy_ms": 32.635424,
+   "kernels": 7661
+  },
+  {
+   "step": 1,
+   "wall_ms": 317.230944,
+   "busy_ms": 32.777536,
+   "kernels": 7817
+  },
+  {
+   "step": 2,
+   "wall_ms": 312.252576,
+   "busy_ms": 32.49936,
+   "kernels": 7661
+  },
+  {
+   "step": 3,
+   "wall_ms": 317.292864,
+   "busy_ms": 32.716544,
+   "kernels": 7817
+  },
+  {
+   "step": 4,
+   "wall_ms": 312.508128,
+   "busy_ms": 32.387712,
+   "kernels": 7661
+  },
+  {
+   "step": 5,
+   "wall_ms": 318.394208,
+   "busy_ms": 32.714592,
+   "kernels": 7817
+  },
+  {
+   "step": 6,
+   "wall_ms": 312.933952,
+   "busy_ms": 32.702112,
+   "kernels": 7661
+  },
+  {
+   "step": 7,
+   "wall_ms": 318.18368,
+   "busy_ms": 33.117504,
+   "kernels": 7817
+  },
+  {
+   "step": 8,
+   "wall_ms": 311.840896,
+   "busy_ms": 32.470016,
+   "kernels": 7661
+  },
+  {
+   "step": 9,
+   "wall_ms": 318.545184,
+   "busy_ms": 32.687936,
+   "kernels": 7817
+  },
+  {
+   "step": 10,
+   "wall_ms": 310.978656,
+   "busy_ms": 32.809056,
+   "kernels": 7661
+  },
+  {
+   "step": 11,
+   "wall_ms": 315.989216,
+   "busy_ms": 32.745728,
+   "kernels": 7817
+  },
+  {
+   "step": 12,
+   "wall_ms": 312.459744,
+   "busy_ms": 32.614048,
+   "kernels": 7661
+  },
+  {
+   "step": 13,
+   "wall_ms": 316.955904,
+   "busy_ms": 32.65232,
+   "kernels": 7817
+  },
+  {
+   "step": 14,
+   "wall_ms": 312.057184,
+   "busy_ms": 32.697216,
+   "kernels": 7661
+  },
+  {
+   "step": 15,
+   "wall_ms": 317.01696,
+   "busy_ms": 32.518528,
+   "kernels": 7817
+  },
+  {
+   "step": 16,
+   "wall_ms": 309.628256,
+   "busy_ms": 32.899616,
+   "kernels": 7661
+  },
+  {
+   "step": 17,
+   "wall_ms": 316.19744,
+   "busy_ms": 32.626048,
+   "kernels": 7817
+  },
+  {
+   "step": 18,
+   "wall_ms": 313.898944,
+   "busy_ms": 32.822432,
+   "kernels": 7661
+  },
+  {
+   "step": 19,
+   "wall_ms": 317.627264,
+   "busy_ms": 33.054272,
+   "kernels": 7817
+  },
+  {
+   "step": 20,
+   "wall_ms": 313.179872,
+   "busy_ms": 33.091968,
+   "kernels": 7661
+  },
+  {
+   "step": 21,
+   "wall_ms": 317.345376,
+   "busy_ms": 32.88096,
+   "kernels": 7817
+  },
+  {
+   "step": 22,
+   "wall_ms": 313.423296,
+   "busy_ms": 32.310432,
+   "kernels": 7661
+  },
+  {
+   "step": 23,
+   "wall_ms": 317.500864,
+   "busy_ms": 32.428736,
+   "kernels": 7817
+  },
+  {
+   "step": 24,
+   "wall_ms": 312.115296,
+   "busy_ms": 32.440736,
+   "kernels": 7661
+  },
+  {
+   "step": 25,
+   "wall_ms": 315.972928,
+   "busy_ms": 32.725472,
+   "kernels": 7817
+  },
+  {
+   "step": 26,
+   "wall_ms": 312.823072,
+   "busy_ms": 32.622784,
+   "kernels": 7661
+  },
+  {
+   "step": 27,
+   "wall_ms": 318.32576,
+   "busy_ms": 32.96432,
+   "kernels": 7817
+  },
+  {
+   "step": 28,
+   "wall_ms": 313.706368,
+   "busy_ms": 32.347744,
+   "kernels": 7661
+  },
+  {
+   "step": 29,
+   "wall_ms": 318.582848,
+   "busy_ms": 33.073184,
+   "kernels": 7817
+  },
+  {
+   "step": 30,
+   "wall_ms": 312.1224,
+   "busy_ms": 32.354112,
+   "kernels": 7661
+  },
+  {
+   "step": 31,
+   "wall_ms": 319.283712,
+   "busy_ms": 33.199456,
+   "kernels": 7817
+  }
+ ],
+ "role_ms_per_step": {
+  "step-other": 17.792130999998747,
+  "moe": 14.218056999999593,
+  "engram": 0.2738979999999999,
+  "head": 0.42178600000000005
+ },
+ "role_launches_per_step": {
+  "step-other": 4691.0,
+  "moe": 2960.0,
+  "engram": 86.0,
+  "head": 2.0
+ },
+ "layer_ms_per_step": {},
+ "top_kernels": [
+  [
+   "sparse_attn_kernel__kernel",
+   5.11628,
+   40.0
+  ],
+  [
+   "t8_gather_rows",
+   4.199405999999981,
+   240.0
+  ],
+  [
+   "unrolled_elementwise_kernel",
+   4.062940999999999,
+   1125.0
+  ],
+  [
+   "vectorized_elementwise_kernel",
+   3.105926000000052,
+   2387.0
+  ],
+  [
+   "elementwise_kernel",
+   2.9656689999998256,
+   1120.0
+  ],
+  [
+   "t9b_mxfp8_gemv",
+   2.7760610000000323,
+   290.0
+  ],
+  [
+   "sm100_fp8_fp4_gemm_1d1d_impl",
+   1.819815000000001,
+   120.0
+  ],
+  [
+   "reduce_kernel",
+   1.6437159999999598,
+   511.5
+  ],
+  [
+   "act_quant_kernel__kernel",
+   1.222730000000035,
+   450.0
+  ],
+  [
+   "transpose_and_pack_fp32_into_ue8m0",
+   1.0104119999999983,
+   240.0
+  ],
+  [
+   "t9b_splitk_reduce",
+   0.8290950000000057,
+   250.0
+  ],
+  [
+   "nvjet_sm103_tst_64x8_64x16_4x1_v_bz_TNT",
+   0.5873599999999993,
+   40.0
+  ],
+  [
+   "gemv2T_kernel_val",
+   0.419169,
+   1.0
+  ],
+  [
+   "gatherTopK",
+   0.38425400000000043,
+   49.0
+  ],
+  [
+   "hc_split_sinkhorn_kernel__kernel",
+   0.35046099999999913,
+   80.0
+  ],
+  [
+   "bitonicSortKVInPlace",
+   0.32021400000000017,
+   80.0
+  ],
+  [
+   "dot_kernel",
+   0.29137600000000313,
+   80.0
+  ],
+  [
+   "kernel",
+   0.224432000000004,
+   46.0
+  ],
+  [
+   "_assert_async_cuda_kernel",
+   0.21967499999999646,
+   96.0
+  ],
+  [
+   "radixSortKVInPlace",
+   0.19030600000000006,
+   9.0
+  ],
+  [
+   "CatArrayBatchedCopy_vectorized",
+   0.17253699999999733,
+   77.0
+  ],
+  [
+   "DeviceRadixSortSingleTileKernel",
+   0.16581499999999902,
+   46.0
+  ],
+  [
+   "reduce_1Block_kernel",
+   0.13801199999999847,
+   80.0
+  ],
+  [
+   "index_elementwise_kernel",
+   0.11358299999999948,
+   42.0
+  ],
+  [
+   "_scatter_gather_elementwise_kernel",
+   0.09546599999999995,
+   46.0
+  ],
+  [
+   "indexing_backward_kernel",
+   0.07703000000000029,
+   45.0
+  ],
+  [
+   "elementwise_kernel_with_index",
+   0.07600399999999978,
+   97.0
+  ],
+  [
+   "nvjet_sm103_tst_64x8_64x16_1x1_h_bz_splitK_TNT",
+   0.02712199999999999,
+   8.0
+  ],
+  [
+   "fp4_quant_kernel__kernel",
+   0.024002999999999986,
+   13.0
+  ],
+  [
+   "splitKreduce_kernel",
+   0.017090000000000008,
+   9.0
+  ],
+  [
+   "nvjet_sm103_tst_64x16_64x16_2x2_2cta_h_bz_TNT",
+   0.015443999999999992,
+   5.0
+  ],
+  [
+   "indexSelectSmallIndex",
+   0.009299000000000003,
+   4.5
+  ],
+  [
+   "nvjet_sm103_tst_64x8_64x16_1x4_h_bz_TNT",
+   0.008796000000000003,
+   3.0
+  ],
+  [
+   "vectorized_gather_kernel",
+   0.007732999999999999,
+   2.0
+  ],
+  [
+   "nvjet_sm103_tst_8x64_64x16_4x1_v_bz_TNN",
+   0.007184000000000005,
+   2.5
+  ],
+  [
+   "nvjet_sm103_tst_32x64_64x16_4x1_v_bz_splitK_TNN",
+   0.004882,
+   1.0
+  ],
+  [
+   "cunn_SpatialSoftMaxForward",
+   0.0030320000000000004,
+   1.5
+  ],
+  [
+   "indexing_backward_kernel_stride_1",
+   0.0021490000000000007,
+   1.0
+  ],
+  [
+   "CatArrayBatchedCopy_alignedK_contig",
+   0.0013930000000000001,
+   1.0
+  ]
+ ],
+ "idle_ms_per_step": 282.434377
+}
