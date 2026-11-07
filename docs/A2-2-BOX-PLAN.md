@@ -15,11 +15,11 @@ adapted, not rewritten:
 
 | point | before | now |
 |---|---|---|
-| staging slots under the manager (`n_stage_for`) | `topk * rows` (36 at 6 rows) | `S` = the step's compact budget (16 at 6 rows, `topk` at 1 row); residency slots start at `H + S`, never inside `H..H+S-1` (the dedup kernel addresses those) |
+| staging slots under the manager (`residency_stage`) | `topk * rows` (36 at 6 rows) | `S` = the step's compact budget **kept for cold staging: 8 at 6 rows, `topk` at 1 row** (A2-2 FIX; was 16 = all of the pool's spare slots); residency slots start at `H + S`, never inside `H..H+S-1` (the dedup kernel addresses those) |
 | packed SF of a promoted expert | `step` store re-packs it every step; `resident` store written by the manager | also the **`pool` store** (6-row default): the copy stream writes the packed SF into the pool copy before the copy event, `resident_sf` now covers `pool` as well as `resident` |
-| headroom calc | free HBM − stage − KV − 8 GiB reserve | also − the packed-SF copy the step build allocates AFTER the manager (+ the 6 GiB build headroom `$DSV41_SF_POOL_HEADROOM_GIB`), and one spare slot costs `expert_bytes + one SF group` per layer; KV reservation follows the step's rows |
+| slot budget (A2-2 FIX, box r1 refused with "no spare HBM slot affordable") | free HBM − stage − KV − 8 GiB reserve → NEW slots only | **residency promotes into the pool's own free spare slots first** (pool 16 − staging 8 = 8 per layer, already in HBM: no allocation, no growth, no SF re-key, whatever the free HBM). Only a shortfall (explicit `--residency-spare` above that, or a pool with nothing free → `spare_cap` 4) is NEW HBM, allowed only while free HBM − 8 GiB reserve − KV (− the re-keyed packed-SF copy + 6 GiB headroom, when the pool grows) covers it; else it is capped with a warning, and refused only if zero slots remain. One new slot costs `expert_bytes + one SF group` per layer (0.74 GiB) |
 | per-step hook | `Generator.step` / `step_rows` | also `DSparkLoop.step_once` → `rm.after_step(live=b.live)` after each step's replay (steps after `done` are predicated no-ops: the device `live` flag keeps them out of the hit counters); the hook runs after the step's end event, its GPU time is reported separately (`mgr_ms`) |
-| `bench/headline.py` | no residency | `--residency on --residency-drain N …` (same knobs as `first_light`), `--residency-ref <off headline JSON>`, `--residency-audit`; report key `residency` |
+| `bench/headline.py` | no residency | `--residency on --residency-drain N …` (same knobs as `first_light`) plus `--residency-stage K` (staging slots kept, default `--spare-slots` else 8) and `--pool-spare N` (pre-grow the pool to ≥ N, default 16 with residency), `--residency-ref <off headline JSON>`, `--residency-audit`; report key `residency` |
 
 **Event ordering at 6 rows (the "do not move an expert a captured graph reads in the same replay" rule).** The graphs read
 pointer-table *contents* (`ptabs`, `ptab6`, `gtab`, the fused glue's stacked `_ptab6`, `cold_tab`, `pool.loc`) and the
@@ -54,9 +54,14 @@ fixtures as every earlier window: `w0/results/phase1/parity-A.jsonl` (8 prompts)
 ```
 $D tests/gpu/test_residency_gpu.py 2>&1 | tee $W/scratch/a22-gpu-test.log
 ```
-Expect `11/11 not failed` (the six 1-row tests of the original A2-2 plus five 6-row tests:
-`test_residency_rows6_on_equals_off_{ref,dg_inplace_pool_sf,dg_inplace_step_sf,dg_inplace_fused_glue}` and
-`test_residency_rows6_swaps_while_replays_queued_event_ordering`; the count printed on the last line is authoritative). Gate: no `FAIL`; the event-ordering
+Expect `12/12 not failed` (the six 1-row tests of the original A2-2 plus six 6-row tests:
+`test_residency_rows6_on_equals_off_{ref,dg_inplace_pool_sf,dg_inplace_step_sf,dg_inplace_fused_glue}`,
+`test_residency_rows6_swaps_while_replays_queued_event_ordering` and
+`test_residency_rows6_promotes_into_the_pools_spare_slots_without_growing` (stage 8 + the pool's 8 free slots, no
+growth; prints `overflow {...}` — if S = 8 overflowed on the mini model it says NOTE and skips only the equality
+assert); the count printed on the last line is authoritative). r1 (`docs/residency-gpu-test-r1-20261107.log`) was 8/11:
+the three `read target must be host memory, got cuda:0` failures were the audit's golden digest reading shards into a
+tensor allocated under the cuda default device (fixed: `device="cpu"`). Gate: no `FAIL`; the event-ordering
 tests print their negative control diverging (`negative control diverged at n/N`); the 6-row dg-inplace tests print
 `sf store pool` / `sf store step` respectively and `audit … ok`. A `SKIP (deep_gemm unavailable)` on the dg-inplace
 tests is NOT a pass — the library image has it; investigate.
@@ -112,19 +117,29 @@ Baseline to beat: run 4 (`docs/headline-20261107d.json`): **22.32 ms/step** (ver
 **7.51 ms/token**; the bar is 7.36 ms/token ⇒ at that yield a step ≤ **21.87 ms** (7.36 × 2.971, arithmetic only; the
 yield moves with the near-tie continuations). Cold share on the seed map at 6 rows in that run: 33,587 cold of 500,884
 routed unique-expert calls = **6.7 %** (receipt `routed`; the 1-row figure is 0.9 %), so the 6-row step is where
-residency has something to remove. Same flags as run 4, off then on, back to back (same boot conditions):
+residency has something to remove. Off then on, back to back (same boot conditions). **The A/B needs the same staging
+size S in both arms**: an S-overflow gives wrong logits for that step, and residency changes how many experts are cold,
+so arms with different S can diverge for that reason alone. Default pair (S = 8 both, pool 16 both — the on run uses the
+8 free slots with no new allocation, which is what fits in the real build's 8.6 GiB free):
 
 ```
 H="--model-dir /ref --moe-impl dg-inplace --fp8-impl gemv --glue-impl fused --attn-impl flashmla --fp32-impl fixed \
-   --spare-slots 16 --max-new 256"
+   --spare-slots 8 --pool-spare 16 --max-new 256"
 $D bench/headline.py $H --json scratch/headline-a22-off.json 2>&1 | tee scratch/headline-a22-off.log
 $D bench/headline.py $H --residency on --residency-drain 64 --residency-ref scratch/headline-a22-off.json \
      --residency-audit --json scratch/headline-a22-on.json 2>&1 | tee scratch/headline-a22-on.log
 ```
-(`--map` defaults to the seed map. With `--residency on`, headline pre-grows the pool ONCE to `S + n_spare` slots per
-layer before any build — the manager's own growth is then a no-op, so no layer block is re-allocated while an older
-build still references it (that re-growth is what OOMed M1-T10-FIX round 3); those pre-grown slots are counted as
-prepaid in the headroom calc. The off run pre-grows only `S`. Each run: boot ~60 s, 1-row truth per prompt, then the loop at 2 graphs and 1 graph.)
+(`--map` defaults to the seed map. `--spare-slots 8` is the step's staging S in both arms (`--residency-stage 8` is the
+same thing on the on arm); `--pool-spare 16` pre-grows the pool ONCE to 16 slots per layer before any build in both arms
+(the pre-grow is the only growth: the manager's own `add_spare_slots` is then a no-op, so no layer block is re-allocated
+while an older build still references it — that re-growth OOMed M1-T10-FIX round 3). The on run's log line must read
+`pool holds 16 spare/layer, 8 kept for staging, 8 free in place + 0 new; n_spare 8` and `[pool]` must show no second
+growth. **Overflow check:** with S = 8 the earlier M1-T10-PORT measurement was 123/1018 overflowing steps (before
+residency, seed map); the report's `overflow` field (and the residency line, `overflow steps N`) says what this build
+does. If the OFF arm overflows at S = 8, its logits are wrong on those steps and the A/B is void: rerun the pair with
+`--spare-slots 12 --pool-spare 16` (residency gets 4) or `--residency-stage 12`; the old baseline (S = 16, no residency:
+`--spare-slots 16`) stays the headline number to beat. Each run: boot ~60 s, 1-row truth per prompt, then the loop at
+2 graphs and 1 graph.)
 Report from `scratch/headline-a22-on.json`:
 - `headline.two_graphs.ms_per_step.mean` (graph only, as every earlier headline), `ms_manager_per_step.mean` (the
   manager's GPU time between replays: count kernel + table writes), **`ms_per_step_incl_manager`** (the honest on-number
@@ -141,11 +156,13 @@ Report from `scratch/headline-a22-on.json`:
   `residency.sf_store.got` in the JSON). The pool SF store refuses to build with < 6 GiB free after its 12.8 GiB; the
   manager's spare slots eat headroom. If it fell back, the on/off A/B is confounded (hot scales re-packed every step) —
   rerun with `--residency-spare 2` (or 1) and/or `-e DSV41_SF_POOL_HEADROOM_GIB=4`, and report which.
-- `[residency] … affordable 0 spare slots/layer` ⇒ `RuntimeError: no spare HBM slot affordable` at start: pass
-  `--residency-spare 1 --residency-reserve-gib 4` and report the printed budget line (the headroom calc is conservative
-  about what the later builds need; the real free HBM after the build is in `hbm_after_build_GiB`).
+- `RuntimeError: residency: no residency slot` at start ⇒ the pool holds nothing free beyond the staging (e.g.
+  `--spare-slots 16` with `--residency-stage` unset, so S = 16 = the whole pool) AND no new slot is affordable. Use the
+  default pair above (S = 8 of 16), or give it room: `--residency-stage 12` / `--spare-slots 12`. New HBM is only
+  asked for by an explicit `--residency-spare` above the pool's free slots (`WARNING wants N new HBM slots/layer, only M
+  affordable` — it then uses M); report the printed budget line.
 - Optional 6-row shifted probe (only if §4 adapts): `H` with `--hot-per-layer 295` and no `--map`, off/on pair; expect
-  more cold unique experts per layer-step, so watch `overflow` (S = 16) — an overflow there is a probe artefact, not a
+  more cold unique experts per layer-step, so watch `overflow` (S = 8) — an overflow there is a probe artefact, not a
   residency bug, and the run's logits are then not comparable.
 
 ## 6. Reading the result (what each outcome means)
@@ -160,9 +177,12 @@ Report from `scratch/headline-a22-on.json`:
 
 ## 7. Files changed by the rebase (for the reviewer)
 
-`runtime/residency.py` (`n_stage_for(spare_slots)`, `sf_store_for`, pool-SF write, budget, `after_step(live)`, CLI
-helpers), `runtime/generate.py` (merge of `spare_slots` + `residency`; manager sized from the step's S and rows),
+`runtime/residency.py` (`n_stage_for(spare_slots)`, `residency_stage`, `sf_store_for`, pool-SF write, budget,
+`after_step(live)`, CLI helpers), `runtime/generate.py` (merge of `spare_slots` + `residency`; the step is built with
+the staging the manager keeps), `runtime/expert_pool.py` (`loc_cpu` explicitly on the host),
 `runtime/dspark_loop.py` (per-step hook, `mgr_ms`), `bench/headline.py` (flags, report, cold share per sequence),
 `bench/first_light.py` (merge only), `runtime/README.md`, `tests/test_residency_rebase_cpu.py` (new),
 `tests/test_residency_cpu.py` / `test_residency_rows_cpu.py` (static_kernels `stage_rows`, S), `tests/gpu/test_residency_gpu.py`
-(6-row tests). Mac suite: `.venv/bin/python -m pytest tests/ -q`.
+(6-row tests). A2-2 FIX (box r1): `golden_from_index` and `ExpertPool.loc_cpu` made host-explicit, the pool-first slot
+budget, `--residency-stage` / `--pool-spare`, tests `test_residency_stage_rule`, `test_manager_promotes_into_the_pools_free_spare_slots_without_growing`,
+`test_host_tensors_carry_device_cpu_explicitly` and the GPU no-growth test. Mac suite: `.venv/bin/python -m pytest tests/ -q`.
