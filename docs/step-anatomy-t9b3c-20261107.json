@@ -1,0 +1,412 @@
+{
+ "steps": [
+  {
+   "step": 0,
+   "wall_ms": 269.114752,
+   "busy_ms": 20.064544,
+   "kernels": 5667
+  },
+  {
+   "step": 1,
+   "wall_ms": 272.486976,
+   "busy_ms": 20.440224,
+   "kernels": 5823
+  },
+  {
+   "step": 2,
+   "wall_ms": 267.174208,
+   "busy_ms": 20.145824,
+   "kernels": 5667
+  },
+  {
+   "step": 3,
+   "wall_ms": 269.823232,
+   "busy_ms": 20.354016,
+   "kernels": 5823
+  },
+  {
+   "step": 4,
+   "wall_ms": 267.502048,
+   "busy_ms": 20.044065,
+   "kernels": 5667
+  },
+  {
+   "step": 5,
+   "wall_ms": 273.577856,
+   "busy_ms": 20.211074,
+   "kernels": 5823
+  },
+  {
+   "step": 6,
+   "wall_ms": 271.201536,
+   "busy_ms": 20.079936,
+   "kernels": 5667
+  },
+  {
+   "step": 7,
+   "wall_ms": 275.423936,
+   "busy_ms": 20.469024,
+   "kernels": 5823
+  },
+  {
+   "step": 8,
+   "wall_ms": 270.214048,
+   "busy_ms": 20.262624,
+   "kernels": 5667
+  },
+  {
+   "step": 9,
+   "wall_ms": 273.907424,
+   "busy_ms": 20.4496,
+   "kernels": 5823
+  },
+  {
+   "step": 10,
+   "wall_ms": 269.9032,
+   "busy_ms": 20.114687,
+   "kernels": 5667
+  },
+  {
+   "step": 11,
+   "wall_ms": 274.72912,
+   "busy_ms": 20.435936,
+   "kernels": 5823
+  },
+  {
+   "step": 12,
+   "wall_ms": 271.406048,
+   "busy_ms": 20.170879,
+   "kernels": 5667
+  },
+  {
+   "step": 13,
+   "wall_ms": 274.256192,
+   "busy_ms": 20.420223,
+   "kernels": 5823
+  },
+  {
+   "step": 14,
+   "wall_ms": 269.980832,
+   "busy_ms": 20.013952,
+   "kernels": 5667
+  },
+  {
+   "step": 15,
+   "wall_ms": 274.2656,
+   "busy_ms": 20.356704,
+   "kernels": 5823
+  },
+  {
+   "step": 16,
+   "wall_ms": 270.217632,
+   "busy_ms": 20.166112,
+   "kernels": 5667
+  },
+  {
+   "step": 17,
+   "wall_ms": 275.558112,
+   "busy_ms": 20.385728,
+   "kernels": 5823
+  },
+  {
+   "step": 18,
+   "wall_ms": 270.470816,
+   "busy_ms": 20.090784,
+   "kernels": 5667
+  },
+  {
+   "step": 19,
+   "wall_ms": 274.371936,
+   "busy_ms": 20.280416,
+   "kernels": 5823
+  },
+  {
+   "step": 20,
+   "wall_ms": 268.832032,
+   "busy_ms": 20.017632,
+   "kernels": 5667
+  },
+  {
+   "step": 21,
+   "wall_ms": 274.534432,
+   "busy_ms": 20.230624,
+   "kernels": 5823
+  },
+  {
+   "step": 22,
+   "wall_ms": 269.225216,
+   "busy_ms": 20.107008,
+   "kernels": 5667
+  },
+  {
+   "step": 23,
+   "wall_ms": 272.451008,
+   "busy_ms": 20.198304,
+   "kernels": 5823
+  },
+  {
+   "step": 24,
+   "wall_ms": 270.506432,
+   "busy_ms": 19.93456,
+   "kernels": 5667
+  },
+  {
+   "step": 25,
+   "wall_ms": 273.925152,
+   "busy_ms": 20.238784,
+   "kernels": 5823
+  },
+  {
+   "step": 26,
+   "wall_ms": 265.804416,
+   "busy_ms": 19.887488,
+   "kernels": 5667
+  },
+  {
+   "step": 27,
+   "wall_ms": 272.7432,
+   "busy_ms": 20.295488,
+   "kernels": 5823
+  },
+  {
+   "step": 28,
+   "wall_ms": 270.50192,
+   "busy_ms": 19.988064,
+   "kernels": 5667
+  },
+  {
+   "step": 29,
+   "wall_ms": 275.074144,
+   "busy_ms": 20.197757,
+   "kernels": 5823
+  },
+  {
+   "step": 30,
+   "wall_ms": 270.220896,
+   "busy_ms": 20.203612,
+   "kernels": 5667
+  },
+  {
+   "step": 31,
+   "wall_ms": 273.615808,
+   "busy_ms": 20.380256,
+   "kernels": 5823
+  }
+ ],
+ "role_ms_per_step": {
+  "step-other": 11.350331843749595,
+  "moe": 8.161781968750367,
+  "engram": 0.2727009999999996,
+  "head": 0.42255796874999996
+ },
+ "role_launches_per_step": {
+  "step-other": 4097.0,
+  "moe": 1560.0,
+  "engram": 86.0,
+  "head": 2.0
+ },
+ "layer_ms_per_step": {},
+ "top_kernels": [
+  [
+   "t9b_mxfp8_gemv",
+   2.781550968750016,
+   290.0
+  ],
+  [
+   "vectorized_elementwise_kernel",
+   2.19774696875,
+   1711.0
+  ],
+  [
+   "unrolled_elementwise_kernel",
+   2.1073649062500177,
+   647.0
+  ],
+  [
+   "sm100_fp8_fp4_gemm_1d1d_impl",
+   1.7977969687499966,
+   120.0
+  ],
+  [
+   "t9b2_gather_tables",
+   1.4825760000000023,
+   40.0
+  ],
+  [
+   "reduce_kernel",
+   1.3963280000000178,
+   431.5
+  ],
+  [
+   "transpose_and_pack_fp32_into_ue8m0",
+   1.123532999999993,
+   240.0
+  ],
+  [
+   "elementwise_kernel",
+   0.795198999999979,
+   440.0
+  ],
+  [
+   "t9b_splitk_reduce",
+   0.7893929999999735,
+   250.0
+  ],
+  [
+   "act_quant_kernel__kernel",
+   0.787219000000024,
+   290.0
+  ],
+  [
+   "nvjet_sm103_tst_64x8_64x16_4x1_v_bz_TNT",
+   0.5812830312499987,
+   40.0
+  ],
+  [
+   "gemv2T_kernel_val",
+   0.4199609687499999,
+   1.0
+  ],
+  [
+   "gatherTopK",
+   0.38746096874999975,
+   49.0
+  ],
+  [
+   "sparse_attn_fwd_kernel",
+   0.3579890000000003,
+   40.0
+  ],
+  [
+   "hc_split_sinkhorn_kernel__kernel",
+   0.3501509999999976,
+   80.0
+  ],
+  [
+   "bitonicSortKVInPlace",
+   0.32330299999999973,
+   80.0
+  ],
+  [
+   "dot_kernel",
+   0.28999800000000286,
+   80.0
+  ],
+  [
+   "kernel",
+   0.22268600000000302,
+   46.0
+  ],
+  [
+   "_assert_async_cuda_kernel",
+   0.2195869999999962,
+   96.0
+  ],
+  [
+   "t9b2_swiglu_quant",
+   0.19868800000000045,
+   80.0
+  ],
+  [
+   "radixSortKVInPlace",
+   0.190548,
+   9.0
+  ],
+  [
+   "t9b2_hc_post",
+   0.17437000000000136,
+   80.0
+  ],
+  [
+   "CatArrayBatchedCopy_vectorized",
+   0.17390599999999742,
+   77.0
+  ],
+  [
+   "DeviceRadixSortSingleTileKernel",
+   0.16436899999999885,
+   46.0
+  ],
+  [
+   "reduce_1Block_kernel",
+   0.15048600000000362,
+   80.0
+  ],
+  [
+   "index_elementwise_kernel",
+   0.11586300000000023,
+   42.0
+  ],
+  [
+   "_scatter_gather_elementwise_kernel",
+   0.0963610000000001,
+   46.0
+  ],
+  [
+   "t9b2_moe_combine",
+   0.09491100000000045,
+   40.0
+  ],
+  [
+   "t9b2_act_quant_bcast",
+   0.08361499999999962,
+   40.0
+  ],
+  [
+   "elementwise_kernel_with_index",
+   0.07732899999999931,
+   97.0
+  ],
+  [
+   "t9b2_o_rope_qdq",
+   0.07517100000000049,
+   40.0
+  ],
+  [
+   "indexing_backward_kernel",
+   0.07156399999999975,
+   45.0
+  ],
+  [
+   "nvjet_sm103_tst_64x8_64x16_1x1_h_bz_splitK_TNT",
+   0.028539000000000005,
+   8.0
+  ],
+  [
+   "fp4_quant_kernel__kernel",
+   0.02415999999999998,
+   13.0
+  ],
+  [
+   "splitKreduce_kernel",
+   0.017109000000000017,
+   9.0
+  ],
+  [
+   "nvjet_sm103_tst_64x16_64x16_2x2_2cta_h_bz_TNT",
+   0.015439000000000007,
+   5.0
+  ],
+  [
+   "nvjet_sm103_tst_64x8_64x16_1x4_h_bz_TNT",
+   0.008822000000000003,
+   3.0
+  ],
+  [
+   "indexSelectSmallIndex",
+   0.008812999999999996,
+   4.5
+  ],
+  [
+   "vectorized_gather_kernel",
+   0.007563,
+   2.0
+  ],
+  [
+   "nvjet_sm103_tst_8x64_64x16_4x1_v_bz_TNN",
+   0.007134999999999996,
+   2.5
+  ]
+ ],
+ "idle_ms_per_step": 251.5270545625
+}
