@@ -576,16 +576,20 @@ if HAVE_TRITON:
 
     @triton.jit
     def t9b_mxfp8_gemv(xq, xs, w, s, out, ws, M, N, KB, PER,
-                       stride_xm, stride_xsm, stride_wn, stride_sn, stride_om,
+                       stride_xm, stride_xsm, stride_wn, stride_sn, stride_om, freqs,
                        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, KU: tl.constexpr, EVEN: tl.constexpr,
-                       MMA: tl.constexpr, SPLIT: tl.constexpr):
+                       MMA: tl.constexpr, SPLIT: tl.constexpr, ROPE: tl.constexpr = False, HEAD_DIM: tl.constexpr = 2,
+                       ROPE_DIM: tl.constexpr = 0, RE_MODE: tl.constexpr = 0, IM_MODE: tl.constexpr = 0):
         """Program (pn, ks): output columns [pn*BLOCK_N, (pn+1)*BLOCK_N) for all M rows over K blocks
         [ks*PER, min((ks+1)*PER, KB)). Per K block (KU per loop iteration, unrolled, in K order): the [BLOCK_M, 32]
         activation tile and the [BLOCK_N, 32] weight tile, fp32 block partials for every (m, n) (tl.dot or broadcast
         + tl.sum), times pow2(sa[m]) * pow2(sb[n // 32]), one fp32 add into acc[m, n]. Rows m >= M and n >= N read
         row 0 (in bounds, unmasked vector loads) and are never stored. EVEN: every split is PER long and PER % KU == 0;
         otherwise blocks past the split's end re-read its last block and are not added. SPLIT: fp32 acc -> ws[ks]
-        (summed by t9b_splitk_reduce); else bf16 -> out."""
+        (summed by t9b_splitk_reduce); else bf16 -> out. ROPE (T9b-2 #13, direct store only): the bf16-rounded values
+        of every head's last ROPE_DIM columns are rotated in pairs by freqs (fp32 [ROPE_DIM/2, 2]) with the
+        contraction form (RE_MODE, IM_MODE) torch's complex multiply uses, then rounded to bf16 -- exactly
+        apply_rotary_emb on the stored output; the accumulation above is untouched."""
         pid_n = tl.program_id(0)
         ks = tl.program_id(1)
         kb_lo = ks * PER
@@ -625,12 +629,30 @@ if HAVE_TRITON:
         mask = m_ok[:, None] & n_ok[None, :]
         if SPLIT:
             tl.store(ws + ks * M * N + rm[:, None] * N + rn[None, :], acc, mask=mask)
+        elif ROPE:
+            xb = acc.to(tl.bfloat16).to(tl.float32)                                   # the stored q values
+            a, b = tl.split(tl.reshape(xb, [BLOCK_M, BLOCK_N // 2, 2]))               # even / odd columns
+            ce = pid_n * BLOCK_N + 2 * tl.arange(0, BLOCK_N // 2)
+            hcol = ce % HEAD_DIM
+            is_r = hcol >= HEAD_DIM - ROPE_DIM
+            fi = tl.where(is_r, (hcol - (HEAD_DIM - ROPE_DIM)) // 2, 0)
+            c = tl.broadcast_to(tl.load(freqs + 2 * fi)[None, :], [BLOCK_M, BLOCK_N // 2])
+            d = tl.broadcast_to(tl.load(freqs + 2 * fi + 1)[None, :], [BLOCK_M, BLOCK_N // 2])
+            rr = tl.broadcast_to(is_r[None, :], [BLOCK_M, BLOCK_N // 2])
+            a2 = tl.where(rr, _t9b2_rope_re(a, b, c, d, RE_MODE), a)
+            b2 = tl.where(rr, _t9b2_rope_im(a, b, c, d, IM_MODE), b)
+            val = tl.reshape(tl.join(a2, b2), [BLOCK_M, BLOCK_N])
+            tl.store(out + rm[:, None] * stride_om + rn[None, :], val.to(tl.bfloat16), mask=mask)
         else:
             tl.store(out + rm[:, None] * stride_om + rn[None, :], acc.to(tl.bfloat16), mask=mask)
 
     @triton.jit
-    def t9b_splitk_reduce(ws, out, M, N, NSPLIT, stride_om, BLOCK_R: tl.constexpr):
-        """out[m, n] = bf16(((0 + ws[0, m, n]) + ws[1, m, n]) + ... + ws[NSPLIT-1, m, n]): fixed split order."""
+    def t9b_splitk_reduce(ws, out, M, N, NSPLIT, stride_om, freqs, BLOCK_R: tl.constexpr, ROPE: tl.constexpr = False,
+                          HEAD_DIM: tl.constexpr = 2, ROPE_DIM: tl.constexpr = 0, RE_MODE: tl.constexpr = 0,
+                          IM_MODE: tl.constexpr = 0):
+        """out[m, n] = bf16(((0 + ws[0, m, n]) + ws[1, m, n]) + ... + ws[NSPLIT-1, m, n]): fixed split order. ROPE
+        (T9b-2 #13): each lane also sums its pair partner n ^ 1 in the same order (so both see the same two values),
+        rounds both to bf16 and stores its own component of the rotated pair (columns outside RoPE: unchanged)."""
         i = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
         ok = i < M * N
         acc = tl.zeros([BLOCK_R], dtype=tl.float32)
@@ -638,7 +660,65 @@ if HAVE_TRITON:
             acc += tl.load(ws + j * M * N + i, mask=ok, other=0.0)
         m = i // N
         n = i - m * N
-        tl.store(out + m * stride_om + n, acc.to(tl.bfloat16), mask=ok)
+        if ROPE:
+            ip = i ^ 1
+            accp = tl.zeros([BLOCK_R], dtype=tl.float32)
+            for j in range(0, NSPLIT):
+                accp += tl.load(ws + j * M * N + ip, mask=ok, other=0.0)
+            x = acc.to(tl.bfloat16).to(tl.float32)
+            xp = accp.to(tl.bfloat16).to(tl.float32)
+            even = (n & 1) == 0
+            a = tl.where(even, x, xp)
+            b = tl.where(even, xp, x)
+            hcol = n % HEAD_DIM
+            is_r = hcol >= HEAD_DIM - ROPE_DIM
+            fi = tl.where(is_r, (hcol - hcol % 2 - (HEAD_DIM - ROPE_DIM)) // 2, 0)
+            c = tl.load(freqs + 2 * fi)
+            d = tl.load(freqs + 2 * fi + 1)
+            rot = tl.where(even, _t9b2_rope_re(a, b, c, d, RE_MODE), _t9b2_rope_im(a, b, c, d, IM_MODE))
+            tl.store(out + m * stride_om + n, tl.where(is_r, rot, x).to(tl.bfloat16), mask=ok)
+        else:
+            tl.store(out + m * stride_om + n, acc.to(tl.bfloat16), mask=ok)
+
+    # T9b-2: the RoPE helpers, a verbatim copy of runtime/fused_glue.py's (tests/test_fused_glue_cpu.py asserts the
+    # source is identical): explicit mul.rn/add.rn/sub.rn PTX and tl.fma, so the result does not depend on this
+    # kernel's fp-fusion setting (the GEMV keeps Triton's default; its accumulation numerics are T9b-1's).
+    @triton.jit
+    def _t9b2_mul_rn(a, b):
+        return tl.inline_asm_elementwise("mul.rn.f32 $0, $1, $2;", "=f,f,f", [a, b], dtype=tl.float32,
+                                         is_pure=True, pack=1)
+
+    @triton.jit
+    def _t9b2_add_rn(a, b):
+        return tl.inline_asm_elementwise("add.rn.f32 $0, $1, $2;", "=f,f,f", [a, b], dtype=tl.float32,
+                                         is_pure=True, pack=1)
+
+    @triton.jit
+    def _t9b2_sub_rn(a, b):
+        return tl.inline_asm_elementwise("sub.rn.f32 $0, $1, $2;", "=f,f,f", [a, b], dtype=tl.float32,
+                                         is_pure=True, pack=1)
+
+    @triton.jit
+    def _t9b2_rope_re(a, b, c, d, MODE: tl.constexpr):
+        """rope_re: MODE 0 a*c - b*d, 1 fma(a, c, -(b*d)), 2 fma(-b, d, a*c); a, b, c, d same shape."""
+        if MODE == 0:
+            r = _t9b2_sub_rn(_t9b2_mul_rn(a, c), _t9b2_mul_rn(b, d))
+        elif MODE == 1:
+            r = tl.fma(a, c, -_t9b2_mul_rn(b, d))
+        else:
+            r = tl.fma(-b, d, _t9b2_mul_rn(a, c))
+        return r
+
+    @triton.jit
+    def _t9b2_rope_im(a, b, c, d, MODE: tl.constexpr):
+        """rope_im: MODE 0 a*d + b*c, 1 fma(a, d, b*c), 2 fma(b, c, a*d)."""
+        if MODE == 0:
+            r = _t9b2_add_rn(_t9b2_mul_rn(a, d), _t9b2_mul_rn(b, c))
+        elif MODE == 1:
+            r = tl.fma(a, d, _t9b2_mul_rn(b, c))
+        else:
+            r = tl.fma(b, c, _t9b2_mul_rn(a, d))
+        return r
 
 
 REDUCE_BLOCK = 1024
@@ -664,38 +744,66 @@ def launch_plan(cfg: GemvConfig, M: int, N: int, K: int) -> dict:
             "reduce_grid": (-(-(M * N) // REDUCE_BLOCK),) if nsplit > 1 else None}
 
 
+def check_rope(rope, N: int) -> None:
+    """rope = (freqs fp32 [rope_dim/2, 2] contiguous, head_dim, rope_dim, (re_mode, im_mode)) for an output of N."""
+    freqs, hd, rd, modes = rope
+    if hd < 2 or hd % 2 or rd % 2 or not 0 < rd <= hd or N % hd:
+        raise ValueError(f"mxfp8_gemv rope: head_dim {hd} / rope_dim {rd} must be even, 0 < rope_dim <= head_dim, "
+                         f"and divide N = {N}")
+    if freqs.dtype != torch.float32 or tuple(freqs.shape) != (rd // 2, 2) or not freqs.is_contiguous():
+        raise ValueError(f"mxfp8_gemv rope: freqs {tuple(freqs.shape)} {freqs.dtype} must be contiguous fp32 "
+                         f"[{rd // 2}, 2]")
+    if tuple(modes) not in {(a, b) for a in (0, 1, 2) for b in (0, 1, 2)}:
+        raise ValueError(f"mxfp8_gemv rope: modes {modes}")
+
+
 def mxfp8_gemv(xq: torch.Tensor, xs: torch.Tensor, w: torch.Tensor, s: torch.Tensor, out: torch.Tensor,
-               config: Optional[GemvConfig] = None) -> torch.Tensor:
+               config: Optional[GemvConfig] = None, rope=None) -> torch.Tensor:
     """out[M, N] (bf16) <- MXFP8 GEMV of xq [M, K] fp8 (scales xs [M, K/32] e8m0) with w [N, K] fp8 (32x32 block
     scales s [ceil(N/32), K/32] e8m0), M <= 8. On CUDA one launch (two with split-K), graph-capturable once the
     shape's config is known and its workspace exists; on CPU the torch algorithm with the config's split (1 if
-    none)."""
+    none). rope (T9b-2 #13, `check_rope`): rotate every head's last rope_dim outputs in the store (the bf16 output
+    then equals apply_rotary_emb applied to the plain output); same config, same accumulation."""
     M, N, K = check_operands(xq, xs, w, s, out)
+    if rope is not None:
+        check_rope(rope, N)
     if not xq.is_cuda:
         sk = resolve_config(config, N, K).split_k if config is not None else 1
-        return gemv_torch(xq, xs, w, s, out, split_k=sk)
+        res = gemv_torch(xq, xs, w, s, out, split_k=sk)
+        if rope is not None:
+            from runtime.fused_glue import rope_rows_torch
+
+            freqs, hd, rd, modes = rope
+            res.copy_(rope_rows_torch(res, freqs, hd, rd, tuple(modes), inverse=False))
+        return res
     if not HAVE_TRITON:  # pragma: no cover
         raise RuntimeError("mxfp8_gemv on CUDA needs triton")
     cfg = resolve_config(config or get_config(N, K, M, xq.device), N, K, num_sms(xq.device))
     p = launch_plan(cfg, M, N, K)
     ws = workspace(xq.device, M, N, p["NSPLIT"]) if p["SPLIT"] else out
-    return _launch(xq, xs, w, s, out, cfg, ws)
+    return _launch(xq, xs, w, s, out, cfg, ws, rope=rope)
 
 
-def _launch(xq, xs, w, s, out, cfg: GemvConfig, ws) -> torch.Tensor:
+def _launch(xq, xs, w, s, out, cfg: GemvConfig, ws, rope=None) -> torch.Tensor:
     """The kernel launch(es) of one call for a resolved config; `ws` is the [NSPLIT, M, N] fp32 workspace when the
-    plan splits (else unused). Separate from mxfp8_gemv so tests can drive the kernels through a Triton stand-in."""
+    plan splits (else unused). Separate from mxfp8_gemv so tests can drive the kernels through a Triton stand-in.
+    rope: as mxfp8_gemv (the epilogue goes to the main kernel's store, or to the reduce when the plan splits)."""
     M, K = xq.shape
     N = w.size(0)
     p = launch_plan(cfg, M, N, K)
+    rk = {}
+    freqs = out
+    if rope is not None:
+        freqs, hd, rd, modes = rope
+        rk = dict(ROPE=True, HEAD_DIM=int(hd), ROPE_DIM=int(rd), RE_MODE=int(modes[0]), IM_MODE=int(modes[1]))
     t9b_mxfp8_gemv[p["grid"]](
         xq, xs.view(torch.uint8), w, s.view(torch.uint8), out, ws, M, N, K // BLOCK, p["PER"],
-        xq.stride(0), xs.stride(0), w.stride(0), s.stride(0), out.stride(0),
+        xq.stride(0), xs.stride(0), w.stride(0), s.stride(0), out.stride(0), freqs,
         BLOCK_M=p["BLOCK_M"], BLOCK_N=cfg.block_n, KU=cfg.ku, EVEN=p["EVEN"], MMA=bool(cfg.mma), SPLIT=p["SPLIT"],
-        num_warps=cfg.num_warps, num_stages=cfg.num_stages)
+        num_warps=cfg.num_warps, num_stages=cfg.num_stages, **({} if p["SPLIT"] else rk))
     if p["SPLIT"]:
-        t9b_splitk_reduce[p["reduce_grid"]](ws, out, M, N, p["NSPLIT"], out.stride(0), BLOCK_R=REDUCE_BLOCK,
-                                            num_warps=4)
+        t9b_splitk_reduce[p["reduce_grid"]](ws, out, M, N, p["NSPLIT"], out.stride(0), freqs, BLOCK_R=REDUCE_BLOCK,
+                                            num_warps=4, **rk)
     return out
 
 
@@ -706,4 +814,16 @@ def linear_fp8(xq: torch.Tensor, xs: torch.Tensor, w: torch.Tensor, s: torch.Ten
     N = w.size(0)
     out = torch.empty(*xq.shape[:-1], N, dtype=torch.bfloat16, device=xq.device)
     mxfp8_gemv(xq.view(-1, K), xs.view(-1, K // BLOCK), w, s, out.view(-1, N))
+    return out
+
+
+def linear_fp8_rope(xq: torch.Tensor, xs: torch.Tensor, w: torch.Tensor, s: torch.Tensor, freqs: torch.Tensor,
+                    head_dim: int, rope_dim: int, modes) -> torch.Tensor:
+    """T9b-2 #13: linear_fp8 followed by apply_rotary_emb on every head's last rope_dim outputs (model.py:771-772),
+    as one GEMV launch (the rotation is in the store). freqs: fp32 [rope_dim/2, 2] (view_as_real of freqs_cis[pos])."""
+    K = xq.size(-1)
+    N = w.size(0)
+    out = torch.empty(*xq.shape[:-1], N, dtype=torch.bfloat16, device=xq.device)
+    mxfp8_gemv(xq.view(-1, K), xs.view(-1, K // BLOCK), w, s, out.view(-1, N),
+               rope=(freqs, int(head_dim), int(rope_dim), tuple(int(m) for m in modes)))
     return out

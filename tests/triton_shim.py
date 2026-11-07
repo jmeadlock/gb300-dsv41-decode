@@ -1,5 +1,8 @@
-"""A tiny numpy stand-in for the subset of Triton that runtime/gemv_mxfp8.py's kernels use, so the Mac (no Triton,
-no GPU) can execute the real `@triton.jit` function bodies program by program.
+"""A tiny numpy stand-in for the subset of Triton that runtime/gemv_mxfp8.py's and runtime/fused_glue.py's kernels
+use, so the Mac (no Triton, no GPU) can execute the real `@triton.jit` function bodies program by program. (T9b-2
+added: tl.max/abs/fma, the `mul.rn/add.rn/sub.rn.f32` inline-asm forms, reshape/split/join/broadcast_to, uint8 and
+fp8e4nv casts (RNE, as `fp_downcast_rounding="rtne"`), `%`, `>>`, `^`, unary minus, fp32 scalar args, the
+`enable_fp_fusion` launch option, and write-back of any stored-to fp8/uint8/int buffer.)
 
 What it is for: the kernels' INDEX MATH and CONTROL FLOW -- pointer arithmetic, row/column clamping, masks, the
 split-K K-block ranges, the KU unroll and its tail, the workspace layout, the reduce order, the constexpr branches.
@@ -59,6 +62,14 @@ class T:
     def __eq__(self, o): return self._bin(o, lambda a, b: a == b)  # noqa: E704
     def __and__(self, o): return self._bin(o, lambda a, b: a & b)
     def __or__(self, o): return self._bin(o, lambda a, b: a | b)
+    # T9b-2 kernels (runtime/fused_glue.py, the GEMV's RoPE epilogue)
+    def __rand__(self, o): return T(_v(o) & self.a)
+    def __mod__(self, o): return self._bin(o, lambda a, b: a % b)
+    def __rshift__(self, o): return self._bin(o, lambda a, b: np.right_shift(a, b))
+    def __xor__(self, o): return self._bin(o, lambda a, b: a ^ b)
+    def __ne__(self, o): return self._bin(o, lambda a, b: a != b)  # noqa: E704
+    def __neg__(self): return T(-self.a)
+    def __rfloordiv__(self, o): return T(_v(o) // self.a)
 
     __hash__ = None
 
@@ -73,13 +84,17 @@ class T:
     def shape(self):
         return self.a.shape
 
-    def to(self, dtype, bitcast=False):
+    def to(self, dtype, bitcast=False, fp_downcast_rounding=None):
+        assert fp_downcast_rounding in (None, "rtne"), fp_downcast_rounding
         if bitcast:
+            if dtype is int32:                                           # fp32 bits as int32
+                return T(np.ascontiguousarray(self.a.astype(np.float32)).view(np.int32))
             assert dtype is float32
-            return T(self.a.astype(np.int32).view(np.float32))
-        if dtype is bfloat16:
+            return T(np.ascontiguousarray(self.a.astype(np.int32)).view(np.float32))
+        if dtype is bfloat16 or dtype is float8e4nv:
             f = torch.from_numpy(np.ascontiguousarray(self.a.astype(np.float32)))
-            return T(f.to(torch.bfloat16).to(torch.float32).numpy())     # round to nearest even, as Triton
+            tdt = torch.bfloat16 if dtype is bfloat16 else torch.float8_e4m3fn
+            return T(f.to(tdt).to(torch.float32).numpy())                # round to nearest even, as Triton
         return T(self.a.astype(dtype.np))
 
 
@@ -102,6 +117,7 @@ class _DT:
 
 int32, int64, float32, bfloat16 = _DT("int32", np.int32), _DT("int64", np.int64), _DT("float32", np.float32), \
     _DT("bfloat16", None)
+uint8, float8e4nv = _DT("uint8", np.uint8), _DT("float8e4nv", None)
 
 
 class constexpr:  # noqa: N801 - Triton's name; only used as an annotation
@@ -152,6 +168,61 @@ def trans(x):
     return T(_v(x).T)
 
 
+# T9b-2 (runtime/fused_glue.py kernels, the GEMV RoPE epilogue)
+def max(x, axis):  # noqa: A001 - Triton's name
+    return T(np.max(_v(x), axis=axis))
+
+
+def abs(x):  # noqa: A001 - Triton's name
+    return T(np.abs(_v(x)))
+
+
+def fma(a, b, c):
+    """fp32 fma with one rounding, exactly (the a*b product is exact in float64; TwoSum keeps the sum's error)."""
+    a, b, c = (np.asarray(_v(t), dtype=np.float32) for t in (a, b, c))
+    a, b, c = np.broadcast_arrays(a, b, c)
+    p = a.astype(np.float64) * b.astype(np.float64)
+    cd = c.astype(np.float64)
+    s = p + cd
+    bb = s - p
+    e = (p - (s - bb)) + (cd - bb)
+    r = s.astype(np.float32)
+    rd = r.astype(np.float64)
+    n = np.nextafter(r, np.where(s > rd, np.float32(np.inf), np.float32(-np.inf))).astype(np.float32)
+    mid = ((rd + n.astype(np.float64)) * 0.5 == s) & (rd != s)
+    take_n = mid & (e != 0) & ((e > 0) == (s > rd))
+    return T(np.where(take_n, n, r).astype(np.float32))
+
+
+_ASM = {"mul.rn.f32": lambda a, b: a * b, "add.rn.f32": lambda a, b: a + b, "sub.rn.f32": lambda a, b: a - b}
+
+
+def inline_asm_elementwise(asm, constraints, args, dtype, is_pure, pack):
+    """Only the single-instruction fp32 forms runtime/fused_glue.py uses (`mul.rn.f32 $0, $1, $2;` etc.)."""
+    op = asm.split()[0]
+    assert op in _ASM and dtype is float32 and pack == 1, asm
+    a, b = (np.asarray(_v(t), dtype=np.float32) for t in args)
+    return T(_ASM[op](a, b).astype(np.float32))
+
+
+def reshape(x, shape):
+    return T(np.reshape(_v(x), tuple(shape)))
+
+
+def split(x):
+    a = _v(x)
+    assert a.shape[-1] == 2
+    return T(a[..., 0]), T(a[..., 1])
+
+
+def join(a, b):
+    return T(np.stack([_v(a), _v(b)], axis=-1))
+
+
+def broadcast_to(x, shape):
+    return T(np.broadcast_to(_v(x), tuple(shape)).copy())
+
+
 def static_range(n):
     return range(n)
 
@@ -174,9 +245,11 @@ def store(ptr, val, mask=None):
     assert len(np.unique(off)) == len(off), "two lanes store to one address"
     ptr.buf[off] = v[m]
     STORES.append(off.copy())
+    DIRTY.add(id(ptr.buf))
 
 
 STORES: list = []
+DIRTY: set = set()  # id() of the buffers a launch stored to (fp8 / uint8 / int64 ones are written back only then)
 
 
 # ------------------------------------------------------------------------------------------------ jit + launch
@@ -195,7 +268,21 @@ def _buffer(t: torch.Tensor):
         return f.to(torch.int32).numpy().copy()
     if t.dtype == torch.float32:
         return f.numpy().copy()
+    if t.dtype in (torch.int64, torch.int32):
+        return f.numpy().copy()
     raise TypeError(t.dtype)
+
+
+def _write_back(t: torch.Tensor, b) -> None:
+    if t.dtype in (torch.float32, torch.bfloat16):
+        _flat(t).copy_(torch.from_numpy(b).to(t.dtype))
+    elif t.dtype in (torch.float8_e4m3fn, torch.float16):
+        _flat(t).copy_(torch.from_numpy(np.ascontiguousarray(b, dtype=np.float32)).to(t.dtype))
+    elif t.dtype == torch.uint8:
+        assert ((b >= 0) & (b <= 255)).all()
+        _flat(t).copy_(torch.from_numpy(np.ascontiguousarray(b).astype(np.int32)).to(torch.uint8))
+    elif t.dtype in (torch.int64, torch.int32):
+        _flat(t).copy_(torch.from_numpy(np.ascontiguousarray(b)).to(t.dtype))
 
 
 class JitFunction:
@@ -207,7 +294,7 @@ class JitFunction:
         return self.fn(*a, **k)
 
     def __getitem__(self, grid):
-        def launch(*args, num_warps=None, num_stages=None, **constexprs):
+        def launch(*args, num_warps=None, num_stages=None, enable_fp_fusion=None, **constexprs):
             bufs = {}
             conv = []
             for x in args:
@@ -216,16 +303,20 @@ class JitFunction:
                     if key not in bufs:
                         bufs[key] = (x, _buffer(x))
                     conv.append(P(bufs[key][1], 0))
+                elif isinstance(x, float):
+                    conv.append(np.float32(x))    # Triton passes a Python float as an fp32 scalar
                 else:
                     conv.append(int(x))
             g = tuple(grid) + (1,) * (3 - len(grid))
-            self.launches.append({"grid": tuple(grid), "constexprs": dict(constexprs)})
+            self.launches.append({"grid": tuple(grid), "constexprs": dict(constexprs),
+                                  "enable_fp_fusion": enable_fp_fusion})
+            DIRTY.clear()
             for pid in itertools.product(*(range(n) for n in g)):
                 _PID[:] = list(pid)
                 self.fn(*conv, **constexprs)
             for t, b in bufs.values():  # write back (untouched elements round-trip exactly)
-                if t.dtype in (torch.float32, torch.bfloat16):
-                    _flat(t).copy_(torch.from_numpy(b).to(t.dtype))
+                if t.dtype in (torch.float32, torch.bfloat16) or id(b) in DIRTY:
+                    _write_back(t, b)
         return launch
 
 
@@ -240,7 +331,9 @@ def cdiv(a, b):
 def _modules():
     tl = types.ModuleType("triton.language")
     for name in ("T", "P", "int32", "int64", "float32", "bfloat16", "constexpr", "program_id", "arange", "zeros",
-                 "where", "minimum", "maximum", "sum", "dot", "trans", "static_range", "load", "store"):
+                 "where", "minimum", "maximum", "sum", "dot", "trans", "static_range", "load", "store",
+                 "uint8", "float8e4nv", "max", "abs", "fma", "inline_asm_elementwise", "reshape", "split", "join",
+                 "broadcast_to"):
         setattr(tl, name, globals()[name])
     tr = types.ModuleType("triton")
     tr.jit, tr.cdiv, tr.language, tr.__version__ = jit, cdiv, tl, "numpy-shim"

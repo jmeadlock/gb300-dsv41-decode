@@ -67,6 +67,8 @@ the bit-identical T8 path); `last_meta["moe_impl"]` records it; `logits_sink(i, 
 position's fp32 CPU logits in `greedy` (first_light's dg-vs-ref drift row).
 T9b-1: `fp8_impl="ref"|"gemv"` selects the static step's fp8 Linear implementation (runtime/gemv_mxfp8.py; `ref` is
 the bit-identical reference `fp8_gemm`), with the same rebuild-on-change rule as `moe_impl`; `last_meta["fp8_impl"]`.
+T9b-2: `glue_impl="ref"|"fused"` selects the static step's glue (runtime/fused_glue.py; both bit-identical, `ref` is
+today's ops), same rebuild-on-change rule; `last_meta["glue_impl"]`.
 """
 from __future__ import annotations
 
@@ -86,6 +88,7 @@ CUBLAS_WORKSPACE_CONFIG = ":4096:8"
 MODES = ("eager", "static", "graph")
 MOE_IMPLS = ("ref", "dg-masked")  # = runtime.static_step.MOE_IMPLS (not imported: that module needs the reference)
 FP8_IMPLS = ("ref", "gemv")       # = runtime.static_step.FP8_IMPLS (T9b-1)
+GLUE_IMPLS = ("ref", "fused")     # = runtime.static_step.GLUE_IMPLS (T9b-2)
 RECORD_KEYS = ("tag", "prompt", "model", "finish_reason", "n_tokens", "text", "logprobs", "usage")
 
 
@@ -281,7 +284,7 @@ class Generator:
                  model_name: str = "m0-reference-runtime", profiler=None, set_default_device: bool = True,
                  mode: str = "eager", max_pos: Optional[int] = None, marker: bool = False,
                  static_counters: bool = True, static_factory: Optional[Callable] = None, moe_impl: str = "ref",
-                 fp8_impl: str = "ref"):
+                 fp8_impl: str = "ref", glue_impl: str = "ref"):
         self.model = model
         self.tokenizer_dir = tokenizer_dir
         self.tokenizer = tokenizer if tokenizer is not None else (load_tokenizer(tokenizer_dir) if tokenizer_dir else None)
@@ -319,6 +322,8 @@ class Generator:
         self.set_moe_impl(moe_impl)
         self.fp8_impl = "ref"
         self.set_fp8_impl(fp8_impl)
+        self.glue_impl = "ref"
+        self.set_glue_impl(glue_impl)
         self.logits_sink: Optional[Callable] = None  # greedy calls sink(i, fp32 CPU logits) per position (drift rows)
         self.mode = "eager"
         self.set_mode(mode)
@@ -347,6 +352,15 @@ class Generator:
             self.reset_static()
         self.fp8_impl = impl
 
+    def set_glue_impl(self, impl: str) -> None:
+        """T9b-2: the static step's glue implementation ("ref" | "fused"). A change drops the StaticStep (and its
+        graphs); the next static/graph use rebuilds it. Eager mode never uses it."""
+        if impl not in GLUE_IMPLS:
+            raise ValueError(f"glue_impl {impl!r} not in {GLUE_IMPLS}")
+        if impl != self.glue_impl and self.static is not None:
+            self.reset_static()
+        self.glue_impl = impl
+
     @property
     def max_pos(self) -> int:
         """Largest decode position this Generator can serve in its current mode."""
@@ -363,13 +377,15 @@ class Generator:
                 kw = {} if self.moe_impl == "ref" else {"moe_impl": self.moe_impl}
                 if self.fp8_impl != "ref":
                     kw["fp8_impl"] = self.fp8_impl
+                if self.glue_impl != "ref":
+                    kw["glue_impl"] = self.glue_impl
                 self.static = self.static_factory(self.model, **kw)
             else:
                 from runtime.static_step import StaticStep
 
                 self.static = StaticStep(self.model, self.pool, max_pos=self._static_max_pos, marker=self.marker,
                                          counters=self.static_counters, moe_impl=self.moe_impl,
-                                         fp8_impl=self.fp8_impl)
+                                         fp8_impl=self.fp8_impl, glue_impl=self.glue_impl)
         return self.static
 
     def reset_static(self) -> None:
@@ -578,7 +594,7 @@ class Generator:
         c1 = self.cold_totals()
         meta = {"logits_sha256": digest.hexdigest(), "token_ids": gen, "prompt_tokens": L, "wall_s": wall,
                 "prefill_s": t_prefill, "n_forward": len(gen), "mode": self.mode, "step_sha256": step_digests,
-                "moe_impl": self.moe_impl, "fp8_impl": self.fp8_impl,
+                "moe_impl": self.moe_impl, "fp8_impl": self.fp8_impl, "glue_impl": self.glue_impl,
                 "decode_ms_per_token": (wall - t_prefill) / max(1, len(gen) - 1) * 1e3 if len(gen) > 1 else None}
         if c0 is not None and c1 is not None:
             hot, cold = c1[0] - c0[0], c1[1] - c0[1]

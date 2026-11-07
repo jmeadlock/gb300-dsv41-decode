@@ -49,6 +49,12 @@ host-side ints become device tensors and dynamic lengths become fixed lengths (c
       warm-ups and capture; the prefill and the eager reference never see it). 290 calls/step on the real model (40 x
       wq_a, wq_b, wkv, wo_b, shared w1/w3/w2 + 8 indexer wq_b + 2 Engram wkv). Not bit-identical by design (the
       32-wide block sum's order; K-block order and scales are the reference's). `fp8_impl="ref"` (default) is T8.
+  #17 T9b-2, docs/HANDOFF-T9B2-GLUE-R1.md -> with `glue_impl="fused"` the zero/low-risk glue clusters of
+      docs/GLUE-AUDIT.md run as fused kernels (runtime/fused_glue.py: MoE gather/act/SwiGLU/combine, shared-expert
+      SwiGLU, mHC post, o-path inverse RoPE + QDQ, q RoPE in the wq_b GEMV store). Bit-identical to `glue_impl="ref"`
+      (default: the ops above, unchanged) with the same moe/fp8 impls; each cluster is self-checked at construction
+      and stays on the reference ops if it fails (`st.glue.describe()`). The sub-steps are methods (`_q_proj`,
+      `_o_path`, `_hc_post`; StaticMoE `_gather`, `_shared`) so the census can attribute launches.
 
 Not computed: `main_hiddens` (model.py:1267-1269) -- MTP-only, never feeds the logits; the loader's overlay sets
 dspark_target_layer_ids=() and `StaticStep` refuses a model that has target layers.
@@ -67,6 +73,7 @@ PARITIES = (0, 1)
 SUPPORTED_RATIOS = (0, 1, 2)
 MOE_IMPLS = ("ref", "dg-masked")  # T9a-1: "ref" = StaticMoE (bit-identical), "dg-masked" = runtime/dg_moe.py
 FP8_IMPLS = ("ref", "gemv")       # T9b-1: "ref" = reference fp8_gemm (bit-identical), "gemv" = runtime/gemv_mxfp8.py
+GLUE_IMPLS = ("ref", "fused")     # T9b-2: "ref" = the glue ops as below, "fused" = runtime/fused_glue.py (bit-identical)
 DUMMY_PROMPT = (0, 1)
 
 
@@ -230,23 +237,43 @@ class StaticMoE:
         return self.owner.active
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        from runtime.static_kernels import gather_rows
-
         o, moe = self.owner, self.moe
+        glue = o.glue
         shape = x.size()
         x = x.view(-1, moe.dim)                                        # model.py:893
         weights, indices = moe.gate(x, None)                           # model.py:894 (text: no image mask)
         ids, order = torch.sort(indices[0])                            # ascending id = model.py:897 loop order
         w = weights[0, order]
-        if o.counters:
-            o.ids_step[self.layer].copy_(ids)
-        for key, tab in self.ptabs.items():                            # one launch per (proj, weight|scale)
-            gather_rows(tab, ids, o.staging[key], o.row_bytes[key])
+        if glue is not None and glue.on("gather"):
+            self._gather_fused(ids)                                    # T9b-2 #11: one launch (+ ids_step)
+        else:
+            if o.counters:
+                self._record_ids(ids)
+            self._gather(ids)
         y = torch.zeros_like(x, dtype=torch.float32)                   # model.py:895
         for j, ex in enumerate(o.staged_experts):                      # fixed k, slot order = ascending id
             y += ex(x, w[j].view(1, 1))                                # model.py:902 (1 row: idx = [0])
-        y += moe.shared_experts(x)                                     # model.py:905
+        y += self._shared(x)                                           # model.py:905
         return y.type_as(x).view(shape)                                # model.py:906
+
+    def _gather_fused(self, ids: torch.Tensor) -> None:
+        self.owner.glue.gather(self, ids)
+
+    def _record_ids(self, ids: torch.Tensor) -> None:
+        self.owner.ids_step[self.layer].copy_(ids)
+
+    def _gather(self, ids: torch.Tensor) -> None:
+        from runtime.static_kernels import gather_rows
+
+        o = self.owner
+        for key, tab in self.ptabs.items():                            # one launch per (proj, weight|scale)
+            gather_rows(tab, ids, o.staging[key], o.row_bytes[key])
+
+    def _shared(self, x: torch.Tensor) -> torch.Tensor:
+        glue = self.owner.glue
+        if glue is not None and glue.on("swiglu_shared"):
+            return glue.shared_expert(self.moe.shared_experts, x)      # T9b-2 #2 (shared)
+        return self.moe.shared_experts(x)
 
 
 # ------------------------------------------------------------------------------------------------ the step
@@ -264,7 +291,8 @@ class StaticStep:
 
     def __init__(self, model: nn.Module, pool=None, *, max_pos: Optional[int] = None, marker: bool = False,
                  counters: bool = True, moe_impl: str = "ref", dg_deterministic: bool = True,
-                 fp8_impl: str = "ref", _allow_cpu: bool = False):
+                 fp8_impl: str = "ref", glue_impl: str = "ref", glue_opts: Optional[dict] = None,
+                 _allow_cpu: bool = False):
         R = _ref()
         from runtime import patches
 
@@ -272,12 +300,16 @@ class StaticStep:
             raise ValueError(f"moe_impl {moe_impl!r} not in {MOE_IMPLS}")
         if fp8_impl not in FP8_IMPLS:
             raise ValueError(f"fp8_impl {fp8_impl!r} not in {FP8_IMPLS}")
+        if glue_impl not in GLUE_IMPLS:
+            raise ValueError(f"glue_impl {glue_impl!r} not in {GLUE_IMPLS}")
         if fp8_impl == "gemv" and ((R.fp8_block_size, R.scale_dtype) != (32, torch.float8_e8m0fnu)
                                     or R.scale_fmt is None):
             raise ValueError(f"fp8_impl gemv assumes MXFP8 (block 32, ue8m0) activations; the reference has "
                              f"fp8_block_size={R.fp8_block_size} scale_fmt={R.scale_fmt} scale_dtype={R.scale_dtype}")
         self.moe_impl, self.dg_deterministic = moe_impl, bool(dg_deterministic)
         self.fp8_impl = fp8_impl
+        self.glue_impl = glue_impl
+        self.glue = None  # runtime.fused_glue.FusedGlue when glue_impl == "fused" (built after the MoE buffers)
         self.dg = None  # runtime.dg_moe.DGBuffers when moe_impl == "dg-masked"
         self.R, self.model, self.pool = R, model, pool
         self.dev = model.embed.weight.device
@@ -329,6 +361,10 @@ class StaticStep:
         self._dev_pos: Optional[int] = None
         self.n_counted = 0
         self._c: Optional[_StepScalars] = None
+        if self.glue_impl == "fused":  # #17: tables + build-time self-check (eager; syncs; before any capture)
+            from runtime.fused_glue import FusedGlue
+
+            self.glue = FusedGlue(self, **(glue_opts or {}))
 
     # ---------------------------------------------------------------- build
     def _build_moe(self, R, layers) -> None:
@@ -464,8 +500,7 @@ class StaticStep:
         rd = attn.rope_head_dim
         freqs_cis = c.freqs(attn.freqs_cis)                                   # #3
         qr = attn.q_norm(attn.wq_a(x))
-        q = attn.wq_b(qr).unflatten(-1, (attn.n_local_heads, attn.head_dim))
-        R.apply_rotary_emb(q[..., -rd:], freqs_cis)
+        q = self._q_proj(attn, qr, freqs_cis)
         kv = attn.kv_norm(attn.wkv(x))                                        # _window_kv, model.py:706-708
         R.apply_rotary_emb(kv[..., -rd:], freqs_cis)
         R.act_quant(kv, R.fp8_block_size, R.scale_fmt, R.scale_dtype, True)
@@ -477,12 +512,41 @@ class StaticStep:
             kv = torch.cat([kv, compress_kv], dim=1)
             topk_idxs = torch.cat([topk_idxs, compress_idxs], dim=-1)
         o = R.sparse_attn(q, kv, attn.attn_sink, topk_idxs, attn.softmax_scale)
-        R.apply_rotary_emb(o[..., -rd:], freqs_cis, True)
-        o = o.view(1, 1, attn.n_local_groups, -1)
-        R.act_quant(o, R.fp8_block_size, R.scale_fmt, R.scale_dtype, True)
+        o = self._o_path(attn, o, freqs_cis)
         wo_a = attn.wo_a.weight.view(attn.n_local_groups, attn.o_lora_rank, -1)
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
         return attn.wo_b(o.flatten(2))
+
+    def _q_proj(self, attn, qr, freqs_cis):
+        """model.py:770-772: q = wq_b(qr) per head, RoPE on the last rope_head_dim (#17: in the GEMV's store)."""
+        g = self.glue
+        if g is not None and g.on("q_rope_epilogue"):
+            q = g.q_proj(attn, qr, freqs_cis)
+            if q is not None:
+                return q
+        q = attn.wq_b(qr).unflatten(-1, (attn.n_local_heads, attn.head_dim))
+        self.R.apply_rotary_emb(q[..., -attn.rope_head_dim:], freqs_cis)
+        return q
+
+    def _o_path(self, attn, o, freqs_cis):
+        """model.py:781-786: inverse RoPE on the attention output, per-group view, act_quant QDQ in place (#17: one
+        kernel)."""
+        R = self.R
+        g = self.glue
+        if g is not None and g.on("o_rope_qdq"):
+            g.o_path(attn, o, freqs_cis)
+            return o.view(1, 1, attn.n_local_groups, -1)
+        R.apply_rotary_emb(o[..., -attn.rope_head_dim:], freqs_cis, True)
+        o = o.view(1, 1, attn.n_local_groups, -1)
+        R.act_quant(o, R.fp8_block_size, R.scale_fmt, R.scale_dtype, True)
+        return o
+
+    def _hc_post(self, layer, x, residual, post, comb):
+        """Block.hc_post (model.py:964-968) (#17: one kernel)."""
+        g = self.glue
+        if g is not None and g.on("hc_post"):
+            return g.hc_post(x, residual, post, comb)
+        return layer.hc_post(x, residual, post, comb)
 
     def _block(self, layer, x, pre_mix, parity):
         """Block.forward (model.py:970-996) with the static attention; the FFN is the module call (static MoE via
@@ -492,13 +556,13 @@ class StaticStep:
         x = layer.hc_pre(x, pre_mix)
         x = layer.attn_norm(x)
         x = self._attn(layer.attn, x, parity)
-        x = layer.hc_post(x, residual, attn_post, attn_comb)
+        x = self._hc_post(layer, x, residual, attn_post, attn_comb)
         residual = x
         ffn_pre, ffn_post, ffn_comb = layer.hc_mixes(x, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base)
         x = layer.hc_pre(x, attn_pre)
         x = layer.ffn_norm(x)
         x = layer.ffn(x, None)
-        x = layer.hc_post(x, residual, ffn_post, ffn_comb)
+        x = self._hc_post(layer, x, residual, ffn_post, ffn_comb)
         return x, ffn_pre
 
     def _body(self, parity: int) -> None:

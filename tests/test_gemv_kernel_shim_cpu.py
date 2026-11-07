@@ -142,7 +142,8 @@ def test_reduce_order_is_split_order(K):
         rev = rev + ws[j]
     assert not torch.equal(fwd.to(torch.bfloat16), rev.to(torch.bfloat16))   # the data can tell the orders apart
     out = torch.full((M, N), float("nan"), dtype=torch.bfloat16)
-    K.t9b_splitk_reduce[(1,)](ws, out, M, N, NS, out.stride(0), BLOCK_R=K.REDUCE_BLOCK, num_warps=4)
+    K.t9b_splitk_reduce[(1,)](ws, out, M, N, NS, out.stride(0), out,  # freqs (T9b-2 RoPE epilogue): unused here
+                              BLOCK_R=K.REDUCE_BLOCK, num_warps=4)
     assert torch.equal(out, fwd.to(torch.bfloat16)), (out, fwd)
     assert float(out[0, 0]) == 0.0 and float(out[1, 2]) == 1.0
 

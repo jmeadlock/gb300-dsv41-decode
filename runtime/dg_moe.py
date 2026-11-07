@@ -30,6 +30,11 @@ What breaks bit-identity vs `ref`, by design: the block-scaled UMMA accumulation
 on 0.01-0.04 % of outputs with the model's per-32 scales; 0 with coinciding block scales). Everything around it is the
 reference's arithmetic in the reference's order.
 
+T9b-2 (`glue_impl="fused"`, runtime/fused_glue.py): the steps above are methods (`_gather`, `_act`, `_swiglu`,
+`_combine`, `_shared`; bench/glue_census.py counts each as a region). With the fused glue on, (a)'s act_quant writes
+row 0 itself (no load_act copies), the gather + scale conversion + ids copy are one launch, (c)'s glue + (d)'s
+act_quant + load_act are one launch, and the combine is one launch -- each bit-identical to the ops it replaces.
+
 deep_gemm is imported from vllm's `third_party` directory with vllm itself never imported (charter decision 3):
 `import_deep_gemm()` puts that directory on sys.path only for the import, then asserts no `vllm` module is loaded.
 DeepGEMM JIT-compiles on first call (persist it: DG_JIT_CACHE_DIR, runtime/README.md); `StaticStep.capture()` calls
@@ -241,37 +246,84 @@ class DGMaskedMoE:
         return self.owner.active
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        from runtime.static_kernels import gather_rows
-
         o, moe, b = self.owner, self.moe, self.owner.dg
-        R = o.R
+        glue = o.glue  # runtime/fused_glue.py FusedGlue (glue_impl "fused") or None
         shape = x.size()
         x = x.view(-1, moe.dim)                                        # model.py:893
         weights, indices = moe.gate(x, None)                           # model.py:894 (text: no image mask)
         ids, order = torch.sort(indices[0])                            # ascending id = model.py:897 loop order
         w = weights[0, order]
-        if o.counters:
-            o.ids_step[self.layer].copy_(ids)
+        if glue is not None and glue.on("gather"):
+            self._gather_fused(ids)                                    # T9b-2 #11+#9: 1 launch (+ids, +fp32 scales)
+        else:
+            if o.counters:
+                self._record_ids(ids)
+            self._gather(ids)
+            for p in PROJS:                                            # e8m0 -> fp32, one op per projection
+                b.convert_scales(p, o.staging[(p, "scale")])
+        self._act(x)                                                   # model.py:187, once for w1 and w3
+        if glue is not None and glue.on("swiglu_routed"):
+            b.gemm("w1", o.staging[("w1", "weight")], 1)                          # model.py:845
+            b.gemm("w3", o.staging[("w3", "weight")], 1)                          # model.py:846
+            self._swiglu_fused(w)                                                 # T9b-2 #2+#9: 1 launch
+        else:
+            gate = b.gemm("w1", o.staging[("w1", "weight")], 1)[:, 0].float()    # model.py:845
+            up = b.gemm("w3", o.staging[("w3", "weight")], 1)[:, 0].float()      # model.py:846
+            self._swiglu(gate, up, w, x.dtype)
+        out = b.gemm("w2", o.staging[("w2", "weight")], 2)[:, 0]                 # [k, DIM] bf16
+        return self._combine(out, x).view(shape)
+
+    # sub-steps (bench/glue_census.py tags each as a region; `ref` runs exactly the T9a-1 ops in the T9a-1 order)
+    def _record_ids(self, ids: torch.Tensor) -> None:
+        self.owner.ids_step[self.layer].copy_(ids)
+
+    def _gather(self, ids: torch.Tensor) -> None:
+        from runtime.static_kernels import gather_rows
+
+        o = self.owner
         for key, tab in self.ptabs.items():                            # the same gather as StaticMoE
             gather_rows(tab, ids, o.staging[key], o.row_bytes[key])
-        for p in PROJS:                                                # e8m0 -> fp32, one op per projection
-            b.convert_scales(p, o.staging[(p, "scale")])
-        q, s = R.act_quant(x, R.fp8_block_size, R.scale_fmt, R.scale_dtype)       # model.py:187, once for w1 and w3
+
+    def _gather_fused(self, ids: torch.Tensor) -> None:
+        self.owner.glue.gather(self, ids)
+
+    def _act(self, x: torch.Tensor) -> None:
+        o, b, R = self.owner, self.owner.dg, self.owner.R
+        if o.glue is not None and o.glue.on("dg_act"):
+            o.glue.dg_act(x)                                                      # T9b-2 #9: straight into row 0
+            return
+        q, s = R.act_quant(x, R.fp8_block_size, R.scale_fmt, R.scale_dtype)       # model.py:187
         b.load_act(1, q, s)
-        gate = b.gemm("w1", o.staging[("w1", "weight")], 1)[:, 0].float()        # model.py:845
-        up = b.gemm("w3", o.staging[("w3", "weight")], 1)[:, 0].float()          # model.py:846
+
+    def _swiglu(self, gate: torch.Tensor, up: torch.Tensor, w: torch.Tensor, dtype) -> None:
+        b, R = self.owner.dg, self.owner.R
         lim = b.swiglu_limit
         if lim > 0:                                                               # model.py:847-849
             up = torch.clamp(up, min=-lim, max=lim)
             gate = torch.clamp(gate, max=lim)
         h = F.silu(gate) * up                                                     # model.py:850
         h = w.view(-1, 1) * h                                                     # model.py:852 (weights [1,1] each)
-        h = h.to(x.dtype)                                                         # model.py:853 x.to(dtype)
+        h = h.to(dtype)                                                           # model.py:853 x.to(dtype)
         q2, s2 = R.act_quant(h, R.fp8_block_size, R.scale_fmt, R.scale_dtype)     # model.py:187 inside w2
         b.load_act(2, q2, s2)
-        out = b.gemm("w2", o.staging[("w2", "weight")], 2)[:, 0]                 # [k, DIM] bf16
+
+    def _swiglu_fused(self, w: torch.Tensor) -> None:
+        self.owner.glue.routed_swiglu(w)
+
+    def _combine(self, out: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        o, moe, b = self.owner, self.moe, self.owner.dg
+        glue = o.glue
+        if glue is not None and glue.on("moe_combine"):
+            sh = self._shared(x)                                                  # model.py:905
+            return glue.combine(out, sh, x)                                       # T9b-2 #8: 1 launch
         y = torch.zeros_like(x, dtype=torch.float32)                              # model.py:895
         for j in range(b.k):                                                      # slot order = ascending id
             y += out[j]                                                           # model.py:902 (fp32 += bf16)
-        y += moe.shared_experts(x)                                                # model.py:905
-        return y.type_as(x).view(shape)                                           # model.py:906
+        y += self._shared(x)                                                      # model.py:905
+        return y.type_as(x)                                                       # model.py:906
+
+    def _shared(self, x: torch.Tensor) -> torch.Tensor:
+        glue = self.owner.glue
+        if glue is not None and glue.on("swiglu_shared"):
+            return glue.shared_expert(self.moe.shared_experts, x)                 # T9b-2 #2 (shared)
+        return self.moe.shared_experts(x)

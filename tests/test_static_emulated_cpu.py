@@ -130,7 +130,7 @@ KERNELS = dict(act_quant=act_quant, fp4_act_quant=fp4_act_quant, fp8_gemm=fp8_ge
 
 def _fake_static_kernels(registry):
     mod = types.ModuleType("runtime.static_kernels")
-    mod.calls = {"gather": 0, "marker": 0}
+    mod.calls = {"gather": 0, "marker": 0, "gather_tables": 0}
 
     def gather_rows(ptab, ids, dst, row_bytes):
         flat = dst.view(torch.uint8).view(ids.numel(), row_bytes)
@@ -138,11 +138,30 @@ def _fake_static_kernels(registry):
             flat[j].copy_(registry[int(ptab[e])])
         mod.calls["gather"] += 1
 
+    def gather_tables(ptab6, ids, dtab, dsts, row_w, row_s, scale_f32, ids_out=None):
+        """T9b-2's one-launch gather (runtime/static_kernels.py t9b2_gather_tables), emulated through the registry:
+        weight rows as bytes; scale rows as bytes or decoded e8m0 -> fp32; ids into ids_out."""
+        assert [int(a) for a in dtab.tolist()] == [t.data_ptr() for t in dsts] and ptab6.shape[0] == 6
+        k = ids.numel()
+        for p in range(3):
+            flat = dsts[p].view(torch.uint8).view(k, row_w)
+            for j, e in enumerate(ids.tolist()):
+                flat[j].copy_(registry[int(ptab6[p, e])])
+            for j, e in enumerate(ids.tolist()):
+                src = registry[int(ptab6[3 + p, e])]
+                if scale_f32:
+                    dsts[3 + p].view(k, row_s)[j].copy_(src.view(torch.float8_e8m0fnu).float())
+                else:
+                    dsts[3 + p].view(torch.uint8).view(k, row_s)[j].copy_(src)
+        if ids_out is not None:
+            ids_out.copy_(ids)
+        mod.calls["gather_tables"] += 1
+
     def step_marker(ctr):
         ctr += 1
         mod.calls["marker"] += 1
 
-    mod.gather_rows, mod.step_marker = gather_rows, step_marker
+    mod.gather_rows, mod.gather_tables, mod.step_marker = gather_rows, gather_tables, step_marker
     return mod
 
 

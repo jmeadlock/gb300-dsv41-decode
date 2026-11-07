@@ -14,8 +14,9 @@ Standalone: no vllm import anywhere (charter decision 3). The reference `model.p
 | `refmodel.py` | imports the reference modules; `cpu_stubs=True` (Mac tests only) stands in for tilelang/PIL; Python < 3.10 compiles them with `from __future__ import annotations` (the file is untouched) |
 | `generate.py` | T5 driver: `Generator(model, tokenizer_dir)` -- `encode`/`decode` (checkpoint `encoding.py` chat mode + `tokenizer.json`), `prefill`/`step` (generate.py's call pattern), `greedy` -> one parity JSONL record (fp32 log-softmax top-20), NVTX `decode_step`, `arm_profile` (cudaProfilerApi window), `set_determinism`; T8 `mode="eager"|"static"|"graph"`, `marker=True` |
 | `static_step.py` | T8: `StaticStep(model, pool, max_pos=)` -- the fixed-shape 1-row decode step (design table 2.1 #1-#15 row by row in its docstring), `forward_static(parity)` eager, `capture()` g_even/g_odd, `replay(pos)` |
-| `static_kernels.py` | T8 Triton kernels (GPU only): the spike's pointer-table gather `t8_gather_rows`, the per-step `t8_step_marker` |
+| `static_kernels.py` | T8 Triton kernels (GPU only): the spike's pointer-table gather `t8_gather_rows`, the per-step `t8_step_marker`; T9b-2's one-launch six-table gather `t9b2_gather_tables` |
 | `dg_moe.py` | T9a-1: `DGMaskedMoE` (`--moe-impl dg-masked`): the static MoE's routed GEMMs as 3 DeepGEMM masked grouped GEMMs over the same staging; `import_deep_gemm` (no vllm import); exact e8m0 → fp32 |
+| `fused_glue.py` | T9b-2 round 1 (`--glue-impl fused`): Triton kernels for the zero/low-risk glue clusters (gather, DG act, SwiGLU+act_quant, MoE combine, mHC post, o-path RoPE+QDQ, q RoPE in the GEMV store), table-driven act_quant/silu, build-time self-check, per-cluster switches; torch mirrors on CPU |
 | `gemv_mxfp8.py` | T9b-1: Triton MXFP8 GEMV `mxfp8_gemv(xq, xs, w, s, out)` for the fp8 Linears at <= 8 rows (`--fp8-impl gemv`); exact e8m0 pair scale; per-(N,K,M) tuning cache; `gemv_torch` = the same algorithm in torch (CPU) |
 | `patches.py` | flag-gated monkeypatches: `kv_numerics_pg61` (model.py:761), `static_moe` (model.py:891-906, design #14), `fp8_linear_gemv` (model.py:196-205, design #16) |
 
@@ -383,4 +384,80 @@ and `--fp8-impl`, and keep `DSV41_GEMV_CACHE` the same so both processes use the
 
 **Glue census (Mac, CPU):** `.venv/bin/python bench/glue_census.py` -- every torch op a 1-row decode step dispatches on
 a real-structure synthetic model (40 layers, real ratios/sources/Engram), by layer type and code region, for the
-eager reference, T8 and T9a-1+T9b-1 paths (`scratch/glue-census.json`); the numbers behind `docs/GLUE-AUDIT.md`.
+eager reference, T8, T9a-1+T9b-1 and T9b-2 fused-glue paths (`scratch/glue-census.json`); the numbers behind
+`docs/GLUE-AUDIT.md`. With both static-dg-gemv paths it prints launches removed per cluster vs the audit.
+
+## T9b-2 round 1: the zero/low-risk glue clusters as fused kernels (`--glue-impl fused`, `fused_glue.py`)
+
+Spec: `docs/HANDOFF-T9B2-GLUE-R1.md`; cluster numbers from `docs/GLUE-AUDIT.md`. `glue_impl="fused"` replaces, per
+layer, the glue between the GEMMs with one Triton launch each, bit-identical to `glue_impl="ref"` (the default: the
+static path above, unchanged) with the same moe/fp8 impls:
+
+| cluster (`describe()` name) | audit | replaces | applies to |
+|---|---|---|---|
+| `gather` | #11 + #9 | 6 x `t8_gather_rows` (+ dg: 3 x e8m0->fp32 `convert_scales`, the `ids_step` copy) -> `t9b2_gather_tables` | both moe impls |
+| `dg_act` | #9 | act_quant(x) + `load_act(1)` copies -> act_quant straight into row 0 of every DeepGEMM group | dg-masked |
+| `swiglu_routed` | #2 + #9 | `.float` x2, clamps, silu, `*`, `* weights`, `.to(bf16)`, act_quant, `load_act(2)` | dg-masked |
+| `swiglu_shared` | #2 | the shared expert's SwiGLU + bf16 + w2's act_quant (w1/w3/w2 keep their GEMM path) | fp8 shared experts |
+| `moe_combine` | #8 | `zeros_like`, k x `+=`, `+= shared`, `type_as` | dg-masked |
+| `hc_post` | #7 | `Block.hc_post` | always |
+| `o_rope_qdq` | #10 | inverse RoPE + act_quant QDQ on the attention output (in place) | always |
+| `q_rope_epilogue` | #13 | q RoPE moved into the wq_b GEMV's store (`gemv_mxfp8.linear_fp8_rope`; split-K: in the reduce) | fp8 gemv |
+| `concat_free` | #16 | not done in round 1 (window ring per layer vs compressed caches/topk shared per group) | -- |
+
+How it stays exact: the act_quant scale code is read from a 65,536-row table the reference act_quant produced for
+every bf16 amax; silu is read from a table of torch's own `F.silu` over every bf16 value (+ the limit); the rest are
+the reference's fp32 ops in the reference's order (`enable_fp_fusion=False`; the RoPE helpers are explicit
+`mul.rn`/`fma.rn`). Where torch's order depends on how the device compiled it -- the complex multiply's FMA form,
+the 4-term `torch.sum` in `hc_post` -- the build-time self-check (`FusedGlue.calibrate`, eager, before any capture)
+picks the form that matches torch on random and cancellation-crafted data, then verifies every enabled cluster
+end to end against its reference ops at the model's shapes. A cluster that matches no form or fails a check is
+**off** (reason in `st.glue.describe()`, recorded in the first-light report as `fused_glue`) and runs today's ops;
+nothing is approximated. `DSV41_GLUE_DISABLE=gather,hc_post` forces clusters off (bisecting a mismatch).
+
+Flags: `StaticStep(..., glue_impl="fused")` / `Generator(..., glue_impl=...)` / `first_light.py --glue-impl fused`
+(threaded like `--moe-impl`/`--fp8-impl`). With `--parity-levels` one extra static-eager run with glue `ref` and the
+same moe/fp8 impls gives the gated row **"fused glue vs ref glue (same moe/fp8 impl)"** (level G); the drift
+reference stays pure T8. Census receipt (Mac, real structure): static-dg-gemv 6,725 -> 4,645 launches/step, 2,080
+removed; each implemented cluster removes exactly the audit's count (#16's 76 deferred).
+
+**Mac:** `tests/test_fused_glue_cpu.py` -- the torch mirrors vs the unfused op sequences (clamp edges incl. the bf16
+neighbours of the limit, e8m0 boundaries, every finite bf16 value through act_quant/QDQ, an exact fp32 fma vs
+Fraction arithmetic, the three RoPE forms and hc orders distinguishable); the real kernel bodies of all six
+fused_glue kernels and the GEMV/reduce RoPE epilogue through `tests/triton_shim.py` == the mirrors bit for bit
+(`FG_SHIM_MODULE=<mutated copy>` for sensitivity checks); fused == ref StaticStep logits on both mini checkpoints for
+all four moe/fp8 pairs with the same GEMV routing counts; `DSV41_GLUE_DISABLE`; the self-check switching broken
+clusters off; Generator / first_light / census plumbing. The gather kernel's address loads are GPU-only (emulated).
+
+**Box, GPU test** (kernels vs reference at real shapes, the RoPE forms / hc order that match on the device printed;
+one-launch gather vs 6 gathers on real pointer tables; mini/mini4 x ref/ref and dg-masked/gemv: every applicable
+cluster on, fused == ref static-eager over prefill + 10 steps both parities, no host sync, graph == static / replay
+x2 / fills-on / relaunch; informative step cells):
+
+    docker run --rm --device nvidia.com/gpu=GPU-1c1855c8-dd10-0247-583e-3c3880ddbf55 --ipc=host --ulimit memlock=-1:-1 \
+      -v "$W":/work -w /work -e CUBLAS_WORKSPACE_CONFIG=:4096:8 \
+      -v "$HOME/dsv41/w0/jit-cache/tilelang":/root/.tilelang -v "$HOME/dsv41/w0/jit-cache/triton":/root/.triton \
+      -v "$HOME/dsv41/w0/jit-cache/nv":/root/.nv \
+      -v "$HOME/dsv41/w0/jit-cache/dg":/root/.deep_gemm -e DG_JIT_CACHE_DIR=/root/.deep_gemm \
+      --entrypoint python3 vllm/vllm-openai:v0.31.0 tests/gpu/test_fused_glue_gpu.py
+
+**Box, first light** (gates: row G 8/8, L1/L2 8/8, output byte-identical to the T9b-1 run, step cell <= 30 ms; same
+flags as T9b-1's `docs/first-light-gemv-20261106.json` plus `--glue-impl fused`, same tuned GEMV configs -- copy
+them to scratch first, the cache file is written back: `cp docs/gemv-tune-gb300-20261106.json scratch/gemv-tune.json`):
+
+    docker run --rm --device nvidia.com/gpu=GPU-1c1855c8-dd10-0247-583e-3c3880ddbf55 \
+      --ipc=host --ulimit memlock=-1:-1 --cap-add IPC_LOCK \
+      -v "$W":/work -w /work -v "$W/w0":/work/w0 \
+      -v /models/DeepSeek-V4.1-Flash-1017-1bae0e1088993b9b82de08f59de5be5a34e42170:/ref:ro \
+      -v "$HOME/dsv41/w0/jit-cache/tilelang":/root/.tilelang -v "$HOME/dsv41/w0/jit-cache/triton":/root/.triton \
+      -v "$HOME/dsv41/w0/jit-cache/nv":/root/.nv \
+      -v "$HOME/dsv41/w0/jit-cache/dg":/root/.deep_gemm -e DG_JIT_CACHE_DIR=/root/.deep_gemm \
+      -e CUBLAS_WORKSPACE_CONFIG=:4096:8 -e DSV41_GEMV_CACHE=/work/scratch/gemv-tune.json \
+      --entrypoint python3 vllm/vllm-openai:v0.31.0 \
+      bench/first_light.py --model-dir /ref --hot-per-layer 295 --mode graph --moe-impl dg-masked --fp8-impl gemv \
+        --glue-impl fused --parity-levels --max-pos 4095 --fixture w0/results/phase1/parity-A.jsonl \
+        --out scratch/first-light-fused.jsonl --max-new 256 --reps 2 --step-cell 512 --no-fill-uninit \
+        --json docs/first-light-fused-<date>.json
+    cmp scratch/first-light-fused.jsonl w0/results/first-light-cand-gemv.jsonl && echo BYTE-IDENTICAL
+
+Then check `fused_glue.clusters` in the report: any cluster "off" is named with its reason (it ran today's ops).

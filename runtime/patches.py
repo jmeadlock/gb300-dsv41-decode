@@ -168,3 +168,30 @@ def fp8_linear_gemv(enable: bool = True) -> None:
 def fp8_linear_gemv_enabled() -> bool:
     ref = sys.modules.get("model")
     return ref is not None and getattr(ref.linear, "__t9b_fp8_gemv__", False)
+
+
+# ------------------------------------------------------------------------------------------------ T9b-2 helpers
+def count_gemv_routed(weight, x) -> None:
+    """Record one routed GEMV call (N, K, rows) the way the `linear` wrapper does (fused-glue call sites that run the
+    GEMV themselves: runtime/fused_glue.py q_proj, fp8_linear_prequant)."""
+    N, K = weight.shape
+    key = (N, K, x.numel() // K)
+    _GEMV_STATS["routed"][key] = _GEMV_STATS["routed"].get(key, 0) + 1
+
+
+def fp8_linear_prequant(xq, s, weight):
+    """`linear(x, weight)`'s fp8 branch (model.py:196-205) for an activation that is ALREADY quantized (xq fp8 [..., K],
+    s e8m0 [..., K/32] = what `act_quant(x, 32, "ue8m0")` returns): the same routing decision the installed `linear`
+    would make for x (T9b-1 GEMV inside fp8_gemv_scope when eligible, else the reference `fp8_gemm`), without the
+    act_quant. Used by T9b-2's fused SwiGLU, whose kernel writes the w2 input's act_quant itself."""
+    ref = sys.modules.get("model") or __import__("model")
+    if _GEMV_SCOPE["depth"] and fp8_linear_gemv_enabled():
+        why = fp8_gemv_reason(ref, xq, weight)
+        if why is None:
+            from runtime.gemv_mxfp8 import linear_fp8
+
+            count_gemv_routed(weight, xq)
+            return linear_fp8(xq, s, weight, weight.scale)
+        key = (why, weight.size(0), weight.size(1))
+        _GEMV_STATS["fallthrough"][key] = _GEMV_STATS["fallthrough"].get(key, 0) + 1
+    return ref.fp8_gemm(xq, s, weight, weight.scale, ref.scale_dtype, block_size=ref.fp8_block_size)
