@@ -112,3 +112,82 @@ prefill (about 3.9 s) plus ~100 live steps, and a two-graph recapture when the o
 JIT cache). ESTIMATE from the 11/08 s3 receipts (the 16 fast runs of the headline cell total 84 s; the parity runs are
 a little slower per step): **about 3–4 minutes per headline run**. The pass's measured `wall_s` is in the block —
 replace this estimate with it after the first box run. `--no-steady-state` removes the cost.
+
+## Decode wall columns (LOOP-OVERRUN)
+
+The headline and steady-state columns above are GPU numbers (CUDA events around the live steps). What a client waits for
+is the host wall of the whole request, and the loop used to waste part of it: it learned that a sequence had finished up to
+15 steps late (poll every 8 steps, lookahead 1) and issued 9-15 predicated no-op graph replays (~18.6 ms each) after every
+sequence — 97 steps ≈ 1.8 s over the 8 fixture prompts (`docs/headline-20261108-main-ss.json`: per prompt
+`steps_issued − steps` = 9, 12, 14, 12, 10, 12, 15, 13), a fixed 0.2–0.3 s per request. Three new numbers per cell, per
+prompt and pooled, next to (never replacing) the GPU columns:
+
+| column | JSON key (under `decode_wall`) | definition |
+|---|---|---|
+| decode wall ms/token **excluding overrun** | `ms_per_token_wall_excl_overrun` | Σ(decode wall − GPU ms of the overrun steps) ÷ Σ decoded tokens |
+| decode wall ms/token **including overrun** | `ms_per_token_wall_incl_overrun` | Σ decode wall ÷ Σ decoded tokens (what a client waits for) |
+| GPU ms/token | `ms_per_token_gpu` | Σ live step ms (CUDA events) ÷ Σ decoded tokens |
+| host gap | `host_gap_ms_per_token` | excl − gpu (gate: ≤ 0.1) |
+| overrun steps | `overrun_steps` (per rep), `overrun_steps_total`, `overrun_steps_max` | `steps_issued − steps` (gate: ≤ 2 on every prompt) |
+| overrun cost | `overrun_ms_total`, `overrun_ms_per_token` | GPU ms of the no-op steps (their own events); incl − excl |
+| TTFT | `ttft_ms` (stats), headline `ttft_ms_mean` | = `prefill_ms`: reference prefill + draft-ring seeding + first draft, synced (≈ 3.5–4.2 s; the M4 work) |
+| poll cost | `poll` (`polls`, `drains`, `enqueue_us`, `wait_ms`, `poll_every`, `lookahead`, `tail_sync`), `poll_enqueue_us_per_poll` | host µs spent in the status copy + event record; ms blocked waiting |
+
+"Decoded tokens" = tokens after the prefill's first one (`len(token_ids) − 1`), pooled total ÷ total over the fast reps
+like `ms_per_token`. Where it lives: `prompts.<tag>.decode_wall` (+ `overrun_steps`), `headline.<cell>.decode_wall`,
+`headline.decode_wall` (the headline cell), `headline.ttft_ms_mean`, `steady_state.decode_wall`,
+`steady_state.prompts.<tag>.decode_wall`; the per-run keys from `DSparkLoop.generate` are `overrun_steps`, `overrun_ms`,
+`decode_wall_ms_excl_overrun`, `poll`. All additive; every existing key is unchanged. The printed summary has one
+`decode wall ms/token: excl overrun … | incl overrun … | GPU … | host gap … | overrun steps … | TTFT … | poll …` line per
+cell (and for the steady-state pass) and two new table columns (`ovr` = max overrun steps over the reps, `ms/tok wall` =
+incl overrun).
+
+What changed in the loop (`runtime/dspark_loop.py`, `PollPlan`): a poll after **every** step, one poll in flight
+(`--poll-every 1 --lookahead 1`): the host learns of `done` after issuing one more step, so an EOS ending costs exactly
+1 no-op step; plus a **tail sync** for max_new endings (a step emits ≤ 6 tokens, so from the last observed `n_out` the host
+knows when a length ending is possible and waits for the exact state before issuing the step that could be a no-op):
+length endings cost 0. The old schedule is `--poll-every 8 --no-tail-sync`. Arithmetic is untouched (the device already
+turns every post-`done` step into a no-op; the host only picks when to stop issuing).
+
+Expected (CPU simulation, real `LoopBuffers`, the fixture's own accept plans; `tests/test_dspark_loop_cpu.py
+test_fixture_overrun_reproduced_and_fixed`): the old schedule reproduces the measured `steps_issued` of all 8 prompts
+exactly (97 overrun steps); the new default gives **4** (one each for code, json, tool, story — the EOS endings; 0 for
+prose, math, shell, long — the max_new endings), ≈ 1.7 s less wall over the fixture, ≈ 0.2 s per short request. A
+length-ending sequence pays 1–4 tail drains (each a short GPU bubble: the host waits for the poll, wakes, launches).
+
+Not measured here (no CUDA on the Mac): the host cost of a poll and the per-step bubble of waiting synchronously. The loop
+records the first per run (`poll.enqueue_us`, `poll.wait_ms`); `--poll-probe` measures both without a model (below).
+The trade it sizes: lookahead 0 (wait for the poll right after each step) would give overrun 0 for EOS endings too, at a
+GPU bubble per step; it pays only while `steps × bubble < one step (18.6 ms)` — the probe reports the break-even step
+count. A larger `--lookahead` (2) buys host-jitter slack at the price of overrun 2 (still within the gate).
+
+### Box commands (orchestrator; after the merge, on main)
+
+```
+# 1. poll probe (no model, ~1 min; GPU lease as every box script): host µs per poll, per-step bubble per schedule
+$D bench/headline.py --poll-probe --probe-step-ms 18.6 --json scratch/poll-probe.json
+
+# 2. headline on main, new default schedule (also the steady-state pass), then the old schedule once for the A/B
+$D bench/headline.py $H --json scratch/headline-lo-new.json
+$D bench/headline.py $H --poll-every 8 --no-tail-sync --no-steady-state --json scratch/headline-lo-old.json
+```
+with `$D` = the docker-run prefix of `docs/A2-2-BOX-PLAN.md` (`bench/box/lease.sh` first; `--entrypoint python3 vllm/vllm-openai:v0.31.0`) and `$H` = the 11/08 main headline line (`--model-dir /ref --moe-impl dg-inplace --fp8-impl gemv --glue-impl fused
+--attn-impl flashmla --fp32-impl fixed --moe-rowmatch on --spare-slots 16 --residency-drain 64 --max-new 256`). Gate (read
+from `headline.decode_wall.gate` and the summary line): tokens/streams and accept plans byte-identical between the two runs
+(`streams` 8/8, `replay_ok` 8, and per prompt `tokens_sha256` / `accepts` equal old vs new); `overrun_steps_max` ≤ 2 (expected
+1); `host_gap_ms_per_token` ≤ 0.1; GPU ms/step unchanged within noise (the poll copy sits outside the step events; the residency
+manager counts the no-op steps in `host_steps`, so with ~90 fewer of them per pass `policy_steps_before` and the drain
+cadence shift slightly — cite them from the block, expect streams identical and ms/step within the usual cold-share noise).
+
+## Device-side early stop: feasibility (not implemented)
+
+A CUDA conditional graph node (IF, CUDA ≥ 12.4; the box has CUDA 13) around the step body, its condition set by a
+one-thread kernel from `status[1]` (`done`), would make a post-`done` replay cost ~µs instead of ~18 ms. Byte-identical for
+the stream (a no-op step already changes nothing that reaches it, `test_async_poll_streams_identical_…`). Not done because
+(1) `torch.cuda.CUDAGraph` has no conditional-node capture that we know of (unverified on torch 2.13): it needs the driver
+API through cuda-python and our own capture of the body graph (the current captures share torch's graph pool), (2) none of our
+captured kernels (DeepGEMM, FlashMLA, TileLang, Triton, PDL edges) has been tried inside a conditional body — the driver
+restricts what a conditional body may contain — so it needs a box probe first, (3) what it buys beyond the host poll is
+≤ 1 step (≈ 18 ms) per request. Revisit only if the probe shows the host cannot keep lookahead 1 without GPU bubbles
+(then lookahead would have to grow and the conditional node would pay for the extra overrun). Details: the
+`runtime/dspark_loop.py` module docstring.
