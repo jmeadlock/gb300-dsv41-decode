@@ -1,0 +1,730 @@
+{
+ "date": "2026-11-07 23:54:28 UTC",
+ "argv": [
+  "--ckpt",
+  "/ref",
+  "--layer",
+  "0",
+  "--out",
+  "scratch/dg-mega-spike.json"
+ ],
+ "errors": [],
+ "checks": {
+  "api": {
+   "dg_mega_names": [
+    "bf16_mega_gate",
+    "bf16_mega_moe",
+    "fp8_fp4_mega_moe",
+    "get_bf16_mega_gate_config",
+    "get_block_m_for_mega_moe",
+    "get_symm_buffer_for_mega_moe",
+    "mega",
+    "mega_mhc",
+    "transform_weights_for_mega_moe"
+   ],
+   "fp8_fp4_mega_moe": {
+    "signature": "(y: torch.Tensor, l1_weights: Tuple[torch.Tensor, torch.Tensor], l2_weights: Tuple[torch.Tensor, torch.Tensor], sym_buffer: deep_gemm.mega.SymmBuffer, shared_l1_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, shared_l2_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None, recipe: Tuple[int, int, int] = (1, 1, 32), activation: str = 'swiglu', activation_clamp: Optional[float] = None, fast_math: bool = True, activation_alpha: float = 1.0, activation_beta: float = 0.0)",
+    "doc": ""
+   },
+   "bf16_mega_moe": {
+    "signature": "(y: torch.Tensor, l1_weights: torch.Tensor, l2_weights: torch.Tensor, sym_buffer: deep_gemm.mega.SymmBuffer, shared_l1_weights: Optional[torch.Tensor] = None, shared_l2_weights: Optional[torch.Tensor] = None, cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None, activation: str = 'swiglu', activation_clamp: Optional[float] = None, fast_math: bool = True, activation_alpha: float = 1.0, activation_beta: float = 0.0)",
+    "doc": ""
+   },
+   "SymmBuffer": {
+    "signature": "(group: torch.distributed.distributed_c10d.ProcessGroup, num_experts: int, num_max_tokens_per_rank: int, num_topk: int, hidden: int, intermediate_hidden: int, num_shared_experts: int = 0, mma_type: str = 'fp8xfp4', activation: str = 'swiglu', base: Optional[ForwardRef('SymmBuffer')] = None)",
+    "doc": ""
+   },
+   "get_symm_buffer_for_mega_moe": {
+    "signature": "(group: torch.distributed.distributed_c10d.ProcessGroup, num_experts: int, num_max_tokens_per_rank: int, num_topk: int, hidden: int, intermediate_hidden: int, num_shared_experts: int = 0, use_fp8_dispatch: Optional[bool] = None, mma_type: str = 'fp8xfp4', activation: str = 'swiglu') -> deep_gemm.mega.SymmBuffer",
+    "doc": ""
+   },
+   "transform_weights_for_mega_moe": {
+    "signature": "(l1_weights: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], l2_weights: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], activation: str = 'swiglu') -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]",
+    "doc": ""
+   },
+   "get_block_m_for_mega_moe": {
+    "signature": null,
+    "doc": "get_block_m_for_mega_moe(arg0: typing.SupportsInt | typing.SupportsIndex, arg1: typing.SupportsInt | typing.SupportsIndex, arg2: typing.SupportsInt | typing.SupportsIndex, arg3: typing.SupportsInt | typing.SupportsIndex, arg4: typing.SupportsInt | typing.SupportsIndex, arg5: str) -> int\n"
+   },
+   "bf16_mega_gate": {
+    "signature": null,
+    "doc": "bf16_mega_gate(x: torch.Tensor, weight: torch.Tensor, num_topk: typing.SupportsInt | typing.SupportsIndex, use_shared_as_routed: bool, num_shared_experts: typing.SupportsInt | typing.SupportsIndex, routed_scaling_factor: typing.SupportsFloat | typing.SupportsIndex, ep_rank: typing.SupportsInt | typing.SupportsIndex, scoring_func: str = 'identity', mask: torch.Tensor | None = None, bias: torch.Tensor | None = None, image_bias: torch.Tensor | None = None, image_token_mask: torch.Tensor | None = None, fix_routing_mask: torch.Tensor | None = None, to_physical_map: torch.Tensor | None = None, logical_count: torch.Tensor | None = None, unmapped_topk_idx: torch.Tensor | None = None, force_random: torch.Tensor | None = None, out: tuple[torch.Tensor, torch.Tensor] | None = None) -> tuple[torch.Tensor, torch.Tensor]\n"
+   },
+   "mega_mhc": {
+    "signature": null,
+    "doc": "mega_mhc(x: torch.Tensor, residual: torch.Tensor, shifted_prev_mix: torch.Tensor | None, post_mix: torch.Tensor, comb_res_mix: torch.Tensor, fn: torch.Tensor, mix_scales: torch.Tensor, mix_bases: torch.Tensor, hc_mult: typing.SupportsInt | typing.SupportsIndex, hc_norm_eps: typing.SupportsFloat | typing.SupportsIndex, hc_pre_eps: typing.SupportsFloat | typing.SupportsIndex, hc_post_scale: typing.SupportsFloat | typing.SupportsIndex, sinkhorn_eps: typing.SupportsFloat | typing.SupportsIndex, num_sinkhorn_iters: typing.SupportsInt | typing.SupportsIndex, rmsnorm_weight: torch.Tensor, rmsnorm_eps: typing.SupportsFloat | typing.SupportsIndex, rmsnorm_scale: typing.SupportsFloat | typing.SupportsIndex, new_residual: torch.Tensor, new_prev_mix: torch.Tensor | None, new_post_mix: torch.Tensor, new_comb_res_mix: torch.Tensor, y_bf16: torch.Tensor | None = None, y_fp8: torch.Tensor | None = None, y_gemm_sf: torch.Tensor | None = None, y_routed_sf: torch.Tensor | None = None, y_shared_sf: torch.Tensor | None = None, shared_sf_block_m: typing.SupportsInt | typing.SupportsIndex = 0) -> None\n"
+   },
+   "_C_mega_names": [
+    "bf16_mega_gate",
+    "bf16_mega_moe",
+    "fp8_fp4_mega_moe",
+    "get_bf16_mega_gate_config",
+    "get_block_m_for_mega_moe",
+    "get_symm_buffer_size_for_mega_moe",
+    "get_token_alignment_for_mega_moe",
+    "mega_mhc"
+   ],
+   "_C.fp8_fp4_mega_moe": "fp8_fp4_mega_moe(arg0: torch.Tensor, arg1: tuple[torch.Tensor, torch.Tensor], arg2: tuple[torch.Tensor, torch.Tensor], arg3: tuple[torch.Tensor, torch.Tensor] | None, arg4: tuple[torch.Tensor, torch.Tensor] | None, arg5: torch.Tensor | None, arg6: torch.Tensor, arg7: collections.abc.Sequence[typing.SupportsInt | typing.SupportsIndex], arg8: typing.SupportsInt | typing.SupportsIndex, arg9: typing.SupportsInt | typing.SupportsIndex, arg10: typing.SupportsInt | typing.SupportsIndex, arg11: typing.SupportsInt | typing.SupportsIndex, arg12: tuple[typing.SupportsInt | typing.SupportsIndex, typing.SupportsInt | typing.SupportsIndex, typing.SupportsInt | typing.SupportsIndex], arg13: str, arg14: typing.SupportsFloat | typing.SupportsIndex | None, arg15: bool, arg16: typing.SupportsFloat | typing.SupportsIndex, arg17: typing.SupportsFloat | typing.SupportsIndex) -> None\n",
+   "_C.get_symm_buffer_size_for_mega_moe": "get_symm_buffer_size_for_mega_moe(arg0: typing.SupportsInt | typing.SupportsIndex, arg1: typing.SupportsInt | typing.SupportsIndex, arg2: typing.SupportsInt | typing.SupportsIndex, arg3: typing.SupportsInt | typing.SupportsIndex, arg4: typing.SupportsInt | typing.SupportsIndex, arg5: typing.SupportsInt | typing.SupportsIndex, arg6: str, arg7: str, arg8: typing.SupportsInt | typing.SupportsIndex) -> tuple[int, collections.abc.Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]]\n",
+   "_C.get_token_alignment_for_mega_moe": "get_token_alignment_for_mega_moe() -> int\n",
+   "_C.get_block_m_for_mega_moe": "get_block_m_for_mega_moe(arg0: typing.SupportsInt | typing.SupportsIndex, arg1: typing.SupportsInt | typing.SupportsIndex, arg2: typing.SupportsInt | typing.SupportsIndex, arg3: typing.SupportsInt | typing.SupportsIndex, arg4: typing.SupportsInt | typing.SupportsIndex, arg5: str) -> int\n",
+   "token_alignment": 1920,
+   "get_block_m(36,)": "TypeError('get_block_m_for_mega_moe(): incompatible function arguments. The following argument types are supported:\\n    1. (arg0: typing.SupportsInt | typing.SupportsIndex, arg1: typing.SupportsInt | typing.SupportsIndex, arg2: typing.SupportsInt | typing.SupportsIndex, arg3: typing.SupportsInt | t",
+   "get_block_m(6, 6)": "TypeError('get_block_m_for_mega_moe(): incompatible function arguments. The following argument types are supported:\\n    1. (arg0: typing.SupportsInt | typing.SupportsIndex, arg1: typing.SupportsInt | typing.SupportsIndex, arg2: typing.SupportsInt | typing.SupportsIndex, arg3: typing.SupportsInt | t",
+   "get_block_m(36, 384)": "TypeError('get_block_m_for_mega_moe(): incompatible function arguments. The following argument types are supported:\\n    1. (arg0: typing.SupportsInt | typing.SupportsIndex, arg1: typing.SupportsInt | typing.SupportsIndex, arg2: typing.SupportsInt | typing.SupportsIndex, arg3: typing.SupportsInt | t",
+   "get_block_m(6, 311, 6)": "TypeError('get_block_m_for_mega_moe(): incompatible function arguments. The following argument types are supported:\\n    1. (arg0: typing.SupportsInt | typing.SupportsIndex, arg1: typing.SupportsInt | typing.SupportsIndex, arg2: typing.SupportsInt | typing.SupportsIndex, arg3: typing.SupportsInt | t",
+   "get_block_m(1,)": "TypeError('get_block_m_for_mega_moe(): incompatible function arguments. The following argument types are supported:\\n    1. (arg0: typing.SupportsInt | typing.SupportsIndex, arg1: typing.SupportsInt | typing.SupportsIndex, arg2: typing.SupportsInt | typing.SupportsIndex, arg3: typing.SupportsInt | t",
+   "get_block_m(6,)": "TypeError('get_block_m_for_mega_moe(): incompatible function arguments. The following argument types are supported:\\n    1. (arg0: typing.SupportsInt | typing.SupportsIndex, arg1: typing.SupportsInt | typing.SupportsIndex, arg2: typing.SupportsInt | typing.SupportsIndex, arg3: typing.SupportsInt | t",
+   "mega_py_sha256_installed": "3a221b6d380fd0c94e9be1bd45c2e79554f48a25a68f88a78bca1b0fd98bac38",
+   "mega_py_sha256_vendored": "3a221b6d380fd0c94e9be1bd45c2e79554f48a25a68f88a78bca1b0fd98bac38",
+   "mega_py_same_as_vendored": true,
+   "source:_interleave_weights": "def _interleave_weights(t: torch.Tensor, gran: int = 8) -> torch.Tensor:\n    # [gate: 0..7, up: 0..7, gate: 8..15, up: 8..15, ...] instead of [gate | up]\n    # Unsqueeze for 2D\n    assert t.dim() in (2, 3)\n    squeeze_group_dim = t.dim() == 2\n    if squeeze_group_dim:\n        t = t.unsqueeze(0)\n\n    # Transpose\n    g, n, *rest = t.shape\n    half = n // 2\n    gate = t[:, :half].reshape(g, half // gran, gran, *rest)\n    up = t[:, half:].reshape(g, half // gran, gran, *rest)\n    result = torch.empty_like(t).copy_(torch.stack([gate, up], dim=2).reshape(g, n, *rest))\n    return result.squeeze(0) if squeeze_group_dim else result\n",
+   "source:_transpose_sf_for_utccp": "def _transpose_sf_for_utccp(sf: torch.Tensor) -> torch.Tensor:\n    # Unsqueeze for 2D\n    assert sf.dtype == torch.int and sf.dim() in (2, 3)\n    squeeze_group_dim = sf.dim() == 2\n    if squeeze_group_dim:\n        sf = sf.unsqueeze(0)\n\n    # Transpose\n    num_groups, mn, packed_sf_k = sf.shape\n    assert mn % 128 == 0\n    result = (sf.reshape(num_groups, -1, 4, 32, packed_sf_k)\n                .transpose(2, 3)\n                .reshape(num_groups, mn, packed_sf_k))\n    result = torch.empty_like(sf).copy_(result)\n    return result.squeeze(0) if squeeze_group_dim else result\n",
+   "source:fp8_fp4_mega_moe": "def fp8_fp4_mega_moe(y: torch.Tensor,\n                     l1_weights: Tuple[torch.Tensor, torch.Tensor],\n                     l2_weights: Tuple[torch.Tensor, torch.Tensor],\n                     sym_buffer: SymmBuffer,\n                     shared_l1_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,\n                     shared_l2_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,\n                     cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,\n                     recipe: Tuple[int, int, int] = (1, 1, 32),\n                     activation: str = 'swiglu',\n                     activation_clamp: Optional[float] = None,\n                     fast_math: bool = True,\n                     activation_alpha: float = 1.0,\n                     activation_beta: float = 0.0):\n    _validate_activation(activation)\n    _C.fp8_fp4_mega_moe(\n        y,\n        l1_weights, l2_weights,\n        shared_l1_weights, shared_l2_weights,\n        cumulative_local_expert_recv_stats,\n        sym_buffer.buffer,\n        sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),\n        sym_buffer.num_max_tokens_per_rank,\n        sym_buffer.num_experts, sym_buffer.num_topk,\n        recipe,\n        activation, activation_clamp,\n        fast_math,\n        activation_alpha, activation_beta\n    )\n",
+   "source:SymmBuffer": "class SymmBuffer:\n    def __init__(self, group: dist.ProcessGroup,\n                 num_experts: int,\n                 num_max_tokens_per_rank: int, num_topk: int,\n                 hidden: int, intermediate_hidden: int,\n                 num_shared_experts: int = 0,\n                 mma_type: str = 'fp8xfp4',\n                 activation: str = 'swiglu',\n                 base: Optional['SymmBuffer'] = None):\n        # Align token count\n        num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())\n\n        # Init\n        _validate_activation(activation)\n        self.group = group\n        self.num_experts = num_experts\n        self.num_max_tokens_per_rank = num_max_tokens_per_rank\n        self.num_topk = num_topk\n        self.hidden = hidden\n        self.intermediate_hidden = intermediate_hidden\n        self.num_shared_experts = num_shared_experts\n        self.mma_type = mma_type\n        self.activation = activation\n\n        # Allocate or reuse a symmetric buffer\n        num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_mega_moe(\n            group.size(), num_experts,\n            num_max_tokens_per_rank, num_topk,\n            hidden, intermediate_hidden,\n            mma_type, activation,\n            num_shared_experts\n        )\n        if base is None:\n            allocator = torch if group.size() == 1 else symm_mem\n            self.buffer = allocator.empty(num_bytes, dtype=torch.int8, device='cuda')\n            self.handle = (\n                types.SimpleNamespace(buffer_ptrs=[self.buffer.data_ptr()])\n                if group.size() == 1\n                else symm_mem.rendezvous(self.buffer, group=group)\n            )\n            self.buffer.zero_()\n            self.group.barrier()\n            torch.cuda.synchronize()\n        else:\n            assert base.buffer is not None and base.handle is not None and base.group is group, \\\n                'Cannot reuse an invalid symmetric buffer'\n            assert num_bytes <= base.buffer.nbytes, \\\n                (f'The reused Mega MoE config requires {num_bytes} bytes, '\n                 f'but the symmetric buffer only has {base.buffer.nbytes} bytes')\n            self.buffer = base.buffer\n            self.handle = base.handle\n\n        # Create input buffer views\n        (self.x, self.x_sf,\n         self.topk_idx, self.topk_weights,\n         self.shared_l1_acts, self.shared_l1_acts_sf,\n         self.shared_l2_acts, self.shared_l2_acts_sf,\n         self.l1_acts, self."
+  },
+  "layouts": {
+   "l2_is_pool_w2": true,
+   "l1_copy_bytes": 3668705280,
+   "library_transform_mn": {
+    "l1_equal": true,
+    "sf1_equal_values": true,
+    "sf1_strides_lib_ours": [
+     [
+      184320,
+      1,
+      4608
+     ],
+     [
+      184320,
+      1,
+      4608
+     ]
+    ],
+    "l2_equal": true,
+    "sf2_equal_values": true
+   },
+   "library_transform_k": {
+    "l1_equal": true,
+    "sf1_equal_values": true,
+    "sf1_strides_lib_ours": [
+     [
+      184320,
+      40,
+      1
+     ],
+     [
+      184320,
+      40,
+      1
+     ]
+    ],
+    "l2_equal": true,
+    "sf2_equal_values": true
+   },
+   "mem_get_info_GiB": [
+    238.81,
+    249.81
+   ]
+  },
+  "symm_buffer": {
+   "shared0": {
+    "num_bytes": 302528384,
+    "x": {
+     "shape": [
+      1920,
+      5120
+     ],
+     "dtype": "torch.float8_e4m3fn",
+     "stride": [
+      5120,
+      1
+     ]
+    },
+    "x_sf": {
+     "shape": [
+      1920,
+      40
+     ],
+     "dtype": "torch.int32",
+     "stride": [
+      40,
+      1
+     ]
+    },
+    "topk_idx": {
+     "shape": [
+      1920,
+      6
+     ],
+     "dtype": "torch.int64",
+     "stride": [
+      6,
+      1
+     ]
+    },
+    "topk_weights": {
+     "shape": [
+      1920,
+      6
+     ],
+     "dtype": "torch.float32",
+     "stride": [
+      6,
+      1
+     ]
+    },
+    "shared_l1_acts": {
+     "shape": [
+      1920,
+      5120
+     ],
+     "dtype": "torch.float8_e4m3fn",
+     "stride": [
+      5120,
+      1
+     ]
+    },
+    "shared_l1_acts_sf": null,
+    "shared_l2_acts": null,
+    "shared_l2_acts_sf": null,
+    "l1_acts": {
+     "shape": [
+      13440,
+      5120
+     ],
+     "dtype": "torch.float8_e4m3fn",
+     "stride": [
+      5120,
+      1
+     ]
+    },
+    "l1_acts_sf": {
+     "shape": [
+      215040,
+      40
+     ],
+     "dtype": "torch.int32",
+     "stride": [
+      1,
+      215040
+     ]
+    },
+    "l2_acts": {
+     "shape": [
+      13440,
+      2304
+     ],
+     "dtype": "torch.float8_e4m3fn",
+     "stride": [
+      2304,
+      1
+     ]
+    },
+    "l2_acts_sf": {
+     "shape": [
+      215040,
+      18
+     ],
+     "dtype": "torch.int32",
+     "stride": [
+      1,
+      215040
+     ]
+    },
+    "num_experts": 311,
+    "num_max_tokens_per_rank": 1920,
+    "num_topk": 6,
+    "hidden": 5120,
+    "intermediate_hidden": 2304,
+    "num_shared_experts": 0
+   },
+   "shared1": {
+    "num_bytes": 333739904,
+    "x": {
+     "shape": [
+      1920,
+      5120
+     ],
+     "dtype": "torch.float8_e4m3fn",
+     "stride": [
+      5120,
+      1
+     ]
+    },
+    "x_sf": {
+     "shape": [
+      1920,
+      40
+     ],
+     "dtype": "torch.int32",
+     "stride": [
+      40,
+      1
+     ]
+    },
+    "topk_idx": {
+     "shape": [
+      1920,
+      6
+     ],
+     "dtype": "torch.int64",
+     "stride": [
+      6,
+      1
+     ]
+    },
+    "topk_weights": {
+     "shape": [
+      1920,
+      6
+     ],
+     "dtype": "torch.float32",
+     "stride": [
+      6,
+      1
+     ]
+    },
+    "shared_l1_acts": {
+     "shape": [
+      1920,
+      5120
+     ],
+     "dtype": "torch.float8_e4m3fn",
+     "stride": [
+      5120,
+      1
+     ]
+    },
+    "shared_l1_acts_sf": {
+     "shape": [
+      30720,
+      40
+     ],
+     "dtype": "torch.int32",
+     "stride": [
+      1,
+      30720
+     ]
+    },
+    "shared_l2_acts": {
+     "shape": [
+      1920,
+      2304
+     ],
+     "dtype": "torch.float8_e4m3fn",
+     "stride": [
+      2304,
+      1
+     ]
+    },
+    "shared_l2_acts_sf": {
+     "shape": [
+      30720,
+      18
+     ],
+     "dtype": "torch.int32",
+     "stride": [
+      1,
+      30720
+     ]
+    },
+    "l1_acts": {
+     "shape": [
+      13440,
+      5120
+     ],
+     "dtype": "torch.float8_e4m3fn",
+     "stride": [
+      5120,
+      1
+     ]
+    },
+    "l1_acts_sf": {
+     "shape": [
+      215040,
+      40
+     ],
+     "dtype": "torch.int32",
+     "stride": [
+      1,
+      215040
+     ]
+    },
+    "l2_acts": {
+     "shape": [
+      13440,
+      2304
+     ],
+     "dtype": "torch.float8_e4m3fn",
+     "stride": [
+      2304,
+      1
+     ]
+    },
+    "l2_acts_sf": {
+     "shape": [
+      215040,
+      18
+     ],
+     "dtype": "torch.int32",
+     "stride": [
+      1,
+      215040
+     ]
+    },
+    "num_experts": 311,
+    "num_max_tokens_per_rank": 1920,
+    "num_topk": 6,
+    "hidden": 5120,
+    "intermediate_hidden": 2304,
+    "num_shared_experts": 1
+   }
+  },
+  "first_call": {
+   "shared0_mn": {
+    "ok": true,
+    "finite": true,
+    "max_abs": 340.0,
+    "padding_rows_zero": null
+   },
+   "shared0_k": {
+    "ok": false,
+    "error": "RuntimeError: Assertion error (/workspace/.deps/deepgemm-src/csrc/apis/../jit_kernels/impls/../heuristics/../../utils/layout.hpp:119): sf.stride(-3) == sf.stride(-1) * sf.size(-1)"
+   },
+   "shared1_mn": {
+    "ok": true,
+    "finite": true,
+    "max_abs": 340.0,
+    "padding_rows_zero": null
+   },
+   "shared1_k": {
+    "ok": false,
+    "error": "RuntimeError: Assertion error (/workspace/.deps/deepgemm-src/csrc/apis/../jit_kernels/impls/../heuristics/../../utils/layout.hpp:119): sf.stride(-3) == sf.stride(-1) * sf.size(-1)"
+   },
+   "working": {
+    "shared0": "mn",
+    "shared1": "mn"
+   }
+  },
+  "numerics": {
+   "R6": {
+    "mega_vs_inplace_routed": {
+     "equal": false,
+     "mismatch_frac": 0.8223958611488342,
+     "max_ulp": 32869,
+     "n_ulp_gt1": 17294,
+     "max_abs": 8.5,
+     "n": 30720,
+     "nonfinite": 0
+    },
+    "replay_equal": true
+   },
+   "oracle": {
+    "inplace_routed_plus_oracle_shared": {
+     "equal": false,
+     "mismatch_frac": 0.015494792722165585,
+     "max_ulp": 104,
+     "n_ulp_gt1": 133,
+     "max_abs": 1.0,
+     "n": 30720,
+     "nonfinite": 0,
+     "rel_l2": 0.001668479773879048
+    },
+    "mega_gemv_mode": {
+     "equal": false,
+     "mismatch_frac": 0.7354817986488342,
+     "max_ulp": 32820,
+     "n_ulp_gt1": 13284,
+     "max_abs": 8.5,
+     "n": 30720,
+     "nonfinite": 0,
+     "rel_l2": 0.013357026880999955
+    },
+    "mega_routed_vs_oracle_routed": {
+     "equal": false,
+     "mismatch_frac": 0.8222982287406921,
+     "max_ulp": 32869,
+     "n_ulp_gt1": 17294,
+     "max_abs": 8.5,
+     "n": 30720,
+     "nonfinite": 0,
+     "rel_l2": 0.022494974367862772
+    },
+    "inplace_routed_vs_oracle_routed": {
+     "equal": false,
+     "mismatch_frac": 0.02089843899011612,
+     "max_ulp": 31464,
+     "n_ulp_gt1": 210,
+     "max_abs": 0.5,
+     "n": 30720,
+     "nonfinite": 0,
+     "rel_l2": 0.0017287302562631309
+    },
+    "mega_fused_shared": {
+     "equal": false,
+     "mismatch_frac": 0.9986328482627869,
+     "max_ulp": 34164,
+     "n_ulp_gt1": 30580,
+     "max_abs": 622.0,
+     "n": 30720,
+     "nonfinite": 0,
+     "rel_l2": 0.7819301997922168
+    }
+   },
+   "fused_vs_gemv_mode": {
+    "equal": false,
+    "mismatch_frac": 0.9984049797058105,
+    "max_ulp": 34164,
+    "n_ulp_gt1": 30588,
+    "max_abs": 626.0,
+    "n": 30720,
+    "nonfinite": 0
+   },
+   "gate_oracle_distance_le_today": {
+    "mega_gemv_mode": false,
+    "mega_fused_shared": false
+   },
+   "R1": {
+    "mega_vs_inplace_routed": {
+     "equal": false,
+     "mismatch_frac": 0.7933593988418579,
+     "max_ulp": 32267,
+     "n_ulp_gt1": 2507,
+     "max_abs": 1.25,
+     "n": 5120,
+     "nonfinite": 0
+    },
+    "replay_equal": true
+   },
+   "row_invariant_R1_vs_R6": [
+    true,
+    true,
+    true,
+    true,
+    true,
+    true
+   ]
+  },
+  "speed": {
+   "mega_shared0_R1_hot": {
+    "us": 52.77,
+    "how": "graph"
+   },
+   "mega_shared0_R1_route_stage_act_call": {
+    "us": 66.96,
+    "how": "graph"
+   },
+   "mega_shared0_R6_hot": {
+    "us": 92.17,
+    "how": "graph"
+   },
+   "mega_shared0_R6_route_stage_act_call": {
+    "us": 274.6,
+    "how": "graph"
+   },
+   "mega_shared1_R1_hot": {
+    "us": 56.58,
+    "how": "graph"
+   },
+   "mega_shared1_R1_route_stage_act_call": {
+    "us": 71.52,
+    "how": "graph"
+   },
+   "mega_shared1_R6_hot": {
+    "us": 95.03,
+    "how": "graph"
+   },
+   "mega_shared1_R6_route_stage_act_call": {
+    "us": 278.59,
+    "how": "graph"
+   },
+   "inplace_3gemm_contiguous16_R1": {
+    "us": 98.37,
+    "how": "graph"
+   },
+   "inplace_3gemm_contiguous16_R6": {
+    "us": 115.54,
+    "how": "graph"
+   },
+   "note": "mega_*_hot = the launch alone; *_route_stage_act_call = routing ops + the staging launch (3 cold at R = 6) + x/x_sf writes + the launch. Today's S9+S10+S11 also has SwiGLU, combine, the shared GEMVs and the dedup/stage launches around the 3 GEMMs: compare against the step anatomy, not against inplace_3gemm alone."
+  }
+ },
+ "labels": {
+  "activations": "synthetic",
+  "router_weights": "synthetic",
+  "expert_weights": "real layer bytes"
+ },
+ "deep_gemm": {
+  "file": "/usr/local/lib/python3.12/dist-packages/vllm/third_party/deep_gemm/__init__.py",
+  "version": "2.8.0"
+ },
+ "pool": {
+  "layer": 0,
+  "H": 295,
+  "S": 16,
+  "G": 311,
+  "experts": [
+   27,
+   48,
+   53,
+   55,
+   103,
+   107,
+   108,
+   116,
+   131,
+   139,
+   148,
+   150,
+   166,
+   191,
+   209,
+   222,
+   251,
+   266,
+   293,
+   315,
+   369,
+   375
+  ],
+  "cold_used": [
+   103,
+   139,
+   315
+  ],
+  "routing": [
+   [
+    27,
+    107,
+    116,
+    150,
+    293,
+    369
+   ],
+   [
+    27,
+    139,
+    166,
+    191,
+    293,
+    375
+   ],
+   [
+    55,
+    191,
+    209,
+    251,
+    266,
+    375
+   ],
+   [
+    48,
+    103,
+    209,
+    222,
+    315,
+    369
+   ],
+   [
+    53,
+    55,
+    131,
+    148,
+    222,
+    369
+   ],
+   [
+    27,
+    107,
+    108,
+    166,
+    191,
+    266
+   ]
+  ],
+  "load_s": 2.8,
+  "shared_dtypes": {
+   "w1": [
+    "torch.float8_e4m3fn",
+    [
+     72,
+     160
+    ]
+   ],
+   "w3": [
+    "torch.float8_e4m3fn",
+    [
+     72,
+     160
+    ]
+   ],
+   "w2": [
+    "torch.float8_e4m3fn",
+    [
+     160,
+     72
+    ]
+   ]
+  }
+ },
+ "hbm_real_model": {
+  "l1_copy_B": 146748211200,
+  "sf_copy_B": 13757644800,
+  "total_B": 160505856000,
+  "l1_copy_GiB": 136.67,
+  "sf_copy_GiB": 12.813,
+  "total_GiB": 149.483,
+  "n_layers": 40
+ },
+ "mem_get_info_GiB": [
+  238.11,
+  249.81
+ ],
+ "verdict": {
+  "abi_call_works": {
+   "shared0": "mn",
+   "shared1": "mn"
+  },
+  "l2_in_place": true,
+  "l1_in_place": false,
+  "mega_vs_inplace_routed_R6": {
+   "equal": false,
+   "mismatch_frac": 0.8223958611488342,
+   "max_ulp": 32869,
+   "n_ulp_gt1": 17294,
+   "max_abs": 8.5,
+   "n": 30720,
+   "nonfinite": 0
+  },
+  "row_invariant": [
+   true,
+   true,
+   true,
+   true,
+   true,
+   true
+  ],
+  "replay_equal": [
+   true,
+   true
+  ],
+  "oracle_gate": {
+   "mega_gemv_mode": false,
+   "mega_fused_shared": false
+  },
+  "us": {
+   "mega_shared0_R1_hot": 52.77,
+   "mega_shared0_R1_route_stage_act_call": 66.96,
+   "mega_shared0_R6_hot": 92.17,
+   "mega_shared0_R6_route_stage_act_call": 274.6,
+   "mega_shared1_R1_hot": 56.58,
+   "mega_shared1_R1_route_stage_act_call": 71.52,
+   "mega_shared1_R6_hot": 95.03,
+   "mega_shared1_R6_route_stage_act_call": 278.59,
+   "inplace_3gemm_contiguous16_R1": 98.37,
+   "inplace_3gemm_contiguous16_R6": 115.54
+  },
+  "errors": []
+ }
+}

@@ -1,0 +1,1256 @@
+{
+ "schema": "gap-ledger/1",
+ "date": "2026-11-07 19:40:30 CST",
+ "columns": {
+  "ours.headline": {
+   "condition": {
+    "value": "fixture 8 prompts, own greedy stream (DSpark k=5 loop), max_new 256, impls {'moe': 'dg-inplace', 'fp8': 'gemv', 'glue': 'fused', 'attn': 'flashmla', 'fp32': 'fixed', 'moe_rowmatch': 'on'}, map hot-v26ar-seed-295.json, spare 16, residency off",
+    "kind": "measured",
+    "how": "docs/headline-20261107j.json argv ['--model-dir', '/ref', '--moe-impl', 'dg-inplace', '--fp8-impl', 'gemv', '--glue-impl', 'fused', '--attn-impl', 'flashmla', '--fp32-impl', 'fixed', '--moe-rowmatch', 'on', '--spare-slots', '16', '--max-new', '256', '--json', 'scratch/headline-20261107j.json']"
+   },
+   "verify_gpu_ms": {
+    "value": 17.39962537656121,
+    "kind": "measured",
+    "how": "docs/headline-20261107j.json headline.two_graphs.ms_verify_graph.mean: CUDA events per step (live steps >= 32, 558 steps pooled over prompts x reps)"
+   },
+   "draft_gpu_ms": {
+    "value": 2.904417146918594,
+    "kind": "measured",
+    "how": "docs/headline-20261107j.json headline.two_graphs.ms_draft_graph.mean: CUDA events per step (live steps >= 32, 558 steps pooled over prompts x reps)"
+   },
+   "step_gpu_ms": {
+    "value": 20.30404253587073,
+    "kind": "measured",
+    "how": "docs/headline-20261107j.json headline.two_graphs.ms_per_step.mean: CUDA events per step (live steps >= 32, 558 steps pooled over prompts x reps)"
+   },
+   "tokens_per_step": {
+    "value": 2.903225806451613,
+    "kind": "measured",
+    "how": "docs/headline-20261107j.json two_graphs.tokens_per_step (sum tokens / sum steps, live steps >= 32, 558 steps pooled over prompts x reps)"
+   },
+   "gpu_ms_per_token": {
+    "value": 6.993614651244363,
+    "kind": "measured",
+    "how": "docs/headline-20261107j.json two_graphs.ms_per_token = sum step ms / sum tokens (live steps >= 32, 558 steps pooled over prompts x reps); all steps: 6.660"
+   },
+   "wall_ms_per_token_e2e": {
+    "value": 29.048076839083034,
+    "kind": "derived",
+    "how": "sum wall_ms_fast / sum (tokens x fast reps) = 85575.634 / 2946.000 = 29.048 ms (host wall incl. the reference prefill, 3857 ms/prompt)"
+   },
+   "wall_ms_per_token_decode": {
+    "value": 8.102959929380594,
+    "kind": "derived",
+    "how": "sum (wall_ms_fast - prefill_ms) / sum (tokens x fast reps) = 23871.320 / 2946.000 = 8.103 ms (host wall of the decode loop, all steps incl. the async poll)"
+   },
+   "residency": {
+    "value": "seed map docs/maps/hot-v26ar-seed-295.json: 295 hot experts/layer in HBM, 89 cold in pinned Grace, cold read over C2C (UVA) into 16 spare slots/layer by the staging kernel; residency manager off",
+    "kind": "measured",
+    "how": "docs/headline-20261107j.json boot.map, --spare-slots"
+   },
+   "fam.moe.routed.gemm": {
+    "value": null,
+    "kind": "not measured",
+    "how": "the loop's graphs cannot be profiled per kernel (nsys stalls on graph replay); attribution: ours.matched (verify) / ours.loop_static (verify + draft)"
+   },
+   "fam.moe.swiglu": {
+    "value": null,
+    "kind": "not measured",
+    "how": "the loop's graphs cannot be profiled per kernel (nsys stalls on graph replay); attribution: ours.matched (verify) / ours.loop_static (verify + draft)"
+   },
+   "fam.moe.routed.combine": {
+    "value": null,
+    "kind": "not measured",
+    "how": "the loop's graphs cannot be profiled per kernel (nsys stalls on graph replay); attribution: ours.matched (verify) / ours.loop_static (verify + draft)"
+   },
+   "fam.moe.routed.staging": {
+    "value": null,
+    "kind": "not measured",
+    "how": "the loop's graphs cannot be profiled per kernel (nsys stalls on graph replay); attribution: ours.matched (verify) / ours.loop_static (verify + draft)"
+   },
+   "fam.moe.shared": {
+    "value": null,
+    "kind": "not measured",
+    "how": "the loop's graphs cannot be profiled per kernel (nsys stalls on graph replay); attribution: ours.matched (verify) / ours.loop_static (verify + draft)"
+   },
+   "fam.moe.router": {
+    "value": null,
+    "kind": "not measured",
+    "how": "the loop's graphs cannot be profiled per kernel (nsys stalls on graph replay); attribution: ours.matched (verify) / ours.loop_static (verify + draft)"
+   },
+   "fam.dense.proj": {
+    "value": null,
+    "kind": "not measured",
+    "how": "the loop's graphs cannot be profiled per kernel (nsys stalls on graph replay); attribution: ours.matched (verify) / ours.loop_static (verify + draft)"
+   },
+   "fam.dense.head": {
+    "value": null,
+    "kind": "not measured",
+    "how": "the loop's graphs cannot be profiled per kernel (nsys stalls on graph replay); attribution: ours.matched (verify) / ours.loop_static (verify + draft)"
+   },
+   "fam.fp8_gemv.unsplit": {
+    "value": null,
+    "kind": "not measured",
+    "how": "the loop's graphs cannot be profiled per kernel (nsys stalls on graph replay); attribution: ours.matched (verify) / ours.loop_static (verify + draft)"
+   },
+   "fam.attn": {
+    "value": null,
+    "kind": "not measured",
+    "how": "the loop's graphs cannot be profiled per kernel (nsys stalls on graph replay); attribution: ours.matched (verify) / ours.loop_static (verify + draft)"
+   },
+   "fam.glue.norm_mhc": {
+    "value": null,
+    "kind": "not measured",
+    "how": "the loop's graphs cannot be profiled per kernel (nsys stalls on graph replay); attribution: ours.matched (verify) / ours.loop_static (verify + draft)"
+   },
+   "fam.glue.engram": {
+    "value": null,
+    "kind": "not measured",
+    "how": "the loop's graphs cannot be profiled per kernel (nsys stalls on graph replay); attribution: ours.matched (verify) / ours.loop_static (verify + draft)"
+   },
+   "fam.glue.indexer": {
+    "value": null,
+    "kind": "not measured",
+    "how": "the loop's graphs cannot be profiled per kernel (nsys stalls on graph replay); attribution: ours.matched (verify) / ours.loop_static (verify + draft)"
+   },
+   "fam.topk.unsplit": {
+    "value": null,
+    "kind": "not measured",
+    "how": "the loop's graphs cannot be profiled per kernel (nsys stalls on graph replay); attribution: ours.matched (verify) / ours.loop_static (verify + draft)"
+   },
+   "fam.glue.compressor": {
+    "value": null,
+    "kind": "not measured",
+    "how": "the loop's graphs cannot be profiled per kernel (nsys stalls on graph replay); attribution: ours.matched (verify) / ours.loop_static (verify + draft)"
+   },
+   "fam.glue.quant_rope": {
+    "value": null,
+    "kind": "not measured",
+    "how": "the loop's graphs cannot be profiled per kernel (nsys stalls on graph replay); attribution: ours.matched (verify) / ours.loop_static (verify + draft)"
+   },
+   "fam.glue.torch": {
+    "value": null,
+    "kind": "not measured",
+    "how": "the loop's graphs cannot be profiled per kernel (nsys stalls on graph replay); attribution: ours.matched (verify) / ours.loop_static (verify + draft)"
+   },
+   "fam.residency": {
+    "value": null,
+    "kind": "not measured",
+    "how": "the loop's graphs cannot be profiled per kernel (nsys stalls on graph replay); attribution: ours.matched (verify) / ours.loop_static (verify + draft)"
+   },
+   "fam.instrument": {
+    "value": null,
+    "kind": "not measured",
+    "how": "the loop's graphs cannot be profiled per kernel (nsys stalls on graph replay); attribution: ours.matched (verify) / ours.loop_static (verify + draft)"
+   },
+   "fam.unmapped": {
+    "value": null,
+    "kind": "not measured",
+    "how": "the loop's graphs cannot be profiled per kernel (nsys stalls on graph replay); attribution: ours.matched (verify) / ours.loop_static (verify + draft)"
+   },
+   "expert_bytes_hbm": {
+    "value": null,
+    "kind": "not measured",
+    "how": "headline records the cold share, not per-step unique counts; see ours.matched"
+   },
+   "expert_bytes_c2c": {
+    "value": null,
+    "kind": "not measured",
+    "how": "headline records the cold share, not per-step unique counts; see ours.matched"
+   },
+   "sum_kernels": {
+    "value": null,
+    "kind": "not measured",
+    "how": "ours.headline: this source does not record it"
+   },
+   "unattributed": {
+    "value": null,
+    "kind": "not measured",
+    "how": "ours.headline: this source does not record it"
+   },
+   "busy_ms": {
+    "value": null,
+    "kind": "not measured",
+    "how": "ours.headline: this source does not record it"
+   },
+   "overlap": {
+    "value": null,
+    "kind": "not measured",
+    "how": "ours.headline: this source does not record it"
+   },
+   "concurrency": {
+    "value": null,
+    "kind": "not measured",
+    "how": "ours.headline: this source does not record it"
+   },
+   "cold_share": {
+    "value": null,
+    "kind": "not measured",
+    "how": "ours.headline: this source does not record it"
+   },
+   "cold_experts_per_layer_call": {
+    "value": null,
+    "kind": "not measured",
+    "how": "ours.headline: this source does not record it"
+   },
+   "cold_exposed_ms": {
+    "value": null,
+    "kind": "not measured",
+    "how": "ours.headline: this source does not record it"
+   },
+   "graph_nodes": {
+    "value": null,
+    "kind": "not measured",
+    "how": "ours.headline: this source does not record it"
+   }
+  },
+  "ours.matched": {
+   "fam.moe.routed.gemm": {
+    "value": 4.448988734374978,
+    "kind": "static",
+    "how": "[static, diagnostic] scratch/gap-tf-anatomy.json: eager static-path kernel durations over 128 steps, mapped by step_anatomy.family_of (roles known); 120.0 launches/step"
+   },
+   "fam.moe.swiglu": {
+    "value": 0.2503432421875028,
+    "kind": "static",
+    "how": "[static, diagnostic] scratch/gap-tf-anatomy.json: eager static-path kernel durations over 128 steps, mapped by step_anatomy.family_of (roles known); 80.0 launches/step"
+   },
+   "fam.moe.routed.combine": {
+    "value": 0.15472324999999804,
+    "kind": "static",
+    "how": "[static, diagnostic] scratch/gap-tf-anatomy.json: eager static-path kernel durations over 128 steps, mapped by step_anatomy.family_of (roles known); 40.0 launches/step"
+   },
+   "fam.moe.routed.staging": {
+    "value": 4.645162749999954,
+    "kind": "static",
+    "how": "[static, diagnostic] scratch/gap-tf-anatomy.json: eager static-path kernel durations over 128 steps, mapped by step_anatomy.family_of (roles known); 80.0 launches/step"
+   },
+   "fam.moe.shared": {
+    "value": 0.8805432500000081,
+    "kind": "static",
+    "how": "[static, diagnostic] scratch/gap-tf-anatomy.json: eager static-path kernel durations over 128 steps, mapped by step_anatomy.family_of (roles known); 120.0 launches/step"
+   },
+   "fam.moe.router": {
+    "value": 0.8112100000000073,
+    "kind": "static",
+    "how": "[static, diagnostic] scratch/gap-tf-anatomy.json: eager static-path kernel durations over 128 steps, mapped by step_anatomy.family_of (roles known); 80.0 launches/step"
+   },
+   "fam.dense.proj": {
+    "value": 2.0085992421874246,
+    "kind": "static",
+    "how": "[static, diagnostic] scratch/gap-tf-anatomy.json: eager static-path kernel durations over 128 steps, mapped by step_anatomy.family_of (roles known); 180.0 launches/step"
+   },
+   "fam.dense.head": {
+    "value": 1.0175625000000001,
+    "kind": "static",
+    "how": "[static, diagnostic] scratch/gap-tf-anatomy.json: eager static-path kernel durations over 128 steps, mapped by step_anatomy.family_of (roles known); 1.0 launches/step"
+   },
+   "fam.fp8_gemv.unsplit": {
+    "value": 0.0,
+    "kind": "static",
+    "how": "[static, diagnostic] scratch/gap-tf-anatomy.json: eager static-path kernel durations over 128 steps, mapped by step_anatomy.family_of (roles known); no kernel of this family in the profile"
+   },
+   "fam.attn": {
+    "value": 0.4046027656250011,
+    "kind": "static",
+    "how": "[static, diagnostic] scratch/gap-tf-anatomy.json: eager static-path kernel durations over 128 steps, mapped by step_anatomy.family_of (roles known); 40.0 launches/step"
+   },
+   "fam.glue.norm_mhc": {
+    "value": 2.5010695156249847,
+    "kind": "static",
+    "how": "[static, diagnostic] scratch/gap-tf-anatomy.json: eager static-path kernel durations over 128 steps, mapped by step_anatomy.family_of (roles known); 471.0 launches/step"
+   },
+   "fam.glue.engram": {
+    "value": 0.015942750000000006,
+    "kind": "static",
+    "how": "[static, diagnostic] scratch/gap-tf-anatomy.json: eager static-path kernel durations over 128 steps, mapped by step_anatomy.family_of (roles known); 4.0 launches/step"
+   },
+   "fam.glue.indexer": {
+    "value": 0.2165379999999987,
+    "kind": "static",
+    "how": "[static, diagnostic] scratch/gap-tf-anatomy.json: eager static-path kernel durations over 128 steps, mapped by step_anatomy.family_of (roles known); 31.0 launches/step"
+   },
+   "fam.topk.unsplit": {
+    "value": 0.0,
+    "kind": "static",
+    "how": "[static, diagnostic] scratch/gap-tf-anatomy.json: eager static-path kernel durations over 128 steps, mapped by step_anatomy.family_of (roles known); no kernel of this family in the profile"
+   },
+   "fam.glue.compressor": {
+    "value": 0.28398723437499984,
+    "kind": "static",
+    "how": "[static, diagnostic] scratch/gap-tf-anatomy.json: eager static-path kernel durations over 128 steps, mapped by step_anatomy.family_of (roles known); 6.0 launches/step"
+   },
+   "fam.glue.quant_rope": {
+    "value": 0.23908975781249303,
+    "kind": "static",
+    "how": "[static, diagnostic] scratch/gap-tf-anatomy.json: eager static-path kernel durations over 128 steps, mapped by step_anatomy.family_of (roles known); 98.0 launches/step"
+   },
+   "fam.glue.torch": {
+    "value": 1.3751402421875143,
+    "kind": "static",
+    "how": "[static, diagnostic] scratch/gap-tf-anatomy.json: eager static-path kernel durations over 128 steps, mapped by step_anatomy.family_of (roles known); 626.5 launches/step"
+   },
+   "fam.residency": {
+    "value": 0.0,
+    "kind": "static",
+    "how": "[static, diagnostic] scratch/gap-tf-anatomy.json: eager static-path kernel durations over 128 steps, mapped by step_anatomy.family_of (roles known); no kernel of this family in the profile"
+   },
+   "fam.instrument": {
+    "value": 0.0,
+    "kind": "static",
+    "how": "[static, diagnostic] scratch/gap-tf-anatomy.json: eager static-path kernel durations over 128 steps, mapped by step_anatomy.family_of (roles known); no kernel of this family in the profile"
+   },
+   "fam.unmapped": {
+    "value": 0.0,
+    "kind": "static",
+    "how": "[static, diagnostic] scratch/gap-tf-anatomy.json: eager static-path kernel durations over 128 steps, mapped by step_anatomy.family_of (roles known); no kernel of this family in the profile"
+   },
+   "sum_kernels": {
+    "value": 19.253503234374865,
+    "kind": "static",
+    "how": "[static, diagnostic] scratch/gap-tf-anatomy.json: eager static-path kernel durations over 128 steps, mapped by step_anatomy.family_of (roles known); sum over families = 19.254 ms/step"
+   },
+   "busy_ms": {
+    "value": 19.253503234375,
+    "kind": "static",
+    "how": "[static, diagnostic] scratch/gap-tf-anatomy.json busy_ms_per_step (busy = union of kernel intervals; overlap = busy / step wall; concurrency = sum / busy); the eager wall is host-launch-bound, so overlap here is NOT the graph's"
+   },
+   "overlap": {
+    "value": 0.09628990742694805,
+    "kind": "static",
+    "how": "[static, diagnostic] scratch/gap-tf-anatomy.json overlap (busy = union of kernel intervals; overlap = busy / step wall; concurrency = sum / busy); the eager wall is host-launch-bound, so overlap here is NOT the graph's"
+   },
+   "concurrency": {
+    "value": 1.0,
+    "kind": "static",
+    "how": "[static, diagnostic] scratch/gap-tf-anatomy.json concurrency (busy = union of kernel intervals; overlap = busy / step wall; concurrency = sum / busy); the eager wall is host-launch-bound, so overlap here is NOT the graph's"
+   },
+   "memcpy": {
+    "value": {
+     "DtoD": {
+      "bytes_per_step": 3820316.25,
+      "ms_per_step": 0.043000500000000004,
+      "n_per_step": 35.8828125
+     }
+    },
+    "kind": "static",
+    "how": "[static, diagnostic] scratch/gap-tf-anatomy.json: CUPTI memcpy per step by kind (HtoD from registered Grace = copy-engine C2C)"
+   },
+   "unattributed": {
+    "value": null,
+    "kind": "not measured",
+    "how": "needs the graph-mode event cell for the same workload"
+   },
+   "condition": {
+    "value": null,
+    "kind": "not measured",
+    "how": "ours.matched: this source does not record it"
+   },
+   "residency": {
+    "value": null,
+    "kind": "not measured",
+    "how": "ours.matched: this source does not record it"
+   },
+   "verify_gpu_ms": {
+    "value": null,
+    "kind": "not measured",
+    "how": "ours.matched: this source does not record it"
+   },
+   "draft_gpu_ms": {
+    "value": null,
+    "kind": "not measured",
+    "how": "ours.matched: this source does not record it"
+   },
+   "step_gpu_ms": {
+    "value": null,
+    "kind": "not measured",
+    "how": "ours.matched: this source does not record it"
+   },
+   "tokens_per_step": {
+    "value": null,
+    "kind": "not measured",
+    "how": "ours.matched: this source does not record it"
+   },
+   "gpu_ms_per_token": {
+    "value": null,
+    "kind": "not measured",
+    "how": "ours.matched: this source does not record it"
+   },
+   "wall_ms_per_token_decode": {
+    "value": null,
+    "kind": "not measured",
+    "how": "ours.matched: this source does not record it"
+   },
+   "wall_ms_per_token_e2e": {
+    "value": null,
+    "kind": "not measured",
+    "how": "ours.matched: this source does not record it"
+   },
+   "expert_bytes_hbm": {
+    "value": null,
+    "kind": "not measured",
+    "how": "ours.matched: this source does not record it"
+   },
+   "expert_bytes_c2c": {
+    "value": null,
+    "kind": "not measured",
+    "how": "ours.matched: this source does not record it"
+   },
+   "cold_share": {
+    "value": null,
+    "kind": "not measured",
+    "how": "ours.matched: this source does not record it"
+   },
+   "cold_experts_per_layer_call": {
+    "value": null,
+    "kind": "not measured",
+    "how": "ours.matched: this source does not record it"
+   },
+   "cold_exposed_ms": {
+    "value": null,
+    "kind": "not measured",
+    "how": "ours.matched: this source does not record it"
+   },
+   "graph_nodes": {
+    "value": null,
+    "kind": "not measured",
+    "how": "ours.matched: this source does not record it"
+   }
+  },
+  "ours.loop_static": {},
+  "pg61.step_cell": {
+   "condition": {
+    "value": "STEP_PROMPT (66 prompt tokens), 512 greedy tokens x 3 reps, thinking off; not the fixture",
+    "kind": "measured",
+    "how": "w0/results/phase1/step-pg61.json: usage.prompt_tokens, max 512, w0/w0_drive.py STEP_PROMPT"
+   },
+   "step_gpu_ms": {
+    "value": 7.739602169981917,
+    "kind": "derived",
+    "how": "wall-clock, not GPU: sum decode_wall_s / sum (steps - 1) = 1000 x 4.280 / 553.000 = 7.740 ms over reps [0, 1, 2] (SSE arrivals / metrics drafts; per rep [7.746, 7.747, 7.724])"
+   },
+   "tokens_per_step": {
+    "value": 2.762589928057554,
+    "kind": "derived",
+    "how": "sum gen_tokens / sum steps = 1536.000 / 556.000 = 2.763"
+   },
+   "wall_ms_per_token_decode": {
+    "value": 2.79191128506197,
+    "kind": "derived",
+    "how": "sum decode_wall_s / sum (gen_tokens - 1) = 1000 x 4.280 / 1533.000 = 2.792 ms (the first chunk = the prefill's token)"
+   },
+   "wall_ms_per_token_e2e": {
+    "value": 2.8476562500000004,
+    "kind": "derived",
+    "how": "sum wall_s / sum gen_tokens = 1000 x 4.374 / 1536.000 = 2.848 ms (incl. TTFT + HTTP)"
+   },
+   "verify_gpu_ms": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61's /metrics have no verify/draft split; Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "draft_gpu_ms": {
+    "value": null,
+    "kind": "not measured",
+    "how": "as verify: Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "gpu_ms_per_token": {
+    "value": null,
+    "kind": "not measured",
+    "how": "no GPU timer on Pg61 (only SSE wall + /metrics)"
+   },
+   "residency": {
+    "value": "NOT all-HBM: Garner rowmap-mix-v1-h255 (255 hot/layer in GB300 HBM, 129 cold) with the cold experts COMPUTED on the RTX PRO 6000 by the peer-tier-v3 sidecar, not read over C2C (A2-RESIDENCY-DESIGN.md 0.2, w0/W0-RESULTS.md phase 2); confirm the map from the ds41 policy at the re-run. The two conditions cannot be equalised without changing one runtime; the ledger reports each side's cold work instead (bytes / exposure rows)",
+    "kind": "measured",
+    "how": "A2-RESIDENCY-DESIGN.md 0.2; w0/W0-RESULTS.md"
+   },
+   "fam.moe.routed.gemm": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.moe.swiglu": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.moe.routed.combine": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.moe.routed.staging": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.moe.shared": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.moe.router": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.dense.proj": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.dense.head": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.fp8_gemv.unsplit": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.attn": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.glue.norm_mhc": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.glue.engram": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.glue.indexer": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.topk.unsplit": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.glue.compressor": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.glue.quant_rope": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.glue.torch": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.residency": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.instrument": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.unmapped": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "sum_kernels": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "unattributed": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "busy_ms": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "overlap": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "concurrency": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "expert_bytes_hbm": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61's hot-expert reads are inside MegaMoE; no counter"
+   },
+   "expert_bytes_c2c": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 does not read cold experts over C2C (the RTX computes them)"
+   },
+   "graph_nodes": {
+    "value": null,
+    "kind": "not measured",
+    "how": "vLLM's captured graphs are not walkable from outside the engine"
+   },
+   "cold_share": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.step_cell: this source does not record it"
+   },
+   "cold_experts_per_layer_call": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.step_cell: this source does not record it"
+   },
+   "cold_exposed_ms": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.step_cell: this source does not record it"
+   }
+  },
+  "pg61.fixture": {
+   "condition": {
+    "value": "fixture 8 prompts (prose,code,math,json,shell,tool,long,story), prompt tokens [42, 47, 54, 38, 34, 49, 46, 31], 1476 emitted, greedy T=0, top-20 logprobs, non-streamed",
+    "kind": "measured",
+    "how": "w0/results/phase1/parity-A.jsonl"
+   },
+   "wall_ms_per_token_e2e": {
+    "value": 2.908536585365854,
+    "kind": "derived",
+    "how": "sum wall_s / sum n_tokens = 1000 x 4.293 / 1476.000 = 2.909 ms (non-streamed: incl. prefill, HTTP and top-20 logprob work; one request each)"
+   },
+   "step_gpu_ms": {
+    "value": null,
+    "kind": "not measured",
+    "how": "parity-A has no step count or arrival times -> the matched re-run (pg61-drive)"
+   },
+   "tokens_per_step": {
+    "value": null,
+    "kind": "not measured",
+    "how": "parity-A has no step count or arrival times -> the matched re-run (pg61-drive)"
+   },
+   "wall_ms_per_token_decode": {
+    "value": null,
+    "kind": "not measured",
+    "how": "parity-A has no step count or arrival times -> the matched re-run (pg61-drive)"
+   },
+   "residency": {
+    "value": "NOT all-HBM: Garner rowmap-mix-v1-h255 (255 hot/layer in GB300 HBM, 129 cold) with the cold experts COMPUTED on the RTX PRO 6000 by the peer-tier-v3 sidecar, not read over C2C (A2-RESIDENCY-DESIGN.md 0.2, w0/W0-RESULTS.md phase 2); confirm the map from the ds41 policy at the re-run. The two conditions cannot be equalised without changing one runtime; the ledger reports each side's cold work instead (bytes / exposure rows)",
+    "kind": "measured",
+    "how": "A2-RESIDENCY-DESIGN.md 0.2; w0/W0-RESULTS.md"
+   },
+   "fam.moe.routed.gemm": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.moe.swiglu": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.moe.routed.combine": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.moe.routed.staging": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.moe.shared": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.moe.router": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.dense.proj": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.dense.head": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.fp8_gemv.unsplit": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.attn": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.glue.norm_mhc": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.glue.engram": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.glue.indexer": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.topk.unsplit": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.glue.compressor": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.glue.quant_rope": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.glue.torch": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.residency": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.instrument": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "fam.unmapped": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "sum_kernels": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "unattributed": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "busy_ms": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "overlap": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "concurrency": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 cannot run under nsys/CUPTI: the engine stalls after 1-2 requests in the peer-tier-v3 spin (w0/W0-RESULTS.md phases 2 and 2b, both trace modes); reopen only with a non-CUPTI instrument (nsys --gpu-metrics-devices sampling) or a peer3-off arm, which is not Pg61"
+   },
+   "expert_bytes_hbm": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61's hot-expert reads are inside MegaMoE; no counter"
+   },
+   "expert_bytes_c2c": {
+    "value": null,
+    "kind": "not measured",
+    "how": "Pg61 does not read cold experts over C2C (the RTX computes them)"
+   },
+   "graph_nodes": {
+    "value": null,
+    "kind": "not measured",
+    "how": "vLLM's captured graphs are not walkable from outside the engine"
+   },
+   "verify_gpu_ms": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.fixture: this source does not record it"
+   },
+   "draft_gpu_ms": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.fixture: this source does not record it"
+   },
+   "gpu_ms_per_token": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.fixture: this source does not record it"
+   },
+   "cold_share": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.fixture: this source does not record it"
+   },
+   "cold_experts_per_layer_call": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.fixture: this source does not record it"
+   },
+   "cold_exposed_ms": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.fixture: this source does not record it"
+   }
+  },
+  "pg61.matched": {},
+  "pg61.sidecar": {
+   "cold_experts_per_layer_call": {
+    "value": 1.6,
+    "kind": "measured",
+    "how": "docs/data/peer3_stats.json by_T['6'].cold_exp_mean (distinct cold experts per 6-row layer-call, 14760 calls)"
+   },
+   "cold_exposed_ms": {
+    "value": 0.02,
+    "kind": "derived",
+    "how": "GB300's exposed wait for the RTX's cold-expert work per 6-row step = 0.5 us x 40 layers / 1000 = 0.020 ms (by_T['6'].gb_wait_us_mean; RTX busy 37.0 us per cold call runs concurrently)"
+   },
+   "condition": {
+    "value": "Pg61 sidecar stats, all requests in its window, by_T['6'] = the 6-row layer-calls; not the fixture",
+    "kind": "measured",
+    "how": "docs/data/peer3_stats.json"
+   },
+   "residency": {
+    "value": "NOT all-HBM: Garner rowmap-mix-v1-h255 (255 hot/layer in GB300 HBM, 129 cold) with the cold experts COMPUTED on the RTX PRO 6000 by the peer-tier-v3 sidecar, not read over C2C (A2-RESIDENCY-DESIGN.md 0.2, w0/W0-RESULTS.md phase 2); confirm the map from the ds41 policy at the re-run. The two conditions cannot be equalised without changing one runtime; the ledger reports each side's cold work instead (bytes / exposure rows)",
+    "kind": "measured",
+    "how": "A2-RESIDENCY-DESIGN.md 0.2"
+   },
+   "verify_gpu_ms": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.sidecar: this source does not record it"
+   },
+   "draft_gpu_ms": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.sidecar: this source does not record it"
+   },
+   "step_gpu_ms": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.sidecar: this source does not record it"
+   },
+   "tokens_per_step": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.sidecar: this source does not record it"
+   },
+   "gpu_ms_per_token": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.sidecar: this source does not record it"
+   },
+   "wall_ms_per_token_decode": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.sidecar: this source does not record it"
+   },
+   "wall_ms_per_token_e2e": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.sidecar: this source does not record it"
+   },
+   "fam.moe.routed.gemm": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.sidecar: this source does not record it"
+   },
+   "fam.moe.swiglu": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.sidecar: this source does not record it"
+   },
+   "fam.moe.routed.combine": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.sidecar: this source does not record it"
+   },
+   "fam.moe.routed.staging": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.sidecar: this source does not record it"
+   },
+   "fam.moe.shared": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.sidecar: this source does not record it"
+   },
+   "fam.moe.router": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.sidecar: this source does not record it"
+   },
+   "fam.dense.proj": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.sidecar: this source does not record it"
+   },
+   "fam.dense.head": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.sidecar: this source does not record it"
+   },
+   "fam.fp8_gemv.unsplit": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.sidecar: this source does not record it"
+   },
+   "fam.attn": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.sidecar: this source does not record it"
+   },
+   "fam.glue.norm_mhc": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.sidecar: this source does not record it"
+   },
+   "fam.glue.engram": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.sidecar: this source does not record it"
+   },
+   "fam.glue.indexer": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.sidecar: this source does not record it"
+   },
+   "fam.topk.unsplit": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.sidecar: this source does not record it"
+   },
+   "fam.glue.compressor": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.sidecar: this source does not record it"
+   },
+   "fam.glue.quant_rope": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.sidecar: this source does not record it"
+   },
+   "fam.glue.torch": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.sidecar: this source does not record it"
+   },
+   "fam.residency": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.sidecar: this source does not record it"
+   },
+   "fam.instrument": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.sidecar: this source does not record it"
+   },
+   "fam.unmapped": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.sidecar: this source does not record it"
+   },
+   "sum_kernels": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.sidecar: this source does not record it"
+   },
+   "unattributed": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.sidecar: this source does not record it"
+   },
+   "busy_ms": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.sidecar: this source does not record it"
+   },
+   "overlap": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.sidecar: this source does not record it"
+   },
+   "concurrency": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.sidecar: this source does not record it"
+   },
+   "expert_bytes_hbm": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.sidecar: this source does not record it"
+   },
+   "expert_bytes_c2c": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.sidecar: this source does not record it"
+   },
+   "cold_share": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.sidecar: this source does not record it"
+   },
+   "graph_nodes": {
+    "value": null,
+    "kind": "not measured",
+    "how": "pg61.sidecar: this source does not record it"
+   }
+  }
+ },
+ "column_labels": {
+  "ours.headline": "ours: headline loop (own stream)",
+  "ours.matched": "ours: 6-row teacher-forced on Pg61 tokens",
+  "ours.loop_static": "ours: loop static profile (phase split)",
+  "pg61.step_cell": "Pg61: W0 step cell (STEP_PROMPT)",
+  "pg61.fixture": "Pg61: parity-A (fixture, matched tokens)",
+  "pg61.matched": "Pg61: matched re-run (pg61-drive)",
+  "pg61.sidecar": "Pg61: peer-tier-v3 sidecar counters"
+ },
+ "metrics": [
+  [
+   "condition",
+   "workload condition"
+  ],
+  [
+   "residency",
+   "expert residency condition"
+  ],
+  [
+   "verify_gpu_ms",
+   "verify GPU ms/step"
+  ],
+  [
+   "draft_gpu_ms",
+   "draft GPU ms/step"
+  ],
+  [
+   "step_gpu_ms",
+   "complete step ms (GPU events; Pg61: wall/steps)"
+  ],
+  [
+   "tokens_per_step",
+   "tokens per step"
+  ],
+  [
+   "gpu_ms_per_token",
+   "GPU ms per emitted token (sum step ms / sum tokens)"
+  ],
+  [
+   "wall_ms_per_token_decode",
+   "wall ms per emitted token, decode (total / total)"
+  ],
+  [
+   "wall_ms_per_token_e2e",
+   "wall ms per emitted token, incl. prefill (total / total)"
+  ],
+  [
+   "fam.moe.routed.gemm",
+   "routed MoE: expert GEMM (DeepGEMM fp8xfp4 / MegaMoE / ref fp4_gemm)"
+  ],
+  [
+   "fam.moe.swiglu",
+   "MoE SwiGLU+quant (routed and shared share one kernel name)"
+  ],
+  [
+   "fam.moe.routed.combine",
+   "routed MoE: combine"
+  ],
+  [
+   "fam.moe.routed.staging",
+   "routed MoE: staging/prep (dedup, cold stage over C2C, SF pack, act quant bcast, gathers)"
+  ],
+  [
+   "fam.moe.shared",
+   "shared expert (fp8 GEMV inside the moe range)"
+  ],
+  [
+   "fam.moe.router",
+   "router (gate fp32, plan, pre/post, top-k inside the moe range)"
+  ],
+  [
+   "fam.dense.proj",
+   "dense projections (fp8 GEMV outside moe: q/kv/o + engram/compressor/indexer linears)"
+  ],
+  [
+   "fam.dense.head",
+   "head (fixed-order fp32 / bf16-stored head, cuBLAS head)"
+  ],
+  [
+   "fam.fp8_gemv.unsplit",
+   "fp8 GEMV, call site not resolvable (no NVTX role)"
+  ],
+  [
+   "fam.attn",
+   "attention (FlashMLA / sparse_attn)"
+  ],
+  [
+   "fam.glue.norm_mhc",
+   "glue: norms + mHC (hc_norm, norm_row, sinkhorn, hc_post, mixes)"
+  ],
+  [
+   "fam.glue.engram",
+   "glue: engram gate/out"
+  ],
+  [
+   "fam.glue.indexer",
+   "glue: indexer top-k/sort (outside the moe range)"
+  ],
+  [
+   "fam.topk.unsplit",
+   "torch top-k/sort, router vs indexer not resolvable (no NVTX role)"
+  ],
+  [
+   "fam.glue.compressor",
+   "glue: ratio-2 compressor (T9b-8 fixed fp32)"
+  ],
+  [
+   "fam.glue.quant_rope",
+   "glue: act quant / rope / QDQ"
+  ],
+  [
+   "fam.glue.torch",
+   "glue: torch residual (elementwise, reduce, cat, index, cub, asserts)"
+  ],
+  [
+   "fam.residency",
+   "residency manager kernels"
+  ],
+  [
+   "fam.instrument",
+   "instrument (step marker)"
+  ],
+  [
+   "fam.unmapped",
+   "kernel names no rule matched"
+  ],
+  [
+   "sum_kernels",
+   "sum of kernel ms/step"
+  ],
+  [
+   "unattributed",
+   "unattributed = step - sum kernels (gaps/scheduling)"
+  ],
+  [
+   "busy_ms",
+   "GPU busy (union) ms/step"
+  ],
+  [
+   "overlap",
+   "measured overlap = busy / wall"
+  ],
+  [
+   "concurrency",
+   "sum kernel / busy"
+  ],
+  [
+   "expert_bytes_hbm",
+   "routed expert bytes from HBM per verify step"
+  ],
+  [
+   "expert_bytes_c2c",
+   "cold expert bytes over C2C per verify step"
+  ],
+  [
+   "cold_share",
+   "cold share of routed unique-expert calls"
+  ],
+  [
+   "cold_experts_per_layer_call",
+   "cold experts per 6-row layer-call"
+  ],
+  [
+   "cold_exposed_ms",
+   "cold-expert work exposed on GB300 per step"
+  ],
+  [
+   "graph_nodes",
+   "captured graph nodes"
+  ]
+ ],
+ "gaps": [
+  {
+   "metric": "step_gpu_ms",
+   "ours": "ours.headline",
+   "pg61": "pg61.step_cell",
+   "matched": "NOT matched: different prompt, 512 tokens",
+   "value": 12.564440365888814,
+   "how": "ours.headline 20.304 - pg61.step_cell 7.740 = +12.564"
+  },
+  {
+   "metric": "tokens_per_step",
+   "ours": "ours.headline",
+   "pg61": "pg61.step_cell",
+   "matched": "NOT matched: different prompt, 512 tokens",
+   "value": 0.1406358783940589,
+   "how": "ours.headline 2.903 - pg61.step_cell 2.763 = +0.141"
+  },
+  {
+   "metric": "wall_ms_per_token_decode",
+   "ours": "ours.headline",
+   "pg61": "pg61.step_cell",
+   "matched": "NOT matched: different prompt, 512 tokens",
+   "value": 5.311048644318625,
+   "how": "ours.headline 8.103 - pg61.step_cell 2.792 = +5.311"
+  },
+  {
+   "metric": "wall_ms_per_token_e2e",
+   "ours": "ours.headline",
+   "pg61": "pg61.fixture",
+   "matched": "prompts matched; ours streamed fast reps incl. reference prefill vs Pg61 non-streamed with top-20 logprobs",
+   "value": 26.13954025371718,
+   "how": "ours.headline 29.048 - pg61.fixture 2.909 = +26.140"
+  }
+ ],
+ "inputs": {
+  "headline": "docs/headline-20261107j.json",
+  "tf": "",
+  "anatomy": "scratch/gap-tf-anatomy.json",
+  "loop_anatomy": "",
+  "pg61_step": "w0/results/phase1/step-pg61.json",
+  "pg61_fixture": "w0/results/phase1/parity-A.jsonl",
+  "pg61_drive": "",
+  "peer3": "docs/data/peer3_stats.json"
+ },
+ "resolvable_pg61_from_existing": [
+  "step_gpu_ms",
+  "tokens_per_step",
+  "wall_ms_per_token_decode",
+  "wall_ms_per_token_e2e",
+  "cold_experts_per_layer_call",
+  "cold_exposed_ms"
+ ],
+ "pending": {
+  "ours.loop_static": "box command 3 (optional): nsys + gap_ledger.py ours-loop-profile, then step_anatomy.py (draft families)",
+  "pg61.matched": "box command 4: gap_ledger.py pg61-drive on the box host -- needs Pg61 bound on :30006, i.e. James's word to boot it (lane is DARK by charter)"
+ }
+}

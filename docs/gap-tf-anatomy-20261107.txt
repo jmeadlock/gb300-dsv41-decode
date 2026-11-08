@@ -1,0 +1,59 @@
+kernels 740642  runtime-api 1398753  nvtx 48039  decode_step ranges 128  layer ranges 160  role ranges 5452  phase ranges 0  memcpy 19418
+
+steps analysed 128: wall mean 199.95 ms  p50 199.87  busy mean 19.25 ms  kernels/step 1978
+
+role            GPU ms/step  launches/step  mean µs/kernel
+moe                  11.29            560           20.2
+step-other            7.97           1418            5.6
+
+layer GPU ms/step (first 3, 14 (engram), last):
+
+top kernels by GPU time (ms/step, launches/step, µs each):
+     4.55      40    113.8  m1_stage_rows
+     4.45     120     37.1  sm100_fp8_fp4_gemm_1d1d_impl  [void deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl<(cute::UMMA::Major)0, (cute::UMMA::Major)0, (unsigned int)32, (unsigned int]
+     1.84     130     14.2  t9b_mxfp8_gemv
+     1.02       1   1017.6  t9b5_head_fp32
+     0.81      80     10.1  t9b4_mxfp8_gemv2
+     0.58      40     14.6  nvjet_sm103_tst_64x8_64x16_4x1_v_bz_TNT
+     0.52      80      6.5  t9b5_mix_fp32
+     0.41      40     10.2  m2_gate_fp32
+     0.41      80      5.1  t9b2r2_norm_row
+     0.40      40     10.1  sparse_attn_fwd_kernel  [void sm100::prefill::sparse_fwd::head64::sparse_attn_fwd_kernel<sm100::prefill::sparse_fwd::head64::KernelTemplate<(Spar]
+     0.40      40     10.1  m2_router_rows
+     0.38     254      1.5  vectorized_elementwise_kernel  [void at::native::vectorized_elementwise_kernel<(int)4, at::native::FillFunctor<int>, std::array<char *, (unsigned long)1]
+     0.37     141      2.6  elementwise_kernel  [void at::native::elementwise_kernel<(int)128, (int)2, void at::native::gpu_kernel_impl_nocast<at::native::CUDAFunctor_ad]
+     0.35      80      4.4  hc_split_sinkhorn_kernel__kernel
+     0.35      81      4.3  t9b4_hc_norm
+     0.28       6     47.3  t9b8_comp_fp32
+     0.25      80      3.1  t9b2_swiglu_quant
+     0.24      90      2.7  t9b_splitk_reduce
+
+inter-kernel idle inside steps: 180.85 ms/step total; largest:
+     434.3 µs  step 123 ?/moe before t9b4_mxfp8_gemv2
+     401.9 µs  step 8 ?/? before t9b4_mxfp8_gemv2
+     377.5 µs  step 26 ?/? before t9b4_mxfp8_gemv2
+     369.8 µs  step 64 ?/moe before t9b4_mxfp8_gemv2
+     367.7 µs  step 110 ?/? before t9b4_mxfp8_gemv2
+     363.8 µs  step 68 ?/? before t9b4_mxfp8_gemv2
+     358.3 µs  step 112 ?/? before t9b4_mxfp8_gemv2
+     350.3 µs  step 87 ?/? before t9b4_mxfp8_gemv2
+     346.1 µs  step 120 ?/? before act_quant_kernel__kernel
+     343.6 µs  step 74 ?/? before act_quant_kernel__kernel
+
+families [static, diagnostic] (roles known): sum 19.254 ms/step, busy 19.254, wall 199.953, concurrency 1.000, overlap 0.096
+  moe.routed.staging      4.645 ms     80.0 launches
+  moe.routed.gemm         4.449 ms    120.0 launches
+  glue.norm_mhc           2.501 ms    471.0 launches
+  dense.proj              2.009 ms    180.0 launches
+  glue.torch              1.375 ms    626.5 launches
+  dense.head              1.018 ms      1.0 launches
+  moe.shared              0.881 ms    120.0 launches
+  moe.router              0.811 ms     80.0 launches
+  attn                    0.405 ms     40.0 launches
+  glue.compressor         0.284 ms      6.0 launches
+  moe.swiglu              0.250 ms     80.0 launches
+  glue.quant_rope         0.239 ms     98.0 launches
+  glue.indexer            0.217 ms     31.0 launches
+  moe.routed.combine      0.155 ms     40.0 launches
+  glue.engram             0.016 ms      4.0 launches
+  memcpy DtoD: 3.8 MB/step, 0.043 ms, 35.9/step
