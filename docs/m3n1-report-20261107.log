@@ -1,0 +1,30 @@
+| layer | R | ours final | mega final (gemv) | tm | tm_fix | tm_fix_1r | mega bf16q | L2-input bytes != oracle: ours / tm / mega-vs-tm (l2_acts) | mega vs tm routed mismatch |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 | 6 | 0.001645 | 0.007163 | 0.007163 | 0.001964 | 0.001645 | 0.001964 | 0 / 0.03368 / 0 | 0 |
+| 0 | 1 | (row-independent: = R 6) | 0.007163 | | | | 0.001964 | row-invariant True | 0 |
+| 10 | 6 | 0.001664 | 0.01238 | 0.01238 | 0.002307 | 0.001664 | 0.002307 | 0 / 0.03424 / 0 | 0 |
+| 10 | 1 | (row-independent: = R 6) | 0.01238 | | | | 0.002307 | row-invariant True | 0 |
+| 20 | 6 | 0.001661 | 0.01334 | 0.01334 | 0.002299 | 0.001661 | 0.002299 | 0 / 0.03414 / 0 | 0 |
+| 20 | 1 | (row-independent: = R 6) | 0.01334 | | | | 0.002299 | row-invariant True | 0 |
+| 39 | 6 | 0.001654 | 0.003095 | 0.003095 | 0.001715 | 0.001654 | 0.001715 | 0 / 0.03438 / 0 | 0 |
+| 39 | 1 | (row-independent: = R 6) | 0.003095 | | | | 0.001715 | row-invariant True | 0 |
+
+| layer | mega R1 hot us | mega R6 hot us | bf16q R1 | bf16q R6 |
+|---|---|---|---|---|
+| 0 | 49.24 | 109.7 | 49.25 | 110 |
+| 10 | 50.98 | 79.57 | 50.99 | 79.55 |
+| 20 | 56.5 | 82.76 | 56.57 | 82.71 |
+| 39 | 54.51 | 109.1 | 54.43 | 108.9 |
+
+| arm | layers | fit | TF positions | flips vs Pg61 (weighted) | flips vs ours (weighted) | max abs dlogprob vs ours | free-run parity | free-run == ours |
+|---|---|---|---|---|---|---|---|---|
+| base | None | None | 1476 | 55 (28.12) | 0 (0) | 0 | identical 2/8; PARITY: FAIL | not measured |
+| mega-L0-10-20-39 | [0, 10, 20, 39] | True | 1476 | 64 (32) | 58 (25.22) | 2.018 | identical 2/8; PARITY: FAIL | 2 |
+
+[model (synthetic)] rel-L2 to oracle_ref, final (+shared): ours 0.001668, ours_2r 0.002032, tm 0.009405, tm_1r 0.009342, tm_fix 0.002032, tm_fix_1r 0.001668, mega not measured
+[model (synthetic)] routed: ours 0.001661, ours_2r 0.001661, tm 0.01609, tm_1r 0.01609, tm_fix 0.001661, tm_fix_1r 0.001661, mega not measured
+[model (synthetic)] stages: L1 gate/up 1.937e-05; L2 input ours 1.133e-06 (bytes 6.028e-06), tm 0.01587 (bytes 0.03532), tm_fix 1.133e-06 (bytes 6.028e-06); tm vs ours L2-input bytes differ 0.03532
+[model (synthetic)] L2 out: ours 8.975e-06, tm 0.01603, tm_fix 8.975e-06
+[model (synthetic)] routed mismatch pairs: tm_vs_ours 0.8875, tm_fix_vs_ours 0, mega_vs_ours not measured, mega_vs_tm not measured, mega_vs_tm_fix not measured
+[model (synthetic)] routed vs oracle_mega (MegaMoE's rounding points): ours 0.01609, ours_2r 0.01609, tm 0.00166, tm_1r 0.00166, tm_fix 0.01609, tm_fix_1r 0.01609, mega not measured; oracle_mega vs oracle_ref 0.01601
+[model (synthetic)] routed vs EXACT (no bf16 / fp8 rounding after the weights): ours 0.02679, ours_2r 0.02679, tm 0.02659, tm_1r 0.02659, tm_fix 0.02679, tm_fix_1r 0.02679, mega not measured; oracle_ref 0.02673, oracle_mega 0.02654
