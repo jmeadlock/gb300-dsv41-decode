@@ -62,6 +62,7 @@ except ImportError:  # pragma: no cover - depends on the environment
     HAVE_TRITON = False
 
 PROJS = ("w1", "w3", "w2")
+PROJ_INDEX = {"w1": 0, "w3": 1, "w2": 2}   # M3-S1: = staging_overlap.PROJ_INDEX (the ptab6 / dtab rows)
 KERNELS_ON_CPU = False   # tests set it under tests/triton_shim.py: dedup_fused launches the kernel
 DEDUP_MAX_PAIRS = 64     # R*k pairs in the one-program dedup kernel (R <= 8 rows, k <= 8)
 
@@ -737,9 +738,35 @@ class DGInplaceMoERows(DGMaskedMoERows):
         self.has_dummy = len(hot) > 0
         self.ar_rows = torch.arange(owner.rows, dtype=torch.long, device=d).view(1, -1)
         self.S = int(b.spare_limit)
+        # M3-S1 ($DSV41_STAGE, runtime/staging_overlap.py): the step's staging hook (None / mode "kernel": today's
+        # one stage_rows launch); per-projection forked staging still to be joined; the hoisted shared expert
+        self._ov = getattr(owner, "stage_ov", None)
+        self._stage_pending = [False, False, False]
+        self._x_cur: Optional[torch.Tensor] = None
+        self._sh_pre: Optional[torch.Tensor] = None
 
     def _block_rows(self) -> int:
         return self.owner.dg.block_rows
+
+    def _route(self, x: torch.Tensor, block_rows: int, mm=None, inpl: Optional[dict] = None
+               ) -> Dict[str, torch.Tensor]:
+        self._x_cur = x                                                # M3-S1: the shared expert's input (hoist)
+        return super()._route(x, block_rows, mm=mm, inpl=inpl)
+
+    def _shared(self, x: torch.Tensor) -> torch.Tensor:
+        sh, self._sh_pre = self._sh_pre, None                          # M3-S1: computed under the forked staging
+        return sh if sh is not None else super()._shared(x)
+
+    def _stage(self, t: dict, m: Dict[str, torch.Tensor]) -> None:
+        """Today's ONE staging launch, or (M3-S1, $DSV41_STAGE != kernel) the staging_overlap hook; in the overlap
+        modes the shared expert (same kernels, same input) runs on the main stream while the side stream stages."""
+        ov = self._ov
+        if ov is None or not ov.active:
+            self.owner.dg.stage_rows(t, m)                             # 1 launch: staged cold c -> H + c (+ SF)
+        elif ov.launch(self, t, m) and self._x_cur is not None:
+            self._sh_pre = super()._shared(self._x_cur)
+            ov.hoisted(self)
+        self._x_cur = None
 
     def _weights(self, m: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """M1-T10-MOE: the layout's m_indices / gl, the overflow count, arow / posmat and the work list are the
@@ -753,10 +780,12 @@ class DGInplaceMoERows(DGMaskedMoERows):
             m = _with_extras(m, ext)
             _write_layout(ext, inpl, b.block_rows, R_)
             self.last = m
-        b.stage_rows(t, m)                                             # 1 launch: staged cold c -> H + c (+ SF)
+        self._stage(t, m)                                              # 1 launch (M3-S1: or the staging hook)
         return m
 
     def _gemm(self, p: str, which: int) -> torch.Tensor:
+        if self._ov is not None and self._ov.active:                   # M3-S1: projection p's staging joined first
+            self._ov.wait(self, PROJ_INDEX[p])
         return self.owner.dg.gemm_rows(p, self.t, which)
 
     def _inpl(self) -> dict:

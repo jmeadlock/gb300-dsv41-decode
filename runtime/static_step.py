@@ -478,6 +478,7 @@ class StaticStep:
         self._idx_tlen: Optional[torch.Tensor] = None  # #19: the topk_length published with sa.topk_idxs
         self.glue = None  # runtime.fused_glue.FusedGlue when glue_impl == "fused" (built after the MoE buffers)
         self.dg = None  # runtime.dg_moe.DGBuffers when moe_impl == "dg-masked"
+        self.stage_ov = None  # M3-S1: runtime.staging_overlap.StageOverlap (the R-row dg-inplace step only)
         self.R, self.model, self.pool = R, model, pool
         self.dev = model.embed.weight.device
         if self.dev.type != "cuda" and not _allow_cpu:
@@ -733,6 +734,9 @@ class StaticStep:
                 self.dg.spare_added_B = added
                 self._ovf_on = True
                 moe_cls = moe_rows.DGInplaceMoERows
+                from runtime import staging_overlap  # M3-S1: $DSV41_STAGE (default kernel = today's one launch)
+
+                self.stage_ov = staging_overlap.build(self, len(layers))
         elif self.moe_impl == "dg-masked":  # T9a-1: same staging + pointer tables, routed GEMMs on DeepGEMM
             from runtime.dg_moe import DGBuffers, DGMaskedMoE
 
@@ -1319,7 +1323,8 @@ class StaticStep:
                 "attn_impl": self.attn_impl, "attn_on": bool(self._attn_on or self._fm_on),
                 "hidden_layers": list(self.hidden_layers), "n_slots": self.n_slots, "spare_slots": self.spare_slots,
                 "rows_moe_gemm": getattr(getattr(self, "dg", None), "rows_gemm", None),
-                "dedup_impl": _dedup_describe() if self.rows > 1 else None, "fp32_impl": _fp32_impl()}
+                "dedup_impl": _dedup_describe() if self.rows > 1 else None, "fp32_impl": _fp32_impl(),
+                "stage": None if self.stage_ov is None else self.stage_ov.describe()}
 
     def marker_count(self) -> int:
         return int(self.marker_ctr.item())
