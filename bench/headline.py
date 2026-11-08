@@ -629,7 +629,7 @@ def summary_lines(rep: dict) -> List[str]:
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--model-dir", required=True)
-    ap.add_argument("--map", default=os.path.join(REPO, "docs", "maps", "hot-v26ar-seed-295.json"))
+    ap.add_argument("--map", default=os.path.join(REPO, "docs", "maps", "hot-v26ar-seed-301.json"))   # 11/08 box: 301 = 18.62 vs 295 18.74, bit-identical, 3.9 GiB free (304: 18.56 but 1.7 GiB free -> opt-in)
     ap.add_argument("--hot-per-layer", type=int, default=None)
     ap.add_argument("--config", default=None)
     ap.add_argument("--tokenizer-dir", default=None)

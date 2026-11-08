@@ -1,0 +1,46 @@
+{
+ "counts": "/ar/counts-post-20261024-020438.npz",
+ "counts_key": "cnt",
+ "base_map": "docs/maps/hot-v26ar-seed-295.json",
+ "base_hot": 295,
+ "layers": 40,
+ "self_test": "pass",
+ "base": {
+  "hot_per_layer": 295,
+  "decode_selections": 128678880,
+  "in_sample_cold_share": 0.008813,
+  "boundary_tie_layers": 2
+ },
+ "outputs": {
+  "301": {
+   "hot_per_layer": 301,
+   "decode_selections": 128678880,
+   "in_sample_cold_share": 0.007579,
+   "boundary_tie_layers": 3,
+   "path": "docs/maps/hot-v26ar-seed-301.json",
+   "sha256": "4b68d8316697a77a3b98d4bc4077e4756dbba477b12b3df2866a92ddacb64ac6",
+   "extra_per_layer": 6,
+   "equals_pure_top_n": true
+  },
+  "304": {
+   "hot_per_layer": 304,
+   "decode_selections": 128678880,
+   "in_sample_cold_share": 0.007001,
+   "boundary_tie_layers": 0,
+   "path": "docs/maps/hot-v26ar-seed-304.json",
+   "sha256": "aa36e3fffe5e71cb123a5dd5998991933e1d163eacb972d5461b71d4faec1e19",
+   "extra_per_layer": 9,
+   "equals_pure_top_n": true
+  },
+  "307": {
+   "hot_per_layer": 307,
+   "decode_selections": 128678880,
+   "in_sample_cold_share": 0.006446,
+   "boundary_tie_layers": 1,
+   "path": "docs/maps/hot-v26ar-seed-307.json",
+   "sha256": "5b432efc1a69f4892a104f6e863a45be84114d4cf261711ae11e849d256dc6c9",
+   "extra_per_layer": 12,
+   "equals_pure_top_n": true
+  }
+ }
+}

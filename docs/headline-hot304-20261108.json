@@ -1,0 +1,3542 @@
+{
+ "date": "2026-11-08 12:37:34 UTC",
+ "argv": [
+  "--model-dir",
+  "/ref",
+  "--moe-impl",
+  "dg-inplace",
+  "--fp8-impl",
+  "gemv",
+  "--glue-impl",
+  "fused",
+  "--attn-impl",
+  "flashmla",
+  "--fp32-impl",
+  "fixed",
+  "--moe-rowmatch",
+  "on",
+  "--spare-slots",
+  "16",
+  "--residency-drain",
+  "64",
+  "--max-new",
+  "256",
+  "--map",
+  "docs/maps/hot-v26ar-seed-304.json",
+  "--json",
+  "scratch/headline-hot304.json"
+ ],
+ "metric": "ms per 6-row step, DSpark k=5",
+ "mode": "graph",
+ "impls": {
+  "moe": "dg-inplace",
+  "fp8": "gemv",
+  "glue": "fused",
+  "attn": "flashmla",
+  "fp32": "fixed",
+  "moe_rowmatch": "on"
+ },
+ "max_new": 256,
+ "gemv_pin_m1": true,
+ "errors": [],
+ "json": "scratch/headline-hot304.json",
+ "pg61_ms_per_step": 7.36,
+ "bar_ms_per_step": 5.0,
+ "receipt": {
+  "schema": "dsv41-receipt/1",
+  "argv": [
+   "--model-dir",
+   "/ref",
+   "--moe-impl",
+   "dg-inplace",
+   "--fp8-impl",
+   "gemv",
+   "--glue-impl",
+   "fused",
+   "--attn-impl",
+   "flashmla",
+   "--fp32-impl",
+   "fixed",
+   "--moe-rowmatch",
+   "on",
+   "--spare-slots",
+   "16",
+   "--residency-drain",
+   "64",
+   "--max-new",
+   "256",
+   "--map",
+   "docs/maps/hot-v26ar-seed-304.json",
+   "--json",
+   "scratch/headline-hot304.json"
+  ],
+  "host": "5d50bbbbe9c0",
+  "python": "3.12.3 aarch64",
+  "git_commit": null,
+  "git_branch": null,
+  "git_dirty": null,
+  "git_dirty_sha256": null,
+  "git_dirty_files": null,
+  "git_untracked_count": null,
+  "git_source": null,
+  "env_switches": {
+   "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+   "DSV41_FP32_IMPL": "fixed",
+   "DSV41_GEMV_CACHE": "/work/scratch/gemv-tune.json",
+   "DSV41_GEMV_PIN_M1": "1",
+   "DSV41_MODEL_DIR": "/ref",
+   "DSV41_MOE_ROWMATCH": "on"
+  },
+  "impls": {
+   "moe": "dg-inplace",
+   "fp8": "gemv",
+   "glue": "fused",
+   "attn": "flashmla",
+   "fp32": "fixed",
+   "moe_rowmatch": "on"
+  },
+  "checkpoint_path": "/ref",
+  "checkpoint_config_path": "/ref/config.json",
+  "checkpoint_config_sha256": "8be45ce0476004a3f529fd896115a4a2e800a129ad2d3ec05b16050f52e21879",
+  "fixture_path": "/work/w0/results/phase1/parity-A.jsonl",
+  "fixture_sha256": "4555c8b6cbb94f5b18a889337b4c2e1c8dab3d92eedc430d076f5e5a4e55c52c",
+  "torch_version": "2.13.0+cu130",
+  "triton_version": "3.7.1",
+  "cuda_version": "13.0",
+  "driver_version": "595.99.02",
+  "gpu_name": "NVIDIA GB300",
+  "gpu_uuid": "GPU-1c1855c8-dd10-0247-583e-3c3880ddbf55",
+  "clocks_sm_mhz_start": 390.0,
+  "clocks_mem_mhz_start": 3996.0,
+  "clocks_sm_mhz_end": 2070.0,
+  "clocks_mem_mhz_end": 3996.0,
+  "residency_condition": "on drain_n=64, force_random=0, frozen=False, halflife=500.0, hyst=1.5, min_abs=8.0, n_demote=64, n_spare=None, reserve_gib=8.0, stage_keep=None, swaps_per_barrier=4, swaps_per_drain=2 (map docs/maps/hot-v26ar-seed-304.json)",
+  "lease": null,
+  "start_wall": 1794141454.517905,
+  "start_iso": "2026-11-08 12:37:34 UTC",
+  "end_wall": 1794141855.3361683,
+  "end_iso": "2026-11-08 12:44:15 UTC",
+  "wall_s": 400.818,
+  "receipt_errors": [
+   "git: FileNotFoundError: [Errno 2] No such file or directory: 'git'",
+   "git_env: RuntimeError: no RECEIPT_GIT_COMMIT in the environment"
+  ]
+ },
+ "boot": {
+  "model_dir": "/ref",
+  "config": "/ref/inference/config.json",
+  "device": "cuda",
+  "map": "/work/docs/maps/hot-v26ar-seed-304.json",
+  "head_dtype": "fp32",
+  "head_bf16": [],
+  "bytes_GiB": {
+   "read_HBM": 209.561,
+   "read_HOST": 257.388,
+   "pool_HBM": 212.915,
+   "pool_HOST": 56.03,
+   "pool_HOST_hot_scales": 12.524,
+   "engram_HOST": 188.833,
+   "hbm_params": 11.681,
+   "mtp_HBM": 7.543
+  },
+  "timings_s": {
+   "scan": 0.65,
+   "construct": 8.32,
+   "alloc": 0.14,
+   "host_read": 23.82,
+   "hbm_load": 21.31,
+   "register": 0.58,
+   "pack_hot_sf": 0.08,
+   "assign": 2.05,
+   "mtp": 0.86,
+   "total": 60.68
+  },
+  "mem_log": [
+   {
+    "stage": "before-host-alloc",
+    "mem_available_GiB": 449.57,
+    "need_GiB": 257.39,
+    "reserve_GiB": 16.0
+   },
+   {
+    "stage": "before-pin",
+    "mem_available_GiB": 190.78,
+    "need_GiB": 0.0,
+    "reserve_GiB": 16.0
+   },
+   {
+    "stage": "after-pin",
+    "mem_available_GiB": 190.78,
+    "need_GiB": 0.0,
+    "reserve_GiB": 16.0
+   },
+   {
+    "stage": "registered",
+    "pinned_GiB": 257.388,
+    "register_s": {
+     "layers.1.engram.embed.scale": 0.007,
+     "layers.1.engram.embed.weight": 0.207,
+     "layers.14.engram.embed.scale": 0.006,
+     "layers.14.engram.embed.weight": 0.206,
+     "cold_experts": 0.125,
+     "hot_scales": 0.028
+    }
+   }
+  ],
+  "dequantized_wo_a": 40,
+  "widened_bf16_to_fp32": [
+   "head.weight",
+   "layers.14.attn.compressor.wgate.weight",
+   "layers.14.attn.compressor.wkv.weight",
+   "layers.2.attn.compressor.wgate.weight",
+   "layers.2.attn.compressor.wkv.weight",
+   "layers.8.attn.compressor.wgate.weight",
+   "layers.8.attn.compressor.wkv.weight"
+  ],
+  "host_buffers": {
+   "layers.1.engram.embed.scale": "HostBuffer('layers.1.engram.embed.scale', 2.861 GiB, ptr=0xf81866f40000, registered=1 chunks, hugepages=True)",
+   "layers.1.engram.embed.weight": "HostBuffer('layers.1.engram.embed.weight', 91.554 GiB, ptr=0xf801837b0000, registered=2 chunks, hugepages=True)",
+   "layers.14.engram.embed.scale": "HostBuffer('layers.14.engram.embed.scale', 2.861 GiB, ptr=0xf800cc5d0000, registered=1 chunks, hugepages=True)",
+   "layers.14.engram.embed.weight": "HostBuffer('layers.14.engram.embed.weight', 91.557 GiB, ptr=0xf7e9e8bb0000, registered=2 chunks, hugepages=True)",
+   "cold_experts": "HostBuffer('cold_experts', 56.030 GiB, ptr=0xf8191e100000, registered=1 chunks, hugepages=True)",
+   "hot_scales": "HostBuffer('hot_scales', 12.524 GiB, ptr=0xf8633e700000, registered=1 chunks, hugepages=True)"
+  },
+  "verify": null,
+  "wall_s": 60.74367070198059
+ },
+ "mtp": {
+  "n_stages": 3,
+  "target_layer_ids": [
+   37,
+   38,
+   39
+  ],
+  "block_size": 5,
+  "n_tensors": 2395,
+  "bytes_GiB": {
+   "read": 7.3881,
+   "hbm_params": 0.8197,
+   "hbm_expert_stacks": 6.7236,
+   "hbm_total": 7.5434
+  },
+  "bytes": {
+   "read": 7932873096,
+   "hbm_params": 880194440,
+   "hbm_expert_stacks": 7219445760,
+   "hbm_total": 8099640200
+  },
+  "timings_s": {
+   "construct": 0.07,
+   "alloc": 0.03,
+   "hbm_load": 0.73,
+   "total": 0.86
+  },
+  "dequantized_wo_a": 3,
+  "widened_bf16_to_fp32": [
+   "mtp.2.confidence_head.proj.weight",
+   "mtp.2.markov_head.head.weight"
+  ],
+  "verify": null
+ },
+ "determinism": {
+  "seed": 0,
+  "deterministic_algorithms": true,
+  "warn_only": true,
+  "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+  "fill_uninitialized_memory": true,
+  "float32_matmul_precision": "highest"
+ },
+ "rowmatch": {
+  "dg": {
+   "mode": "on",
+   "on": true,
+   "why": null,
+   "align": 16,
+   "gemm_blocks": 36,
+   "rows_gemm": "contiguous16",
+   "check_equal": true,
+   "today_equal": true,
+   "check": {
+    "w1": {
+     "build_vs_rows": 6,
+     "today_vs_rows": 6,
+     "of": 6
+    },
+    "w2": {
+     "build_vs_rows": 6,
+     "today_vs_rows": 6,
+     "of": 6
+    }
+   }
+  },
+  "glue_orders_one_row": {
+   "norm_D": "vec_T512_V4_dec|mul",
+   "mix": "vec_T512_V4_dec|mul",
+   "kv": "vec_T128_V4_dec|mul",
+   "q": "vec_T256_V4_dec|mul",
+   "router": "vec_T4_V1_dec|mul",
+   "engram": "vec_T128_V4_dec|mul",
+   "engram_sum": "vec_T128_V4_dec|mul"
+  },
+  "glue_off_one_row": [
+   "concat_free",
+   "dedup",
+   "gather"
+  ],
+  "glue_orders_verify": {
+   "norm_D": "vec_T512_V4_dec|mul",
+   "mix": "vec_T512_V4_dec|mul",
+   "kv": "vec_T128_V4_dec|mul",
+   "q": "vec_T256_V4_dec|mul",
+   "router": "vec_T4_V1_dec|mul",
+   "engram": "vec_T128_V4_dec|mul",
+   "engram_sum": "vec_T128_V4_dec|mul"
+  },
+  "glue_off_verify": [
+   "concat_free",
+   "gather"
+  ],
+  "glue_orders_differ": [],
+  "glue_off_only_verify": []
+ },
+ "residency_config": {
+  "drain_n": 64,
+  "swaps_per_drain": 2,
+  "hyst": 1.5,
+  "min_abs": 8.0,
+  "halflife": 500.0,
+  "swaps_per_barrier": 4,
+  "n_spare": null,
+  "stage_keep": null,
+  "n_demote": 64,
+  "reserve_gib": 8.0,
+  "frozen": false,
+  "force_random": 0
+ },
+ "loop": {
+  "rows": 6,
+  "block": 5,
+  "hidden_layers": [
+   37,
+   38,
+   39
+  ],
+  "max_pos": 4095,
+  "max_new_cap": 256,
+  "poll_every": 8,
+  "lookahead": 1,
+  "n_graphs": 0,
+  "ratio2_compressors": 3,
+  "eos_ids": [
+   1
+  ],
+  "draft_impls": {
+   "moe_impl": "dg-inplace",
+   "fp8_impl": "gemv",
+   "glue_impl": "fused",
+   "attn_impl": "flashmla"
+  },
+  "verify": {
+   "rows": 6,
+   "ring": 256,
+   "win": 128,
+   "max_pos": 4095,
+   "moe_impl": "dg-inplace",
+   "fp8_impl": "gemv",
+   "glue_impl": "fused",
+   "glue_effective": "fused",
+   "glue_note": "rows=6: fused dg_act,swiglu_routed,swiglu_shared,moe_combine,hc_post,o_rope_qdq,q_rope_epilogue,hc_norm,mix_stat,kv_path,q_path,router,engram,indexer_post,hc_split,gemv_pair,reduce_fold,dg_sf_pack,dedup (self-checked at 6 rows); reference ops for gather,concat_free",
+   "attn_impl": "flashmla",
+   "attn_on": true,
+   "hidden_layers": [
+    37,
+    38,
+    39
+   ],
+   "n_slots": 36,
+   "spare_slots": 16,
+   "rows_moe_gemm": "contiguous16",
+   "dedup_impl": {
+    "impl": "warp",
+    "warp_error": null
+   },
+   "fp32_impl": "fixed",
+   "mixes": {
+    "impl": "off",
+    "stream": "main",
+    "source": "auto",
+    "priority": "default",
+    "forks": 0,
+    "joins": 0
+   },
+   "stage": {
+    "mode": "kernel-overlap",
+    "capturable": true,
+    "overlap": true,
+    "outputs_valid": true,
+    "side_stream": true,
+    "nprog": [
+     48,
+     16,
+     16
+    ],
+    "block_bytes": [
+     8192,
+     32768,
+     32768
+    ],
+    "stats": {
+     "launches": 0,
+     "proj_launches": 0,
+     "ce_copies": 0,
+     "host_syncs": 0,
+     "waits": 0,
+     "shared_hoisted": 0
+    },
+    "hist": null
+   },
+   "pool_sf": {
+    "sf_layout": "beside",
+    "hbm_pool_GiB": 213.739,
+    "packed_sf_hbm_GiB": 13.348,
+    "hot_e8m0_host_GiB": 12.524,
+    "groups_per_layer": [
+     324
+    ],
+    "layers_packed": 40
+   }
+  },
+  "draft": {
+   "stages": 3,
+   "block": 5,
+   "ctx_rows": 6,
+   "win": 128,
+   "topk": 3,
+   "n_slots": 15,
+   "staging_bytes": 478072320,
+   "hidden_dim": 15360,
+   "ctx_rowwise": false,
+   "max_pos": 32767,
+   "captured": false,
+   "impls": {
+    "fp8": "gemv",
+    "moe": "dg-inplace",
+    "glue": "fused",
+    "attn": "flashmla"
+   },
+   "moe": {
+    "impl": "dg-inplace (resident stacks)",
+    "deep_gemm": "/usr/local/lib/python3.12/dist-packages/vllm/third_party/deep_gemm/__init__.py",
+    "align": 128,
+    "alignment": {
+     "prev": 128,
+     "set": 128,
+     "now": 128,
+     "settable": true
+    },
+    "deterministic": {
+     "requested": true,
+     "applied": true,
+     "note": null
+    },
+    "e8m0_to_f32": "cast",
+    "a_blocks": 15,
+    "experts": 128,
+    "dim": 5120,
+    "inter": 2304,
+    "bytes": {
+     "buffers": 53399040,
+     "packed_sf": 424673280
+    },
+    "calls": 36
+   },
+   "glue": {
+    "clusters": {
+     "hc_post": "on",
+     "o_rope_qdq": "on",
+     "swiglu_shared": "on",
+     "dg_act": "on",
+     "swiglu_routed": "on",
+     "moe_combine": "on"
+    },
+    "on": [
+     "hc_post",
+     "o_rope_qdq",
+     "swiglu_shared",
+     "dg_act",
+     "swiglu_routed",
+     "moe_combine"
+    ],
+    "hc_mode": 0,
+    "rope_inv": [
+     0,
+     0
+    ],
+    "calibration": {
+     "hc_post": {
+      "mismatches": {
+       "0": 0,
+       "1": 0,
+       "2": 0
+      },
+      "picked": 0
+     },
+     "o_rope_qdq": {
+      "mismatches": {
+       "00": 0,
+       "01": 0,
+       "02": 0,
+       "10": 0,
+       "11": 0,
+       "12": 0,
+       "20": 0,
+       "21": 0,
+       "22": 0
+      },
+      "picked": [
+       0,
+       0
+      ]
+     },
+     "verify_swiglu_shared": "equal",
+     "verify_dg_act": "equal",
+     "verify_swiglu_routed": "equal",
+     "verify_moe_combine": "equal"
+    }
+   },
+   "attn": {
+    "impl": "flashmla",
+    "on": true,
+    "reason": null,
+    "load": {
+     "so": "/usr/local/lib/python3.12/dist-packages/vllm/_flashmla_C.abi3.so",
+     "loaded": true,
+     "vllm_modules": []
+    }
+   }
+  }
+ },
+ "small_wins": {
+  "rows": {
+   "1": {
+    "mixes": "fork",
+    "mixes_src": "auto",
+    "qkv_tail": "fused",
+    "qkv_tail_src": "auto"
+   },
+   "6": {
+    "mixes": "off",
+    "mixes_src": "auto",
+    "qkv_tail": "split",
+    "qkv_tail_src": "auto"
+   }
+  },
+  "env": {
+   "DSV41_MIXES": null,
+   "DSV41_QKV_TAIL": null
+  },
+  "fp8_impl_arg": "gemv",
+  "gemv_kernel": "gemv",
+  "mixes_step": {
+   "impl": "off",
+   "stream": "main",
+   "source": "auto",
+   "priority": "default",
+   "forks": 0,
+   "joins": 0
+  }
+ },
+ "capture": {
+  "2": {
+   "n_graphs": 2,
+   "fills": false,
+   "warmup_s": 2.0685379250207916,
+   "capture_s": 0.18977088300744072,
+   "static_step": {
+    "warmup_s": 1.3615204630186781,
+    "capture_s": 0.1752229580306448,
+    "fills": false,
+    "warmup_steps": 4,
+    "graphs": 1
+   },
+   "draft": {
+    "warmup_s": 0.08352713100612164,
+    "capture_s": 0.02109259000280872,
+    "fills": false
+   }
+  },
+  "1": {
+   "n_graphs": 1,
+   "fills": false,
+   "warmup_s": 2.0151426499942318,
+   "capture_s": 0.22060024895472452,
+   "static_step": {
+    "warmup_s": 1.3387184459716082,
+    "capture_s": 0.1761186370276846,
+    "fills": false,
+    "warmup_steps": 4,
+    "graphs": 1
+   },
+   "draft": {
+    "warmup_s": 0.04518266802188009,
+    "capture_s": 0.021116004965733737,
+    "fills": false
+   }
+  }
+ },
+ "hbm_after_build_GiB": {
+  "free": 0.504,
+  "total": 249.814,
+  "allocated": 247.983,
+  "max_allocated": 248.036
+ },
+ "overflow": {
+  "steps": 0,
+  "experts": 0,
+  "steps_counted": 0,
+  "spare_slots": 16
+ },
+ "routed": {
+  "hot_calls": 499290,
+  "cold_calls": 6711
+ },
+ "prompts": {
+  "prose": {
+   "prompt_tokens": 42,
+   "tokens": 256,
+   "steps": 103,
+   "tokens_sha256": "f260754a904e3bbcf6398bb5dab1745223b885a998094fc2d9192e82bfae9b2d",
+   "cold_share_by_rep": [
+    0.012911115789051615,
+    0.011858579175813712
+   ],
+   "tokens_per_step": 2.4854368932038833,
+   "accept_hist": [
+    34,
+    27,
+    18,
+    11,
+    8,
+    5
+   ],
+   "accepts": [
+    4,
+    1,
+    2,
+    2,
+    0,
+    2,
+    1,
+    5,
+    1,
+    5,
+    0,
+    0,
+    1,
+    2,
+    0,
+    4,
+    0,
+    4,
+    1,
+    1,
+    1,
+    4,
+    1,
+    4,
+    0,
+    1,
+    3,
+    4,
+    2,
+    0,
+    2,
+    0,
+    0,
+    5,
+    0,
+    3,
+    1,
+    0,
+    1,
+    2,
+    1,
+    5,
+    1,
+    0,
+    3,
+    0,
+    2,
+    1,
+    4,
+    0,
+    0,
+    2,
+    1,
+    2,
+    0,
+    3,
+    5,
+    0,
+    1,
+    2,
+    0,
+    1,
+    3,
+    0,
+    1,
+    2,
+    3,
+    0,
+    0,
+    0,
+    0,
+    3,
+    0,
+    1,
+    0,
+    0,
+    0,
+    4,
+    1,
+    1,
+    0,
+    0,
+    1,
+    2,
+    3,
+    2,
+    3,
+    0,
+    1,
+    2,
+    3,
+    1,
+    1,
+    2,
+    1,
+    2,
+    0,
+    3,
+    0,
+    0,
+    0,
+    2,
+    1
+   ],
+   "stream": {
+    "exact": true,
+    "first_divergence": null,
+    "loop_tokens": 256,
+    "r1_tokens": 256,
+    "logit_rows_compared": 256,
+    "logit_rows_bit_equal": 256
+   },
+   "replay_ok": true,
+   "one_graph_equal": true,
+   "prefill_ms": [
+    4070.305178000126,
+    3991.4893400273286
+   ],
+   "r1_ms_per_token": 22.074941043084596,
+   "r1_vs_ref": null,
+   "finish_reason": "length",
+   "window": {
+    "stats_from_step": 32,
+    "steps": 142,
+    "ms_per_step": {
+     "n": 142,
+     "mean": 17.99643163278069,
+     "p50": 17.964943885803223,
+     "p90": 18.14320659637451,
+     "min": 17.742847442626953,
+     "max": 18.712064743041992
+    },
+    "ms_manager_per_step": {
+     "n": 142,
+     "mean": 0.03575436642367236,
+     "p50": 0.03187200054526329,
+     "p90": 0.03513279929757118,
+     "min": 0.03081599995493889,
+     "max": 0.1581439971923828
+    },
+    "ms_per_step_incl_manager": 18.032185999204362,
+    "ms_verify_graph": {
+     "n": 142,
+     "mean": 15.106839441917312,
+     "p50": 15.072832107543945,
+     "p90": 15.256774711608887,
+     "min": 14.84598445892334,
+     "max": 15.817024230957031
+    },
+    "ms_draft_graph": {
+     "n": 142,
+     "mean": 2.889592106913177,
+     "p50": 2.8888959884643555,
+     "p90": 2.89771511554718,
+     "min": 2.8767359256744385,
+     "max": 2.940256118774414
+    },
+    "tokens_per_step": 2.3380281690140845,
+    "ms_per_token": 7.697268951370056,
+    "total_gpu_ms": 2555.4932918548584,
+    "total_manager_ms": 5.077120032161474,
+    "total_emitted_tokens": 332,
+    "ms_per_token_definition": "total GPU ms / total emitted tokens: sum of the CUDA-event step times (verify graph + draft graph) over the window's live steps, divided by the sum of tokens emitted in those steps (accepted drafts + 1 per step), pooled over all prompts and fast reps",
+    "all_steps": 206,
+    "all_ms_per_step": {
+     "n": 206,
+     "mean": 17.96275407365225,
+     "p50": 17.947120666503906,
+     "p90": 18.13036823272705,
+     "min": 17.624256134033203,
+     "max": 18.73535919189453
+    },
+    "all_tokens_per_step": 2.4854368932038833,
+    "all_ms_per_token": 7.227201834321022,
+    "all_total_gpu_ms": 3700.3273391723633,
+    "all_total_emitted_tokens": 512
+   },
+   "window_one_graph": {
+    "stats_from_step": 32,
+    "steps": 71,
+    "ms_per_step": {
+     "n": 71,
+     "mean": 17.895274901054275,
+     "p50": 17.885791778564453,
+     "p90": 17.989215850830078,
+     "min": 17.634784698486328,
+     "max": 18.338464736938477
+    },
+    "ms_manager_per_step": {
+     "n": 71,
+     "mean": 0.03802952159878234,
+     "p50": 0.03232000023126602,
+     "p90": 0.03436800092458725,
+     "min": 0.030848000198602676,
+     "max": 0.15625600516796112
+    },
+    "ms_per_step_incl_manager": 17.93330442265306,
+    "ms_verify_graph": null,
+    "ms_draft_graph": null,
+    "tokens_per_step": 2.3380281690140845,
+    "ms_per_token": 7.654003120330443,
+    "total_gpu_ms": 1270.5645179748535,
+    "total_manager_ms": 2.700096033513546,
+    "total_emitted_tokens": 166,
+    "ms_per_token_definition": "total GPU ms / total emitted tokens: sum of the CUDA-event step times (verify graph + draft graph) over the window's live steps, divided by the sum of tokens emitted in those steps (accepted drafts + 1 per step), pooled over all prompts and fast reps",
+    "all_steps": 103,
+    "all_ms_per_step": {
+     "n": 103,
+     "mean": 17.893918491104273,
+     "p50": 17.883039474487305,
+     "p90": 17.989177322387697,
+     "min": 17.634784698486328,
+     "max": 18.561023712158203
+    },
+    "all_tokens_per_step": 2.4854368932038833,
+    "all_ms_per_token": 7.199506267905235,
+    "all_total_gpu_ms": 1843.0736045837402,
+    "all_total_emitted_tokens": 256
+   },
+   "cold_share_by_rep_one_graph": [
+    0.004591064465361522
+   ],
+   "steps_issued": [
+    112,
+    112
+   ],
+   "wall_ms_fast": [
+    6095.510904036928,
+    6014.525133010466
+   ]
+  },
+  "code": {
+   "prompt_tokens": 47,
+   "tokens": 218,
+   "steps": 52,
+   "tokens_sha256": "088be7649270245829a8b002dcca60ed53a00d54aff022e90d785f20c2cabfa9",
+   "cold_share_by_rep": [
+    0.1203216482620618,
+    0.10635144148817906
+   ],
+   "tokens_per_step": 4.1923076923076925,
+   "accept_hist": [
+    4,
+    8,
+    6,
+    9,
+    6,
+    19
+   ],
+   "accepts": [
+    5,
+    5,
+    2,
+    5,
+    4,
+    5,
+    4,
+    5,
+    0,
+    5,
+    0,
+    1,
+    5,
+    5,
+    1,
+    1,
+    3,
+    4,
+    3,
+    4,
+    1,
+    5,
+    5,
+    5,
+    1,
+    3,
+    1,
+    2,
+    0,
+    1,
+    0,
+    5,
+    3,
+    4,
+    5,
+    5,
+    1,
+    5,
+    5,
+    2,
+    5,
+    3,
+    2,
+    2,
+    5,
+    3,
+    2,
+    3,
+    4,
+    3,
+    5,
+    3
+   ],
+   "stream": {
+    "exact": true,
+    "first_divergence": null,
+    "loop_tokens": 218,
+    "r1_tokens": 218,
+    "logit_rows_compared": 218,
+    "logit_rows_bit_equal": 218
+   },
+   "replay_ok": true,
+   "one_graph_equal": true,
+   "prefill_ms": [
+    4058.2088290248066,
+    4041.064658027608
+   ],
+   "r1_ms_per_token": 23.525341073789285,
+   "r1_vs_ref": null,
+   "finish_reason": "stop",
+   "window": {
+    "stats_from_step": 32,
+    "steps": 40,
+    "ms_per_step": {
+     "n": 40,
+     "mean": 22.10969524383545,
+     "p50": 22.142576217651367,
+     "p90": 23.533545112609865,
+     "min": 20.478239059448242,
+     "max": 23.99456024169922
+    },
+    "ms_manager_per_step": {
+     "n": 40,
+     "mean": 0.12757840058766307,
+     "p50": 0.15398399531841278,
+     "p90": 0.15651520639657973,
+     "min": 0.031168000772595406,
+     "max": 0.15824000537395477
+    },
+    "ms_per_step_incl_manager": 22.237273644423112,
+    "ms_verify_graph": {
+     "n": 40,
+     "mean": 19.22322392463684,
+     "p50": 19.25224018096924,
+     "p90": 20.646701431274415,
+     "min": 17.591840744018555,
+     "max": 21.110271453857422
+    },
+    "ms_draft_graph": {
+     "n": 40,
+     "mean": 2.8864711999893187,
+     "p50": 2.8855680227279663,
+     "p90": 2.892454409599304,
+     "min": 2.8771519660949707,
+     "max": 2.8969919681549072
+    },
+    "tokens_per_step": 4.5,
+    "ms_per_token": 4.913265609741211,
+    "total_gpu_ms": 884.387809753418,
+    "total_manager_ms": 5.103136023506522,
+    "total_emitted_tokens": 180,
+    "ms_per_token_definition": "total GPU ms / total emitted tokens: sum of the CUDA-event step times (verify graph + draft graph) over the window's live steps, divided by the sum of tokens emitted in those steps (accepted drafts + 1 per step), pooled over all prompts and fast reps",
+    "all_steps": 104,
+    "all_ms_per_step": {
+     "n": 104,
+     "mean": 20.55981073012719,
+     "p50": 20.752192497253418,
+     "p90": 22.84352626800537,
+     "min": 17.74630355834961,
+     "max": 23.99456024169922
+    },
+    "all_tokens_per_step": 4.1923076923076925,
+    "all_ms_per_token": 4.9041750365441,
+    "all_total_gpu_ms": 2138.2203159332275,
+    "all_total_emitted_tokens": 436
+   },
+   "window_one_graph": {
+    "stats_from_step": 32,
+    "steps": 20,
+    "ms_per_step": {
+     "n": 20,
+     "mean": 18.182756900787354,
+     "p50": 18.123519897460938,
+     "p90": 18.492607498168944,
+     "min": 17.828256607055664,
+     "max": 18.7890567779541
+    },
+    "ms_manager_per_step": {
+     "n": 20,
+     "mean": 0.04197280006483197,
+     "p50": 0.03296000137925148,
+     "p90": 0.04075520001351842,
+     "min": 0.03110400028526783,
+     "max": 0.15647999942302704
+    },
+    "ms_per_step_incl_manager": 18.224729700852187,
+    "ms_verify_graph": null,
+    "ms_draft_graph": null,
+    "tokens_per_step": 4.5,
+    "ms_per_token": 4.0406126446194115,
+    "total_gpu_ms": 363.65513801574707,
+    "total_manager_ms": 0.8394560012966394,
+    "total_emitted_tokens": 90,
+    "ms_per_token_definition": "total GPU ms / total emitted tokens: sum of the CUDA-event step times (verify graph + draft graph) over the window's live steps, divided by the sum of tokens emitted in those steps (accepted drafts + 1 per step), pooled over all prompts and fast reps",
+    "all_steps": 52,
+    "all_ms_per_step": {
+     "n": 52,
+     "mean": 18.02187332740197,
+     "p50": 17.99737548828125,
+     "p90": 18.24944725036621,
+     "min": 17.634784698486328,
+     "max": 18.7890567779541
+    },
+    "all_tokens_per_step": 4.1923076923076925,
+    "all_ms_per_token": 4.298795472591295,
+    "all_total_gpu_ms": 937.1374130249023,
+    "all_total_emitted_tokens": 218
+   },
+   "cold_share_by_rep_one_graph": [
+    0.020658860149707255
+   ],
+   "steps_issued": [
+    64,
+    64
+   ],
+   "wall_ms_fast": [
+    5375.791293976363,
+    5337.125899037346
+   ]
+  },
+  "math": {
+   "prompt_tokens": 54,
+   "tokens": 256,
+   "steps": 58,
+   "tokens_sha256": "b8905da6c41ba5ae3d86d69a3ee4a39c4bf09ae82fb3391a2e703d8bbfa30bad",
+   "cold_share_by_rep": [
+    0.07158622341608636,
+    0.051961606241552175
+   ],
+   "tokens_per_step": 4.396551724137931,
+   "accept_hist": [
+    8,
+    5,
+    8,
+    2,
+    5,
+    30
+   ],
+   "accepts": [
+    2,
+    5,
+    3,
+    0,
+    0,
+    0,
+    4,
+    4,
+    4,
+    2,
+    5,
+    5,
+    0,
+    1,
+    5,
+    5,
+    5,
+    0,
+    2,
+    5,
+    5,
+    5,
+    5,
+    5,
+    5,
+    5,
+    4,
+    2,
+    2,
+    5,
+    0,
+    5,
+    0,
+    2,
+    2,
+    1,
+    5,
+    3,
+    5,
+    5,
+    5,
+    2,
+    1,
+    5,
+    5,
+    5,
+    5,
+    5,
+    5,
+    5,
+    0,
+    1,
+    4,
+    5,
+    5,
+    1,
+    5,
+    5
+   ],
+   "stream": {
+    "exact": true,
+    "first_divergence": null,
+    "loop_tokens": 256,
+    "r1_tokens": 256,
+    "logit_rows_compared": 256,
+    "logit_rows_bit_equal": 256
+   },
+   "replay_ok": true,
+   "one_graph_equal": true,
+   "prefill_ms": [
+    4052.5805950164795,
+    4038.6336619849317
+   ],
+   "r1_ms_per_token": 23.075444737275806,
+   "r1_vs_ref": null,
+   "finish_reason": "length",
+   "window": {
+    "stats_from_step": 32,
+    "steps": 52,
+    "ms_per_step": {
+     "n": 52,
+     "mean": 18.865215374873234,
+     "p50": 18.761216163635254,
+     "p90": 19.559132957458495,
+     "min": 17.912479400634766,
+     "max": 20.21001625061035
+    },
+    "ms_manager_per_step": {
+     "n": 52,
+     "mean": 0.055324307893617794,
+     "p50": 0.03161599859595299,
+     "p90": 0.1536160007119179,
+     "min": 0.03097599931061268,
+     "max": 0.15609599649906158
+    },
+    "ms_per_step_incl_manager": 18.92053968276685,
+    "ms_verify_graph": {
+     "n": 52,
+     "mean": 15.978688625188974,
+     "p50": 15.873055934906006,
+     "p90": 16.674857521057127,
+     "min": 15.0250883102417,
+     "max": 17.334815979003906
+    },
+    "ms_draft_graph": {
+     "n": 52,
+     "mean": 2.8865267634391785,
+     "p50": 2.8853280544281006,
+     "p90": 2.895132851600647,
+     "min": 2.8743040561676025,
+     "max": 2.925312042236328
+    },
+    "tokens_per_step": 4.538461538461538,
+    "ms_per_token": 4.15674237073478,
+    "total_gpu_ms": 980.9911994934082,
+    "total_manager_ms": 2.8768640104681253,
+    "total_emitted_tokens": 236,
+    "ms_per_token_definition": "total GPU ms / total emitted tokens: sum of the CUDA-event step times (verify graph + draft graph) over the window's live steps, divided by the sum of tokens emitted in those steps (accepted drafts + 1 per step), pooled over all prompts and fast reps",
+    "all_steps": 116,
+    "all_ms_per_step": {
+     "n": 116,
+     "mean": 18.794574079842402,
+     "p50": 18.70689582824707,
+     "p90": 19.48080062866211,
+     "min": 17.88819122314453,
+     "max": 20.21001625061035
+    },
+    "all_tokens_per_step": 4.396551724137931,
+    "all_ms_per_token": 4.274844300513174,
+    "all_total_gpu_ms": 2180.1705932617188,
+    "all_total_emitted_tokens": 510
+   },
+   "window_one_graph": {
+    "stats_from_step": 32,
+    "steps": 26,
+    "ms_per_step": {
+     "n": 26,
+     "mean": 17.832824633671688,
+     "p50": 17.809568405151367,
+     "p90": 17.976192474365234,
+     "min": 17.605247497558594,
+     "max": 18.053600311279297
+    },
+    "ms_manager_per_step": {
+     "n": 26,
+     "mean": 0.04485538494415008,
+     "p50": 0.0318400003015995,
+     "p90": 0.0786720011383295,
+     "min": 0.030688000842928886,
+     "max": 0.1576319932937622
+    },
+    "ms_per_step_incl_manager": 17.877680018615838,
+    "ms_verify_graph": null,
+    "ms_draft_graph": null,
+    "tokens_per_step": 4.538461538461538,
+    "ms_per_token": 3.929266444707321,
+    "total_gpu_ms": 463.65344047546387,
+    "total_manager_ms": 1.166240008547902,
+    "total_emitted_tokens": 118,
+    "ms_per_token_definition": "total GPU ms / total emitted tokens: sum of the CUDA-event step times (verify graph + draft graph) over the window's live steps, divided by the sum of tokens emitted in those steps (accepted drafts + 1 per step), pooled over all prompts and fast reps",
+    "all_steps": 58,
+    "all_ms_per_step": {
+     "n": 58,
+     "mean": 17.803599456260944,
+     "p50": 17.793248176574707,
+     "p90": 17.92723159790039,
+     "min": 17.571359634399414,
+     "max": 18.08278465270996
+    },
+    "all_tokens_per_step": 4.396551724137931,
+    "all_ms_per_token": 4.049446150835823,
+    "all_total_gpu_ms": 1032.6087684631348,
+    "all_total_emitted_tokens": 255
+   },
+   "cold_share_by_rep_one_graph": [
+    0.007528187930945986
+   ],
+   "steps_issued": [
+    72,
+    72
+   ],
+   "wall_ms_fast": [
+    5433.080994000193,
+    5390.344549959991
+   ]
+  },
+  "json": {
+   "prompt_tokens": 38,
+   "tokens": 18,
+   "steps": 4,
+   "tokens_sha256": "7beb082cfd41578ae0db80342318f8507da6ee7a91eccd63a36903cde993fa3e",
+   "cold_share_by_rep": [
+    0.13341758440151652,
+    0.13341758440151652
+   ],
+   "tokens_per_step": 4.5,
+   "accept_hist": [
+    0,
+    0,
+    2,
+    0,
+    0,
+    2
+   ],
+   "accepts": [
+    5,
+    2,
+    5,
+    2
+   ],
+   "stream": {
+    "exact": true,
+    "first_divergence": null,
+    "loop_tokens": 18,
+    "r1_tokens": 18,
+    "logit_rows_compared": 18,
+    "logit_rows_bit_equal": 18
+   },
+   "replay_ok": true,
+   "one_graph_equal": true,
+   "prefill_ms": [
+    3677.333967993036,
+    3633.8521449943073
+   ],
+   "r1_ms_per_token": 24.008139529648947,
+   "r1_vs_ref": null,
+   "finish_reason": "stop",
+   "window": {
+    "stats_from_step": 32,
+    "steps": 0,
+    "ms_per_step": {
+     "n": 0
+    },
+    "ms_manager_per_step": null,
+    "ms_per_step_incl_manager": null,
+    "ms_verify_graph": null,
+    "ms_draft_graph": null,
+    "tokens_per_step": null,
+    "ms_per_token": null,
+    "total_gpu_ms": null,
+    "total_manager_ms": null,
+    "total_emitted_tokens": null,
+    "ms_per_token_definition": "total GPU ms / total emitted tokens: sum of the CUDA-event step times (verify graph + draft graph) over the window's live steps, divided by the sum of tokens emitted in those steps (accepted drafts + 1 per step), pooled over all prompts and fast reps",
+    "all_steps": 8,
+    "all_ms_per_step": {
+     "n": 8,
+     "mean": 20.14968776702881,
+     "p50": 19.91214370727539,
+     "p90": 20.965411567687987,
+     "min": 19.81167984008789,
+     "max": 20.97542381286621
+    },
+    "all_tokens_per_step": 4.5,
+    "all_ms_per_token": 4.477708392673069,
+    "all_total_gpu_ms": 161.19750213623047,
+    "all_total_emitted_tokens": 36
+   },
+   "window_one_graph": {
+    "stats_from_step": 32,
+    "steps": 0,
+    "ms_per_step": {
+     "n": 0
+    },
+    "ms_manager_per_step": null,
+    "ms_per_step_incl_manager": null,
+    "ms_verify_graph": null,
+    "ms_draft_graph": null,
+    "tokens_per_step": null,
+    "ms_per_token": null,
+    "total_gpu_ms": null,
+    "total_manager_ms": null,
+    "total_emitted_tokens": null,
+    "ms_per_token_definition": "total GPU ms / total emitted tokens: sum of the CUDA-event step times (verify graph + draft graph) over the window's live steps, divided by the sum of tokens emitted in those steps (accepted drafts + 1 per step), pooled over all prompts and fast reps",
+    "all_steps": 4,
+    "all_ms_per_step": {
+     "n": 4,
+     "mean": 18.5863037109375,
+     "p50": 18.53113555908203,
+     "p90": 18.79360885620117,
+     "min": 18.384416580200195,
+     "max": 18.898527145385742
+    },
+    "all_tokens_per_step": 4.5,
+    "all_ms_per_token": 4.130289713541667,
+    "all_total_gpu_ms": 74.34521484375,
+    "all_total_emitted_tokens": 18
+   },
+   "cold_share_by_rep_one_graph": [
+    0.08912559427092737
+   ],
+   "steps_issued": [
+    16,
+    16
+   ],
+   "wall_ms_fast": [
+    4030.4249959881417,
+    3986.531213973649
+   ]
+  },
+  "shell": {
+   "prompt_tokens": 34,
+   "tokens": 256,
+   "steps": 70,
+   "tokens_sha256": "22764506274c00462cd6f02a3ae1e3a70a16b6055248dace0ce159a9e4cfefaa",
+   "cold_share_by_rep": [
+    0.04169468728984533,
+    0.025274602107150865
+   ],
+   "tokens_per_step": 3.6714285714285713,
+   "accept_hist": [
+    13,
+    10,
+    13,
+    6,
+    7,
+    21
+   ],
+   "accepts": [
+    0,
+    5,
+    3,
+    5,
+    1,
+    3,
+    5,
+    0,
+    0,
+    0,
+    4,
+    2,
+    2,
+    0,
+    4,
+    5,
+    0,
+    2,
+    0,
+    0,
+    5,
+    5,
+    4,
+    0,
+    3,
+    5,
+    5,
+    4,
+    5,
+    4,
+    2,
+    1,
+    2,
+    5,
+    1,
+    1,
+    1,
+    0,
+    5,
+    1,
+    3,
+    5,
+    2,
+    1,
+    5,
+    4,
+    4,
+    0,
+    3,
+    1,
+    5,
+    1,
+    5,
+    2,
+    2,
+    5,
+    5,
+    0,
+    3,
+    1,
+    2,
+    5,
+    2,
+    5,
+    5,
+    2,
+    0,
+    2,
+    5,
+    2
+   ],
+   "stream": {
+    "exact": true,
+    "first_divergence": null,
+    "loop_tokens": 256,
+    "r1_tokens": 256,
+    "logit_rows_compared": 256,
+    "logit_rows_bit_equal": 256
+   },
+   "replay_ok": true,
+   "one_graph_equal": true,
+   "prefill_ms": [
+    3362.340543011669,
+    3380.7465819991194
+   ],
+   "r1_ms_per_token": 22.811084270577734,
+   "r1_vs_ref": null,
+   "finish_reason": "length",
+   "window": {
+    "stats_from_step": 32,
+    "steps": 76,
+    "ms_per_step": {
+     "n": 76,
+     "mean": 18.420030744452227,
+     "p50": 18.44758415222168,
+     "p90": 18.747472763061523,
+     "min": 17.967424392700195,
+     "max": 18.9869441986084
+    },
+    "ms_manager_per_step": {
+     "n": 76,
+     "mean": 0.052892211113909356,
+     "p50": 0.032048000022768974,
+     "p90": 0.15331200510263443,
+     "min": 0.030688000842928886,
+     "max": 0.1568640023469925
+    },
+    "ms_per_step_incl_manager": 18.472922955566137,
+    "ms_verify_graph": {
+     "n": 76,
+     "mean": 15.527346937279953,
+     "p50": 15.535167694091797,
+     "p90": 15.844048023223877,
+     "min": 15.07744026184082,
+     "max": 16.074752807617188
+    },
+    "ms_draft_graph": {
+     "n": 76,
+     "mean": 2.8926837914868404,
+     "p50": 2.891248106956482,
+     "p90": 2.8986400365829468,
+     "min": 2.869823932647705,
+     "max": 2.9849278926849365
+    },
+    "tokens_per_step": 3.710526315789474,
+    "ms_per_token": 4.964263604887834,
+    "total_gpu_ms": 1399.9223365783691,
+    "total_manager_ms": 4.019808044657111,
+    "total_emitted_tokens": 282,
+    "ms_per_token_definition": "total GPU ms / total emitted tokens: sum of the CUDA-event step times (verify graph + draft graph) over the window's live steps, divided by the sum of tokens emitted in those steps (accepted drafts + 1 per step), pooled over all prompts and fast reps",
+    "all_steps": 140,
+    "all_ms_per_step": {
+     "n": 140,
+     "mean": 18.453208010537285,
+     "p50": 18.4727840423584,
+     "p90": 18.89650936126709,
+     "min": 17.865407943725586,
+     "max": 19.294815063476562
+    },
+    "all_tokens_per_step": 3.6714285714285713,
+    "all_ms_per_token": 5.026165605982918,
+    "all_total_gpu_ms": 2583.4491214752197,
+    "all_total_emitted_tokens": 514
+   },
+   "window_one_graph": {
+    "stats_from_step": 32,
+    "steps": 38,
+    "ms_per_step": {
+     "n": 38,
+     "mean": 17.954662875125283,
+     "p50": 17.947999954223633,
+     "p90": 18.082345390319823,
+     "min": 17.768863677978516,
+     "max": 18.213119506835938
+    },
+    "ms_manager_per_step": {
+     "n": 38,
+     "mean": 0.03315115813165903,
+     "p50": 0.03323199972510338,
+     "p90": 0.03428800031542778,
+     "min": 0.031039999797940254,
+     "max": 0.03641600161790848
+    },
+    "ms_per_step_incl_manager": 17.987814033256942,
+    "ms_verify_graph": null,
+    "ms_draft_graph": null,
+    "tokens_per_step": 3.710526315789474,
+    "ms_per_token": 4.838845313863551,
+    "total_gpu_ms": 682.2771892547607,
+    "total_manager_ms": 1.2597440090030432,
+    "total_emitted_tokens": 141,
+    "ms_per_token_definition": "total GPU ms / total emitted tokens: sum of the CUDA-event step times (verify graph + draft graph) over the window's live steps, divided by the sum of tokens emitted in those steps (accepted drafts + 1 per step), pooled over all prompts and fast reps",
+    "all_steps": 70,
+    "all_ms_per_step": {
+     "n": 70,
+     "mean": 17.90738800593785,
+     "p50": 17.89344024658203,
+     "p90": 18.055705070495605,
+     "min": 17.657567977905273,
+     "max": 18.213119506835938
+    },
+    "all_tokens_per_step": 3.6714285714285713,
+    "all_ms_per_token": 4.877498678660115,
+    "all_total_gpu_ms": 1253.5171604156494,
+    "all_total_emitted_tokens": 257
+   },
+   "cold_share_by_rep_one_graph": [
+    0.007019166106254203
+   ],
+   "steps_issued": [
+    80,
+    80
+   ],
+   "wall_ms_fast": [
+    4854.671997018158,
+    4849.113441014197
+   ]
+  },
+  "tool": {
+   "prompt_tokens": 49,
+   "tokens": 21,
+   "steps": 4,
+   "tokens_sha256": "c73c9384f74059bea313f8859e201ca69dc4c8e4f6f996325e623ec0bd7d036b",
+   "cold_share_by_rep": [
+    0.0878203522831622,
+    0.0878203522831622
+   ],
+   "tokens_per_step": 5.0,
+   "accept_hist": [
+    0,
+    1,
+    0,
+    0,
+    0,
+    3
+   ],
+   "accepts": [
+    1,
+    5,
+    5,
+    5
+   ],
+   "stream": {
+    "exact": true,
+    "first_divergence": null,
+    "loop_tokens": 21,
+    "r1_tokens": 21,
+    "logit_rows_compared": 21,
+    "logit_rows_bit_equal": 21
+   },
+   "replay_ok": true,
+   "one_graph_equal": true,
+   "prefill_ms": [
+    4229.0662819868885,
+    4164.610642998014
+   ],
+   "r1_ms_per_token": 23.576086899265647,
+   "r1_vs_ref": null,
+   "finish_reason": "stop",
+   "window": {
+    "stats_from_step": 32,
+    "steps": 0,
+    "ms_per_step": {
+     "n": 0
+    },
+    "ms_manager_per_step": null,
+    "ms_per_step_incl_manager": null,
+    "ms_verify_graph": null,
+    "ms_draft_graph": null,
+    "tokens_per_step": null,
+    "ms_per_token": null,
+    "total_gpu_ms": null,
+    "total_manager_ms": null,
+    "total_emitted_tokens": null,
+    "ms_per_token_definition": "total GPU ms / total emitted tokens: sum of the CUDA-event step times (verify graph + draft graph) over the window's live steps, divided by the sum of tokens emitted in those steps (accepted drafts + 1 per step), pooled over all prompts and fast reps",
+    "all_steps": 8,
+    "all_ms_per_step": {
+     "n": 8,
+     "mean": 18.400843858718872,
+     "p50": 18.383760452270508,
+     "p90": 18.543807601928712,
+     "min": 18.290815353393555,
+     "max": 18.556352615356445
+    },
+    "all_tokens_per_step": 5.0,
+    "all_ms_per_token": 3.6801687717437743,
+    "all_total_gpu_ms": 147.20675086975098,
+    "all_total_emitted_tokens": 40
+   },
+   "window_one_graph": {
+    "stats_from_step": 32,
+    "steps": 0,
+    "ms_per_step": {
+     "n": 0
+    },
+    "ms_manager_per_step": null,
+    "ms_per_step_incl_manager": null,
+    "ms_verify_graph": null,
+    "ms_draft_graph": null,
+    "tokens_per_step": null,
+    "ms_per_token": null,
+    "total_gpu_ms": null,
+    "total_manager_ms": null,
+    "total_emitted_tokens": null,
+    "ms_per_token_definition": "total GPU ms / total emitted tokens: sum of the CUDA-event step times (verify graph + draft graph) over the window's live steps, divided by the sum of tokens emitted in those steps (accepted drafts + 1 per step), pooled over all prompts and fast reps",
+    "all_steps": 4,
+    "all_ms_per_step": {
+     "n": 4,
+     "mean": 18.044600009918213,
+     "p50": 18.06550407409668,
+     "p90": 18.14007110595703,
+     "min": 17.9019832611084,
+     "max": 18.145408630371094
+    },
+    "all_tokens_per_step": 5.0,
+    "all_ms_per_token": 3.6089200019836425,
+    "all_total_gpu_ms": 72.17840003967285,
+    "all_total_emitted_tokens": 20
+   },
+   "cold_share_by_rep_one_graph": [
+    0.04925285917021454
+   ],
+   "steps_issued": [
+    16,
+    16
+   ],
+   "wall_ms_fast": [
+    4535.826576990075,
+    4471.413343970198
+   ]
+  },
+  "long": {
+   "prompt_tokens": 46,
+   "tokens": 256,
+   "steps": 97,
+   "tokens_sha256": "2408624f38fcfb464d7f8143e56c0b81329817e515c18709bbfaa635b2e143e8",
+   "cold_share_by_rep": [
+    0.016543330378574344,
+    0.010059460374689999
+   ],
+   "tokens_per_step": 2.6288659793814433,
+   "accept_hist": [
+    34,
+    18,
+    18,
+    11,
+    9,
+    7
+   ],
+   "accepts": [
+    0,
+    1,
+    1,
+    4,
+    4,
+    5,
+    0,
+    0,
+    1,
+    2,
+    1,
+    1,
+    2,
+    0,
+    2,
+    4,
+    3,
+    2,
+    2,
+    1,
+    0,
+    2,
+    5,
+    0,
+    0,
+    3,
+    3,
+    0,
+    0,
+    0,
+    2,
+    0,
+    5,
+    4,
+    2,
+    1,
+    1,
+    1,
+    2,
+    0,
+    3,
+    1,
+    3,
+    0,
+    0,
+    0,
+    1,
+    3,
+    0,
+    0,
+    3,
+    1,
+    4,
+    0,
+    5,
+    4,
+    1,
+    2,
+    0,
+    0,
+    3,
+    0,
+    0,
+    3,
+    0,
+    0,
+    4,
+    0,
+    5,
+    0,
+    1,
+    0,
+    3,
+    4,
+    1,
+    1,
+    2,
+    0,
+    2,
+    0,
+    2,
+    1,
+    5,
+    1,
+    0,
+    2,
+    0,
+    3,
+    2,
+    0,
+    0,
+    5,
+    0,
+    2,
+    2,
+    4,
+    2
+   ],
+   "stream": {
+    "exact": true,
+    "first_divergence": null,
+    "loop_tokens": 256,
+    "r1_tokens": 256,
+    "logit_rows_compared": 256,
+    "logit_rows_bit_equal": 256
+   },
+   "replay_ok": true,
+   "one_graph_equal": true,
+   "prefill_ms": [
+    3954.1571409790777,
+    3949.9512769980356
+   ],
+   "r1_ms_per_token": 22.531093117625762,
+   "r1_vs_ref": null,
+   "finish_reason": "length",
+   "window": {
+    "stats_from_step": 32,
+    "steps": 130,
+    "ms_per_step": {
+     "n": 130,
+     "mean": 18.056972767756534,
+     "p50": 18.05816078186035,
+     "p90": 18.251260566711426,
+     "min": 17.70252799987793,
+     "max": 18.441856384277344
+    },
+    "ms_manager_per_step": {
+     "n": 130,
+     "mean": 0.05500036903585379,
+     "p50": 0.03227199986577034,
+     "p90": 0.15449280589818953,
+     "min": 0.0306560005992651,
+     "max": 0.15913599729537964
+    },
+    "ms_per_step_incl_manager": 18.111973136792386,
+    "ms_verify_graph": {
+     "n": 130,
+     "mean": 15.166606022761417,
+     "p50": 15.168303966522217,
+     "p90": 15.363667392730713,
+     "min": 14.815936088562012,
+     "max": 15.54867172241211
+    },
+    "ms_draft_graph": {
+     "n": 130,
+     "mean": 2.890366765168997,
+     "p50": 2.8884639739990234,
+     "p90": 2.8967808723449706,
+     "min": 2.8749759197235107,
+     "max": 2.984992027282715
+    },
+    "tokens_per_step": 2.646153846153846,
+    "ms_per_token": 6.823855987814969,
+    "total_gpu_ms": 2347.4064598083496,
+    "total_manager_ms": 7.150047974660993,
+    "total_emitted_tokens": 344,
+    "ms_per_token_definition": "total GPU ms / total emitted tokens: sum of the CUDA-event step times (verify graph + draft graph) over the window's live steps, divided by the sum of tokens emitted in those steps (accepted drafts + 1 per step), pooled over all prompts and fast reps",
+    "all_steps": 194,
+    "all_ms_per_step": {
+     "n": 194,
+     "mean": 18.029171265277665,
+     "p50": 18.0241117477417,
+     "p90": 18.246828269958495,
+     "min": 17.695520401000977,
+     "max": 18.479103088378906
+    },
+    "all_tokens_per_step": 2.6288659793814433,
+    "all_ms_per_token": 6.858155344046798,
+    "all_total_gpu_ms": 3497.659225463867,
+    "all_total_emitted_tokens": 510
+   },
+   "window_one_graph": {
+    "stats_from_step": 32,
+    "steps": 65,
+    "ms_per_step": {
+     "n": 65,
+     "mean": 17.896245193481445,
+     "p50": 17.904064178466797,
+     "p90": 18.02252197265625,
+     "min": 17.661407470703125,
+     "max": 18.189472198486328
+    },
+    "ms_manager_per_step": {
+     "n": 65,
+     "mean": 0.03234313872571175,
+     "p50": 0.031647998839616776,
+     "p90": 0.032921601086854935,
+     "min": 0.0306560005992651,
+     "max": 0.06217600032687187
+    },
+    "ms_per_step_incl_manager": 17.928588332207156,
+    "ms_verify_graph": null,
+    "ms_draft_graph": null,
+    "tokens_per_step": 2.646153846153846,
+    "ms_per_token": 6.763115916141244,
+    "total_gpu_ms": 1163.255937576294,
+    "total_manager_ms": 2.1023040171712637,
+    "total_emitted_tokens": 172,
+    "ms_per_token_definition": "total GPU ms / total emitted tokens: sum of the CUDA-event step times (verify graph + draft graph) over the window's live steps, divided by the sum of tokens emitted in those steps (accepted drafts + 1 per step), pooled over all prompts and fast reps",
+    "all_steps": 97,
+    "all_ms_per_step": {
+     "n": 97,
+     "mean": 17.86977024668271,
+     "p50": 17.871999740600586,
+     "p90": 18.00597152709961,
+     "min": 17.61404800415039,
+     "max": 18.189472198486328
+    },
+    "all_tokens_per_step": 2.6288659793814433,
+    "all_ms_per_token": 6.797520446777344,
+    "all_total_gpu_ms": 1733.3677139282227,
+    "all_total_emitted_tokens": 255
+   },
+   "cold_share_by_rep_one_graph": [
+    0.004631335717060247
+   ],
+   "steps_issued": [
+    112,
+    112
+   ],
+   "wall_ms_fast": [
+    5988.947885984089,
+    5973.3001320273615
+   ]
+  },
+  "story": {
+   "prompt_tokens": 31,
+   "tokens": 192,
+   "steps": 91,
+   "tokens_sha256": "076b75919792fcff2ee597e7cff031a8222a67d7df7dae2b67f8eb2d26b0828b",
+   "cold_share_by_rep": [
+    0.06799503467168906,
+    0.033644379762006675
+   ],
+   "tokens_per_step": 2.10989010989011,
+   "accept_hist": [
+    32,
+    29,
+    19,
+    10,
+    1,
+    0
+   ],
+   "accepts": [
+    0,
+    2,
+    1,
+    3,
+    1,
+    0,
+    0,
+    3,
+    1,
+    0,
+    0,
+    1,
+    2,
+    3,
+    0,
+    2,
+    2,
+    0,
+    3,
+    0,
+    0,
+    1,
+    2,
+    2,
+    1,
+    2,
+    0,
+    3,
+    0,
+    1,
+    0,
+    1,
+    0,
+    2,
+    0,
+    3,
+    1,
+    2,
+    1,
+    0,
+    0,
+    1,
+    1,
+    2,
+    0,
+    2,
+    0,
+    1,
+    1,
+    3,
+    0,
+    2,
+    2,
+    0,
+    1,
+    1,
+    0,
+    2,
+    1,
+    1,
+    2,
+    0,
+    0,
+    3,
+    0,
+    1,
+    2,
+    1,
+    3,
+    1,
+    3,
+    0,
+    2,
+    1,
+    1,
+    0,
+    0,
+    2,
+    0,
+    1,
+    1,
+    2,
+    0,
+    1,
+    1,
+    1,
+    0,
+    0,
+    1,
+    0,
+    4
+   ],
+   "stream": {
+    "exact": true,
+    "first_divergence": null,
+    "loop_tokens": 192,
+    "r1_tokens": 192,
+    "logit_rows_compared": 192,
+    "logit_rows_bit_equal": 192
+   },
+   "replay_ok": true,
+   "one_graph_equal": true,
+   "prefill_ms": [
+    3520.6810910021886,
+    3511.91161503084
+   ],
+   "r1_ms_per_token": 22.39574110976552,
+   "r1_vs_ref": null,
+   "finish_reason": "stop",
+   "window": {
+    "stats_from_step": 32,
+    "steps": 118,
+    "ms_per_step": {
+     "n": 118,
+     "mean": 18.5576678292226,
+     "p50": 18.472304344177246,
+     "p90": 19.265391159057618,
+     "min": 17.826688766479492,
+     "max": 20.35910415649414
+    },
+    "ms_manager_per_step": {
+     "n": 118,
+     "mean": 0.05842386457627102,
+     "p50": 0.03209599852561951,
+     "p90": 0.15423680245876312,
+     "min": 0.030751999467611313,
+     "max": 0.15961599349975586
+    },
+    "ms_per_step_incl_manager": 18.616091693798868,
+    "ms_verify_graph": {
+     "n": 118,
+     "mean": 15.670555664321123,
+     "p50": 15.58412790298462,
+     "p90": 16.382653045654298,
+     "min": 14.94217586517334,
+     "max": 17.470272064208984
+    },
+    "ms_draft_graph": {
+     "n": 118,
+     "mean": 2.887112128532539,
+     "p50": 2.8846240043640137,
+     "p90": 2.8927775621414185,
+     "min": 2.8723199367523193,
+     "max": 2.9700798988342285
+    },
+    "tokens_per_step": 2.0847457627118646,
+    "ms_per_token": 8.901645544098646,
+    "total_gpu_ms": 2189.8048038482666,
+    "total_manager_ms": 6.894016019999981,
+    "total_emitted_tokens": 246,
+    "ms_per_token_definition": "total GPU ms / total emitted tokens: sum of the CUDA-event step times (verify graph + draft graph) over the window's live steps, divided by the sum of tokens emitted in those steps (accepted drafts + 1 per step), pooled over all prompts and fast reps",
+    "all_steps": 182,
+    "all_ms_per_step": {
+     "n": 182,
+     "mean": 18.568907381414057,
+     "p50": 18.467376708984375,
+     "p90": 19.23290843963623,
+     "min": 17.826688766479492,
+     "max": 20.35910415649414
+    },
+    "all_tokens_per_step": 2.10989010989011,
+    "all_ms_per_token": 8.800888394316038,
+    "all_total_gpu_ms": 3379.5411434173584,
+    "all_total_emitted_tokens": 384
+   },
+   "window_one_graph": {
+    "stats_from_step": 32,
+    "steps": 59,
+    "ms_per_step": {
+     "n": 59,
+     "mean": 17.87041033728648,
+     "p50": 17.84547233581543,
+     "p90": 18.026720428466795,
+     "min": 17.569120407104492,
+     "max": 18.461759567260742
+    },
+    "ms_manager_per_step": {
+     "n": 59,
+     "mean": 0.03197288169067795,
+     "p50": 0.03190400078892708,
+     "p90": 0.03305600136518479,
+     "min": 0.03062400035560131,
+     "max": 0.034912001341581345
+    },
+    "ms_per_step_incl_manager": 17.902383218977157,
+    "ms_verify_graph": null,
+    "ms_draft_graph": null,
+    "tokens_per_step": 2.0847457627118646,
+    "ms_per_token": 8.571985446340669,
+    "total_gpu_ms": 1054.3542098999023,
+    "total_manager_ms": 1.886400019749999,
+    "total_emitted_tokens": 123,
+    "ms_per_token_definition": "total GPU ms / total emitted tokens: sum of the CUDA-event step times (verify graph + draft graph) over the window's live steps, divided by the sum of tokens emitted in those steps (accepted drafts + 1 per step), pooled over all prompts and fast reps",
+    "all_steps": 91,
+    "all_ms_per_step": {
+     "n": 91,
+     "mean": 17.86079442370069,
+     "p50": 17.83852767944336,
+     "p90": 18.035104751586914,
+     "min": 17.558080673217773,
+     "max": 18.461759567260742
+    },
+    "all_tokens_per_step": 2.10989010989011,
+    "all_ms_per_token": 8.465272357066473,
+    "all_total_gpu_ms": 1625.3322925567627,
+    "all_total_emitted_tokens": 192
+   },
+   "cold_share_by_rep_one_graph": [
+    0.017774591216505438
+   ],
+   "steps_issued": [
+    104,
+    104
+   ],
+   "wall_ms_fast": [
+    5522.46251195902,
+    5437.628082989249
+   ]
+  }
+ },
+ "n_prompts": 8,
+ "streams": {
+  "exact": 8,
+  "prompts": 8
+ },
+ "replay_ok": 8,
+ "headline": {
+  "metric": "ms per 6-row step, DSpark k=5",
+  "instrument": "CUDA events per step (start | after verify graph | after draft graph), live steps >= 32 of each sequence, pooled over prompts",
+  "two_graphs": {
+   "stats_from_step": 32,
+   "steps": 558,
+   "ms_per_step": {
+    "n": 558,
+    "mean": 18.562734590209086,
+    "p50": 18.153679847717285,
+    "p90": 19.393996810913087,
+    "min": 17.70252799987793,
+    "max": 23.99456024169922
+   },
+   "ms_manager_per_step": {
+    "n": 558,
+    "mean": 0.05577238728576023,
+    "p50": 0.03209599852561951,
+    "p90": 0.15425919741392136,
+    "min": 0.0306560005992651,
+    "max": 0.15961599349975586
+   },
+   "ms_per_step_incl_manager": 18.618506977494846,
+   "ms_verify_graph": {
+    "n": 558,
+    "mean": 15.6735747039959,
+    "p50": 15.257823944091797,
+    "p90": 16.50113925933838,
+    "min": 14.815936088562012,
+    "max": 21.110271453857422
+   },
+   "ms_draft_graph": {
+    "n": 558,
+    "mean": 2.889159852458585,
+    "p50": 2.8877599239349365,
+    "p90": 2.89684157371521,
+    "min": 2.869823932647705,
+    "max": 2.984992027282715
+   },
+   "tokens_per_step": 2.903225806451613,
+   "ms_per_token": 6.39383080329424,
+   "total_gpu_ms": 10358.00590133667,
+   "total_manager_ms": 31.120992105454206,
+   "total_emitted_tokens": 1620,
+   "ms_per_token_definition": "total GPU ms / total emitted tokens: sum of the CUDA-event step times (verify graph + draft graph) over the window's live steps, divided by the sum of tokens emitted in those steps (accepted drafts + 1 per step), pooled over all prompts and fast reps",
+   "all_steps": 958,
+   "all_ms_per_step": {
+    "n": 958,
+    "mean": 18.567611682390122,
+    "p50": 18.204864501953125,
+    "p90": 19.51071720123291,
+    "min": 17.624256134033203,
+    "max": 23.99456024169922
+   },
+   "all_tokens_per_step": 3.0709812108559498,
+   "all_ms_per_token": 6.046149555312623,
+   "all_total_gpu_ms": 17787.771991729736,
+   "all_total_emitted_tokens": 2942,
+   "cold_share": 0.044874417244234695
+  },
+  "one_graph": {
+   "stats_from_step": 32,
+   "steps": 279,
+   "ms_per_step": {
+    "n": 279,
+    "mean": 17.91311983224739,
+    "p50": 17.88924789428711,
+    "p90": 18.07215995788574,
+    "min": 17.569120407104492,
+    "max": 18.7890567779541
+   },
+   "ms_manager_per_step": {
+    "n": 279,
+    "mean": 0.03567827988990105,
+    "p50": 0.031968001276254654,
+    "p90": 0.03408639878034592,
+    "min": 0.03062400035560131,
+    "max": 0.1576319932937622
+   },
+   "ms_per_step_incl_manager": 17.94879811213729,
+   "ms_verify_graph": null,
+   "ms_draft_graph": null,
+   "tokens_per_step": 2.903225806451613,
+   "ms_per_token": 6.170074608885212,
+   "total_gpu_ms": 4997.7604331970215,
+   "total_manager_ms": 9.954240089282393,
+   "total_emitted_tokens": 810,
+   "ms_per_token_definition": "total GPU ms / total emitted tokens: sum of the CUDA-event step times (verify graph + draft graph) over the window's live steps, divided by the sum of tokens emitted in those steps (accepted drafts + 1 per step), pooled over all prompts and fast reps",
+   "all_steps": 479,
+   "all_ms_per_step": {
+    "n": 479,
+    "mean": 17.894698471515312,
+    "p50": 17.875455856323242,
+    "p90": 18.060562896728516,
+    "min": 17.558080673217773,
+    "max": 18.898527145385742
+   },
+   "all_tokens_per_step": 3.0709812108559498,
+   "all_ms_per_token": 5.82702961784897,
+   "all_total_gpu_ms": 8571.560567855835,
+   "all_total_emitted_tokens": 1471,
+   "cold_share": 0.013262819638696367
+  },
+  "ms_per_6row_step_dspark_k5": 18.562734590209086,
+  "ms_verify_graph": 15.6735747039959,
+  "ms_draft_graph": 2.889159852458585,
+  "tokens_per_step": 2.903225806451613,
+  "ms_per_token": 6.39383080329424,
+  "total_gpu_ms": 10358.00590133667,
+  "total_emitted_tokens": 1620,
+  "ms_per_token_definition": "total GPU ms / total emitted tokens: sum of the CUDA-event step times (verify graph + draft graph) over the window's live steps, divided by the sum of tokens emitted in those steps (accepted drafts + 1 per step), pooled over all prompts and fast reps",
+  "ms_per_6row_step_one_graph": 17.91311983224739,
+  "prefill_ms_mean": 3852.3083468171535
+ },
+ "residency": {
+  "config": {
+   "drain_n": 64,
+   "swaps_per_drain": 2,
+   "halflife": 500.0,
+   "hyst": 1.5,
+   "min_abs": 8.0,
+   "swaps_per_barrier": 4,
+   "frozen": false,
+   "n_spare": null,
+   "spare_cap": 4,
+   "stage_keep": null,
+   "n_demote": 64,
+   "reserve_gib": 8.0,
+   "kv_rows": 6,
+   "kv_ctx": 32768,
+   "hbm_free_bytes": null,
+   "host_reserve_gib": 16.0,
+   "force_random": 0,
+   "seed": 0,
+   "verbose": false
+  },
+  "on": true,
+  "params": {
+   "drain_n": 64,
+   "swaps_per_drain": 2,
+   "halflife": 500.0,
+   "hyst": 1.5,
+   "min_abs": 8.0,
+   "swaps_per_barrier": 4,
+   "frozen_at_boot": false,
+   "restore_resets_ewma": false
+  },
+  "n_spare": 4,
+  "n_stage": 16,
+  "sf_store": {
+   "requested": "pool",
+   "got": "pool"
+  },
+  "n_demote": 64,
+  "budget": {
+   "free_GiB": 1.711,
+   "kv_GiB": 0.838,
+   "stage_new_GiB": 0.0,
+   "reserve_GiB": 8.0,
+   "step_extra_GiB": 0.0,
+   "per_spare_slot_all_layers_GiB": 0.6592,
+   "affordable_per_layer": 0,
+   "prepaid_GiB": 0.0,
+   "pool_spare": 20,
+   "stage_keep": 16,
+   "existing_free_per_layer": 4,
+   "want_new_per_layer": 0,
+   "new_per_layer": 0
+  },
+  "hbm": {
+   "spare_weight_B": 2831155200,
+   "spare_scale_B": 176947200,
+   "pool_grown_B": 0,
+   "spare_GiB": 2.802,
+   "demotion_pool_GiB": 44.844,
+   "sf_layout": "beside",
+   "spare_scale_is": "packed SF group (pool.sfp)",
+   "spare_e8m0_host_B": 176947200,
+   "spare_e8m0_host_GiB": 0.165
+  },
+  "hbm_now": {
+   "free_GiB": 0.389,
+   "total_GiB": 249.814,
+   "allocated_GiB": 248.077
+  },
+  "host_steps": 2686,
+  "stats": {
+   "issued": 1660,
+   "published": 1660,
+   "vetoed": 0,
+   "vetoed_no_slot": 0,
+   "vetoed_no_demotion_slot": 0,
+   "d2h_demotions": 1633,
+   "forced_flush": 0,
+   "forced_swaps": 0,
+   "drains": 41,
+   "table_writes": 53120,
+   "restores": 0
+  },
+  "policy": {
+   "n_swaps": 1660,
+   "stale": 0,
+   "drains": 41,
+   "cum_sel": 2057421,
+   "cum_cold": 46509,
+   "cum_cold_share": 0.022605485216686327,
+   "hot_moved": 1254,
+   "freeze": false,
+   "pending": 0
+  },
+  "swaps_per_step": {
+   "steps": 2686,
+   "swaps": 1660,
+   "mean": 0.6180193596425912,
+   "max": 4,
+   "steps_with_swaps": 431,
+   "cap": 4
+  },
+  "inflight": 0,
+  "line": "[residency] HBM free 1.711 GiB - KV 0.838 - new staging 0.0 - reserve 8.0 -> affordable 0 NEW slots/layer (0.6592 GiB each over 40 layers); pool holds 20 spare/layer, 16 kept for staging, 4 free in place + 0 new; n_spare 4 (+2.802 GiB HBM), n_stage 16, demotion pool 64/layer = 44.844 GiB Grace; drain_n 64 swaps/drain 2 cap/step 4 hyst 1.5 min_abs 8.0 halflife 500.0",
+  "drain_log": [
+   {
+    "host_steps": 64,
+    "steps": 64,
+    "sel": 57227,
+    "cold": 417,
+    "cold_share": 0.0072867702308350955,
+    "queued": 2,
+    "swaps": 0,
+    "published": 0,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 0
+   },
+   {
+    "host_steps": 128,
+    "steps": 64,
+    "sel": 49255,
+    "cold": 525,
+    "cold_share": 0.010658816363820931,
+    "queued": 7,
+    "swaps": 2,
+    "published": 2,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 2
+   },
+   {
+    "host_steps": 192,
+    "steps": 64,
+    "sel": 57681,
+    "cold": 437,
+    "cold_share": 0.0075761515923787725,
+    "queued": 12,
+    "swaps": 9,
+    "published": 9,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 9
+   },
+   {
+    "host_steps": 256,
+    "steps": 64,
+    "sel": 48987,
+    "cold": 351,
+    "cold_share": 0.007165166268601874,
+    "queued": 12,
+    "swaps": 21,
+    "published": 21,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 21
+   },
+   {
+    "host_steps": 320,
+    "steps": 64,
+    "sel": 57412,
+    "cold": 408,
+    "cold_share": 0.007106528251933393,
+    "queued": 12,
+    "swaps": 33,
+    "published": 33,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 33
+   },
+   {
+    "host_steps": 384,
+    "steps": 64,
+    "sel": 56842,
+    "cold": 302,
+    "cold_share": 0.005312972801801485,
+    "queued": 21,
+    "swaps": 45,
+    "published": 45,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 45
+   },
+   {
+    "host_steps": 448,
+    "steps": 64,
+    "sel": 56871,
+    "cold": 1514,
+    "cold_share": 0.02662165251182501,
+    "queued": 49,
+    "swaps": 66,
+    "published": 66,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 66
+   },
+   {
+    "host_steps": 512,
+    "steps": 64,
+    "sel": 44492,
+    "cold": 5095,
+    "cold_share": 0.11451496898318798,
+    "queued": 79,
+    "swaps": 115,
+    "published": 115,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 114
+   },
+   {
+    "host_steps": 576,
+    "steps": 64,
+    "sel": 44492,
+    "cold": 3871,
+    "cold_share": 0.08700440528634361,
+    "queued": 79,
+    "swaps": 194,
+    "published": 194,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 191
+   },
+   {
+    "host_steps": 640,
+    "steps": 64,
+    "sel": 54646,
+    "cold": 3480,
+    "cold_share": 0.06368261171906453,
+    "queued": 80,
+    "swaps": 273,
+    "published": 273,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 265
+   },
+   {
+    "host_steps": 704,
+    "steps": 64,
+    "sel": 53272,
+    "cold": 3697,
+    "cold_share": 0.06939855834209341,
+    "queued": 80,
+    "swaps": 353,
+    "published": 353,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 342
+   },
+   {
+    "host_steps": 768,
+    "steps": 64,
+    "sel": 40592,
+    "cold": 2036,
+    "cold_share": 0.05015766653527789,
+    "queued": 77,
+    "swaps": 433,
+    "published": 433,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 419
+   },
+   {
+    "host_steps": 832,
+    "steps": 64,
+    "sel": 40954,
+    "cold": 1333,
+    "cold_share": 0.03254871319040875,
+    "queued": 75,
+    "swaps": 510,
+    "published": 510,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 491
+   },
+   {
+    "host_steps": 896,
+    "steps": 64,
+    "sel": 51830,
+    "cold": 1282,
+    "cold_share": 0.024734709627628786,
+    "queued": 65,
+    "swaps": 585,
+    "published": 585,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 562
+   },
+   {
+    "host_steps": 960,
+    "steps": 64,
+    "sel": 34810,
+    "cold": 1659,
+    "cold_share": 0.04765871875897731,
+    "queued": 71,
+    "swaps": 650,
+    "published": 650,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 624
+   },
+   {
+    "host_steps": 1024,
+    "steps": 64,
+    "sel": 56385,
+    "cold": 2677,
+    "cold_share": 0.0474771659129201,
+    "queued": 71,
+    "swaps": 721,
+    "published": 721,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 686
+   },
+   {
+    "host_steps": 1088,
+    "steps": 64,
+    "sel": 47311,
+    "cold": 1287,
+    "cold_share": 0.027202976052080913,
+    "queued": 65,
+    "swaps": 792,
+    "published": 792,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 738
+   },
+   {
+    "host_steps": 1152,
+    "steps": 64,
+    "sel": 47562,
+    "cold": 933,
+    "cold_share": 0.019616500567680082,
+    "queued": 66,
+    "swaps": 857,
+    "published": 857,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 790
+   },
+   {
+    "host_steps": 1216,
+    "steps": 64,
+    "sel": 56531,
+    "cold": 806,
+    "cold_share": 0.014257663936601156,
+    "queued": 63,
+    "swaps": 923,
+    "published": 923,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 845
+   },
+   {
+    "host_steps": 1280,
+    "steps": 64,
+    "sel": 46660,
+    "cold": 644,
+    "cold_share": 0.013801971710244321,
+    "queued": 50,
+    "swaps": 986,
+    "published": 986,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 895
+   },
+   {
+    "host_steps": 1344,
+    "steps": 64,
+    "sel": 46631,
+    "cold": 901,
+    "cold_share": 0.01932191031717098,
+    "queued": 55,
+    "swaps": 1036,
+    "published": 1036,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 934
+   },
+   {
+    "host_steps": 1408,
+    "steps": 64,
+    "sel": 48750,
+    "cold": 672,
+    "cold_share": 0.013784615384615385,
+    "queued": 43,
+    "swaps": 1091,
+    "published": 1091,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 979
+   },
+   {
+    "host_steps": 1472,
+    "steps": 64,
+    "sel": 51496,
+    "cold": 442,
+    "cold_share": 0.008583190927450676,
+    "queued": 42,
+    "swaps": 1134,
+    "published": 1134,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 1007
+   },
+   {
+    "host_steps": 1536,
+    "steps": 64,
+    "sel": 43826,
+    "cold": 384,
+    "cold_share": 0.008761922146670926,
+    "queued": 29,
+    "swaps": 1176,
+    "published": 1176,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 1042
+   },
+   {
+    "host_steps": 1600,
+    "steps": 64,
+    "sel": 56625,
+    "cold": 297,
+    "cold_share": 0.005245033112582781,
+    "queued": 18,
+    "swaps": 1205,
+    "published": 1205,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 1063
+   },
+   {
+    "host_steps": 1664,
+    "steps": 64,
+    "sel": 57764,
+    "cold": 328,
+    "cold_share": 0.005678277127622741,
+    "queued": 27,
+    "swaps": 1223,
+    "published": 1223,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 1077
+   },
+   {
+    "host_steps": 1728,
+    "steps": 64,
+    "sel": 56939,
+    "cold": 740,
+    "cold_share": 0.012996364530462426,
+    "queued": 24,
+    "swaps": 1250,
+    "published": 1250,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 1093
+   },
+   {
+    "host_steps": 1792,
+    "steps": 64,
+    "sel": 56127,
+    "cold": 3363,
+    "cold_share": 0.059917686674862365,
+    "queued": 75,
+    "swaps": 1274,
+    "published": 1274,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 1103
+   },
+   {
+    "host_steps": 1856,
+    "steps": 64,
+    "sel": 45290,
+    "cold": 1427,
+    "cold_share": 0.031508059174210644,
+    "queued": 62,
+    "swaps": 1349,
+    "published": 1349,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 1119
+   },
+   {
+    "host_steps": 1920,
+    "steps": 64,
+    "sel": 52422,
+    "cold": 954,
+    "cold_share": 0.01819846629277784,
+    "queued": 57,
+    "swaps": 1411,
+    "published": 1411,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 1134
+   },
+   {
+    "host_steps": 1984,
+    "steps": 64,
+    "sel": 49188,
+    "cold": 654,
+    "cold_share": 0.013295925835569652,
+    "queued": 51,
+    "swaps": 1468,
+    "published": 1468,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 1162
+   },
+   {
+    "host_steps": 2048,
+    "steps": 64,
+    "sel": 57117,
+    "cold": 603,
+    "cold_share": 0.010557277167918483,
+    "queued": 55,
+    "swaps": 1519,
+    "published": 1519,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 1186
+   },
+   {
+    "host_steps": 2112,
+    "steps": 64,
+    "sel": 56595,
+    "cold": 430,
+    "cold_share": 0.00759784433253821,
+    "queued": 47,
+    "swaps": 1574,
+    "published": 1574,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 1217
+   },
+   {
+    "host_steps": 2176,
+    "steps": 64,
+    "sel": 57201,
+    "cold": 195,
+    "cold_share": 0.003409031310641422,
+    "queued": 13,
+    "swaps": 1621,
+    "published": 1621,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 1241
+   },
+   {
+    "host_steps": 2240,
+    "steps": 64,
+    "sel": 48680,
+    "cold": 301,
+    "cold_share": 0.006183237469186524,
+    "queued": 6,
+    "swaps": 1634,
+    "published": 1634,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 1244
+   },
+   {
+    "host_steps": 2304,
+    "steps": 64,
+    "sel": 44221,
+    "cold": 649,
+    "cold_share": 0.014676285022952896,
+    "queued": 11,
+    "swaps": 1640,
+    "published": 1640,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 1243
+   },
+   {
+    "host_steps": 2368,
+    "steps": 64,
+    "sel": 35980,
+    "cold": 379,
+    "cold_share": 0.010533629794330184,
+    "queued": 6,
+    "swaps": 1651,
+    "published": 1651,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 1251
+   },
+   {
+    "host_steps": 2432,
+    "steps": 64,
+    "sel": 50677,
+    "cold": 338,
+    "cold_share": 0.006669692365372851,
+    "queued": 1,
+    "swaps": 1657,
+    "published": 1657,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 1253
+   },
+   {
+    "host_steps": 2496,
+    "steps": 64,
+    "sel": 37588,
+    "cold": 227,
+    "cold_share": 0.006039161434500373,
+    "queued": 1,
+    "swaps": 1658,
+    "published": 1658,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 1254
+   },
+   {
+    "host_steps": 2560,
+    "steps": 64,
+    "sel": 57054,
+    "cold": 212,
+    "cold_share": 0.0037157780348441825,
+    "queued": 1,
+    "swaps": 1659,
+    "published": 1659,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 1254
+   },
+   {
+    "host_steps": 2624,
+    "steps": 64,
+    "sel": 43438,
+    "cold": 259,
+    "cold_share": 0.00596252129471891,
+    "queued": 0,
+    "swaps": 1660,
+    "published": 1660,
+    "stale": 0,
+    "vetoed": 0,
+    "hot_moved": 1254
+   }
+  ],
+  "cold_share_curve": [
+   [
+    64,
+    0.0072867702308350955
+   ],
+   [
+    128,
+    0.010658816363820931
+   ],
+   [
+    192,
+    0.0075761515923787725
+   ],
+   [
+    256,
+    0.007165166268601874
+   ],
+   [
+    320,
+    0.007106528251933393
+   ],
+   [
+    384,
+    0.005312972801801485
+   ],
+   [
+    448,
+    0.02662165251182501
+   ],
+   [
+    512,
+    0.11451496898318798
+   ],
+   [
+    576,
+    0.08700440528634361
+   ],
+   [
+    640,
+    0.06368261171906453
+   ],
+   [
+    704,
+    0.06939855834209341
+   ],
+   [
+    768,
+    0.05015766653527789
+   ],
+   [
+    832,
+    0.03254871319040875
+   ],
+   [
+    896,
+    0.024734709627628786
+   ],
+   [
+    960,
+    0.04765871875897731
+   ],
+   [
+    1024,
+    0.0474771659129201
+   ],
+   [
+    1088,
+    0.027202976052080913
+   ],
+   [
+    1152,
+    0.019616500567680082
+   ],
+   [
+    1216,
+    0.014257663936601156
+   ],
+   [
+    1280,
+    0.013801971710244321
+   ],
+   [
+    1344,
+    0.01932191031717098
+   ],
+   [
+    1408,
+    0.013784615384615385
+   ],
+   [
+    1472,
+    0.008583190927450676
+   ],
+   [
+    1536,
+    0.008761922146670926
+   ],
+   [
+    1600,
+    0.005245033112582781
+   ],
+   [
+    1664,
+    0.005678277127622741
+   ],
+   [
+    1728,
+    0.012996364530462426
+   ],
+   [
+    1792,
+    0.059917686674862365
+   ],
+   [
+    1856,
+    0.031508059174210644
+   ],
+   [
+    1920,
+    0.01819846629277784
+   ],
+   [
+    1984,
+    0.013295925835569652
+   ],
+   [
+    2048,
+    0.010557277167918483
+   ],
+   [
+    2112,
+    0.00759784433253821
+   ],
+   [
+    2176,
+    0.003409031310641422
+   ],
+   [
+    2240,
+    0.006183237469186524
+   ],
+   [
+    2304,
+    0.014676285022952896
+   ],
+   [
+    2368,
+    0.010533629794330184
+   ],
+   [
+    2432,
+    0.006669692365372851
+   ],
+   [
+    2496,
+    0.006039161434500373
+   ],
+   [
+    2560,
+    0.0037157780348441825
+   ],
+   [
+    2624,
+    0.00596252129471891
+   ]
+  ],
+  "cold_share_first_drain": 0.0072867702308350955,
+  "cold_share_last4_drains": 0.005596788282359079,
+  "cold_share_by_seq": [
+   {
+    "tag": "prose",
+    "kind": "fast",
+    "i": 0,
+    "steps": 103,
+    "cold_share": 0.012911115789051615,
+    "routed_calls": 99759
+   },
+   {
+    "tag": "prose",
+    "kind": "fast",
+    "i": 1,
+    "steps": 103,
+    "cold_share": 0.011858579175813712,
+    "routed_calls": 99759
+   },
+   {
+    "tag": "prose",
+    "kind": "parity",
+    "i": 0,
+    "steps": 103,
+    "cold_share": 0.00663716814159292,
+    "routed_calls": 92208
+   },
+   {
+    "tag": "prose",
+    "kind": "parity",
+    "i": 1,
+    "steps": 103,
+    "cold_share": 0.0058780149227832725,
+    "routed_calls": 92208
+   },
+   {
+    "tag": "code",
+    "kind": "fast",
+    "i": 0,
+    "steps": 52,
+    "cold_share": 0.1203216482620618,
+    "routed_calls": 53972
+   },
+   {
+    "tag": "code",
+    "kind": "fast",
+    "i": 1,
+    "steps": 52,
+    "cold_share": 0.10635144148817906,
+    "routed_calls": 53972
+   },
+   {
+    "tag": "code",
+    "kind": "parity",
+    "i": 0,
+    "steps": 52,
+    "cold_share": 0.07243998921154365,
+    "routed_calls": 44492
+   },
+   {
+    "tag": "code",
+    "kind": "parity",
+    "i": 1,
+    "steps": 52,
+    "cold_share": 0.0629551380023375,
+    "routed_calls": 44492
+   },
+   {
+    "tag": "math",
+    "kind": "fast",
+    "i": 0,
+    "steps": 58,
+    "cold_share": 0.07158622341608636,
+    "routed_calls": 58447
+   },
+   {
+    "tag": "math",
+    "kind": "fast",
+    "i": 1,
+    "steps": 58,
+    "cold_share": 0.051961606241552175,
+    "routed_calls": 58447
+   },
+   {
+    "tag": "math",
+    "kind": "parity",
+    "i": 0,
+    "steps": 58,
+    "cold_share": 0.03013617399775514,
+    "routed_calls": 47219
+   },
+   {
+    "tag": "math",
+    "kind": "parity",
+    "i": 1,
+    "steps": 58,
+    "cold_share": 0.02151676232025244,
+    "routed_calls": 47219
+   },
+   {
+    "tag": "json",
+    "kind": "fast",
+    "i": 0,
+    "steps": 4,
+    "cold_share": 0.13341758440151652,
+    "routed_calls": 16617
+   },
+   {
+    "tag": "json",
+    "kind": "fast",
+    "i": 1,
+    "steps": 4,
+    "cold_share": 0.13341758440151652,
+    "routed_calls": 16617
+   },
+   {
+    "tag": "json",
+    "kind": "parity",
+    "i": 0,
+    "steps": 4,
+    "cold_share": 0.09382151029748284,
+    "routed_calls": 3933
+   },
+   {
+    "tag": "json",
+    "kind": "parity",
+    "i": 1,
+    "steps": 4,
+    "cold_share": 0.09382151029748284,
+    "routed_calls": 3933
+   },
+   {
+    "tag": "shell",
+    "kind": "fast",
+    "i": 0,
+    "steps": 70,
+    "cold_share": 0.04169468728984533,
+    "routed_calls": 71376
+   },
+   {
+    "tag": "shell",
+    "kind": "fast",
+    "i": 1,
+    "steps": 70,
+    "cold_share": 0.025274602107150865,
+    "routed_calls": 71376
+   },
+   {
+    "tag": "shell",
+    "kind": "parity",
+    "i": 0,
+    "steps": 70,
+    "cold_share": 0.01677298189942687,
+    "routed_calls": 61766
+   },
+   {
+    "tag": "shell",
+    "kind": "parity",
+    "i": 1,
+    "steps": 70,
+    "cold_share": 0.012158792863387623,
+    "routed_calls": 61766
+   },
+   {
+    "tag": "tool",
+    "kind": "fast",
+    "i": 0,
+    "steps": 4,
+    "cold_share": 0.0878203522831622,
+    "routed_calls": 11979
+   },
+   {
+    "tag": "tool",
+    "kind": "fast",
+    "i": 1,
+    "steps": 4,
+    "cold_share": 0.0878203522831622,
+    "routed_calls": 11979
+   },
+   {
+    "tag": "tool",
+    "kind": "parity",
+    "i": 0,
+    "steps": 4,
+    "cold_share": 0.03924866834875245,
+    "routed_calls": 3567
+   },
+   {
+    "tag": "tool",
+    "kind": "parity",
+    "i": 1,
+    "steps": 4,
+    "cold_share": 0.03784693019343986,
+    "routed_calls": 3567
+   },
+   {
+    "tag": "long",
+    "kind": "fast",
+    "i": 0,
+    "steps": 97,
+    "cold_share": 0.016543330378574344,
+    "routed_calls": 100403
+   },
+   {
+    "tag": "long",
+    "kind": "fast",
+    "i": 1,
+    "steps": 97,
+    "cold_share": 0.010059460374689999,
+    "routed_calls": 100403
+   },
+   {
+    "tag": "long",
+    "kind": "parity",
+    "i": 0,
+    "steps": 97,
+    "cold_share": 0.006130498652446995,
+    "routed_calls": 86453
+   },
+   {
+    "tag": "long",
+    "kind": "parity",
+    "i": 1,
+    "steps": 97,
+    "cold_share": 0.004869697986189027,
+    "routed_calls": 86453
+   },
+   {
+    "tag": "story",
+    "kind": "fast",
+    "i": 0,
+    "steps": 91,
+    "cold_share": 0.06799503467168906,
+    "routed_calls": 93448
+   },
+   {
+    "tag": "story",
+    "kind": "fast",
+    "i": 1,
+    "steps": 91,
+    "cold_share": 0.033644379762006675,
+    "routed_calls": 93448
+   },
+   {
+    "tag": "story",
+    "kind": "parity",
+    "i": 0,
+    "steps": 91,
+    "cold_share": 0.01279712033761559,
+    "routed_calls": 80565
+   },
+   {
+    "tag": "story",
+    "kind": "parity",
+    "i": 1,
+    "steps": 91,
+    "cold_share": 0.008539688450319619,
+    "routed_calls": 80565
+   }
+  ],
+  "ms_manager_per_step": 0.05577238728576023,
+  "ms_per_step_incl_manager": 18.618506977494846,
+  "overflow": {
+   "steps": 0,
+   "experts": 0,
+   "steps_counted": 0,
+   "spare_slots": 16
+  }
+ },
+ "mode_gap": {
+  "two_graphs_ms": 18.562734590209086,
+  "one_graph_ms": 17.91311983224739,
+  "gap_ms": 0.6496147579616967,
+  "gap_pct": 3.6264746958944207,
+  "tolerance_ms": 0.05,
+  "within_tolerance": false,
+  "gap_p50_ms": 0.2644319534301758,
+  "gap_p90_ms": 1.3218368530273459,
+  "steps": {
+   "two_graphs": 558,
+   "one_graph": 279
+  },
+  "draft_graph_ms_two_graphs": 2.889159852458585,
+  "verify_graph_ms_two_graphs": 15.6735747039959,
+  "residency_on": true,
+  "cell_order": "two_graphs measured first, one_graph last",
+  "sf_store": {
+   "requested": "pool",
+   "got": "pool"
+  },
+  "manager_ms_per_step": {
+   "two_graphs": 0.05577238728576023,
+   "one_graph": 0.03567827988990105
+  },
+  "gap_incl_manager_ms": 0.6697088653575562,
+  "cold_share": {
+   "two_graphs": 0.044874417244234695,
+   "one_graph": 0.013262819638696367
+  },
+  "per_prompt": {
+   "prose": {
+    "steps": 103,
+    "two_graphs_ms": 17.96275407365225,
+    "one_graph_ms": 17.893918491104273,
+    "gap_ms": 0.06883558254797606,
+    "cold_share_two_graphs_reps": [
+     0.012911115789051615,
+     0.011858579175813712
+    ],
+    "cold_share_one_graph_reps": [
+     0.004591064465361522
+    ]
+   },
+   "code": {
+    "steps": 52,
+    "two_graphs_ms": 20.55981073012719,
+    "one_graph_ms": 18.02187332740197,
+    "gap_ms": 2.5379374027252197,
+    "cold_share_two_graphs_reps": [
+     0.1203216482620618,
+     0.10635144148817906
+    ],
+    "cold_share_one_graph_reps": [
+     0.020658860149707255
+    ]
+   },
+   "math": {
+    "steps": 58,
+    "two_graphs_ms": 18.794574079842402,
+    "one_graph_ms": 17.803599456260944,
+    "gap_ms": 0.990974623581458,
+    "cold_share_two_graphs_reps": [
+     0.07158622341608636,
+     0.051961606241552175
+    ],
+    "cold_share_one_graph_reps": [
+     0.007528187930945986
+    ]
+   },
+   "json": {
+    "steps": 4,
+    "two_graphs_ms": 20.14968776702881,
+    "one_graph_ms": 18.5863037109375,
+    "gap_ms": 1.5633840560913086,
+    "cold_share_two_graphs_reps": [
+     0.13341758440151652,
+     0.13341758440151652
+    ],
+    "cold_share_one_graph_reps": [
+     0.08912559427092737
+    ]
+   },
+   "shell": {
+    "steps": 70,
+    "two_graphs_ms": 18.453208010537285,
+    "one_graph_ms": 17.90738800593785,
+    "gap_ms": 0.5458200045994346,
+    "cold_share_two_graphs_reps": [
+     0.04169468728984533,
+     0.025274602107150865
+    ],
+    "cold_share_one_graph_reps": [
+     0.007019166106254203
+    ]
+   },
+   "tool": {
+    "steps": 4,
+    "two_graphs_ms": 18.400843858718872,
+    "one_graph_ms": 18.044600009918213,
+    "gap_ms": 0.3562438488006592,
+    "cold_share_two_graphs_reps": [
+     0.0878203522831622,
+     0.0878203522831622
+    ],
+    "cold_share_one_graph_reps": [
+     0.04925285917021454
+    ]
+   },
+   "long": {
+    "steps": 97,
+    "two_graphs_ms": 18.029171265277665,
+    "one_graph_ms": 17.86977024668271,
+    "gap_ms": 0.1594010185949557,
+    "cold_share_two_graphs_reps": [
+     0.016543330378574344,
+     0.010059460374689999
+    ],
+    "cold_share_one_graph_reps": [
+     0.004631335717060247
+    ]
+   },
+   "story": {
+    "steps": 91,
+    "two_graphs_ms": 18.568907381414057,
+    "one_graph_ms": 17.86079442370069,
+    "gap_ms": 0.708112957713368,
+    "cold_share_two_graphs_reps": [
+     0.06799503467168906,
+     0.033644379762006675
+    ],
+    "cold_share_one_graph_reps": [
+     0.017774591216505438
+    ]
+   }
+  },
+  "fit_two_graphs_ms_vs_cold_share": {
+   "n": 8,
+   "intercept": 17.624538087684417,
+   "slope": 22.70498244423851,
+   "r": 0.9597539667159913,
+   "ms_per_cold_pct_point": 0.2270498244423851,
+   "what": "weighted LSQ over prompts: mean step ms of the two_graphs cell (all live steps) vs the mean cold share of its fast reps; MODELED relation, not a measurement of the one_graph cell"
+  },
+  "gap_predicted_from_cold_share_ms": 0.7177407686680798,
+  "cause": "residency on: the cells are measured at different policy states (two_graphs first, one_graph last); cold share 4.49% (two_graphs) vs 1.33% (one_graph); two_graphs step ms rises 0.227 ms per cold-share point across prompts (r 0.96, n 8)",
+  "headline_mode": "not decidable from this run: the cells differ in residency state, so the gap is not a property of the graph mode. Compare modes at a fixed state (--residency-frozen after a warm run, or both cells after the same number of passes). Defaults unchanged"
+ },
+ "pg61": {
+  "path": "/work/w0/results/phase1/step-pg61.json",
+  "tokens_per_chunk": [
+   2.738,
+   2.6122,
+   2.9091
+  ]
+ },
+ "hbm_end_GiB": {
+  "free": 0.389,
+  "total": 249.814,
+  "allocated": 248.077,
+  "max_allocated": 248.11
+ }
+}
