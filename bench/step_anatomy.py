@@ -86,6 +86,86 @@ FAMILY_RULES = [
 ]   # the bare short name "kernel" (46/step in every anatomy so far) is deliberately unmapped until identified
 _COMPILED = [(f, re.compile(p), r) for f, p, r in FAMILY_RULES]
 
+# ------------------------------------------------------------------------------------------------ M4-P1: prefill map
+# The reference prefill (`model(tokens, 0)`, model.py:1245-1275) runs the reference's TileLang kernels + torch glue,
+# not our decode kernels, so it gets its own family map. Roles are bench/prefill_anatomy.py's NVTX module ranges
+# (innermost wins): "expert.hot" / "expert.cold" (one routed `Expert` call, model.py:902), "gate" (model.py:894),
+# "shared" (model.py:905), "moe" (the rest of MoE.forward: zeros, bincount().tolist(), where(), y[idx] +=,
+# type_as), "compressor" (model.py:748), "indexer" (model.py:736), "attn" (the rest of Attention.forward), "engram"
+# (model.py:1266), "head" (model.py:1272). A rule's role condition is a set of roles the kernel's launch must sit in
+# ("in") or must not ("not"); with no roles in the profile, role rules are skipped (the name rules still apply).
+PREFILL_EXPERT_ROLES = frozenset({"expert.hot", "expert.cold"})
+PREFILL_ROLES = ("expert.hot", "expert.cold", "gate", "shared", "moe", "compressor", "indexer", "attn", "engram",
+                 "head")
+PREFILL_FAMILIES = {
+    "moe.routed.gemm": "routed experts: reference fp4_gemm, one launch per expert x projection (or a grouped GEMM)",
+    "moe.routed.quant": "routed experts: act_quant of the expert's rows (3 per expert call)",
+    "moe.routed.index": "routed MoE: where()/nonzero compaction, bincount, x[idx] / weights[idx, top] gathers",
+    "moe.routed.combine": "routed MoE: y[idx] += (deterministic index_put: radix sort + indexing_backward)",
+    "moe.routed.glue": "routed experts: float / clamp / silu / mul / weights / to(bf16) elementwise",
+    "moe.router": "gate: fp32 F.linear (cuBLAS), softplus/sqrt, bias, topk, gather, normalise",
+    "moe.shared": "shared expert (fp8_gemm x3 + glue)",
+    "moe.other": "rest of MoE.forward (zeros, y += shared, type_as)",
+    "attn.sparse": "attention kernel (reference sparse_attn / FlashMLA)",
+    "attn.indexer": "indexer (wq_b, weights_proj, einsum scores, masks, topk + sort)",
+    "attn.compressor": "compressor (wkv/wgate F.linear, softmax pooling, norm)",
+    "attn.wo_a": "wo_a einsum (bf16 bmm) and other cuBLAS GEMMs inside the attention range",
+    "dense.proj": "fp8 Linears outside the MoE (wq_a, wq_b, wkv, wo_b, engram wkv): reference fp8_gemm",
+    "dense.head": "head (fp32 F.linear on the last row)",
+    "engram": "engram (hash rows gather from Grace, wkv, gate)",
+    "glue.mhc": "mHC: hc_mixes fp32 F.linear (cuBLAS) + hc_split_sinkhorn",
+    "glue.quant_rope": "act_quant / fp4 QDQ outside the experts (KV, o, latent, index K/Q)",
+    "glue.torch": "torch glue elsewhere (norms, RoPE, hc_pre/post, cat, index lists, copies, fills)",
+    "instrument": "instrument (step marker)",
+    "unmapped": "kernel names no rule matched",
+}
+_ANY = r"."
+PREFILL_FAMILY_RULES = [
+    ("instrument", r"t8_step_marker", None),
+    ("moe.routed.gemm", r"fp4_gemm_kernel|sm100_fp8_fp4_gemm|m_grouped_fp8_fp4|fp8_fp4_mega_moe|mega_moe", None),
+    ("moe.router", _ANY, ("in", frozenset({"gate"}))),
+    ("moe.shared", _ANY, ("in", frozenset({"shared"}))),
+    ("attn.compressor", _ANY, ("in", frozenset({"compressor"}))),
+    ("attn.indexer", _ANY, ("in", frozenset({"indexer"}))),
+    ("dense.head", _ANY, ("in", frozenset({"head"}))),
+    ("engram", _ANY, ("in", frozenset({"engram"}))),
+    ("moe.routed.quant", r"act_quant_kernel", ("in", PREFILL_EXPERT_ROLES)),
+    ("moe.routed.index", r"DeviceSelect|DeviceCompact|write_indices|nonzero|kernelHistogram|index_elementwise|"
+                         r"indexSelect|vectorized_gather|gather_kernel|_scatter_gather|elementwise_kernel_with_index",
+     ("in", PREFILL_EXPERT_ROLES | {"moe"})),
+    ("moe.routed.combine", r"indexing_backward|DeviceRadixSort|radixSort|index_put|DeviceScan",
+     ("in", PREFILL_EXPERT_ROLES | {"moe"})),
+    ("moe.routed.glue", _ANY, ("in", PREFILL_EXPERT_ROLES)),
+    ("moe.other", _ANY, ("in", frozenset({"moe"}))),
+    ("attn.sparse", r"sparse_attn|flash_fwd|flashmla|flash_mla|sparse_prefill|sparse_fwd|splitkv_mla", None),
+    ("dense.proj", r"fp8_gemm_kernel|t9b_mxfp8_gemv|t9b4_mxfp8_gemv2|t9b_splitk_reduce", None),
+    ("glue.mhc", r"hc_split_sinkhorn|hc_prenorm|mhc", None),
+    ("attn.wo_a", r"nvjet|Kernel2|cutlass|gemm|splitKreduce|gemv", ("in", frozenset({"attn"}))),
+    # cuBLAS fp32 outside attn / moe / head: Block.hc_mixes' F.linear (model.py:956) -- the only GEMM left there
+    ("glue.mhc", r"nvjet|^Kernel2\||cutlass|sgemm|splitKreduce|gemv2T|gemm", None),
+    ("glue.quant_rope", r"act_quant_kernel|fp4_quant_kernel", None),
+    ("glue.torch", r"elementwise|reduce_kernel|reduce_1Block|CatArray|index|_scatter_gather|_assert_async|cunn_|"
+                   r"DeviceReduce|write_indices|kernelHistogram|dot_kernel|gather|fill|copy|Device|radix|bitonic|"
+                   r"warpMerge|gatherTopK|sort|topk", None),
+]
+_PREFILL_COMPILED = [(f, re.compile(p), c) for f, p, c in PREFILL_FAMILY_RULES]
+
+
+def prefill_family_of(short: str, demangled: str = "", role=None, roles_known: bool = True) -> str:
+    """Prefill kernel -> family (PREFILL_FAMILIES). `role`: the innermost bench/prefill_anatomy.py NVTX module range
+    of the launch (PREFILL_ROLES or None). roles_known=False skips every role-conditioned rule."""
+    text = f"{short or ''}|{demangled or ''}"
+    for fam, rx, cond in _PREFILL_COMPILED:
+        if cond is not None:
+            if not roles_known:
+                continue
+            kind, roles = cond
+            if (kind == "in") != (role in roles):
+                continue
+        if rx.search(text):
+            return fam
+    return "unmapped"
+
 
 def family_of(short: str, demangled: str = "", role=None, roles_known: bool = True) -> str:
     """Kernel -> ledger family. `role`: innermost NVTX module range of the launch ("moe", "attn", ... or None).
