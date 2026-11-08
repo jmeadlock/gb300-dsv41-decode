@@ -1,0 +1,38 @@
+  s1_stage_proj: 112 device cases == contract / == m1_stage_rows
+PASS test_s1_stage_proj_on_device_equals_contract (8.8s)
+  ce: cudaMemcpyAsync from pinned UVA + scale launch == m1_stage_rows (EVEN + masked sizes, both stores)
+PASS test_ce_path_on_device_equals_kernel (0.4s)
+Traceback (most recent call last):
+  File "/work/tests/gpu/test_staging_overlap_gpu.py", line 285, in <module>
+    t()
+  File "/work/tests/gpu/test_staging_overlap_gpu.py", line 217, in test_static6_modes_equal_kernel_mini4
+    assert torch.equal(a[2][k_], base[2][k_]), (mode, k_)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: ('kernel-overlap', 'L1.ckv')
+  preflight: sparse_attn JIT targets (none introspectable); window idx on cuda:0; direct call on cuda OK
+FAIL test_static6_modes_equal_kernel_mini4 (7.5s)
+/usr/local/lib/python3.12/dist-packages/torch/cuda/graphs.py:169: UserWarning: The CUDA Graph is empty. This usually means that the graph was attempted to be captured on wrong device or stream. (Triggered internally at /__w/pytorch/pytorch/aten/src/ATen/cuda/CUDAGraph.cpp:210.)
+  super().capture_end()
+  [A] c=0: kernel_m1_stage_rows 3.7us, kernel_s1_proj_x3 5.2us, kernel_s1_proj_x3/np48b8k 5.3us, kernel_s1_proj_x3/np16b32k 3.4us, kernel_s1_proj_x3/np8b64k 3.2us, ce_1stream 5.2us, ce_2stream 5.3us, ce_4stream 5.2us, ce_weights_only_1stream 0.4us, scale_pack_x3 5.3us
+  [A] c=1: kernel_m1_stage_rows 54.7us, kernel_s1_proj_x3 80.9us, kernel_s1_proj_x3/np48b8k 80.6us, kernel_s1_proj_x3/np16b32k 92.0us, kernel_s1_proj_x3/np8b64k 111.2us, ce_1stream 76.9us, ce_2stream 78.6us, ce_4stream 79.3us, ce_weights_only_1stream 56.1us, scale_pack_x3 12.7us
+  [A] c=2: kernel_m1_stage_rows 105.5us, kernel_s1_proj_x3 116.3us, kernel_s1_proj_x3/np48b8k 116.0us, kernel_s1_proj_x3/np16b32k 123.8us, kernel_s1_proj_x3/np8b64k 141.5us, ce_1stream 136.7us, ce_2stream 137.1us, ce_4stream 140.8us, ce_weights_only_1stream 111.8us, scale_pack_x3 17.0us
+  [A] c=3: kernel_m1_stage_rows 155.7us, kernel_s1_proj_x3 160.1us, kernel_s1_proj_x3/np48b8k 159.9us, kernel_s1_proj_x3/np16b32k 169.6us, kernel_s1_proj_x3/np8b64k 183.6us, ce_1stream 195.6us, ce_2stream 194.9us, ce_4stream 199.2us, ce_weights_only_1stream 167.5us, scale_pack_x3 19.6us
+  [A] c=4: kernel_m1_stage_rows 207.8us, kernel_s1_proj_x3 212.1us, kernel_s1_proj_x3/np48b8k 212.1us, kernel_s1_proj_x3/np16b32k 219.0us, kernel_s1_proj_x3/np8b64k 231.4us, ce_1stream 255.9us, ce_2stream 255.2us, ce_4stream 258.2us, ce_weights_only_1stream 224.5us, scale_pack_x3 23.1us
+OK   bandwidth {"0": {"kernel_m1_stage_rows": {"us": 3.72, "GBps": null}, "kernel_s1_proj_x3": {"us": 5.23, "GBps": null}, "kernel_s1_proj_x3/np48b8k": {"us": 5.25, "GBps": null}, "kernel_s1_proj_x3/np16b32k": {"us": 3.45, "GBps": null}, "kernel_s1_proj_x3/np8b64k": {"us": 3.21, "GBps": null}, "ce_1stream": {"us": 5.25, "GBps": null}, "ce_2stream": {"us": 5.26, "GBps": null}, "ce_4stream": {"us": 5.24, "GBps": null}, "ce_weights_only_1stream": {"us": 0.45, "GBps": null}, "scale_pack_x3": {"us": 5.26, "GBps": null}}, "1": {"kernel_m1_stage_rows": {"us": 54.66, "GBps": 344.0}, "kernel_s1_proj_x3": {"us": 80.88
+  [B] c=0: gemm-only 137.2 (+0.0), serial 140.4 (+3.2), kernel-overlap/np48b8k 142.2 (+5.0), kernel-overlap/np16b32k 141.9 (+4.6), kernel-overlap/np8b64k 141.5 (+4.2), ce-overlap 141.6 (+4.4)
+  [B] c=1: gemm-only 137.7 (+0.0), serial 195.4 (+57.7), kernel-overlap/np48b8k 164.3 (+26.6), kernel-overlap/np16b32k 172.9 (+35.2), kernel-overlap/np8b64k 191.5 (+53.9), ce-overlap 160.7 (+23.0)
+  [B] c=2: gemm-only 137.7 (+0.0), serial 248.5 (+110.8), kernel-overlap/np48b8k 191.9 (+54.2), kernel-overlap/np16b32k 190.2 (+52.5), kernel-overlap/np8b64k 203.3 (+65.6), ce-overlap 205.2 (+67.5)
+  [B] c=3: gemm-only 137.6 (+0.0), serial 300.5 (+162.8), kernel-overlap/np48b8k 237.3 (+99.6), kernel-overlap/np16b32k 215.9 (+78.3), kernel-overlap/np8b64k 232.5 (+94.8), ce-overlap 266.7 (+129.1)
+  [B] c=4: gemm-only 137.9 (+0.0), serial 353.7 (+215.9), kernel-overlap/np48b8k 289.6 (+151.7), kernel-overlap/np16b32k 265.9 (+128.0), kernel-overlap/np8b64k 280.8 (+143.0), ce-overlap 324.5 (+186.6)
+OK   overlap {"0": {"gemm-only": {"us_per_layer": 137.23, "exposed_us": 0.0}, "serial": {"us_per_layer": 140.44, "exposed_us": 3.21}, "kernel-overlap/np48b8k": {"us_per_layer": 142.23, "exposed_us": 5.0}, "kernel-overlap/np16b32k": {"us_per_layer": 141.87, "exposed_us": 4.64}, "kernel-overlap/np8b64k": {"us_per_layer": 141.45, "exposed_us": 4.22}, "ce-overlap": {"us_per_layer": 141.62, "exposed_us": 4.39}}, "1": {"gemm-only": {"us_per_layer": 137.67, "exposed_us": 0.0}, "serial": {"us_per_layer": 195.39, "exposed_us": 57.72}, "kernel-overlap/np48b8k": {"us_per_layer": 164.32, "exposed_us": 26.64}, "kernel-
+OK   contention {"eager_gemm_us_per_call": {"0": {"gemm-only": {"w1": 91.41, "w3": 46.1, "w2": 40.0}, "kernel-overlap/np48b8k": {"w1": 94.46, "w3": 45.78, "w2": 41.85}, "kernel-overlap/np16b32k": {"w1": 86.22, "w3": 43.28, "w2": 40.78}, "kernel-overlap/np8b64k": {"w1": 86.39, "w3": 43.91, "w2": 41.14}, "ce-overlap": {"w1": 89.36, "w3": 48.03, "w2": 40.83}}, "2": {"gemm-only": {"w1": 90.94, "w3": 45.49, "w2": 41.3}, "kernel-overlap/np48b8k": {"w1": 91.93, "w3": 47.39, "w2": 42.38}, "kernel-overlap/np16b32k": {"w1": 92.11, "w3": 44.15, "w2": 41.1}, "kernel-overlap/np8b64k": {"w1": 89.82, "w3": 44.11, "w2": 40.7
+OK   checks {"serial_staged_equal_host": true, "kernel-overlap/np48b8k": {"slots": true, "sf": true, "d": true}, "kernel-overlap/np16b32k": {"slots": true, "sf": true, "d": true}, "kernel-overlap/np8b64k": {"slots": true, "sf": true, "d": true}, "ce-overlap": {"slots": true, "sf": true, "d": true}}
+  [E] serial                       staging exposed  3.520 ms/step -> step  20.30
+  [E] kernel-overlap/np48b8k       staging exposed  2.009 ms/step -> step  18.35
+  [E] kernel-overlap/np16b32k      staging exposed  1.910 ms/step -> step  18.22
+  [E] kernel-overlap/np8b64k       staging exposed  2.416 ms/step -> step  18.88
+  [E] ce-overlap                   staging exposed  2.365 ms/step -> step  18.81
+wrote /work/scratch/staging-overlap-probe-quick-20261108.json
+  probe (quick): {"bandwidth_c4": {"kernel_m1_stage_rows": {"us": 207.76, "GBps": 362.0}, "kernel_s1_proj_x3": {"us": 212.13, "GBps": 354.5}, "kernel_s1_proj_x3/np48b8k": {"us": 212.08, "GBps": 354.6}, "kernel_s1_proj_x3/np16b32k": {"us": 219.03, "GBps": 343.3}, "kernel_s1_proj_x3/np8b64k": {"us": 231.43, "GBps": 324.9}, "ce_1stream": {"us": 255.93, "GBps": 293.8}, "ce_2stream": {"us": 255.15, "GBps": 294.7}, "ce_4stream": {"us": 258.15, "GBps": 291.3}, "ce_weights_only_1stream": {"us": 224.51, "GBps": 335.0}, "scale_pack_x3": {"us": 23.15, "GBps": 3248.9}}, "overlap_c2": {"gemm-only": {"us_per_layer": 137.71, "exposed_us": 0.0}, "serial": {"us_per_layer": 248.54, "exposed_us": 110.83}, "kernel-overlap/np48b8k": {"us_per_layer": 191.9, "exposed_us": 54.19}, "kernel-overlap/np16b32k": {"us_per_layer": 190.24, "exposed_us": 52.54}, "kernel-overlap/np8b64k": {"us_per_layer": 203.27, "exposed_us": 65.57}, "ce-overlap": {"us_per_layer": 205.17, "exposed_us": 67.46}}, "model_measured": {"ms_per_step": {"serial": 3.52, "kernel-overlap/np48b8k": 2.009, "kernel-overlap/np16b32k": 1.91, "kernel-overlap/np8b64k": 2.416, "ce-overlap": 2.365}, "step_ms_E": {"serial": 20.304, "kernel-overlap/np48b8k": 18.35, "kernel-overlap/np16b32k": 18.222, "kernel-overlap/np8b64k": 18.876, "ce-overlap": 18.81}, "cold_mean": 1.58, "dist": [0.206, 0.3254, 0.2571, 0.1354, 0.0535, 0.0169, 0.0045, 0.001, 0.0002, 0.0, 0.0, 0.0, 0.0], "label": "[E] serial row is the synthetic probe's own; step_ms_E scales every row by the meas
+PASS test_probe_quick (7.7s)
+3/4 not failed; 1 failed

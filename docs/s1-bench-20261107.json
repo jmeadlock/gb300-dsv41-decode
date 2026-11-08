@@ -1,0 +1,620 @@
+{
+ "probe": {
+  "date": "2026-11-08 03:52:44 UTC",
+  "argv": [
+   "all",
+   "--out",
+   "scratch/s1-bench.json"
+  ],
+  "errors": [],
+  "label": {
+   "A": "[M] synthetic real shapes, graph replay, distinct cold experts per round",
+   "B": "[M] real DeepGEMM contiguous16 + a bf16 torch.mm shared-expert STAND-IN",
+   "E": "[E] measured per-c exposed time x Poisson cold distribution [A]"
+  },
+  "capability": {
+   "torch": "2.13.0+cu130",
+   "torch_cuda": "13.0",
+   "device": "NVIDIA GB300",
+   "torch.cuda.CUDAGraph.begin_capture_to_if_node": true,
+   "torch.cuda.CUDAGraph.begin_capture_to_while_loop_node": false,
+   "torch.cuda.CUDAGraph.end_capture_to_conditional_node": true,
+   "torch.cuda.CUDAGraph.set_conditional_handle": false,
+   "cuda.bindings": true,
+   "cudaGraphCondTypeSwitch": true,
+   "cudaGraphConditionalHandleCreate": true,
+   "cudaStreamGetCaptureInfo": true,
+   "note": "a capturable data-dependent CE needs a SWITCH conditional node per (layer, spare slot, projection) with one memcpy case per possible cold expert and a device kernel calling cudaGraphSetConditional after the dedup; torch's IF/WHILE helpers alone do not select a source address"
+  },
+  "setup": {
+   "H": 128,
+   "S": 16,
+   "rounds": 16,
+   "host": "hostbuffer",
+   "register_s": 0.003288745880126953,
+   "expert_bytes": 18800640,
+   "row_w": 5898240,
+   "load_s": 4.1,
+   "cold_footprint_GB": 1.2
+  },
+  "bandwidth": {
+   "0": {
+    "kernel_m1_stage_rows": {
+     "us": 2.83,
+     "GBps": null
+    },
+    "kernel_s1_proj_x3": {
+     "us": 4.74,
+     "GBps": null
+    },
+    "kernel_s1_proj_x3/np48b8k": {
+     "us": 4.8,
+     "GBps": null
+    },
+    "kernel_s1_proj_x3/np16b32k": {
+     "us": 2.95,
+     "GBps": null
+    },
+    "kernel_s1_proj_x3/np8b64k": {
+     "us": 2.95,
+     "GBps": null
+    },
+    "ce_1stream": {
+     "us": 5.38,
+     "GBps": null
+    },
+    "ce_2stream": {
+     "us": 5.38,
+     "GBps": null
+    },
+    "ce_4stream": {
+     "us": 5.38,
+     "GBps": null
+    },
+    "ce_weights_only_1stream": {
+     "us": 0.05,
+     "GBps": null
+    },
+    "scale_pack_x3": {
+     "us": 4.74,
+     "GBps": null
+    }
+   },
+   "1": {
+    "kernel_m1_stage_rows": {
+     "us": 52.46,
+     "GBps": 358.4
+    },
+    "kernel_s1_proj_x3": {
+     "us": 66.21,
+     "GBps": 283.9
+    },
+    "kernel_s1_proj_x3/np48b8k": {
+     "us": 66.21,
+     "GBps": 284.0
+    },
+    "kernel_s1_proj_x3/np16b32k": {
+     "us": 78.6,
+     "GBps": 239.2
+    },
+    "kernel_s1_proj_x3/np8b64k": {
+     "us": 99.6,
+     "GBps": 188.8
+    },
+    "ce_1stream": {
+     "us": 73.99,
+     "GBps": 254.1
+    },
+    "ce_2stream": {
+     "us": 76.08,
+     "GBps": 247.1
+    },
+    "ce_4stream": {
+     "us": 78.3,
+     "GBps": 240.1
+    },
+    "ce_weights_only_1stream": {
+     "us": 54.43,
+     "GBps": 345.4
+    },
+    "scale_pack_x3": {
+     "us": 11.9,
+     "GBps": 1580.5
+    }
+   },
+   "2": {
+    "kernel_m1_stage_rows": {
+     "us": 100.49,
+     "GBps": 374.2
+    },
+    "kernel_s1_proj_x3": {
+     "us": 107.53,
+     "GBps": 349.7
+    },
+    "kernel_s1_proj_x3/np48b8k": {
+     "us": 107.55,
+     "GBps": 349.6
+    },
+    "kernel_s1_proj_x3/np16b32k": {
+     "us": 118.39,
+     "GBps": 317.6
+    },
+    "kernel_s1_proj_x3/np8b64k": {
+     "us": 133.98,
+     "GBps": 280.7
+    },
+    "ce_1stream": {
+     "us": 131.31,
+     "GBps": 286.4
+    },
+    "ce_2stream": {
+     "us": 132.53,
+     "GBps": 283.7
+    },
+    "ce_4stream": {
+     "us": 136.91,
+     "GBps": 274.6
+    },
+    "ce_weights_only_1stream": {
+     "us": 108.91,
+     "GBps": 345.3
+    },
+    "scale_pack_x3": {
+     "us": 15.08,
+     "GBps": 2492.7
+    }
+   },
+   "3": {
+    "kernel_m1_stage_rows": {
+     "us": 148.7,
+     "GBps": 379.3
+    },
+    "kernel_s1_proj_x3": {
+     "us": 154.82,
+     "GBps": 364.3
+    },
+    "kernel_s1_proj_x3/np48b8k": {
+     "us": 154.82,
+     "GBps": 364.3
+    },
+    "kernel_s1_proj_x3/np16b32k": {
+     "us": 163.25,
+     "GBps": 345.5
+    },
+    "kernel_s1_proj_x3/np8b64k": {
+     "us": 178.57,
+     "GBps": 315.8
+    },
+    "ce_1stream": {
+     "us": 191.19,
+     "GBps": 295.0
+    },
+    "ce_2stream": {
+     "us": 190.9,
+     "GBps": 295.4
+    },
+    "ce_4stream": {
+     "us": 194.21,
+     "GBps": 290.4
+    },
+    "ce_weights_only_1stream": {
+     "us": 163.4,
+     "GBps": 345.2
+    },
+    "scale_pack_x3": {
+     "us": 18.25,
+     "GBps": 3090.6
+    }
+   },
+   "4": {
+    "kernel_m1_stage_rows": {
+     "us": 199.13,
+     "GBps": 377.7
+    },
+    "kernel_s1_proj_x3": {
+     "us": 205.1,
+     "GBps": 366.7
+    },
+    "kernel_s1_proj_x3/np48b8k": {
+     "us": 205.11,
+     "GBps": 366.6
+    },
+    "kernel_s1_proj_x3/np16b32k": {
+     "us": 211.42,
+     "GBps": 355.7
+    },
+    "kernel_s1_proj_x3/np8b64k": {
+     "us": 223.22,
+     "GBps": 336.9
+    },
+    "ce_1stream": {
+     "us": 246.6,
+     "GBps": 305.0
+    },
+    "ce_2stream": {
+     "us": 246.39,
+     "GBps": 305.2
+    },
+    "ce_4stream": {
+     "us": 250.7,
+     "GBps": 300.0
+    },
+    "ce_weights_only_1stream": {
+     "us": 217.89,
+     "GBps": 345.1
+    },
+    "scale_pack_x3": {
+     "us": 21.5,
+     "GBps": 3497.8
+    }
+   }
+  },
+  "overlap": {
+   "0": {
+    "gemm-only": {
+     "us_per_layer": 137.18,
+     "exposed_us": 0.0
+    },
+    "serial": {
+     "us_per_layer": 140.47,
+     "exposed_us": 3.29
+    },
+    "kernel-overlap/np48b8k": {
+     "us_per_layer": 140.42,
+     "exposed_us": 3.24
+    },
+    "kernel-overlap/np16b32k": {
+     "us_per_layer": 140.23,
+     "exposed_us": 3.04
+    },
+    "kernel-overlap/np8b64k": {
+     "us_per_layer": 140.16,
+     "exposed_us": 2.97
+    },
+    "ce-overlap": {
+     "us_per_layer": 140.28,
+     "exposed_us": 3.09
+    }
+   },
+   "1": {
+    "gemm-only": {
+     "us_per_layer": 137.07,
+     "exposed_us": 0.0
+    },
+    "serial": {
+     "us_per_layer": 193.18,
+     "exposed_us": 56.11
+    },
+    "kernel-overlap/np48b8k": {
+     "us_per_layer": 154.43,
+     "exposed_us": 17.37
+    },
+    "kernel-overlap/np16b32k": {
+     "us_per_layer": 164.9,
+     "exposed_us": 27.83
+    },
+    "kernel-overlap/np8b64k": {
+     "us_per_layer": 190.11,
+     "exposed_us": 53.05
+    },
+    "ce-overlap": {
+     "us_per_layer": 159.32,
+     "exposed_us": 22.25
+    }
+   },
+   "2": {
+    "gemm-only": {
+     "us_per_layer": 137.22,
+     "exposed_us": 0.0
+    },
+    "serial": {
+     "us_per_layer": 244.19,
+     "exposed_us": 106.96
+    },
+    "kernel-overlap/np48b8k": {
+     "us_per_layer": 185.8,
+     "exposed_us": 48.57
+    },
+    "kernel-overlap/np16b32k": {
+     "us_per_layer": 185.51,
+     "exposed_us": 48.28
+    },
+    "kernel-overlap/np8b64k": {
+     "us_per_layer": 198.6,
+     "exposed_us": 61.37
+    },
+    "ce-overlap": {
+     "us_per_layer": 202.44,
+     "exposed_us": 65.22
+    }
+   },
+   "3": {
+    "gemm-only": {
+     "us_per_layer": 137.25,
+     "exposed_us": 0.0
+    },
+    "serial": {
+     "us_per_layer": 294.84,
+     "exposed_us": 157.59
+    },
+    "kernel-overlap/np48b8k": {
+     "us_per_layer": 232.52,
+     "exposed_us": 95.28
+    },
+    "kernel-overlap/np16b32k": {
+     "us_per_layer": 209.68,
+     "exposed_us": 72.43
+    },
+    "kernel-overlap/np8b64k": {
+     "us_per_layer": 227.7,
+     "exposed_us": 90.45
+    },
+    "ce-overlap": {
+     "us_per_layer": 260.71,
+     "exposed_us": 123.46
+    }
+   },
+   "4": {
+    "gemm-only": {
+     "us_per_layer": 137.17,
+     "exposed_us": 0.0
+    },
+    "serial": {
+     "us_per_layer": 345.08,
+     "exposed_us": 207.9
+    },
+    "kernel-overlap/np48b8k": {
+     "us_per_layer": 278.76,
+     "exposed_us": 141.59
+    },
+    "kernel-overlap/np16b32k": {
+     "us_per_layer": 257.65,
+     "exposed_us": 120.48
+    },
+    "kernel-overlap/np8b64k": {
+     "us_per_layer": 273.47,
+     "exposed_us": 136.3
+    },
+    "ce-overlap": {
+     "us_per_layer": 315.94,
+     "exposed_us": 178.76
+    }
+   }
+  },
+  "contention": {
+   "eager_gemm_us_per_call": {
+    "0": {
+     "gemm-only": {
+      "w1": 83.91,
+      "w3": 44.46,
+      "w2": 41.5
+     },
+     "kernel-overlap/np48b8k": {
+      "w1": 83.6,
+      "w3": 44.36,
+      "w2": 41.42
+     },
+     "kernel-overlap/np16b32k": {
+      "w1": 83.65,
+      "w3": 44.44,
+      "w2": 41.33
+     },
+     "kernel-overlap/np8b64k": {
+      "w1": 83.75,
+      "w3": 44.29,
+      "w2": 41.27
+     },
+     "ce-overlap": {
+      "w1": 83.93,
+      "w3": 44.84,
+      "w2": 41.69
+     }
+    },
+    "2": {
+     "gemm-only": {
+      "w1": 81.33,
+      "w3": 44.75,
+      "w2": 41.55
+     },
+     "kernel-overlap/np48b8k": {
+      "w1": 87.57,
+      "w3": 43.79,
+      "w2": 41.51
+     },
+     "kernel-overlap/np16b32k": {
+      "w1": 87.11,
+      "w3": 44.52,
+      "w2": 41.27
+     },
+     "kernel-overlap/np8b64k": {
+      "w1": 87.43,
+      "w3": 44.39,
+      "w2": 41.6
+     },
+     "ce-overlap": {
+      "w1": 85.65,
+      "w3": 44.15,
+      "w2": 41.34
+     }
+    },
+    "4": {
+     "gemm-only": {
+      "w1": 81.12,
+      "w3": 45.32,
+      "w2": 41.56
+     },
+     "kernel-overlap/np48b8k": {
+      "w1": 56.64,
+      "w3": 44.03,
+      "w2": 41.25
+     },
+     "kernel-overlap/np16b32k": {
+      "w1": 72.45,
+      "w3": 43.99,
+      "w2": 41.33
+     },
+     "kernel-overlap/np8b64k": {
+      "w1": 72.19,
+      "w3": 44.04,
+      "w2": 41.5
+     },
+     "ce-overlap": {
+      "w1": 84.91,
+      "w3": 44.52,
+      "w2": 41.36
+     }
+    }
+   },
+   "label": "[M] eager CUDA events around each GEMM on the main stream (after its wait): the GEMM's own duration alone vs with the forked staging running"
+  },
+  "checks": {
+   "serial_staged_equal_host": true,
+   "kernel-overlap/np48b8k": {
+    "slots": true,
+    "sf": true,
+    "d": true
+   },
+   "kernel-overlap/np16b32k": {
+    "slots": true,
+    "sf": true,
+    "d": true
+   },
+   "kernel-overlap/np8b64k": {
+    "slots": true,
+    "sf": true,
+    "d": true
+   },
+   "ce-overlap": {
+    "slots": true,
+    "sf": true,
+    "d": true
+   }
+  },
+  "model_measured": {
+   "ms_per_step": {
+    "serial": 3.404,
+    "kernel-overlap/np48b8k": 1.754,
+    "kernel-overlap/np16b32k": 1.7,
+    "kernel-overlap/np8b64k": 2.306,
+    "ce-overlap": 2.264
+   },
+   "step_ms_E": {
+    "serial": 20.304,
+    "kernel-overlap/np48b8k": 18.098,
+    "kernel-overlap/np16b32k": 18.025,
+    "kernel-overlap/np8b64k": 18.836,
+    "ce-overlap": 18.78
+   },
+   "cold_mean": 1.58,
+   "dist": [
+    0.206,
+    0.3254,
+    0.2571,
+    0.1354,
+    0.0535,
+    0.0169,
+    0.0045,
+    0.001,
+    0.0002,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "label": "[E] serial row is the synthetic probe's own; step_ms_E scales every row by the measured 4.552 ms / probe-serial so the ledger's staging line is the calibration"
+  }
+ },
+ "model": {
+  "assumptions": {
+   "gemm_us": 37.1,
+   "act_us": 2.3,
+   "swiglu_us": 3.1,
+   "shared_us": 30.0,
+   "launch_us": 3.0,
+   "kernel_GBps": 261.0,
+   "ce_GBps": 366.0,
+   "cold_mean": 1.58,
+   "layers": 40,
+   "c_max": 16,
+   "serial_ms_measured": 4.552,
+   "step_ms": 20.304,
+   "contention": 0.0
+  },
+  "dist": [
+   0.206,
+   0.3254,
+   0.2571,
+   0.1354,
+   0.0535,
+   0.0169,
+   0.0045,
+   0.001,
+   0.0002,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0
+  ],
+  "staging_exposed_ms_per_step": {
+   "kernel (serial, today)": 4.672,
+   "kernel-overlap": 1.617,
+   "ce serial [needs capturable CE]": 3.366,
+   "ce-overlap [needs capturable CE]": 0.67
+  },
+  "step_ms_E": {
+   "kernel (serial, today)": 20.304,
+   "kernel-overlap": 17.327,
+   "ce serial [needs capturable CE]": 19.032,
+   "ce-overlap [needs capturable CE]": 16.405
+  },
+  "per_c_exposed_us": {
+   "0": {
+    "kernel": 3.0,
+    "kernel-overlap": 0.0,
+    "ce": 3.0,
+    "ce-overlap": 0.0
+   },
+   "1": {
+    "kernel": 75.0,
+    "kernel-overlap": 0.0,
+    "ce": 54.4,
+    "ce-overlap": 0.0
+   },
+   "2": {
+    "kernel": 147.1,
+    "kernel-overlap": 37.5,
+    "ce": 105.7,
+    "ce-overlap": 4.9
+   },
+   "3": {
+    "kernel": 219.1,
+    "kernel-overlap": 109.5,
+    "ce": 157.1,
+    "ce-overlap": 47.5
+   },
+   "4": {
+    "kernel": 291.1,
+    "kernel-overlap": 181.5,
+    "ce": 208.5,
+    "ce-overlap": 98.9
+   },
+   "5": {
+    "kernel": 363.2,
+    "kernel-overlap": 253.6,
+    "ce": 259.8,
+    "ce-overlap": 150.2
+   },
+   "6": {
+    "kernel": 435.2,
+    "kernel-overlap": 325.6,
+    "ce": 311.2,
+    "ce-overlap": 201.6
+   }
+  },
+  "label": "[E] desk model: per-layer timeline of runtime/staging_overlap.layer_exposed_us; kernel means [M] from docs/gap-tf-anatomy-20261107.json; cold count per layer ~ Poisson(mean) [A]; the ce rows assume a capturable data-dependent CE that does not exist (runtime/staging_overlap.py docstring)"
+ }
+}
