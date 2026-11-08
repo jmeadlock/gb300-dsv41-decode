@@ -1555,7 +1555,10 @@ def launch_topk_post(idx, clen, out, offset: int):
 QKV_TAIL_ENV = "DSV41_QKV_TAIL"
 QKV_TAILS = ("split", "fused")
 QKV_TAIL_DEFAULT = "split"
-QKV_TICKETS = 2            # gemv_mxfp8.L10_TICKETS (restated: this module never imports it at load; tests check)
+QKV_TICKETS = 256          # gemv_mxfp8.L10_TICKET_WORDS (restated: this module never imports it at load; tests check)
+# M2-L10-FIX: the fused launch's form is gemv_mxfp8.qkv_tail_form() ($DSV41_QKV_TAIL_FORM: stage (default) | fold, the
+# round-1 kernel that was 1.5 ms/step slower at 6 rows); read at every launch, so the build-time self-check below
+# checks the form the step runs.
 GEMV_MODULE = None         # tests: the shim-loaded gemv_mxfp8 for launch_qkv_tail's kernel path (default: the real one)
 
 
@@ -1580,7 +1583,7 @@ def launch_qkv_tail(xq, wa, wb, *, q_nw, q_eps: float, q_ord: dict, qr, q, s, kv
     xq = act_quant(x) (q fp8 [.., R, K], s e8m0 [.., R, K/32]); wa / wb = attn.wq_a / attn.wkv (fp8 Linears with
     .weight.scale); qr / q / s [1, R, QL] bf16 / fp8 / [1, R, QL/32] e8m0 out; ring (bf16 rows of HD) + slot [R] int64:
     row t's kv goes to ring row slot[t]; rope = (freqs fp32 [rd/2, 2] or [R, rd/2, 2], rd, (re, im) modes) or None;
-    ticket int32 [QKV_TICKETS] (zero). One launch on CUDA (gemv_mxfp8.qkv_pair_tail) -> (result_a, result_b) of the
+    ticket int32 [QKV_TICKETS] (zero; left zero). One launch on CUDA (gemv_mxfp8.qkv_pair_tail) -> (result_a, result_b) of the
     GEMV (bf16 or SplitK), or None when the pair cannot form there (the caller runs the split path). CPU: the split
     path's own functions in order (gemv_pair, launch_norm_row x 2) -- the mirror, identical by definition."""
     GM = _gm()
@@ -2382,7 +2385,14 @@ class R2Glue:
             self.qkv_tail = "split"
             self.qkv_tail_why = f"off: {why}"
             self.log(f"[fused-glue] qkv_tail fused OFF: {why}")
-        cal["qkv_tail"] = self.qkv_tail_why or "fused: equal to split (qr, q, s, ring; ticket reset)"
+        if self.qkv_tail_why:
+            cal["qkv_tail"] = self.qkv_tail_why
+        else:
+            try:
+                form = _gm().qkv_tail_form()
+            except Exception as e:  # pragma: no cover - a bad $DSV41_QKV_TAIL_FORM is caught by the check above
+                form = f"? ({e})"
+            cal["qkv_tail"] = f"fused: equal to split (form {form}; qr, q, s, ring; ticket reset)"
 
     def _verify_qkv_tail(self, g) -> Optional[str]:
         """fused (launch_qkv_tail) vs split (the pair + _q_norm_quant + _kv_norm_write in force), at this step's
@@ -2442,7 +2452,13 @@ class R2Glue:
             gm = dict(_gm().L10_STATS)
         except Exception:  # pragma: no cover - module without the M2-L10 kernel
             pass
-        return {"mode": getattr(self, "qkv_tail", None), "env": QKV_TAIL_ENV,
+        form = comp = None
+        try:
+            form = _gm().qkv_tail_form()
+            comp = {"/".join(str(x) for x in k): v for k, v in _gm().L10_COMPILED.items()}
+        except Exception:  # pragma: no cover - module without the M2-L10-FIX kernel / a bad $DSV41_QKV_TAIL_FORM
+            pass
+        return {"mode": getattr(self, "qkv_tail", None), "env": QKV_TAIL_ENV, "form": form, "compiled": comp,
                 "why": getattr(self, "qkv_tail_why", None),
                 "calls": dict(getattr(self, "qkv_calls", {})), "kernel_calls": gm,
                 "launches_per_layer": {"split": 3, "fused": 1}}

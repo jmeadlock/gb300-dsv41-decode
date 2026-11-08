@@ -1410,12 +1410,13 @@ if HAVE_TRITON:
                      QDIV: tl.constexpr, QBB: tl.constexpr, QNS: tl.constexpr,
                      KN: tl.constexpr, KT: tl.constexpr, KV: tl.constexpr, KUN: tl.constexpr, KDEC: tl.constexpr,
                      KDIV: tl.constexpr, KBB: tl.constexpr, KNS: tl.constexpr, RD: tl.constexpr,
-                     RE_MODE: tl.constexpr, IM_MODE: tl.constexpr, RP: tl.constexpr):
+                     RE_MODE: tl.constexpr, IM_MODE: tl.constexpr, RP: tl.constexpr, TAILS: tl.constexpr = True):
         """M2-L10 (section comment): grid (TA + TB, max(NSA, NSB)) = t9b4_mxfp8_gemv2's. Program (pn, ks): the pair
         kernel's tile; then the per-output ticket; the last program of half a runs the q tail (q_norm + act_quant ->
         qr / qq / qs), the last of half b the kv tail (kv_norm + RoPE + QDQ -> ring[slot[t]]), each for all M rows
         at once (_l10_norm_rows, RP = next_pow2(M)). QNS / KNS = the half's split count when it splits, else 0 (its
-        bf16 output is read). Every arm of a runtime `if` uses its own variable names."""
+        bf16 output is read). Every arm of a runtime `if` uses its own variable names. TAILS=False (bench phase probe
+        only, M2-L10-FIX): the GEMV + tickets without the tails' work -- no tail output is written."""
         pid_n = tl.program_id(0)
         ks = tl.program_id(1)
         if pid_n < TA:
@@ -1429,12 +1430,13 @@ if HAVE_TRITON:
                     fza2 = _l10_fence(tl.zeros([FT], dtype=tl.int32))
                     tl.debug_barrier()
                     za = tl.sum(fza2, axis=0)                        # (0: the loads below depend on the fence)
-                    if QNS == 0:
-                        _l10_norm_rows(outa + za, M, 0, qnw, qr, qr, qq, qs, qnw, 0, tab, q_eps, q_fac, q_wf,
-                                       QN, QT, QV, QU, QDEC, QDIV, False, True, False, 0, 0, 0, QBB, 0, RP)
-                    else:
-                        _l10_norm_rows(wsa + za, M, M * QN, qnw, qr, qr, qq, qs, qnw, 0, tab, q_eps, q_fac, q_wf,
-                                       QN, QT, QV, QU, QDEC, QDIV, False, True, False, 0, 0, 0, QBB, QNS, RP)
+                    if TAILS:
+                        if QNS == 0:
+                            _l10_norm_rows(outa + za, M, 0, qnw, qr, qr, qq, qs, qnw, 0, tab, q_eps, q_fac, q_wf,
+                                           QN, QT, QV, QU, QDEC, QDIV, False, True, False, 0, 0, 0, QBB, 0, RP)
+                        else:
+                            _l10_norm_rows(wsa + za, M, M * QN, qnw, qr, qr, qq, qs, qnw, 0, tab, q_eps, q_fac, q_wf,
+                                           QN, QT, QV, QU, QDEC, QDIV, False, True, False, 0, 0, 0, QBB, QNS, RP)
                     tl.store(ticket, 0)
         else:
             if ks < NSB:
@@ -1447,54 +1449,235 @@ if HAVE_TRITON:
                     fzb2 = _l10_fence(tl.zeros([FT], dtype=tl.int32))
                     tl.debug_barrier()
                     zb = tl.sum(fzb2, axis=0)
-                    if KNS == 0:
-                        _l10_norm_rows(outb + zb, M, 0, kvnw, ring, slot, kvnw, kvnw, freqs, FS, tab, kv_eps,
-                                       kv_fac, kv_wf, KN, KT, KV, KUN, KDEC, KDIV, True, False, True, RD, RE_MODE,
-                                       IM_MODE, KBB, 0, RP)
-                    else:
-                        _l10_norm_rows(wsb + zb, M, M * KN, kvnw, ring, slot, kvnw, kvnw, freqs, FS, tab, kv_eps,
-                                       kv_fac, kv_wf, KN, KT, KV, KUN, KDEC, KDIV, True, False, True, RD, RE_MODE,
-                                       IM_MODE, KBB, KNS, RP)
+                    if TAILS:
+                        if KNS == 0:
+                            _l10_norm_rows(outb + zb, M, 0, kvnw, ring, slot, kvnw, kvnw, freqs, FS, tab, kv_eps,
+                                           kv_fac, kv_wf, KN, KT, KV, KUN, KDEC, KDIV, True, False, True, RD, RE_MODE,
+                                           IM_MODE, KBB, 0, RP)
+                        else:
+                            _l10_norm_rows(wsb + zb, M, M * KN, kvnw, ring, slot, kvnw, kvnw, freqs, FS, tab, kv_eps,
+                                           kv_fac, kv_wf, KN, KT, KV, KUN, KDEC, KDIV, True, False, True, RD, RE_MODE,
+                                           IM_MODE, KBB, KNS, RP)
                     tl.store(ticket + 1, 0)
 
 
-def qkv_tail_plan(pp: dict, M: int, NA: int, NB: int, rp: Optional[int] = None) -> dict:
+# ------------------------------------------------------------------------------------------------ M2-L10-FIX: stage form
+# docs/HANDOFF-M2-L10-FIX.md. The round-1 kernel above (form "fold") was 1.5 ms/step SLOWER at 6 rows on the box
+# (headline 20.30 -> 21.80, docs/box-m2-round1-20261107.log): its whole tail -- for every row, the split-K fold of NS
+# fp32 partials (read twice: statistic, then apply), the norm, RoPE, QDQ -- runs on the ONE last CTA of each half,
+# ceil(M / RP) serial passes, where the split path ran it on M CTAs (t9b2r2_norm_row's grid is (R,)) [cause (a) of the
+# handoff; (d) "overlapped before" is not the mechanism: static_step._attn issues q_path / q_proj / kv_path in one
+# stream, nothing overlapped -- the parallelism the split path had was across rows]. Form "stage" keeps the ONE launch
+# and the bits, and moves the serial work off the single CTA:
+#   1. dynamic CTA ids: every CTA first takes v = atomic_add(ticket[0], 1). v < NWORK (= the pair grid's G0 x G1
+#      programs, v -> (pn, ks) = (v % G0, v // G0), the CUDA linear order of that grid): the pair kernel's tile,
+#      `_t9b4_gemv_tile`, unchanged. v >= NWORK: a TAIL CTA (2 x ceil(M / RP) of them: half a's row groups, then
+#      half b's).
+#   2. per-tile ticket (split halves): the last of a tile's NS split programs folds that tile's [M, BLOCK_N] partials
+#      in t9b_splitk_reduce's order (from +0.0, split 0, 1, ...) and stores the bf16 -- `_t9b4_ld`'s value exactly --
+#      into a bf16 [M, N] stage buffer (unsplit halves: the tile's bf16 store already is that buffer), then counts
+#      the tile done on ticket[1 + h]. The fold is spread over TA (TB) CTAs instead of one.
+#   3. tail CTA (half h, rows [j*RP, (j+1)*RP)): waits until ticket[1 + h] == TA (TB) -- every tile of its half
+#      folded -- then runs `_l10_norm_pass` (the round-1 tail body, unchanged) on the bf16 stage rows (NS = 0: one
+#      bf16 load per element, not NS fp32 ones). RP = 1 (default): one row per CTA, the split path's parallelism.
+#   Why the wait cannot deadlock (CUB's decoupled look-back argument): a tail CTA only waits on work items whose ids
+#   are smaller than its own, and an id is handed out only to a CTA that is already running, so everything it waits
+#   on is resident or done; no CTA ever waits on one that has not started. No grid barrier, no co-residency
+#   assumption, any grid size.
+#   Reset (a graph replay starts from 0): the last split CTA of a tile zeroes that tile's ticket; the last tail CTA
+#   (ticket[3] == number of tails - 1: by then every CTA has taken its id and every counter access of this launch is
+#   done) zeroes ticket[0:4]. One ticket buffer serves every layer's launch because launches on it never overlap
+#   (stream order); with PDL (M2-L5) a dependent launch must gdc-wait before its first ticket atomic.
+# Numerics: the GEMV is the pair kernel's code under its launch options; the fold is fp32 adds only (no product to
+# contract); the tail is `_l10_norm_pass` (round-1's, block comment above); bf16(fold) stored and reloaded is the fp32
+# value `_t9b4_ld` / `_l10_load` hand the norm. Same bits as pair + norm_row + norm_row, any program order
+# (tests/test_qkv_tail_cpu.py, shim; tests/gpu/test_qkv_tail_gpu.py, box).
+L10_FORMS = ("stage", "fold")
+L10_FORM_DEFAULT = "stage"
+L10_FORM_ENV = "DSV41_QKV_TAIL_FORM"
+L10_TICKET_WORDS = 256   # int32 words a caller allocates per launch site (either form): fold uses [0:2]; stage uses
+#                          [0:4] + one per column tile (4 + TA + TB <= 256: N up to 8064 at BLOCK_N 32)
+L10_STAGE_RP = int(os.environ.get("DSV41_QKV_TAIL_STAGE_RP", "1"))   # rows per tail CTA (stage form; speed only)
+
+
+def qkv_tail_form(form: Optional[str] = None) -> str:
+    v = (form or os.environ.get(L10_FORM_ENV) or L10_FORM_DEFAULT).strip()
+    if v not in L10_FORMS:
+        raise ValueError(f"${L10_FORM_ENV}={v!r}: expected one of {L10_FORMS}")
+    return v
+
+
+if HAVE_TRITON:
+
+    @triton.jit
+    def _l10_reduce_tile(ws, st, M, N, pid_n, NS: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+        """Tile pid_n's fold: st[m, n] = bf16 of the sum of the NS fp32 partials ws[j, m, n] from +0.0 in split order
+        (t9b_splitk_reduce / _t9b4_ld's value; .cg: written by other CTAs of this launch), m < M, n in the tile."""
+        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        rm = tl.arange(0, BLOCK_M)
+        msk = (rm < M)[:, None] & (rn < N)[None, :]
+        e = rm[:, None] * N + rn[None, :]
+        acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        for j in tl.static_range(NS):
+            acc = acc + tl.load(ws + j * (M * N) + e, mask=msk, other=0.0, cache_modifier=".cg")
+        tl.store(st + e, acc.to(tl.bfloat16, fp_downcast_rounding="rtne"), mask=msk)
+
+    @triton.jit
+    def _l10_publish(ticket, HSLOT: tl.constexpr, tslot, ws, st, M, N, pid_n, NS: tl.constexpr, SPLIT: tl.constexpr,
+                     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, FT: tl.constexpr):
+        """After a (tile, split) program's stores: split halves take the tile's ticket; its last split folds the tile
+        into the stage buffer, zeroes the tile ticket and counts the tile on ticket[HSLOT]. Unsplit halves: count the
+        tile directly (its bf16 store is the stage buffer)."""
+        f1 = _l10_fence(tl.zeros([FT], dtype=tl.int32))                     # this program's stores before the ticket
+        tl.debug_barrier()
+        if SPLIT:
+            told = tl.atomic_add(ticket + tslot, 1 + tl.sum(f1, axis=0), sem="acq_rel", scope="gpu")
+            if told == NS - 1:                                              # the tile's last split: all partials in
+                f2 = _l10_fence(tl.zeros([FT], dtype=tl.int32))
+                tl.debug_barrier()
+                z2 = tl.sum(f2, axis=0)
+                tl.store(ticket + tslot, 0)
+                _l10_reduce_tile(ws + z2, st, M, N, pid_n, NS, BLOCK_M, BLOCK_N)
+                f3 = _l10_fence(tl.zeros([FT], dtype=tl.int32))             # the stage stores before the count
+                tl.debug_barrier()
+                tl.atomic_add(ticket + HSLOT, 1 + tl.sum(f3, axis=0), sem="acq_rel", scope="gpu")
+        else:
+            tl.atomic_add(ticket + HSLOT, 1 + tl.sum(f1, axis=0), sem="acq_rel", scope="gpu")
+
+    @triton.jit
+    def _l10_wait(ticket, HSLOT: tl.constexpr, target, FT: tl.constexpr):
+        """Spin until ticket[HSLOT] >= target (acquire), then a fence in every thread; -> 0 for the loads to depend
+        on. Only ever waits on smaller dynamic ids (section comment: no deadlock)."""
+        seen = tl.atomic_add(ticket + HSLOT, 0, sem="acquire", scope="gpu")
+        while seen < target:
+            seen = tl.atomic_add(ticket + HSLOT, 0, sem="acquire", scope="gpu")
+        tl.debug_barrier()
+        fw = _l10_fence(tl.zeros([FT], dtype=tl.int32))
+        tl.debug_barrier()
+        return tl.sum(fw, axis=0)
+
+    @triton.jit
+    def l10_qkv_tail2(xq, xs, wa, sa, outa, wsa, sta, wb, sb, outb, wsb, stb, M, NA, NB, KB, PERA, PERB, NSA, NSB,
+                      TA, TB, G0, NWORK, NTA, NTB,
+                      stride_xm, stride_xsm, stride_wan, stride_san, stride_oam, stride_wbn, stride_sbn, stride_obm,
+                      ticket, tab,
+                      qnw, qr, qq, qs, q_eps, q_fac, q_wf,
+                      kvnw, ring, slot, freqs, FS, kv_eps, kv_fac, kv_wf,
+                      BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, KU: tl.constexpr, EVENA: tl.constexpr,
+                      EVENB: tl.constexpr, MMA: tl.constexpr, SPLITA: tl.constexpr, SPLITB: tl.constexpr,
+                      FT: tl.constexpr,
+                      QN: tl.constexpr, QT: tl.constexpr, QV: tl.constexpr, QU: tl.constexpr, QDEC: tl.constexpr,
+                      QDIV: tl.constexpr, QBB: tl.constexpr, QNS: tl.constexpr,
+                      KN: tl.constexpr, KT: tl.constexpr, KV: tl.constexpr, KUN: tl.constexpr, KDEC: tl.constexpr,
+                      KDIV: tl.constexpr, KBB: tl.constexpr, KNS: tl.constexpr, RD: tl.constexpr,
+                      RE_MODE: tl.constexpr, IM_MODE: tl.constexpr, RP: tl.constexpr, TAILS: tl.constexpr = True):
+        """M2-L10-FIX stage form (section comment): grid (NWORK + NTA + NTB,), dynamic ids. sta / stb: the halves'
+        bf16 [M, N] stage rows (the bf16 output itself when the half does not split). ticket words: [0] ids, [1] / [2]
+        tiles folded of half a / b, [3] tails done, [4 + pn] the split ticket of column tile pn. QNS / KNS: the half's
+        split count when it splits (the fold's constexpr), else 1. TAILS=False: bench phase probe (no tail output)."""
+        v = tl.atomic_add(ticket, 1, sem="relaxed", scope="gpu")
+        if v < NWORK:
+            pid_n = v % G0
+            ks = v // G0
+            if pid_n < TA:
+                if ks < NSA:
+                    _t9b4_gemv_tile(xq, xs, wa, sa, outa, wsa, M, NA, KB, PERA, pid_n, ks, stride_xm, stride_xsm,
+                                    stride_wan, stride_san, stride_oam, BLOCK_M, BLOCK_N, KU, EVENA, MMA, SPLITA)
+                    _l10_publish(ticket, 1, 4 + pid_n, wsa, sta, M, NA, pid_n, QNS, SPLITA, BLOCK_M, BLOCK_N, FT)
+            else:
+                if ks < NSB:
+                    _t9b4_gemv_tile(xq, xs, wb, sb, outb, wsb, M, NB, KB, PERB, pid_n - TA, ks, stride_xm,
+                                    stride_xsm, stride_wbn, stride_sbn, stride_obm, BLOCK_M, BLOCK_N, KU, EVENB, MMA,
+                                    SPLITB)
+                    _l10_publish(ticket, 2, 4 + pid_n, wsb, stb, M, NB, pid_n - TA, KNS, SPLITB, BLOCK_M, BLOCK_N,
+                                 FT)
+        else:
+            j = v - NWORK
+            if j < NTA:
+                zq = _l10_wait(ticket, 1, TA, FT)
+                if TAILS:
+                    _l10_norm_pass(sta + zq, j * RP + tl.arange(0, RP), M, 0, qnw, qr, qr, qq, qs, qnw, 0, tab,
+                                   q_eps, q_fac, q_wf, QN, QT, QV, QU, QDEC, QDIV, False, True, False, 0, 0, 0, QBB, 0,
+                                   RP)
+            else:
+                zk = _l10_wait(ticket, 2, TB, FT)
+                if TAILS:
+                    _l10_norm_pass(stb + zk, (j - NTA) * RP + tl.arange(0, RP), M, 0, kvnw, ring, slot, kvnw, kvnw,
+                                   freqs, FS, tab, kv_eps, kv_fac, kv_wf, KN, KT, KV, KUN, KDEC, KDIV, True, False,
+                                   True, RD, RE_MODE, IM_MODE, KBB, 0, RP)
+            fd = _l10_fence(tl.zeros([FT], dtype=tl.int32))                 # this tail's stores before the count
+            tl.debug_barrier()
+            dn = tl.atomic_add(ticket + 3, 1 + tl.sum(fd, axis=0), sem="acq_rel", scope="gpu")
+            if dn == NTA + NTB - 1:                                         # the last CTA of the launch to count
+                tl.store(ticket, 0)
+                tl.store(ticket + 1, 0)
+                tl.store(ticket + 2, 0)
+                tl.store(ticket + 3, 0)
+
+
+def qkv_tail_plan(pp: dict, M: int, NA: int, NB: int, rp: Optional[int] = None, form: str = "fold") -> dict:
     """The tail-side constexprs that depend only on the pair plan and M: which halves split (QNS / KNS: the split
     count read in the tail, 0 = the bf16 output), the per-half ticket counts, the fence width, the tails' rows per
     pass RP (min(next_pow2(M), rp or L10_TAIL_RP), a power of two; speed only) and their 32-block tiles (metadata;
-    the Mac tests check it)."""
-    return {"QNS": int(pp["NSA"]) if pp["NSA"] > 1 else 0, "KNS": int(pp["NSB"]) if pp["NSB"] > 1 else 0,
-            "tickets": (int(pp["TA"]) * int(pp["NSA"]), int(pp["TB"]) * int(pp["NSB"])),
-            "FT": 32 * int(pp["num_warps"]), "RP": min(_np2(M), _np2(max(1, int(rp or L10_TAIL_RP)))),
-            "QBB": min(16, _np2(NA // BLOCK)), "KBB": min(16, _np2(NB // BLOCK))}
+    the Mac tests check it). form "stage" (M2-L10-FIX): RP = rows per tail CTA (default L10_STAGE_RP), NTA = NTB =
+    ceil(M / RP) tail CTAs per half, NWORK = the pair grid's programs, ticket words needed 4 + TA + TB."""
+    out = {"QNS": int(pp["NSA"]) if pp["NSA"] > 1 else 0, "KNS": int(pp["NSB"]) if pp["NSB"] > 1 else 0,
+           "tickets": (int(pp["TA"]) * int(pp["NSA"]), int(pp["TB"]) * int(pp["NSB"])),
+           "FT": 32 * int(pp["num_warps"]), "RP": min(_np2(M), _np2(max(1, int(rp or L10_TAIL_RP)))),
+           "QBB": min(16, _np2(NA // BLOCK)), "KBB": min(16, _np2(NB // BLOCK)), "form": form}
+    if form == "stage":
+        rps = min(_np2(M), _np2(max(1, int(rp or L10_STAGE_RP))))
+        nt = -(-int(M) // rps)
+        g0, g1 = pp["grid"]
+        out.update(RP=rps, NTA=nt, NTB=nt, NWORK=int(g0) * int(g1), G0=int(g0),
+                   grid=(int(g0) * int(g1) + 2 * nt,), ticket_words=4 + int(pp["TA"]) + int(pp["TB"]))
+    return out
 
 
 def _np2(n: int) -> int:
     return 1 << max(0, (int(n) - 1).bit_length())
 
 
-L10_STATS = {"fused": 0, "refused": 0}   # host-side counts: qkv_pair_tail calls that took one launch / were refused
+L10_STATS = {"fused": 0, "refused": 0, "stage": 0, "fold": 0}   # host-side counts of qkv_pair_tail calls: one launch
+#                                                                  (by form) / refused
+L10_COMPILED: Dict[tuple, dict] = {}   # (form, M, RP, TAILS) -> the compiled kernel's registers / spills (eager only)
+
+
+def kernel_meta(k) -> Optional[dict]:
+    """n_regs / n_spills / num_warps / shared of a Triton launch's returned CompiledKernel (None when unavailable:
+    the shim, other Triton versions)."""
+    if k is None:
+        return None
+    md = getattr(k, "metadata", None)
+    out = {"n_regs": getattr(k, "n_regs", None), "n_spills": getattr(k, "n_spills", None),
+           "num_warps": getattr(md, "num_warps", None), "shared": getattr(md, "shared", None)}
+    return out if any(v is not None for v in out.values()) else None
 
 
 def qkv_pair_tail(xq, xs, wa, sa, wb, sb, *, ticket: torch.Tensor, tab: torch.Tensor, q_tail: dict, kv_tail: dict,
                   tags: Tuple[str, str] = ("", ""),
                   configs: Tuple[Optional[GemvConfig], Optional[GemvConfig]] = (None, None),
-                  rp: Optional[int] = None):
-    """M2-L10: gemv_pair(xq, xs, wa, sa, wb, sb) and both consumers in ONE launch (section comment). Kernel path only
+                  rp: Optional[int] = None, form: Optional[str] = None, tails: bool = True):
+    """M2-L10: gemv_pair(xq, xs, wa, sa, wb, sb) and both consumers in ONE launch (section comments). Kernel path only
     (CUDA, or the shim with KERNELS_ON_CPU); the CPU mirror is runtime/fused_glue_r2.launch_qkv_tail's.
       q_tail  = {nw [NA] bf16, qr [M, NA] bf16, q [M, NA] fp8, s [M, NA/32] e8m0, eps, fac, wf, order (T, V, U, DEC,
                  DIV)}
       kv_tail = {nw [NB] bf16, ring (bf16, rows of NB, contiguous), slot [M] int64, freqs fp32 [RD/2, 2] or
                  [M, RD/2, 2] contiguous (None when RD == 0), FS (freqs row stride), rd, modes (re, im), eps, fac, wf,
                  order}
-      ticket  = int32 [L10_TICKETS], zero (left zero by every launch).
-      rp      = the tails' rows per pass (default L10_TAIL_RP; speed only).
-    -> (result_a, result_b) as gemv_pair's (bf16 [M, N] or SplitK: the tails' inputs, still valid after the launch),
-    or None when the halves cannot share a launch (pair_plan refuses: the caller runs the split path)."""
+      ticket  = int32 [>= L10_TICKET_WORDS for form stage, >= L10_TICKETS for fold], zero (left zero by every launch).
+      form    = "stage" (M2-L10-FIX, default $DSV41_QKV_TAIL_FORM or L10_FORM_DEFAULT) | "fold" (round 1).
+      rp      = fold: the single tail CTA's rows per pass (default L10_TAIL_RP); stage: rows per tail CTA (default
+                L10_STAGE_RP). Speed only.
+      tails   = False: bench phase probe only (the GEMV + tickets, no tail output written).
+    The GEMV configs are gemv_pair's exactly (the same `_resolved` + `pair_plan`: tuned config, split-K, warps,
+    stages) -> (result_a, result_b) as gemv_pair's (bf16 [M, N] or SplitK, still valid after the launch), or None
+    when the halves cannot share a launch (pair_plan refuses: the caller runs the split path)."""
     M, NA, K = check_operands(xq, xs, wa, sa)
     _, NB, _ = check_operands(xq, xs, wb, sb)
     if not _kern_gemv(xq):
         raise RuntimeError("qkv_pair_tail: kernel path only (CUDA or the shim); the CPU mirror is fused_glue_r2's")
+    fm = qkv_tail_form(form)
     if NA % BLOCK or NB % BLOCK or ticket.dtype != torch.int32 or ticket.numel() < L10_TICKETS:
         raise ValueError(f"qkv_pair_tail: NA {NA} / NB {NB} must be 32-multiples, ticket int32 [{L10_TICKETS}]")
     cfg_a = _resolved(NA, K, M, xq.device, configs[0])
@@ -1503,17 +1686,21 @@ def qkv_pair_tail(xq, xs, wa, sa, wb, sb, *, ticket: torch.Tensor, tab: torch.Te
     if pp is None:
         L10_STATS["refused"] += 1
         return None
-    tp = qkv_tail_plan(pp, M, NA, NB, rp)
+    tp = qkv_tail_plan(pp, M, NA, NB, rp, fm)
+    if fm == "stage" and ticket.numel() < tp["ticket_words"]:
+        raise ValueError(f"qkv_pair_tail: form stage needs {tp['ticket_words']} int32 ticket words, got "
+                         f"{ticket.numel()} (allocate L10_TICKET_WORDS)")
     res, bufs = [], []
     for w, ns, tag in ((wa, pp["NSA"], tags[0]), (wb, pp["NSB"], tags[1])):
         N = w.size(0)
         if ns > 1:
             ws = workspace(xq.device, M, N, ns, tag or f"t9b4:{w.data_ptr():x}")
-            bufs.append((ws[0], ws))
+            st = torch.empty(M, N, dtype=torch.bfloat16, device=xq.device) if fm == "stage" else ws
+            bufs.append((ws[0], ws, st))
             res.append(SplitK(ws, ns))
         else:
             out = torch.empty(M, N, dtype=torch.bfloat16, device=xq.device)
-            bufs.append((out, out))
+            bufs.append((out, out, out))
             res.append(out)
     qt, kt = q_tail, kv_tail
     qo, ko = qt["order"], kt["order"]
@@ -1521,19 +1708,33 @@ def qkv_pair_tail(xq, xs, wa, sa, wb, sb, *, ticket: torch.Tensor, tab: torch.Te
     modes = tuple(kt.get("modes", (0, 0)))
     fr = kt.get("freqs") if rd else None
     L10_STATS["fused"] += 1
-    l10_qkv_tail[pp["grid"]](
-        xq, xs.view(torch.uint8), wa, sa.view(torch.uint8), bufs[0][0], bufs[0][1], wb, sb.view(torch.uint8),
-        bufs[1][0], bufs[1][1], M, NA, NB, K // BLOCK, pp["PERA"], pp["PERB"], pp["NSA"], pp["NSB"], pp["TA"],
-        pp["TB"], xq.stride(0), xs.stride(0), wa.stride(0), sa.stride(0), bufs[0][0].stride(0), wb.stride(0),
-        sb.stride(0), bufs[1][0].stride(0),
-        ticket, tab, qt["nw"], qt["qr"], qt["q"], qt["s"].view(torch.uint8), float(qt["eps"]), float(qt["fac"]),
-        float(qt["wf"]), kt["nw"], kt["ring"], kt["slot"], fr if fr is not None else kt["nw"],
-        int(kt.get("FS", 0) or 0), float(kt["eps"]), float(kt["fac"]), float(kt["wf"]),
-        BLOCK_M=pp["BLOCK_M"], BLOCK_N=pp["BLOCK_N"], KU=pp["KU"], EVENA=pp["EVENA"], EVENB=pp["EVENB"],
-        MMA=pp["MMA"], SPLITA=pp["NSA"] > 1, SPLITB=pp["NSB"] > 1, FT=tp["FT"],
-        QN=NA, QT=int(qo["T"]), QV=int(qo["V"]), QU=bool(qo["U"]), QDEC=bool(qo["DEC"]), QDIV=bool(qo["DIV"]),
-        QBB=tp["QBB"], QNS=tp["QNS"],
-        KN=NB, KT=int(ko["T"]), KV=int(ko["V"]), KUN=bool(ko["U"]), KDEC=bool(ko["DEC"]), KDIV=bool(ko["DIV"]),
-        KBB=tp["KBB"], KNS=tp["KNS"], RD=rd, RE_MODE=int(modes[0]), IM_MODE=int(modes[1]), RP=tp["RP"],
-        num_warps=pp["num_warps"], num_stages=pp["num_stages"])
+    L10_STATS[fm] += 1
+    tail_args = (ticket, tab, qt["nw"], qt["qr"], qt["q"], qt["s"].view(torch.uint8), float(qt["eps"]),
+                 float(qt["fac"]), float(qt["wf"]), kt["nw"], kt["ring"], kt["slot"],
+                 fr if fr is not None else kt["nw"], int(kt.get("FS", 0) or 0), float(kt["eps"]), float(kt["fac"]),
+                 float(kt["wf"]))
+    strides = (xq.stride(0), xs.stride(0), wa.stride(0), sa.stride(0), bufs[0][0].stride(0), wb.stride(0),
+               sb.stride(0), bufs[1][0].stride(0))
+    ce = dict(BLOCK_M=pp["BLOCK_M"], BLOCK_N=pp["BLOCK_N"], KU=pp["KU"], EVENA=pp["EVENA"], EVENB=pp["EVENB"],
+              MMA=pp["MMA"], SPLITA=pp["NSA"] > 1, SPLITB=pp["NSB"] > 1, FT=tp["FT"],
+              QN=NA, QT=int(qo["T"]), QV=int(qo["V"]), QU=bool(qo["U"]), QDEC=bool(qo["DEC"]), QDIV=bool(qo["DIV"]),
+              QBB=tp["QBB"], KN=NB, KT=int(ko["T"]), KV=int(ko["V"]), KUN=bool(ko["U"]), KDEC=bool(ko["DEC"]),
+              KDIV=bool(ko["DIV"]), KBB=tp["KBB"], RD=rd, RE_MODE=int(modes[0]), IM_MODE=int(modes[1]), RP=tp["RP"],
+              TAILS=bool(tails), num_warps=pp["num_warps"], num_stages=pp["num_stages"])
+    if fm == "stage":
+        k = l10_qkv_tail2[tp["grid"]](
+            xq, xs.view(torch.uint8), wa, sa.view(torch.uint8), bufs[0][0], bufs[0][1], bufs[0][2], wb,
+            sb.view(torch.uint8), bufs[1][0], bufs[1][1], bufs[1][2], M, NA, NB, K // BLOCK, pp["PERA"], pp["PERB"],
+            pp["NSA"], pp["NSB"], pp["TA"], pp["TB"], tp["G0"], tp["NWORK"], tp["NTA"], tp["NTB"], *strides,
+            *tail_args, QNS=max(1, tp["QNS"]), KNS=max(1, tp["KNS"]), **ce)
+    else:
+        k = l10_qkv_tail[pp["grid"]](
+            xq, xs.view(torch.uint8), wa, sa.view(torch.uint8), bufs[0][0], bufs[0][1], wb, sb.view(torch.uint8),
+            bufs[1][0], bufs[1][1], M, NA, NB, K // BLOCK, pp["PERA"], pp["PERB"], pp["NSA"], pp["NSB"], pp["TA"],
+            pp["TB"], *strides, *tail_args, QNS=tp["QNS"], KNS=tp["KNS"], **ce)
+    key = (fm, int(M), int(tp["RP"]), bool(tails))
+    if key not in L10_COMPILED and not _capturing():
+        meta = kernel_meta(k)
+        if meta is not None:
+            L10_COMPILED[key] = meta
     return res[0], res[1]

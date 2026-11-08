@@ -1,23 +1,30 @@
-"""GPU tests of M2-L10, the q/kv tail (docs/HANDOFF-M2-L10-QKV-TAIL.md). Skipped without CUDA (Mac); on the box a
-missing triton FAILS (it is what is under test). Same docker line as tests/gpu/test_t9b4_gpu.py, with this file:
+"""GPU tests of M2-L10, the q/kv tail (docs/HANDOFF-M2-L10-QKV-TAIL.md, fix round docs/HANDOFF-M2-L10-FIX.md).
+Skipped without CUDA (Mac); on the box a missing triton FAILS (it is what is under test). Same docker line as
+tests/gpu/test_t9b4_gpu.py, with this file -- run as a script it prints the harness lines (PASS / FAIL / SKIP per test,
+then "N/M not failed; K failed"), under pytest the usual summary:
 
+  ... --entrypoint python3 vllm/vllm-openai:v0.31.0 tests/gpu/test_qkv_tail_gpu.py
   ... --entrypoint python3 vllm/vllm-openai:v0.31.0 -m pytest -q -s tests/gpu/test_qkv_tail_gpu.py
 
   * real shapes (wq_a || wkv: 1280 + 512 x 5120, rope 64, the tuned GEMV configs, the orders pick_order calibrates on
-    THIS device, every RoPE contraction form, 1 and 6 rows, rows per pass 1 / 2 (default) / 4 / 8): l10_qkv_tail (one
-    launch) == gemv_pair + norm_row (q) + norm_row (kv), torch.equal on qr / q / s / the whole ring and the GEMV
-    results; 64 eager launches in a row and 100 CUDA-graph replays all equal and the tickets at 0 after each (the
-    per-output ticket under real CTA concurrency); graph-timed us per call of both (informative; the receipt is
-    bench/qkv_tail_bench.py's);
-  * the mini4 checkpoint, dg-inplace + gemv + fused glue, 1 and 6 rows, both P0 parities: $DSV41_QKV_TAIL=fused ==
-    split, torch.equal on every row's fp32 logits, main_hidden and the caches (the byte-identical gate); graph ==
-    static-eager under fused (replay-identical); the build-time self-check says equal and the step took the fused
-    launch on every layer.
+    THIS device, every RoPE contraction form, 1 and 6 rows), BOTH fused forms -- stage (l10_qkv_tail2, the fix:
+    dynamic CTA ids, per-tile fold, one tail CTA per RP rows, RP 1 (default) / 2 / 8) and fold (l10_qkv_tail, round
+    1, rows per pass 1 / 2 (default) / 4 / 8): one launch == gemv_pair + norm_row (q) + norm_row (kv), torch.equal on
+    qr / q / s / the whole ring and the GEMV results; 64 eager launches in a row and 100 CUDA-graph replays all equal
+    and every ticket word 0 after each (the tickets and the stage form's wait under real CTA concurrency); graph-timed
+    us per call (informative; the receipt is bench/qkv_tail_bench.py --timing's);
+  * the compiled kernels' registers / spills next to the pair kernel's (cause (b), informative);
+  * the mini4 checkpoint, dg-inplace + gemv + fused glue, 1 and 6 rows, both P0 parities: $DSV41_QKV_TAIL=fused (each
+    form) == split, torch.equal on every row's fp32 logits, main_hidden and the caches (the byte-identical gate);
+    graph == static-eager under fused (replay-identical); the build-time self-check says equal and the step took the
+    fused launch on every layer.
 """
 from __future__ import annotations
 
 import os
 import sys
+import time
+import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
@@ -33,13 +40,13 @@ E8 = torch.float8_e8m0fnu
 BF = torch.bfloat16
 DIM, QL, HD, RD, WIN = 5120, 1280, 512, 64, 256
 EPS = 1e-20
+FORMS = ("stage", "fold")
+RPS = {"stage": (1, 2, 8), "fold": (1, 2, 4, 8)}
 
 
 def _need():
     if not torch.cuda.is_available():
-        import pytest
-
-        pytest.skip("no CUDA")
+        raise unittest.SkipTest("no CUDA (Mac): GPU tests run on the box")
     import triton  # noqa: F401  (FAIL on the box if missing)
     from runtime import fused_glue_r2 as R2
     from runtime import gemv_mxfp8 as GM
@@ -96,7 +103,7 @@ def _split(R2, GM, ops, tail, M, modes, qo, ko, tab, out=None):
     return out, (ra, rb)
 
 
-def _fused_fn(R2, GM, ops, tail, M, modes, qo, ko, tab, ticket, rp=None):
+def _fused_fn(R2, GM, ops, tail, M, modes, qo, ko, tab, ticket, rp=None, form=None):
     xq, xs, wa, sa, wb, sb = ops
     qnw, kvnw, fr, slot = tail
     out = dict(qr=torch.empty(M, QL, dtype=BF, device="cuda"), q=torch.empty(M, QL, dtype=FP8, device="cuda"),
@@ -105,7 +112,7 @@ def _fused_fn(R2, GM, ops, tail, M, modes, qo, ko, tab, ticket, rp=None):
 
     def run():
         return GM.qkv_pair_tail(
-            xq, xs, wa, sa, wb, sb, ticket=ticket, tab=tab, tags=("l10_fa", "l10_fb"), rp=rp,
+            xq, xs, wa, sa, wb, sb, ticket=ticket, tab=tab, tags=("l10_fa", "l10_fb"), rp=rp, form=form,
             q_tail=dict(nw=qnw, qr=out["qr"], q=out["q"], s=out["s"], eps=EPS, fac=R2.fac_of(QL), wf=float(QL),
                         order=R2.order_args(qo)),
             kv_tail=dict(nw=kvnw, ring=out["ring"], slot=slot, freqs=fr, FS=int(fr.stride(0)) if fr.dim() == 3 else 0,
@@ -113,70 +120,99 @@ def _fused_fn(R2, GM, ops, tail, M, modes, qo, ko, tab, ticket, rp=None):
     return out, run
 
 
+def _ticket(GM):
+    return torch.zeros(GM.L10_TICKET_WORDS, dtype=torch.int32, device="cuda")
+
+
 def test_real_shapes_fused_equals_split_and_replays():
     R2, GM = _need()
     from runtime import fused_glue as FG
+    from runtime.gemv_mxfp8 import time_graph
     from runtime.refmodel import import_reference
 
     tab = FG.scale_code_table(import_reference(), "cuda")
     qo, ko = R2.pick_order("cuda", QL, 1, "sqmean"), R2.pick_order("cuda", HD, 1, "sqmean")
     assert qo["exact"] and ko["exact"], (qo, ko)
     for M in (1, 6):
-        for modes in ((0, 0), (1, 1), (2, 2), (1, 2)):
-            ops = _ops(M, 10 * M + modes[0])
-            tail = _inputs(M, 3 * M + modes[1])
-            want, (wa_r, wb_r) = _split(R2, GM, ops, tail, M, modes, qo, ko, tab)
-            ticket = torch.zeros(GM.L10_TICKETS, dtype=torch.int32, device="cuda")
-            out, run = _fused_fn(R2, GM, ops, tail, M, modes, qo, ko, tab, ticket)
-            res = run()
-            assert res is not None, "pair_plan refused the real shapes (MMA forms differ): fused stays off"
-            torch.cuda.synchronize()
-            for k in want:
-                assert _eq(out[k], want[k]), (M, modes, k)
-            for r, w in ((res[0], wa_r), (res[1], wb_r)):
-                assert _eq(r.ws, w.ws) if hasattr(r, "nsplit") else _eq(r, w)
-            for rp in (1, 4, 8):                                 # rows per pass: speed only, same bits
-                o2, run2 = _fused_fn(R2, GM, ops, tail, M, modes, qo, ko, tab, ticket, rp)
-                assert run2() is not None
+        pa = GM.pair_plan(GM._resolved(QL, DIM, M, "cuda", None), GM._resolved(HD, DIM, M, "cuda", None), M, QL, HD,
+                          DIM)
+        for form in FORMS:
+            for modes in ((0, 0), (1, 1), (2, 2), (1, 2)):
+                ops = _ops(M, 10 * M + modes[0])
+                tail = _inputs(M, 3 * M + modes[1])
+                want, (wa_r, wb_r) = _split(R2, GM, ops, tail, M, modes, qo, ko, tab)
+                ticket = _ticket(GM)
+                out, run = _fused_fn(R2, GM, ops, tail, M, modes, qo, ko, tab, ticket, form=form)
+                res = run()
+                assert res is not None, "pair_plan refused the real shapes (MMA forms differ): fused stays off"
                 torch.cuda.synchronize()
-                assert all(_eq(o2[k], want[k]) for k in want), (M, modes, "rp", rp)
-            first = {k: v.clone() for k, v in out.items()}
-            for _ in range(64):                               # eager, back to back
-                run()
-            torch.cuda.synchronize()
-            assert all(_eq(out[k], first[k]) for k in first) and int(ticket.abs().sum()) == 0
-            gr = torch.cuda.CUDAGraph()
-            s = torch.cuda.Stream()
-            s.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(s):
-                run()
-            torch.cuda.current_stream().wait_stream(s)
-            with torch.cuda.graph(gr):
-                run()
-            for _ in range(100):
-                for k in ("qr", "q", "s"):
-                    out[k].view(torch.uint8).fill_(0x55)
-                out["ring"][0, tail[3]] = 0.0
-                gr.replay()
+                for k in want:
+                    assert _eq(out[k], want[k]), (form, M, modes, k)
+                for r, w in ((res[0], wa_r), (res[1], wb_r)):
+                    assert _eq(r.ws, w.ws) if hasattr(r, "nsplit") else _eq(r, w)
+                assert int(ticket.abs().sum()) == 0, (form, ticket.nonzero().flatten().tolist())
+                for rp in RPS[form]:                            # rows per pass / per tail CTA: speed only, same bits
+                    o2, run2 = _fused_fn(R2, GM, ops, tail, M, modes, qo, ko, tab, ticket, rp, form)
+                    assert run2() is not None
+                    torch.cuda.synchronize()
+                    assert all(_eq(o2[k], want[k]) for k in want), (form, M, modes, "rp", rp)
+                    assert int(ticket.abs().sum()) == 0, (form, rp)
+                first = {k: v.clone() for k, v in out.items()}
+                for _ in range(64):                             # eager, back to back
+                    run()
                 torch.cuda.synchronize()
-                assert all(_eq(out[k], first[k]) for k in first), "graph replay differs"
-                assert int(ticket.abs().sum()) == 0, ticket
-            pa = GM.pair_plan(GM.get_config(QL, DIM, M), GM.get_config(HD, DIM, M), M, QL, HD, DIM)
-            print(f"  M {M} modes {modes}: fused == split (qr, q, s, ring, GEMV results); 64 eager + 100 graph "
-                  f"replays equal, tickets 0; pair plan grid {pa['grid']} NSA {pa['NSA']} NSB {pa['NSB']}")
-        from runtime.gemv_mxfp8 import time_graph
-
+                assert all(_eq(out[k], first[k]) for k in first) and int(ticket.abs().sum()) == 0
+                gr = torch.cuda.CUDAGraph()
+                s = torch.cuda.Stream()
+                s.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(s):
+                    run()
+                torch.cuda.current_stream().wait_stream(s)
+                with torch.cuda.graph(gr):
+                    run()
+                for _ in range(100):
+                    for k in ("qr", "q", "s"):
+                        out[k].view(torch.uint8).fill_(0x55)
+                    out["ring"][0, tail[3]] = 0.0
+                    gr.replay()
+                    torch.cuda.synchronize()
+                    assert all(_eq(out[k], first[k]) for k in first), f"{form}: graph replay differs"
+                    assert int(ticket.abs().sum()) == 0, (form, ticket.nonzero().flatten().tolist())
+                print(f"  M {M} {form} modes {modes}: fused == split (qr, q, s, ring, GEMV results); rp "
+                      f"{RPS[form]} equal; 64 eager + 100 graph replays equal, tickets 0; pair plan grid "
+                      f"{pa['grid']} NSA {pa['NSA']} NSB {pa['NSB']}", flush=True)
         ops = _ops(M, 99)
         tail = _inputs(M, 98)
-        ticket = torch.zeros(GM.L10_TICKETS, dtype=torch.int32, device="cuda")
-        _, run = _fused_fn(R2, GM, ops, tail, M, (1, 1), qo, ko, tab, ticket)
-        run()
         so, _ = _split(R2, GM, ops, tail, M, (1, 1), qo, ko, tab)
-        torch.cuda.synchronize()
-        us_f = time_graph([run] * 100)
-        us_s = time_graph([lambda: _split(R2, GM, ops, tail, M, (1, 1), qo, ko, tab, out=so)] * 100)
-        print(f"  M {M}: graph us per layer-call: split (pair + 2 norm_row) {us_s:.2f}, fused {us_f:.2f} "
-              f"(informative; receipt: bench/qkv_tail_bench.py)")
+        us = {"split": time_graph([lambda: _split(R2, GM, ops, tail, M, (1, 1), qo, ko, tab, out=so)] * 100)}
+        for form in FORMS:
+            _, run = _fused_fn(R2, GM, ops, tail, M, (1, 1), qo, ko, tab, _ticket(GM), form=form)
+            run()
+            torch.cuda.synchronize()
+            us[form] = time_graph([run] * 100)
+        print(f"  M {M}: graph us per layer-call (one weight copy, L2-warm -- informative; the receipt is "
+              f"bench/qkv_tail_bench.py --timing): split (pair + 2 norm_row) {us['split']:.2f}, fused stage "
+              f"{us['stage']:.2f}, fused fold {us['fold']:.2f}", flush=True)
+
+
+def test_compiled_registers_informative():
+    """Cause (b): registers / spills of the fused kernels next to the pair kernel's at the real shapes (printed; the
+    only assertion is that the fused kernels compiled)."""
+    R2, GM = _need()
+    from runtime import fused_glue as FG
+    from runtime.refmodel import import_reference
+
+    tab = FG.scale_code_table(import_reference(), "cuda")
+    qo, ko = R2.pick_order("cuda", QL, 1, "sqmean"), R2.pick_order("cuda", HD, 1, "sqmean")
+    for M in (1, 6):
+        ops = _ops(M, 5)
+        tail = _inputs(M, 6)
+        for form in FORMS:
+            GM.L10_COMPILED.clear()
+            _, run = _fused_fn(R2, GM, ops, tail, M, (1, 1), qo, ko, tab, _ticket(GM), form=form)
+            assert run() is not None
+            torch.cuda.synchronize()
+            print(f"  M {M} {form}: compiled {GM.L10_COMPILED or '(no metadata in this Triton)'}", flush=True)
 
 
 def test_mini_static_fused_equals_split_1_and_6_rows():
@@ -190,8 +226,11 @@ def test_mini_static_fused_equals_split_1_and_6_rows():
             for L in (17, 18):
                 ids, toks = _toks(L, rows * 4, 90 + L)
                 runs = {}
-                for mode in ("split", "fused"):
-                    os.environ[R2.QKV_TAIL_ENV] = mode
+                for mode in ("split", "fused:stage", "fused:fold"):
+                    tail_mode, _, form = mode.partition(":")
+                    os.environ[R2.QKV_TAIL_ENV] = tail_mode
+                    if form:
+                        os.environ[GM.L10_FORM_ENV] = form
                     try:
                         kw = dict(rows=rows, moe_impl="dg-inplace", fp8_impl="gemv", glue_impl="fused")
                         if rows > 1:
@@ -199,13 +238,13 @@ def test_mini_static_fused_equals_split_1_and_6_rows():
                         st = _need_step(model, pool, **kw)
                         d = st.glue.describe()
                         qt = d["r2"]["qkv_tail"]
-                        print(f"  rows {rows} P0 {L} {mode}: qkv_tail {qt['mode']} ({qt['why']}); check "
-                              f"{d['calibration'].get('qkv_tail')}")
-                        assert qt["mode"] == mode, qt
+                        print(f"  rows {rows} P0 {L} {mode}: qkv_tail {qt['mode']} form {qt.get('form')} "
+                              f"({qt['why']}); check {d['calibration'].get('qkv_tail')}", flush=True)
+                        assert qt["mode"] == tail_mode, qt
                         n0 = dict(GM.L10_STATS)
                         a = _static(model, st, ids, toks, 4)
-                        if mode == "fused":
-                            took = GM.L10_STATS["fused"] - n0["fused"]
+                        if tail_mode == "fused":
+                            took = GM.L10_STATS[form] - n0[form]
                             assert took == 4 * len(model.layers), (took, GM.L10_STATS)
                         st.capture()
                         ag = _static(model, st, ids, toks, 4, graph=True)
@@ -214,5 +253,31 @@ def test_mini_static_fused_equals_split_1_and_6_rows():
                         st.detach()
                     finally:
                         os.environ.pop(R2.QKV_TAIL_ENV, None)
-                _eq_runs(runs["fused"], runs["split"], f"rows {rows} P0 {L}: qkv_tail fused vs split")
-                print(f"  rows {rows} P0 {L}: fused == split (logits, main_hidden, caches); graph == eager for both")
+                        os.environ.pop(GM.L10_FORM_ENV, None)
+                for mode in ("fused:stage", "fused:fold"):
+                    _eq_runs(runs[mode], runs["split"], f"rows {rows} P0 {L}: qkv_tail {mode} vs split")
+                print(f"  rows {rows} P0 {L}: fused stage == fused fold == split (logits, main_hidden, caches); "
+                      f"graph == eager for all three", flush=True)
+
+
+TESTS = [test_real_shapes_fused_equals_split_and_replays, test_compiled_registers_informative,
+         test_mini_static_fused_equals_split_1_and_6_rows]
+
+if __name__ == "__main__":
+    import traceback
+
+    results = {}
+    for t in TESTS:
+        t0 = time.time()
+        try:
+            t()
+            results[t.__name__] = "PASS"
+        except unittest.SkipTest as e:
+            results[t.__name__] = f"SKIP ({e})"
+        except Exception:
+            traceback.print_exc()
+            results[t.__name__] = "FAIL"
+        print(f"{results[t.__name__]:4s} {t.__name__} ({time.time() - t0:.1f}s)", flush=True)
+    n_fail = sum(v == "FAIL" for v in results.values())
+    print(f"{len(results) - n_fail}/{len(results)} not failed; {n_fail} failed")
+    sys.exit(1 if n_fail else 0)

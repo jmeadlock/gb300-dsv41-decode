@@ -16,6 +16,12 @@ own weight copies (so wq_a / wkv stream from HBM as in the step) and its own out
 = graph us / layers; ms/step saved = 40 x (split - fused) / 1000 (the verify step's 40 layers; the draft does not run
 these clusters). Bit-equality: every layer's qr / q / s / ring of the fused graph == the split graph's, after the
 replays; the tickets read 0.
+M2-L10-FIX (docs/HANDOFF-M2-L10-FIX.md) phases, each its own graph, all measured: `pair` (the GEMV alone), `q_norm_row`
+/ `kv_norm_row` (each consumer alone, on the pair's partials), `split` (all three); per fused form (fold = round 1,
+stage = the fix) and rows-per-pass / per-tail-CTA RP: the full launch, and `<form>_notail` (TAILS=False: the GEMV +
+tickets (+ the stage fold) without the tail work), so tail cost = best - notail and GEMV/ticket overhead = notail -
+pair. `compiled`: registers / spills / warps / shared of every kernel (cause (b)); `config` / `pair_plan`: the tuned
+GEMV configs both paths resolve (cause (c)). Final line `QKV-TAIL-TIMING: R=1 ... ; R=6 ...`.
 """
 from __future__ import annotations
 
@@ -140,18 +146,78 @@ def _graph_us(calls, reps: int) -> float:
     return t0.elapsed_time(t1) * 1000.0 / reps
 
 
-def timing(rows_list, layers: int, reps: int, modes, rps=(None,)) -> dict:
+class _MetaRecorder:
+    """Cause (b): the compiled kernels' registers / spills / warps / shared memory. Wraps each Triton JITFunction's
+    `run` (what `kernel[grid](...)` calls) and keeps the distinct kernel_meta of what it returned. Best effort: any
+    Triton without these attributes records nothing (never fails the bench)."""
+
+    def __init__(self, GM, fns):
+        self.GM, self.fns, self.saved, self.seen = GM, fns, {}, {}
+
+    def __enter__(self):
+        for name, fn in self.fns.items():
+            run = getattr(fn, "run", None)
+            if run is None:
+                continue
+            self.saved[name] = run
+
+            def wrapped(*a, _run=run, _name=name, **k):
+                kern = _run(*a, **k)
+                try:
+                    if not torch.cuda.is_current_stream_capturing():
+                        m = self.GM.kernel_meta(kern)
+                        if m is not None and m not in self.seen.setdefault(_name, []):
+                            self.seen[_name].append(m)
+                except Exception:  # noqa: BLE001 - informative only
+                    pass
+                return kern
+            try:
+                fn.run = wrapped
+            except Exception:  # noqa: BLE001
+                self.saved.pop(name, None)
+        return self
+
+    def __exit__(self, *exc):
+        for name, run in self.saved.items():
+            try:
+                del self.fns[name].run          # back to the class attribute
+            except Exception:  # noqa: BLE001
+                self.fns[name].run = run
+        return False
+
+
+def timing(rows_list, layers: int, reps: int, modes, rps=(None,), forms=("fold", "stage"), _dry=None) -> dict:
+    """us per layer-call [measured, CUDA events over graph replays of `layers` layer-calls] of every phase, 1 and R
+    rows (section docstring), + bit-equality of every fused variant vs split on qr / q / s / ring.
+    _dry (tests/test_qkv_tail_cpu.py only): {"GM", "R2": the shim-loaded modules, "dims": (DIM, QL, HD), "tab": the
+    act_quant code table} -- the same
+    code on CPU through tests/triton_shim.py, each graph replaced by one eager pass and a placeholder time (NOT a
+    measurement), so the bookkeeping that crashed round 1's box run is exercised on the Mac."""
     from runtime import fused_glue as FG
-    from runtime import fused_glue_r2 as R2
-    from runtime import gemv_mxfp8 as GM
     from runtime.refmodel import import_reference
 
-    assert torch.cuda.is_available() and GM.HAVE_TRITON, "--timing runs on the box (CUDA + Triton)"
-    dev = "cuda"
-    tab = FG.scale_code_table(import_reference(), dev)
+    if _dry is None:
+        from runtime import fused_glue_r2 as R2
+        from runtime import gemv_mxfp8 as GM
+
+        assert torch.cuda.is_available() and GM.HAVE_TRITON, "--timing runs on the box (CUDA + Triton)"
+        dev, graph_us, sync = "cuda", _graph_us, torch.cuda.synchronize
+        DIM, QL, HD = globals()["DIM"], globals()["QL"], globals()["HD"]
+    else:
+        GM, R2, (DIM, QL, HD) = _dry["GM"], _dry["R2"], _dry["dims"]
+        dev, sync = "cpu", (lambda: None)
+
+        def graph_us(calls, reps_):
+            for c in calls:
+                c()
+            return float(len(calls))          # placeholder, not a time
+    tab = _dry["tab"] if _dry is not None else FG.scale_code_table(import_reference(), dev)
     qo, ko = R2.pick_order(dev, QL, 1, "sqmean"), R2.pick_order(dev, HD, 1, "sqmean")
     out = {"orders": {"q": qo["name"], "kv": ko["name"], "exact": bool(qo["exact"] and ko["exact"])},
-           "rope_modes": list(modes), "layers": layers, "reps": reps}
+           "rope_modes": list(modes), "layers": layers, "reps": reps, "label": "measured (CUDA events, graph replay)",
+           "gemv_pin_m1": GM.pin_m1(), "forms": list(forms), "dry_run": _dry is not None}
+    fns = {"t9b4_mxfp8_gemv2": GM.t9b4_mxfp8_gemv2, "t9b2r2_norm_row": R2.t9b2r2_norm_row,
+           "l10_qkv_tail (fold)": GM.l10_qkv_tail, "l10_qkv_tail2 (stage)": GM.l10_qkv_tail2}
     for M in rows_list:
         xq, xs, wa_l, sa_l = GM._synthetic(QL, DIM, M, layers, dev)
         _, _, wb_l, sb_l = GM._synthetic(HD, DIM, M, layers, dev)
@@ -172,22 +238,35 @@ def timing(rows_list, layers: int, reps: int, modes, rps=(None,)) -> dict:
                          s=torch.empty(M, QL // 32, dtype=torch.float8_e8m0fnu, device=dev),
                          ring=torch.zeros(1, WIN, HD, dtype=torch.bfloat16, device=dev)) for _ in range(layers)]
         so, fo = bufs(), bufs()
-        ticket = torch.zeros(GM.L10_TICKETS, dtype=torch.int32, device=dev)
+        ticket = torch.zeros(GM.L10_TICKET_WORDS, dtype=torch.int32, device=dev)
+        pr = {}
+
+        def pair(i):
+            pr[i] = GM.gemv_pair(xq, xs, wa_l[i], sa_l[i], wb_l[i], sb_l[i], tags=(f"qkvb_sa{i}", f"qkvb_sb{i}"))
+            return pr[i]
+
+        def qnorm(i):
+            ra = pr[i][0]
+            R2.launch_norm_row(ra if hasattr(ra, "nsplit") else ra.view(M, QL), qnw[i], so[i]["qr"], eps=EPS,
+                               ordd=qo, code_tab=tab, q=so[i]["q"], s=so[i]["s"])
+
+        def kvnorm(i):
+            rb = pr[i][1]
+            R2.launch_norm_row(rb if hasattr(rb, "nsplit") else rb.view(M, HD), kvnw[i], so[i]["ring"], eps=EPS,
+                               ordd=ko, code_tab=tab, slot=slot, qdq=True, rope=(fr, RD, tuple(modes)))
 
         def split_call(i):
             def f():
-                ra, rb = GM.gemv_pair(xq, xs, wa_l[i], sa_l[i], wb_l[i], sb_l[i], tags=(f"qkvb_sa{i}", f"qkvb_sb{i}"))
-                R2.launch_norm_row(ra if hasattr(ra, "nsplit") else ra.view(M, QL), qnw[i], so[i]["qr"], eps=EPS,
-                                   ordd=qo, code_tab=tab, q=so[i]["q"], s=so[i]["s"])
-                R2.launch_norm_row(rb if hasattr(rb, "nsplit") else rb.view(M, HD), kvnw[i], so[i]["ring"], eps=EPS,
-                                   ordd=ko, code_tab=tab, slot=slot, qdq=True, rope=(fr, RD, tuple(modes)))
+                pair(i)
+                qnorm(i)
+                kvnorm(i)
             return f
 
-        def fused_call(i, rp):
+        def fused_call(i, form, rp, tails):
             def f():
                 r = GM.qkv_pair_tail(
-                    xq, xs, wa_l[i], sa_l[i], wb_l[i], sb_l[i], ticket=ticket, tab=tab, rp=rp,
-                    tags=(f"qkvb_fa{i}", f"qkvb_fb{i}"),
+                    xq, xs, wa_l[i], sa_l[i], wb_l[i], sb_l[i], ticket=ticket, tab=tab, rp=rp, form=form,
+                    tails=tails, tags=(f"qkvb_fa{i}", f"qkvb_fb{i}"),
                     q_tail=dict(nw=qnw[i], qr=fo[i]["qr"], q=fo[i]["q"], s=fo[i]["s"], eps=EPS, fac=R2.fac_of(QL),
                                 wf=float(QL), order=R2.order_args(qo)),
                     kv_tail=dict(nw=kvnw[i], ring=fo[i]["ring"], slot=slot, freqs=fr,
@@ -195,35 +274,93 @@ def timing(rows_list, layers: int, reps: int, modes, rps=(None,)) -> dict:
                                  fac=R2.fac_of(HD), wf=float(HD), order=R2.order_args(ko)))
                 assert r is not None, "pair_plan refused the real shapes (the halves' MMA forms differ)"
             return f
-        us_s = _graph_us([split_call(i) for i in range(layers)], reps) / layers
-        pp = GM.pair_plan(GM.get_config(QL, DIM, M), GM.get_config(HD, DIM, M), M, QL, HD, DIM)
-        rec = {"us_per_layer": {"split": round(us_s, 3)}, "launches_per_layer": {"split": 3, "fused": 1},
-               "pair_plan": {k: pp[k] for k in ("grid", "NSA", "NSB", "BLOCK_N", "KU", "num_warps")} if pp else None,
-               "rp": {}}
 
         def bits(t):
             return t.view(torch.uint8) if t.element_size() == 1 else t.view(torch.int16)
-        for rp in rps:
-            for b in fo:
-                for v in b.values():
-                    bits(v).zero_()                           # (byte views: e8m0 has no zero value)
-            us_f = _graph_us([fused_call(i, rp) for i in range(layers)], reps) / layers
-            torch.cuda.synchronize()
-            bad = [(i, k) for i in range(layers) for k in so[i] if not torch.equal(bits(so[i][k]), bits(fo[i][k]))]
-            rp_eff = GM.qkv_tail_plan(pp, M, QL, HD, rp)["RP"] if pp else None
-            rec["rp"][str(rp_eff)] = {"us_per_layer": round(us_f, 3), "us_saved_per_layer": round(us_s - us_f, 3),
-                                     "ms_saved_per_step_40_layers": round((us_s - us_f) * 40 / 1000.0, 4),
-                                     "bit_identical": not bad, "mismatches": bad[:8],
-                                     "tickets_zero": int(ticket.abs().sum()) == 0}
-            print(f"rows {M} RP {rp_eff}: us/layer split {us_s:.2f} fused {us_f:.2f} (saved {us_s - us_f:.2f}; "
-                  f"{(us_s - us_f) * 40 / 1000.0:.3f} ms/step at 40 layers); bit-identical {not bad}; tickets 0 "
-                  f"{int(ticket.abs().sum()) == 0}", flush=True)
-        best = min(rec["rp"].items(), key=lambda kv: kv[1]["us_per_layer"])
-        rec["best_rp"] = {"RP": best[0], **best[1]}
+
+        cfg_a, cfg_b = GM._resolved(QL, DIM, M, dev, None), GM._resolved(HD, DIM, M, dev, None)   # gemv_pair's
+        pp = GM.pair_plan(cfg_a, cfg_b, M, QL, HD, DIM)
+        rec = {"config": {"wq_a": cfg_a.as_dict(), "wkv": cfg_b.as_dict()},
+               "pair_plan": {k: pp[k] for k in ("grid", "NSA", "NSB", "TA", "TB", "BLOCK_M", "BLOCK_N", "KU",
+                                                "num_warps", "num_stages")} if pp else None,
+               "us_per_layer": {}, "variants": {}, "launches_per_layer": {"split": 3, "fused": 1}}
+        us = rec["us_per_layer"]
+        with _MetaRecorder(GM, fns) as mr:
+            us["pair"] = graph_us([(lambda i=i: pair(i)) for i in range(layers)], reps) / layers
+            us["q_norm_row"] = graph_us([(lambda i=i: qnorm(i)) for i in range(layers)], reps) / layers
+            us["kv_norm_row"] = graph_us([(lambda i=i: kvnorm(i)) for i in range(layers)], reps) / layers
+            us["split"] = graph_us([split_call(i) for i in range(layers)], reps) / layers
+            print(f"rows {M} split : {us['split']:7.2f} us/layer-call = pair {us['pair']:.2f} + q norm_row "
+                  f"{us['q_norm_row']:.2f} + kv norm_row {us['kv_norm_row']:.2f} (each phase alone; measured)",
+                  flush=True)
+            for form in forms:
+                eff = []
+                for rp in rps:
+                    tp = GM.qkv_tail_plan(pp, M, QL, HD, rp, form)
+                    if tp["RP"] not in eff:
+                        eff.append(tp["RP"])
+                for rp_eff in eff:
+                    for b in fo:
+                        for v in b.values():
+                            bits(v).zero_()                   # (byte views: e8m0 has no zero value)
+                    name = f"{form}_rp{rp_eff}"
+                    u = graph_us([fused_call(i, form, rp_eff, True) for i in range(layers)], reps) / layers
+                    sync()
+                    bad = [(i, k) for i in range(layers) for k in so[i] if not torch.equal(bits(so[i][k]),
+                                                                                           bits(fo[i][k]))]
+                    t0 = int(ticket.abs().sum()) == 0
+                    us[name] = u
+                    rec["variants"][name] = {"form": form, "RP": rp_eff, "us_per_layer": round(u, 3),
+                                             "us_saved_vs_split": round(us["split"] - u, 3),
+                                             "ms_saved_per_step_40_layers": round((us["split"] - u) * 40 / 1000.0, 4),
+                                             "bit_identical": not bad, "mismatches": bad[:8], "tickets_zero": t0}
+                    print(f"rows {M} {name:9s}: {u:7.2f} us/layer-call (split - this {us['split'] - u:+.2f}); "
+                          f"bit-identical {not bad}; tickets 0 {t0}", flush=True)
+                nt = f"{form}_notail"
+                us[nt] = graph_us([fused_call(i, form, None, False) for i in range(layers)], reps) / layers
+                sync()
+                rec["variants"][nt] = {"form": form, "probe": "TAILS=False: GEMV + tickets (+ stage fold), no tail",
+                                       "us_per_layer": round(us[nt], 3), "tickets_zero": int(ticket.abs().sum()) == 0}
+                print(f"rows {M} {nt:9s}: {us[nt]:7.2f} us/layer-call (phase probe: no tail work)", flush=True)
+        rec["compiled"] = mr.seen
+        rec["us_per_layer"] = {k: round(v, 3) for k, v in us.items()}
+        ph = {"split.norm_rows (split - pair)": us["split"] - us["pair"]}
+        best = {}
+        for form in forms:
+            cand = {k: v for k, v in rec["variants"].items() if v.get("form") == form and "RP" in v}
+            if not cand:
+                continue
+            bk = min(cand, key=lambda k: cand[k]["us_per_layer"])
+            best[form] = bk
+            ph[f"{form}.gemv+tickets (notail - pair)"] = us[f"{form}_notail"] - us["pair"]
+            ph[f"{form}.tail (best - notail)"] = us[bk] - us[f"{form}_notail"]
+        rec["phases_us"] = {k: round(v, 3) for k, v in ph.items()}
+        rec["best"] = {f: {"variant": k, **rec["variants"][k]} for f, k in best.items()}
+        bk_all = min(best.values(), key=lambda k: us[k]) if best else None
+        rec["best_fused"] = bk_all
+        rec["us_saved_per_layer"] = round(us["split"] - us[bk_all], 3) if bk_all else None
+        rec["ms_saved_per_step_40_layers"] = round((us["split"] - us[bk_all]) * 40 / 1000.0, 4) if bk_all else None
+        rec["fused_beats_split"] = bool(bk_all and us[bk_all] < us["split"])
+        rec["bit_identical_all"] = all(v.get("bit_identical", True) for v in rec["variants"].values())
+        rec["tickets_zero_all"] = all(v.get("tickets_zero", True) for v in rec["variants"].values())
         out[f"rows{M}"] = rec
-        print(f"rows {M}: us/layer split {us_s:.2f} fused {us_f:.2f} (saved {us_s - us_f:.2f}; "
-              f"{rec['ms_saved_per_step_40_layers']:.3f} ms/step at 40 layers); bit-identical {not bad}; "
-              f"tickets 0 {rec['tickets_zero']}", flush=True)
+        print(f"rows {M} phases (us/layer-call, measured): " + "; ".join(f"{k} {v:+.2f}" for k, v in ph.items()),
+              flush=True)
+        for name, metas in mr.seen.items():
+            print(f"rows {M} compiled {name}: {metas}", flush=True)
+        if bk_all:
+            print(f"rows {M}: us/layer-call split {us['split']:.2f} vs fused {bk_all} {us[bk_all]:.2f} (saved "
+                  f"{rec['us_saved_per_layer']:+.2f}; {rec['ms_saved_per_step_40_layers']:+.3f} ms/step at 40 "
+                  f"layers); bit-identical all {rec['bit_identical_all']}; tickets 0 all {rec['tickets_zero_all']}",
+                  flush=True)
+    line = []
+    for M in rows_list:
+        r = out[f"rows{M}"]
+        if r.get("best_fused"):
+            line.append(f"R={M} split {r['us_per_layer']['split']:.2f} vs {r['best_fused']} "
+                        f"{r['us_per_layer'][r['best_fused']]:.2f} us/layer-call")
+    out["verdict"] = "; ".join(line)
+    print("QKV-TAIL-TIMING: " + out["verdict"], flush=True)
     return out
 
 
@@ -236,14 +373,21 @@ def main(argv=None) -> int:
     ap.add_argument("--layers", type=int, default=40)
     ap.add_argument("--reps", type=int, default=50)
     ap.add_argument("--rope-modes", default="1,1", help="RoPE contraction forms for --timing (speed only)")
-    ap.add_argument("--rp", default="1,2,4,8", help="--timing: the tails' rows per pass to sweep (speed only; "
-                    "runtime default gemv_mxfp8.L10_TAIL_RP, $DSV41_QKV_TAIL_RP)")
+    ap.add_argument("--rp", default="1,2,4,8", help="--timing: rows per pass of the fold form's one tail CTA / rows "
+                    "per tail CTA of the stage form, to sweep (speed only; runtime defaults gemv_mxfp8.L10_TAIL_RP / "
+                    "L10_STAGE_RP, $DSV41_QKV_TAIL_RP / $DSV41_QKV_TAIL_STAGE_RP)")
+    ap.add_argument("--forms", default="fold,stage", help="--timing: fused forms to time (gemv_mxfp8.L10_FORMS)")
+    ap.add_argument("--pin-m1", choices=["on", "off", "env"], default="on",
+                    help="$DSV41_GEMV_PIN_M1 for --timing (default on: the headline's gemv_pin_m1, so the R-row GEMV "
+                    "configs are the ones the step runs)")
     ap.add_argument("--qkv-tail", choices=["split", "fused"], default=None,
                     help="set $DSV41_QKV_TAIL for anything this process builds")
     ap.add_argument("--json", default=None, help="receipt path (default scratch/qkv-tail-<date>.json)")
     a = ap.parse_args(argv)
     if a.qkv_tail:
         os.environ["DSV41_QKV_TAIL"] = a.qkv_tail
+    if a.pin_m1 != "env":
+        os.environ["DSV41_GEMV_PIN_M1"] = "1" if a.pin_m1 == "on" else "0"
     if not (a.census or a.timing):
         a.census = not torch.cuda.is_available()
         a.timing = torch.cuda.is_available()
@@ -253,7 +397,8 @@ def main(argv=None) -> int:
         rep["census"] = census(rows, a.steps)
     if a.timing:
         rep["timing"] = timing(rows, a.layers, a.reps, tuple(int(m) for m in a.rope_modes.split(",")),
-                               tuple(int(r) for r in a.rp.split(",") if r.strip()))
+                               tuple(int(r) for r in a.rp.split(",") if r.strip()),
+                               tuple(f.strip() for f in a.forms.split(",") if f.strip()))
     path = a.json or os.path.join(REPO, "scratch", f"qkv-tail-{time.strftime('%Y%m%d-%H%M%S')}.json")
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w") as f:

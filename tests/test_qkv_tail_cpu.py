@@ -13,8 +13,13 @@ tests/test_qkv_tail_cpu.py`
      rows: qkv_tail fused == split == ref glue (torch.equal on logits, hidden, caches), one launch_qkv_tail per layer
      and step and no norm_row launch outside it, kv_path never re-writes the ring, the build-time self-check passes
      (and turns fused off with the reason when the tail is broken), kv_path refuses foreign ring arguments.
+M2-L10-FIX (docs/HANDOFF-M2-L10-FIX.md): every kernel-body test runs both forms -- "stage" (l10_qkv_tail2: dynamic
+CTA ids, per-tile fold into a bf16 stage buffer, one tail CTA per RP rows; the default) and "fold" (round 1) -- and
+in shuffled program orders (a stage tail never waits on a later id: the shim fails a spin that is not released at
+once); the fused launch takes gemv_pair's tuned config exactly (tile, KU, split-K, warps, stages); TAILS=False (the
+bench's phase probe) writes no tail output and still leaves the tickets at 0.
 Not here (box: tests/gpu/test_qkv_tail_gpu.py): Triton compilation, FMA contraction under the kernel's launch options,
-the acq_rel ticket across real CTAs, tl.dot numerics, us.
+the acq_rel tickets and the stage form's wait across real CTAs, tl.dot numerics, us.
 """
 from __future__ import annotations
 
@@ -119,7 +124,15 @@ def test_tail_body_is_norm_row_with_two_explicit_products(KG, KR):
 
 
 def test_constants_and_switch(monkeypatch):
-    assert R2.QKV_TICKETS == GM.L10_TICKETS == 2
+    assert R2.QKV_TICKETS == GM.L10_TICKET_WORDS == 256 and GM.L10_TICKETS == 2
+    monkeypatch.delenv(GM.L10_FORM_ENV, raising=False)
+    assert GM.qkv_tail_form() == "stage" == GM.L10_FORM_DEFAULT and GM.qkv_tail_form("fold") == "fold"
+    monkeypatch.setenv(GM.L10_FORM_ENV, "fold")
+    assert GM.qkv_tail_form() == "fold"
+    monkeypatch.setenv(GM.L10_FORM_ENV, "per-row")
+    with pytest.raises(ValueError):
+        GM.qkv_tail_form()
+    monkeypatch.delenv(GM.L10_FORM_ENV)
     monkeypatch.delenv(R2.QKV_TAIL_ENV, raising=False)
     assert R2.qkv_tail_mode() == "split" == R2.QKV_TAIL_DEFAULT
     monkeypatch.setenv(R2.QKV_TAIL_ENV, "fused")
@@ -136,6 +149,11 @@ def test_plan_metadata():
     assert tp["QBB"] == 4 and tp["KBB"] == 2 and tp["RP"] == GM.L10_TAIL_RP == 2      # the default rows per pass
     assert GM.qkv_tail_plan(pp, 6, 96, 64, rp=8)["RP"] == 8 and GM.qkv_tail_plan(pp, 6, 96, 64, rp=3)["RP"] == 4
     assert GM.qkv_tail_plan(pp, 1, 96, 64, rp=8)["RP"] == 1 and GM.qkv_tail_plan(pp, 3, 96, 64, rp=8)["RP"] == 4
+    st = GM.qkv_tail_plan(pp, 6, 96, 64, form="stage")                       # M2-L10-FIX: one tail CTA per row
+    assert st["RP"] == GM.L10_STAGE_RP == 1 and st["NTA"] == st["NTB"] == 6 and st["G0"] == 3 + 2   # TA 3, TB 2
+    assert st["NWORK"] == 5 * 3 and st["grid"] == (5 * 3 + 12,) and st["ticket_words"] == 4 + 3 + 2
+    st2 = GM.qkv_tail_plan(pp, 6, 96, 64, rp=4, form="stage")
+    assert st2["RP"] == 4 and st2["NTA"] == 2 and st2["grid"] == (15 + 4,)
 
 
 # ================================================================================ 2. kernel bodies (shim)
@@ -183,22 +201,34 @@ def _split_path(KG, KR, tab, xq, xs, wa, sa, wb, sb, cfgs, qnw, kvnw, slot, fr, 
 
 
 def _fused(KG, tab, xq, xs, wa, sa, wb, sb, cfgs, qnw, kvnw, slot, fr, RD, modes, qo, ko, nslot, tags, ticket,
-           rp=None):
+           rp=None, form=None, tails=True):
     M, NA, NB = xq.size(0), wa.size(0), wb.size(0)
     qr, q = torch.empty(M, NA, dtype=BF, device="cpu"), torch.empty(M, NA // 32 * 32, dtype=FP8, device="cpu")
     s = torch.empty(M, NA // 32, dtype=E8, device="cpu")
     ring = torch.full((1, nslot, NB), 3.0, dtype=BF, device="cpu")
     res = KG.qkv_pair_tail(
-        xq, xs, wa, sa, wb, sb, ticket=ticket, tab=tab, tags=tags, configs=cfgs, rp=rp,
+        xq, xs, wa, sa, wb, sb, ticket=ticket, tab=tab, tags=tags, configs=cfgs, rp=rp, form=form, tails=tails,
         q_tail=dict(nw=qnw, qr=qr, q=q, s=s, eps=1e-6, fac=R2.fac_of(NA), wf=float(NA), order=R2.order_args(qo)),
         kv_tail=dict(nw=kvnw, ring=ring, slot=slot, freqs=fr, FS=int(fr.stride(0)) if fr is not None and fr.dim() == 3
                      else 0, rd=RD, modes=modes, eps=1e-6, fac=R2.fac_of(NB), wf=float(NB), order=R2.order_args(ko)))
     return dict(qr=qr, q=q, s=s, ring=ring), res
 
 
-@pytest.mark.parametrize("rp", [None, 1, 8])            # rows per pass: the default (2), one row, all rows at once
+def _kern_of(KG, form):
+    return KG.l10_qkv_tail2 if form == "stage" else KG.l10_qkv_tail
+
+
+def _ticket():
+    return torch.zeros(GM.L10_TICKET_WORDS, dtype=torch.int32, device="cpu")
+
+
+FORMS = ("stage", "fold")
+
+
+@pytest.mark.parametrize("form", FORMS)
+@pytest.mark.parametrize("rp", [None, 1, 8])   # fold: rows per pass (default 2); stage: rows per tail CTA (default 1)
 @pytest.mark.parametrize("case", range(len(CASES)))
-def test_fused_launch_equals_pair_plus_two_norm_rows(KG, KR, tab, case, rp):
+def test_fused_launch_equals_pair_plus_two_norm_rows(KG, KR, tab, case, rp, form):
     M, NA, NB, K, ca, cb, RD, modes, qo_, ko_ = CASES[case]
     qo, ko = _od(*qo_), _od(*ko_)
     xq, xs, wa, sa = _ops(NA, K, M, 40 + case)
@@ -208,12 +238,14 @@ def test_fused_launch_equals_pair_plus_two_norm_rows(KG, KR, tab, case, rp):
     tags = (f"l10a{case}", f"l10b{case}")
     want, (wa_res, wb_res) = _split_path(KG, KR, tab, xq, xs, wa, sa, wb, sb, (ca, cb), qnw, kvnw, slot, fr, RD,
                                          modes, qo, ko, nslot, tags)
-    ticket = torch.zeros(KG.L10_TICKETS, dtype=torch.int32, device="cpu")
+    ticket = _ticket()
+    kern = _kern_of(KG, form)
     for rep in range(2):                                   # the second launch starts from the tickets the first left
-        n0, n1 = _n(KG.l10_qkv_tail), _n(KG.t9b4_mxfp8_gemv2)
+        n0, n1, n2 = _n(kern), _n(KG.t9b4_mxfp8_gemv2), _n(_kern_of(KG, "fold" if form == "stage" else "stage"))
         got, res = _fused(KG, tab, xq, xs, wa, sa, wb, sb, (ca, cb), qnw, kvnw, slot, fr, RD, modes, qo, ko, nslot,
-                          tags, ticket, rp)
-        assert _n(KG.l10_qkv_tail) - n0 == 1 and _n(KG.t9b4_mxfp8_gemv2) == n1, "one launch, not the pair + tails"
+                          tags, ticket, rp, form)
+        assert _n(kern) - n0 == 1 and _n(KG.t9b4_mxfp8_gemv2) == n1, "one launch, not the pair + tails"
+        assert _n(_kern_of(KG, "fold" if form == "stage" else "stage")) == n2
         assert torch.equal(ticket, torch.zeros_like(ticket)), ticket
         for k in want:
             assert _eq(got[k], want[k]), (case, rep, k)
@@ -221,18 +253,29 @@ def test_fused_launch_equals_pair_plus_two_norm_rows(KG, KR, tab, case, rp):
             assert hasattr(r, "nsplit") == hasattr(w, "nsplit")
             assert _eq(r.ws, w.ws) if hasattr(r, "nsplit") else _eq(r, w)
     pp = KG.pair_plan(KG.resolve_config(ca, NA, K), KG.resolve_config(cb, NB, K), M, NA, NB, K)
-    ln = KG.l10_qkv_tail.launches[-1]
-    assert ln["grid"] == pp["grid"] and ln["enable_fp_fusion"] is None      # the pair kernel's launch options
-    assert ln["constexprs"]["QNS"] == (pp["NSA"] if pp["NSA"] > 1 else 0)
-    assert ln["constexprs"]["KNS"] == (pp["NSB"] if pp["NSB"] > 1 else 0)
-    assert ln["constexprs"]["RP"] == min(GM._np2(M), rp or GM.L10_TAIL_RP)
+    ln = kern.launches[-1]
+    assert ln["enable_fp_fusion"] is None                                    # the pair kernel's launch options
+    if form == "fold":
+        assert ln["grid"] == pp["grid"]
+        assert ln["constexprs"]["QNS"] == (pp["NSA"] if pp["NSA"] > 1 else 0)
+        assert ln["constexprs"]["KNS"] == (pp["NSB"] if pp["NSB"] > 1 else 0)
+        assert ln["constexprs"]["RP"] == min(GM._np2(M), rp or GM.L10_TAIL_RP)
+    else:
+        rps = min(GM._np2(M), rp or GM.L10_STAGE_RP)
+        nt = -(-M // rps)
+        assert ln["grid"] == (pp["grid"][0] * pp["grid"][1] + 2 * nt,) and ln["constexprs"]["RP"] == rps
+        assert ln["constexprs"]["QNS"] == max(1, pp["NSA"]) and ln["constexprs"]["KNS"] == max(1, pp["NSB"])
     assert (want["ring"][0, [r for r in range(nslot) if r not in slot.tolist()]].float() == 3.0).all()
 
 
+@pytest.mark.parametrize("form", FORMS)
+@pytest.mark.parametrize("case", [0, 2, 3])
 @pytest.mark.parametrize("seed", [0, 1, 2])
-def test_tail_waits_for_its_half_in_any_program_order(KG, KR, tab, monkeypatch, seed):
+def test_tail_waits_for_its_half_in_any_program_order(KG, KR, tab, monkeypatch, seed, case, form):
     """The tails are gated by the tickets, not by grid order: the shim's programs run in a shuffled order (the CTA
-    arrival order on the device is arbitrary) and every output still equals the split path; the tickets end at 0."""
+    arrival order on the device is arbitrary) and every output still equals the split path; the tickets end at 0.
+    Stage form: the work / tail roles come from the dynamic ids, so a tail never waits on a program that runs after
+    it (the shim raises if one would)."""
     import itertools
     import random
 
@@ -243,22 +286,23 @@ def test_tail_waits_for_its_half_in_any_program_order(KG, KR, tab, monkeypatch, 
         random.Random(seed).shuffle(progs)
         return iter(progs)
     monkeypatch.setattr(triton_shim.itertools, "product", shuffled)
-    M, NA, NB, K, ca, cb, RD, modes, qo_, ko_ = CASES[3]
+    M, NA, NB, K, ca, cb, RD, modes, qo_, ko_ = CASES[case]
     qo, ko = _od(*qo_), _od(*ko_)
     xq, xs, wa, sa = _ops(NA, K, M, 90 + seed)
     _, _, wb, sb = _ops(NB, K, M, 95 + seed)
     qnw, kvnw, nslot, slot, fr = _tail_inputs(torch.Generator(device="cpu").manual_seed(seed), M, NA, NB, RD)
     want, _ = _split_path(KG, KR, tab, xq, xs, wa, sa, wb, sb, (ca, cb), qnw, kvnw, slot, fr, RD, modes, qo, ko,
                           nslot, ("sha", "shb"))
-    ticket = torch.zeros(2, dtype=torch.int32, device="cpu")
+    ticket = _ticket()
     got, _ = _fused(KG, tab, xq, xs, wa, sa, wb, sb, (ca, cb), qnw, kvnw, slot, fr, RD, modes, qo, ko, nslot,
-                    ("sha", "shb"), ticket)
+                    ("sha", "shb"), ticket, form=form)
     for k in want:
         assert _eq(got[k], want[k]), k
     assert torch.equal(ticket, torch.zeros_like(ticket))
 
 
-def test_rows_equal_one_row_launches(KG, KR, tab):
+@pytest.mark.parametrize("form", FORMS)
+def test_rows_equal_one_row_launches(KG, KR, tab, form):
     """6 rows in one fused launch == each row alone in a 1-row fused launch (the row-invariance the 6-row step's
     8/8 rests on), at a config where both halves split."""
     M, NA, NB, K = 6, 128, 64, 320
@@ -267,12 +311,13 @@ def test_rows_equal_one_row_launches(KG, KR, tab):
     xq, xs, wa, sa = _ops(NA, K, M, 7)
     _, _, wb, sb = _ops(NB, K, M, 8)
     qnw, kvnw, nslot, slot, fr = _tail_inputs(torch.Generator(device="cpu").manual_seed(9), M, NA, NB, 64)
-    ticket = torch.zeros(2, dtype=torch.int32, device="cpu")
+    ticket = _ticket()
     six, _ = _fused(KG, tab, xq, xs, wa, sa, wb, sb, (ca, cb), qnw, kvnw, slot, fr, 64, (1, 2), qo, ko, nslot,
-                    ("r6a", "r6b"), ticket)
+                    ("r6a", "r6b"), ticket, form=form)
     for t in range(M):
         one, _ = _fused(KG, tab, xq[t:t + 1].contiguous(), xs[t:t + 1].contiguous(), wa, sa, wb, sb, (ca, cb), qnw,
-                        kvnw, slot[t:t + 1], fr[t].contiguous(), 64, (1, 2), qo, ko, nslot, ("r1a", "r1b"), ticket)
+                        kvnw, slot[t:t + 1], fr[t].contiguous(), 64, (1, 2), qo, ko, nslot, ("r1a", "r1b"), ticket,
+                        form=form)
         assert _eq(six["qr"][t], one["qr"][0]) and _eq(six["q"][t], one["q"][0]) and _eq(six["s"][t], one["s"][0])
         assert _eq(six["ring"][0, slot[t]], one["ring"][0, slot[t]])
 
@@ -314,16 +359,140 @@ def test_launch_wrapper_kernel_path_equals_cpu_mirror(KG, KR, tab, monkeypatch, 
         qr, q = torch.empty(1, M, QL, dtype=BF, device="cpu"), torch.empty(1, M, QL, dtype=FP8, device="cpu")
         s = torch.empty(1, M, QL // 32, dtype=E8, device="cpu")
         ring = torch.full((1, nslot, HD), 3.0, dtype=BF, device="cpu")
-        n0 = _n(KG.l10_qkv_tail)
+        n0 = _n(KG.l10_qkv_tail2)
         res = mod.launch_qkv_tail((xq.view(1, M, K), xs.view(1, M, K // 32)), la, lb, q_nw=qnw, q_eps=1e-6,
                                   q_ord=qord, qr=qr, q=q, s=s, kv_nw=kvnw, kv_eps=1e-6, kv_ord=kord, ring=ring,
                                   slot=slot, rope=(fr, RD, (2, 1)), code_tab=tab,
-                                  ticket=torch.zeros(2, dtype=torch.int32, device="cpu"), tags=(f"w{M}a", f"w{M}b"))
-        assert res is not None and _n(KG.l10_qkv_tail) - n0 == (1 if mod is KR else 0)
+                                  ticket=torch.zeros(R2.QKV_TICKETS, dtype=torch.int32, device="cpu"),
+                                  tags=(f"w{M}a", f"w{M}b"))
+        assert res is not None and _n(KG.l10_qkv_tail2) - n0 == (1 if mod is KR else 0)      # the default form
         assert hasattr(res[0], "nsplit") and res[0].nsplit == 3
         outs.append((qr, q, s, ring))
     for a, b in zip(*outs):
         assert _eq(a, b)
+
+
+@pytest.mark.parametrize("form", FORMS)
+@pytest.mark.parametrize("case", [0, 2, 3])
+def test_fused_takes_gemv_pairs_config(KG, tab, case, form):
+    """Cause (c) of the fix handoff: the fused launch's GEMV is gemv_pair's launch -- the same tile (BLOCK_M / N, KU),
+    split-K partition, EVEN / MMA / SPLIT forms, num_warps and num_stages -- for the same configs (the tuned ones on
+    the box: both resolve through gemv_mxfp8._resolved + pair_plan)."""
+    M, NA, NB, K, ca, cb, RD, modes, qo_, ko_ = CASES[case]
+    qo, ko = _od(*qo_), _od(*ko_)
+    xq, xs, wa, sa = _ops(NA, K, M, 20 + case)
+    _, _, wb, sb = _ops(NB, K, M, 25 + case)
+    qnw, kvnw, nslot, slot, fr = _tail_inputs(torch.Generator(device="cpu").manual_seed(case), M, NA, NB, RD)
+    KG.gemv_pair(xq, xs, wa, sa, wb, sb, tags=("cfa", "cfb"), configs=(ca, cb))
+    lp = KG.t9b4_mxfp8_gemv2.launches[-1]
+    _fused(KG, tab, xq, xs, wa, sa, wb, sb, (ca, cb), qnw, kvnw, slot, fr, RD, modes, qo, ko, nslot, ("cfa", "cfb"),
+           _ticket(), form=form)
+    lf = _kern_of(KG, form).launches[-1]
+    for k in ("BLOCK_M", "BLOCK_N", "KU", "EVENA", "EVENB", "MMA", "SPLITA", "SPLITB"):
+        assert lf["constexprs"][k] == lp["constexprs"][k], k
+    assert (lf["num_warps"], lf["num_stages"]) == (lp["num_warps"], lp["num_stages"]) == (ca.num_warps, ca.num_stages)
+    if form == "fold":
+        assert lf["grid"] == lp["grid"]
+    else:
+        assert lf["grid"][0] - lp["grid"][0] * lp["grid"][1] == 2 * M      # the pair's programs + 2 x M tails
+
+
+@pytest.mark.parametrize("form", FORMS)
+def test_no_tail_probe_writes_nothing(KG, KR, tab, form):
+    """tails=False (bench/qkv_tail_bench.py's phase probe): the GEMV results are gemv_pair's, no tail output is
+    touched, the tickets end at 0 (graph-replayable), and a real launch after it is still exact."""
+    M, NA, NB, K, ca, cb, RD, modes, qo_, ko_ = CASES[3]
+    qo, ko = _od(*qo_), _od(*ko_)
+    xq, xs, wa, sa = _ops(NA, K, M, 33)
+    _, _, wb, sb = _ops(NB, K, M, 34)
+    qnw, kvnw, nslot, slot, fr = _tail_inputs(torch.Generator(device="cpu").manual_seed(5), M, NA, NB, RD)
+    want, (wa_res, wb_res) = _split_path(KG, KR, tab, xq, xs, wa, sa, wb, sb, (ca, cb), qnw, kvnw, slot, fr, RD,
+                                         modes, qo, ko, nslot, ("npa", "npb"))
+    ticket = _ticket()
+    M_, NA_, NB_ = xq.size(0), wa.size(0), wb.size(0)
+    got, res = _fused(KG, tab, xq, xs, wa, sa, wb, sb, (ca, cb), qnw, kvnw, slot, fr, RD, modes, qo, ko, nslot,
+                      ("npa", "npb"), ticket, form=form, tails=False)
+    assert torch.equal(ticket, torch.zeros_like(ticket))
+    assert (got["ring"].float() == 3.0).all()                                  # untouched
+    assert _eq(res[0].ws, wa_res.ws) and _eq(res[1].ws, wb_res.ws)
+    got2, _ = _fused(KG, tab, xq, xs, wa, sa, wb, sb, (ca, cb), qnw, kvnw, slot, fr, RD, modes, qo, ko, nslot,
+                     ("npa", "npb"), ticket, form=form)
+    assert all(_eq(got2[k], want[k]) for k in want) and torch.equal(ticket, torch.zeros_like(ticket))
+
+
+def test_shim_fails_an_unreleased_wait(KG, tab, monkeypatch):
+    """The shim's spin guard (what makes the shuffled-order test meaningful for the stage form): a ticket that can
+    never reach the target raises instead of hanging."""
+    M, NA, NB, K, ca, cb, RD, modes, qo_, ko_ = CASES[3]
+    xq, xs, wa, sa = _ops(NA, K, M, 1)
+    _, _, wb, sb = _ops(NB, K, M, 2)
+    qnw, kvnw, nslot, slot, fr = _tail_inputs(torch.Generator(device="cpu").manual_seed(1), M, NA, NB, RD)
+    monkeypatch.setattr(triton_shim, "SPIN_LIMIT", 50)
+    real = KG.pair_plan
+
+    def one_more(*a, **k):                                # half b's tails wait for a tile that does not exist
+        p = real(*a, **k)
+        return dict(p, TB=p["TB"] + 1)
+    monkeypatch.setattr(KG, "pair_plan", one_more)
+    with pytest.raises(RuntimeError, match="never released"):
+        _fused(KG, tab, xq, xs, wa, sa, wb, sb, (ca, cb), qnw, kvnw, slot, fr, RD, modes, _od(*qo_), _od(*ko_),
+               nslot, ("spa", "spb"), _ticket(), form="stage")
+
+
+@pytest.mark.parametrize("M,N,NS,BM,BN", [(6, 96, 5, 8, 32), (1, 64, 3, 1, 32), (3, 128, 4, 16, 64)])
+def test_stage_fold_is_split_order_on_inexact_partials(KG, M, N, NS, BM, BN):
+    """The stage form's per-tile fold (_l10_reduce_tile) == t9b_splitk_reduce's value (SplitK.reduce_torch: from
+    +0.0, split 0, 1, ...; bf16 RNE) on partials whose sums are NOT exact in fp32 -- the GEMV tests' data cannot see
+    the fold order (their sums are exact), this one can: the reversed order differs on this data."""
+    @triton_shim.jit
+    def fold(ws, st, M, N, NS: triton_shim.constexpr, BM: triton_shim.constexpr, BN: triton_shim.constexpr):
+        KG._l10_reduce_tile(ws, st, M, N, triton_shim.program_id(0), NS, BM, BN)
+
+    g = torch.Generator(device="cpu").manual_seed(M * 100 + N)
+    ws = torch.randn(NS, M, N, generator=g, device="cpu") * torch.exp2(
+        torch.randint(-12, 12, (NS, M, N), generator=g, device="cpu").float())
+    big = torch.exp2(torch.full((M, N), 30.0, device="cpu")) * torch.randint(0, 2, (M, N), generator=g,
+                                                                              device="cpu").float()
+    ws[0] += big                                          # split 0 + big, split 1 - big: in split order they cancel
+    ws[1] -= big                                          # first; reversed, the small splits are absorbed into them
+    ws = ws.contiguous()
+    st = torch.full((M, N), 7.0, dtype=BF, device="cpu")
+    fold[(-(-N // BN),)](ws, st, M, N, NS=NS, BM=BM, BN=BN)
+    want = GM.SplitK(ws, NS).reduce_torch()
+    assert _eq(st, want)
+    rev = GM.SplitK(ws.flip(0).contiguous(), NS).reduce_torch()
+    assert not _eq(rev, want), "the data does not distinguish the fold order"
+
+
+def test_bench_timing_bookkeeping_dry_run(KG, KR, tab, monkeypatch, capsys):
+    """bench/qkv_tail_bench.py --timing's code end to end on CPU (shim kernels, tiny dims, one eager pass per phase,
+    placeholder times): round 1's box run died in this bookkeeping (KeyError 'ms_saved_per_step_40_layers') after
+    the 1-row block, so R = 6 was never timed. Every phase / variant / receipt key the handoff asks for is produced,
+    every fused variant is bit-identical to split, and the summary line is printed."""
+    monkeypatch.setattr(KG, "CPU_SPLIT_K", 3)
+    sys.path.insert(0, os.path.join(REPO, "bench"))
+    try:
+        import qkv_tail_bench as QB
+    finally:
+        sys.path.pop(0)
+    dry = {"GM": KG, "R2": KR, "dims": (256, 128, 96), "tab": tab}
+    out = QB.timing([1, 6], 2, 1, (1, 1), (1, 2, 8), ("fold", "stage"), _dry=dry)
+    assert out["dry_run"] is True
+    for M in (1, 6):
+        r = out[f"rows{M}"]
+        for k in ("pair", "q_norm_row", "kv_norm_row", "split", "fold_notail", "stage_notail"):
+            assert k in r["us_per_layer"], (M, k)
+        rps = {1: [1], 6: [1, 2, 8]}[M]
+        for form in ("fold", "stage"):
+            for rp in rps:
+                v = r["variants"][f"{form}_rp{rp}"]
+                assert v["bit_identical"] and v["tickets_zero"], (M, form, rp, v)
+        for k in ("phases_us", "best", "best_fused", "us_saved_per_layer", "ms_saved_per_step_40_layers",
+                  "fused_beats_split", "bit_identical_all", "config", "pair_plan", "compiled"):
+            assert k in r, (M, k)
+        assert r["bit_identical_all"] and r["tickets_zero_all"]
+    assert out["verdict"].startswith("R=1 split") and "R=6 split" in out["verdict"]
+    assert "QKV-TAIL-TIMING: R=1" in capsys.readouterr().out
 
 
 # ================================================================================ 3. StaticStep (emulated)
