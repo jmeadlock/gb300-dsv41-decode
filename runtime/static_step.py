@@ -83,6 +83,11 @@ host-side ints become device tensors and dynamic lengths become fixed lengths (c
       reference forward wrote (the last <= 128 of them) into the 256-ring (`sync_ring`), so a prefill re-seeds it.
       Compressed indices are offset by the kv length (256 + ...) instead of 128: the gathered values and their order
       are unchanged; the bounded/FlashMLA counts use the 128 index slots (`self.win`), not the offset.
+  #21 M2-L1, docs/HANDOFF-M2-L1-MIXES-FORK.md -> $DSV41_MIXES=fork|fused (read at build, `MixesFork`): Block.hc_mixes'
+      tail (fused glue: the mm, *rsqrt and sinkhorn after the hc_norm launch; reference ops: the whole hc_mixes) runs
+      on a second stream forked inside the body -- so inside capture the graph gets a branch -- and is joined at the
+      top of `_hc_post`, the first consumer (post, comb; pre is read later, by the next sublayer). Same kernels, same
+      inputs: bit-identical to `off` (default). `fused` also puts the mm+*rsqrt on the T9b-5 fixed-order kernel.
 
 M1-T10 `rows=6` (`rows` even, <= 8; teacher-forced verify step, design 2.1 row by row): inputs `tok[1, R]`, device P0
 (`pos`), positions P0 + arange(R); RoPE rows per position; R ring writes then attend with per-row lists [1, R, 128];
@@ -415,6 +420,137 @@ def _fp32_impl() -> str:
     return fp32_impl()
 
 
+MIXES_PRIORITY_ENV = "DSV41_MIXES_PRIORITY"   # M2-L1: the side stream's priority, "default" (0) or "high" (-1)
+MIXES_PRIORITIES = {"default": 0, "high": -1}
+
+
+def _same_bits(a: torch.Tensor, b: torch.Tensor) -> bool:
+    if a.shape != b.shape or a.dtype != b.dtype:
+        return False
+    return torch.equal(a.contiguous().view(-1).view(torch.uint8), b.contiguous().view(-1).view(torch.uint8))
+
+
+class MixesFork:
+    """M2-L1 (docs/HANDOFF-M2-L1-MIXES-FORK.md; runtime/fused_glue_r2.py section "M2-L1: mixes fork"): the mHC mixes'
+    tail (mm, `* rsqrt`, the TileLang sinkhorn; model.py:953-957) on a SECOND stream, forked inside the step (and so
+    inside graph capture) and joined before the sublayer's hc_post, the first consumer of its outputs (post, comb;
+    `pre` is consumed later still, by the next sublayer's hc_pre).
+
+      run(fn, inputs)  fork: record an event on the current (main / capture) stream, the side stream waits on it, the
+                       inputs are marked used on the side stream (record_stream: the caching allocator does not hand
+                       their blocks to the main stream before the branch is done -- under capture the free is deferred
+                       to the end of capture), fn() runs on the side stream, an event is recorded after it. Returns
+                       fn's outputs, which the main stream may read only after join().
+      join()           the main stream waits on every pending branch's event; the outputs are marked used on it.
+      finish()         join() (the end of the step body: no side-stream work may stay unjoined at capture end).
+
+    Inside capture the event wait makes the side stream join the capture, so the graph gets a branch: the kernels fn
+    launches become nodes whose only incoming edge is the fork point and whose outgoing edge is the join (no node is
+    added; an off build captures the same kernels as a chain). The kernels, their inputs and launch configs are the
+    unforked path's, so the outputs are bit-identical: only the schedule changes.
+    CPU (Mac): no streams -- fn runs inline. `check = True` (tests) makes the emulation deferred in effect: the outputs
+    are poisoned with NaN until join() (a main-path read before the join shows up in the logits) and join() checks the
+    inputs still hold the bits they had at the fork (a main-path write before the branch could have read them would
+    raise). `forks` / `joins` count calls (per instance)."""
+
+    def __init__(self, dev, impl: str = "off", *, check: bool = False, priority: Optional[str] = None):
+        from runtime.fused_glue_r2 import MIXES_IMPLS
+
+        if impl not in MIXES_IMPLS:
+            raise ValueError(f"mixes impl {impl!r} not in {MIXES_IMPLS}")
+        pr = priority if priority is not None else (os.environ.get(MIXES_PRIORITY_ENV) or "default")
+        if pr not in MIXES_PRIORITIES:
+            raise ValueError(f"{MIXES_PRIORITY_ENV}={pr!r} not in {tuple(MIXES_PRIORITIES)}")
+        self.impl = impl
+        self.on = impl != "off"
+        self.dev = torch.device(dev)
+        self.cuda = self.dev.type == "cuda"
+        self.check = bool(check)
+        self.priority = pr
+        self._side = None
+        self._pending: List[tuple] = []
+        self.forks = 0
+        self.joins = 0
+        if self.on and self.cuda:
+            self.side_stream()   # at build, never first inside a capture (capture(warmup=0) included)
+
+    def engaged(self, owner) -> bool:
+        """Fork now: impl fork/fused and the owner step inside its _active() scope (never the build self-checks)."""
+        return self.on and bool(getattr(owner, "active", False))
+
+    def side_stream(self):
+        """One persistent side stream per step (warm-ups and capture use the same one: its cuBLAS workspace, if
+        cuBLAS ever runs on it, is made before capture)."""
+        if self._side is None:
+            self._side = torch.cuda.Stream(device=self.dev, priority=MIXES_PRIORITIES[self.priority])
+        return self._side
+
+    def run(self, fn, inputs: Sequence) -> tuple:
+        ins = [t for t in inputs if isinstance(t, torch.Tensor)]
+        self.forks += 1
+        if self.cuda:
+            main = torch.cuda.current_stream(self.dev)
+            side = self.side_stream()
+            fork_ev = torch.cuda.Event()
+            fork_ev.record(main)
+            side.wait_event(fork_ev)
+            for t in ins:
+                t.record_stream(side)
+            with torch.cuda.stream(side):
+                out = tuple(fn())
+            done = torch.cuda.Event()
+            done.record(side)
+            self._pending.append((done, out, None))
+            return out
+        if not self.check:
+            out = tuple(fn())
+            self._pending.append((None, out, None))
+            return out
+        snap = [t.clone() for t in ins]
+        out = tuple(fn())
+        true = [o.clone() for o in out]
+        for o in out:
+            if o.is_floating_point():
+                o.fill_(float("nan"))
+        self._pending.append((None, out, (ins, snap, true)))
+        return out
+
+    def join(self) -> None:
+        if not self._pending:
+            return
+        main = torch.cuda.current_stream(self.dev) if self.cuda else None
+        pend, self._pending = self._pending, []
+        for done, out, chk in pend:
+            self.joins += 1
+            if done is not None:
+                main.wait_event(done)
+                for o in out:
+                    o.record_stream(main)
+            elif chk is not None:
+                ins, snap, true = chk
+                bad = [i for i, (a, b) in enumerate(zip(ins, snap)) if not _same_bits(a, b)]
+                if bad:
+                    raise RuntimeError(f"M2-L1 mixes fork: branch input(s) {bad} changed between the fork and the join "
+                                       f"(a main-stream write the branch may not have read yet)")
+                for o, t in zip(out, true):
+                    o.copy_(t)
+
+    def finish(self) -> None:
+        self.join()
+
+    def discard(self) -> None:
+        """Drop pending branches of an aborted body (their events belong to a step that raised)."""
+        self._pending = []
+
+    @property
+    def pending(self) -> int:
+        return len(self._pending)
+
+    def describe(self) -> dict:
+        return {"impl": self.impl, "stream": ("side" if self.cuda else "inline (CPU)") if self.on else "main",
+                "priority": self.priority, "forks": self.forks, "joins": self.joins}
+
+
 class StaticStep:
     """Fixed-shape 1-row decode step over the reference model (module docstring for the row-by-row mapping).
 
@@ -548,6 +684,10 @@ class StaticStep:
         self.n_counted = 0
         self._c: Optional[_StepScalars] = None
         self.glue_note: Optional[str] = None
+        from runtime.fused_glue_r2 import mixes_impl
+
+        self.mix_fork = MixesFork(self.dev, mixes_impl())  # M2-L1 ($DSV41_MIXES, read once here; before the glue's
+        #                                                    self-check, whose oracle follows the impl)
         if self.glue_impl == "fused":  # #17: tables + build-time self-check (eager; syncs; before any capture)
             from runtime.fused_glue import FusedGlue
 
@@ -1021,7 +1161,9 @@ class StaticStep:
         return o
 
     def _hc_post(self, layer, x, residual, post, comb):
-        """Block.hc_post (model.py:964-968) (#17: one kernel)."""
+        """Block.hc_post (model.py:964-968) (#17: one kernel). M2-L1: first joins the forked mixes (their first
+        consumer is this hc_post)."""
+        self.mix_fork.join()
         g = self.glue
         if g is not None and g.on("hc_post"):
             return g.hc_post(x, residual, post, comb)
@@ -1046,14 +1188,19 @@ class StaticStep:
         g = self.glue
         if g is not None and g.on("hc_norm") and x.is_contiguous() and pre_mix.is_contiguous():
             return g.mix_pre_norm(layer, x, pre_mix, side)
-        from runtime.fused_glue_r2 import fp32_fixed, hc_mixes_fixed
+        from runtime.fused_glue_r2 import hc_mixes_fixed, mix_fixed
 
-        mixes = (lambda *a: hc_mixes_fixed(self.R, layer, *a)) if fp32_fixed() else layer.hc_mixes  # T9b-5
+        mixes = (lambda *a: hc_mixes_fixed(self.R, layer, *a)) if mix_fixed(self.mix_fork.impl) else layer.hc_mixes
         if side == "attn":
-            pre, post, comb = mixes(x, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base)
-            return pre, post, comb, layer.attn_norm(layer.hc_pre(x, pre_mix)), None
-        pre, post, comb = mixes(x, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base)
-        return pre, post, comb, layer.ffn_norm(layer.hc_pre(x, pre_mix)), None
+            mp, norm = (layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base), layer.attn_norm
+        else:
+            mp, norm = (layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base), layer.ffn_norm
+        fk = self.mix_fork
+        if fk.engaged(self):   # M2-L1: the whole hc_mixes on the side stream (joined in _hc_post)
+            pre, post, comb = fk.run(lambda: mixes(x, *mp), (x,))
+        else:
+            pre, post, comb = mixes(x, *mp)                                    # T9b-5 / M2-L1 fused
+        return pre, post, comb, norm(layer.hc_pre(x, pre_mix)), None
 
     def _ffn(self, layer, x):
         """layer.ffn(x, None) (model.py:994; the static MoE through the patch). The fused glue's ffn-side
@@ -1092,6 +1239,7 @@ class StaticStep:
             raise ValueError("StaticStep is greedy only (model.temperature must be 0)")
         self._c = _StepScalars(self)
         self._idx_nblk = self._idx_tlen = None
+        self.mix_fork.discard()                                               # M2-L1: nothing of an aborted body
         if self._ovf_on:
             self.ovf_step.zero_()                                             # M1-T10-FIX2: this step's overflows
         if self.marker:
@@ -1110,6 +1258,7 @@ class StaticStep:
             if i in self.hidden_layers:                                       # model.py:1267-1269
                 hidden.append(h.mean(dim=2))
             h, pre_mix = self._block(layer, h, pre_mix, parity)
+        self.mix_fork.finish()                                                # M2-L1: every branch joined
         logits = self._head(layer, h, pre_mix)
         rows = self.rows
         self.logits.copy_(logits.view(rows, -1))
@@ -1319,7 +1468,8 @@ class StaticStep:
                 "attn_impl": self.attn_impl, "attn_on": bool(self._attn_on or self._fm_on),
                 "hidden_layers": list(self.hidden_layers), "n_slots": self.n_slots, "spare_slots": self.spare_slots,
                 "rows_moe_gemm": getattr(getattr(self, "dg", None), "rows_gemm", None),
-                "dedup_impl": _dedup_describe() if self.rows > 1 else None, "fp32_impl": _fp32_impl()}
+                "dedup_impl": _dedup_describe() if self.rows > 1 else None, "fp32_impl": _fp32_impl(),
+                "mixes": self.mix_fork.describe()}
 
     def marker_count(self) -> int:
         return int(self.marker_ctr.item())

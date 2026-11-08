@@ -56,6 +56,9 @@ the R-row kernels reduce each row alone in that order; at R > 1 the self-checks 
 evaluated one row at a time (`per_row_reductions`: torch's sum / mean of each [1, 1, ...] row slice, the 1-row step's
 call). Invariant: 1-row output byte-identical to the pre-T9b-7 1-row step; R-row output equal per row to the 1-row
 output. `rows` = the pre-T9b-7 behaviour (orders calibrated at the R-row reference shapes), kept for A/B.
+M2-L1 (docs/HANDOFF-M2-L1-MIXES-FORK.md; section "M2-L1: mixes fork" below): $DSV41_MIXES=fork runs the mixes' tail
+(mm, *rsqrt, sinkhorn) on a second stream forked after hc_norm and joined before hc_post (runtime/static_step.MixesFork);
+same kernels, bit-identical; `fused` adds the T9b-5 one-launch mm+*rsqrt; default off.
 CPU (the Mac tests, the census): the wrappers run torch mirrors; with no device to calibrate on, the statistics run
 torch's own op (order "native"), so the CPU step is bit-identical by construction; the explicit-order mirrors and the
 Triton bodies (under tests/triton_shim.py) are tested against each other and against the family's definition.
@@ -610,6 +613,38 @@ def head_fixed_w(W: torch.Tensor, x: torch.Tensor, full_logits: bool = False) ->
 def head_fixed(model, x: torch.Tensor, full_logits: bool = False) -> torch.Tensor:
     """head_fixed_w on the backbone's head (model.head.weight, fp32- or bf16-stored)."""
     return head_fixed_w(model.head.weight, x, full_logits)
+
+
+# ------------------------------------------------------------------------------------------------ M2-L1: mixes fork
+# docs/HANDOFF-M2-L1-MIXES-FORK.md, docs/M2-FUSED-CHAIN-DESIGN.md 2.2 L1. Block.forward (model.py:983-996) consumes a
+# sublayer's mixes only in that sublayer's hc_post (post, comb) and in the NEXT sublayer's hc_pre (pre), so the mixes'
+# tail -- the mm, `* rsqrt` (one launch under the T9b-5 order) and the TileLang sinkhorn -- has a whole sublayer of
+# slack. $DSV41_MIXES (read once per StaticStep build, kept on its `mix_fork`, runtime/static_step.MixesFork):
+#   off   (default until the box gate)  the mixes on the step's stream, exactly as before;
+#   fork  the SAME kernels on a second stream: fork after the hc_norm launch (its statistic and the stream copy are the
+#         branch's inputs), join before the sublayer's hc_post; the main stream keeps hc_norm only. Kernels, inputs
+#         and launch configs are unchanged, so every output is bit-identical to `off` (scheduling only);
+#   fused fork + the mm and `* rsqrt` in ONE launch, t9b5_mix_fp32 (the T9b-5 fixed fp32 order: row-invariant, A3 vs
+#         cuBLAS), whatever $DSV41_FP32_IMPL says for the head / compressor. Under `--fp32-impl fixed` (today's
+#         headline) the mixes already run that kernel, so `fused` == `fork` there, byte for byte. The sinkhorn stays
+#         the reference TileLang kernel in every mode. The oracle side (the glue self-check, static_step's
+#         reference-op path) adopts the fixed order under `fused` exactly as under T9b-5 (policy W4 4d A).
+MIXES_ENV = "DSV41_MIXES"
+MIXES_IMPLS = ("off", "fork", "fused")
+MIXES_DEFAULT = "off"
+
+
+def mixes_impl() -> str:
+    v = os.environ.get(MIXES_ENV, MIXES_DEFAULT) or MIXES_DEFAULT
+    if v not in MIXES_IMPLS:
+        raise ValueError(f"{MIXES_ENV}={v!r} not in {MIXES_IMPLS}")
+    return v
+
+
+def mix_fixed(impl: Optional[str] = None) -> bool:
+    """The mixes' mm in the T9b-5 fixed order: $DSV41_FP32_IMPL=fixed, or the step's mixes impl is `fused`
+    (impl None: $DSV41_MIXES now)."""
+    return fp32_fixed() or (mixes_impl() if impl is None else impl) == "fused"
 
 
 # ------------------------------------------------------------------------------------------------ T9b-8: compressor
@@ -1873,7 +1908,7 @@ class R2Glue:
                 fn, sc, bs = self._mix_params(layer, side)
                 norm = layer.attn_norm if side == "attn" else layer.ffn_norm
                 with self._oracle():   # T9b-7: at R > 1 (shape policy) the 1-row reference, row by row
-                    if fp32_fixed():   # T9b-5: the oracle adopts the fixed-order mixes (policy W4 4d A)
+                    if self._mix_fixed():   # T9b-5 / M2-L1 fused: the oracle adopts the fixed-order mixes (W4 4d A)
                         pr, po, cb = hc_mixes_fixed(R, layer, x, fn, sc, bs)
                     else:
                         pr, po, cb = layer.hc_mixes(x, fn, sc, bs)
@@ -2072,12 +2107,35 @@ class R2Glue:
             return layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base
         return layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base
 
+    def _mixes_impl(self) -> str:
+        """M2-L1: the owner step's mixes impl (fixed at its build; `off` for an owner without a MixesFork)."""
+        fk = getattr(self.o, "mix_fork", None)
+        return fk.impl if fk is not None else "off"
+
+    def _mix_fixed(self) -> bool:
+        return mix_fixed(self._mixes_impl())
+
+    def _mixes_fork(self):
+        """M2-L1: the owner's MixesFork when it forks right now (impl fork/fused AND inside the step's _active()
+        scope: eager static steps, warm-ups, capture), else None (the build-time self-checks never fork)."""
+        fk = getattr(self.o, "mix_fork", None)
+        return fk if fk is not None and fk.engaged(self.o) else None
+
+    def _mix_branch(self, layer, xf, mrs, side: str, x=None):
+        """The forked work, in the order of the unforked path: the reference statistic when mix_stat is off (it
+        only feeds the mixes), then mix_tail."""
+        if mrs is None:
+            with self._oracle():
+                mrs = torch.rsqrt(xf.square().mean(-1, keepdim=True) + layer.norm_eps)
+        return self.mix_tail(layer, xf, mrs, side, x=x)
+
     def mix_tail(self, layer, xf, mrs, side: str, x=None):
         """hc_mixes after its statistic (model.py:956-957): F.linear(x, hc_fn) * rsqrt, then the sinkhorn kernel.
-        T9b-5 ($DSV41_FP32_IMPL=fixed): the mm and the * rsqrt in ONE launch (t9b5_mix_fp32, fixed order); it reads
-        the bf16 stream x [1, T, HC, D] when given (the same values as xf = x.float(): half the bytes)."""
+        T9b-5 ($DSV41_FP32_IMPL=fixed) / M2-L1 `fused`: the mm and the * rsqrt in ONE launch (t9b5_mix_fp32, fixed
+        order); it reads the bf16 stream x [1, T, HC, D] when given (the same values as xf = x.float(): half the
+        bytes)."""
         fn, sc, bs = self._mix_params(layer, side)
-        if fp32_fixed():
+        if self._mix_fixed():
             T_ = xf.numel() // xf.size(-1)
             mixes = torch.empty(1, T_, fn.size(0), dtype=torch.float32, device=xf.device)
             src = x.reshape(T_, xf.size(-1)) if x is not None else xf.reshape(T_, xf.size(-1))
@@ -2119,10 +2177,16 @@ class R2Glue:
                        mrs=mrs.view(-1) if mrs is not None else None, mix_ord=self.orders.get("mix"),
                        mix_eps=layer.norm_eps, q=q.view(-1) if one else q.view(T_, D),
                        s=s.view(-1) if one else s.view(T_, D // BLOCK), dq=dq, ds=ds, split=self.on("hc_split"))
-        if mrs is None:   # mix_stat off: the reference statistic, on the same fp32 values (one launch fewer: .float())
-            with self._oracle():   # T9b-7: at R > 1 (shape policy) each row's statistic as the 1-row step's
-                mrs = torch.rsqrt(xf.square().mean(-1, keepdim=True) + layer.norm_eps)
-        pre, post, comb = self.mix_tail(layer, xf, mrs, side, x=x if x.dtype == torch.bfloat16 else None)
+        xb = x if x.dtype == torch.bfloat16 else None
+        fk = self._mixes_fork()
+        if fk is not None:   # M2-L1: statistic (mix_stat off) + mm + *rsqrt + sinkhorn on the side stream; the step
+            #                  joins it before this sublayer's hc_post (StaticStep._hc_post)
+            pre, post, comb = fk.run(lambda: self._mix_branch(layer, xf, mrs, side, xb), (x, xf, mrs))
+        else:
+            if mrs is None:   # mix_stat off: the reference statistic, on the same fp32 values (one launch fewer)
+                with self._oracle():   # T9b-7: at R > 1 (shape policy) each row's statistic as the 1-row step's
+                    mrs = torch.rsqrt(xf.square().mean(-1, keepdim=True) + layer.norm_eps)
+            pre, post, comb = self.mix_tail(layer, xf, mrs, side, x=xb)
         if side == "ffn":
             self._ffn_ctx = {"ptr": y.data_ptr(), "xf": yf, "q": q, "s": s, "dg": dg}
             return pre, post, comb, y, None
