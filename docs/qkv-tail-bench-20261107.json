@@ -1,0 +1,470 @@
+{
+ "date": "2026-11-08 00:35:13 UTC",
+ "modeled": {
+  "ms_per_step_6rows": 0.21,
+  "launches_per_step": 90,
+  "source": "docs/M2-FUSED-CHAIN-DESIGN.md section 2.2 L10 economics row [E]; norm_row 3.4 us [M]"
+ },
+ "host": "bee6b62475c5",
+ "timing": {
+  "orders": {
+   "q": "vec_T256_V4_dec|mul",
+   "kv": "vec_T128_V4_dec|mul",
+   "exact": true
+  },
+  "rope_modes": [
+   1,
+   1
+  ],
+  "layers": 40,
+  "reps": 50,
+  "label": "measured (CUDA events, graph replay)",
+  "gemv_pin_m1": true,
+  "forms": [
+   "fold",
+   "stage"
+  ],
+  "dry_run": false,
+  "rows1": {
+   "config": {
+    "wq_a": {
+     "block_n": 32,
+     "ku": 2,
+     "num_warps": 4,
+     "num_stages": 4,
+     "split_k": 8,
+     "mma": 1
+    },
+    "wkv": {
+     "block_n": 32,
+     "ku": 2,
+     "num_warps": 4,
+     "num_stages": 4,
+     "split_k": 19,
+     "mma": 1
+    }
+   },
+   "pair_plan": {
+    "grid": [
+     56,
+     18
+    ],
+    "NSA": 8,
+    "NSB": 18,
+    "TA": 40,
+    "TB": 16,
+    "BLOCK_M": 16,
+    "BLOCK_N": 32,
+    "KU": 2,
+    "num_warps": 4,
+    "num_stages": 4
+   },
+   "us_per_layer": {
+    "pair": 7.374,
+    "q_norm_row": 4.955,
+    "kv_norm_row": 2.666,
+    "split": 17.444,
+    "fold_rp1": 16.217,
+    "fold_notail": 8.473,
+    "stage_rp1": 19.837,
+    "stage_notail": 16.339
+   },
+   "variants": {
+    "fold_rp1": {
+     "form": "fold",
+     "RP": 1,
+     "us_per_layer": 16.217,
+     "us_saved_vs_split": 1.227,
+     "ms_saved_per_step_40_layers": 0.0491,
+     "bit_identical": true,
+     "mismatches": [],
+     "tickets_zero": true
+    },
+    "fold_notail": {
+     "form": "fold",
+     "probe": "TAILS=False: GEMV + tickets (+ stage fold), no tail",
+     "us_per_layer": 8.473,
+     "tickets_zero": true
+    },
+    "stage_rp1": {
+     "form": "stage",
+     "RP": 1,
+     "us_per_layer": 19.837,
+     "us_saved_vs_split": -2.393,
+     "ms_saved_per_step_40_layers": -0.0957,
+     "bit_identical": true,
+     "mismatches": [],
+     "tickets_zero": true
+    },
+    "stage_notail": {
+     "form": "stage",
+     "probe": "TAILS=False: GEMV + tickets (+ stage fold), no tail",
+     "us_per_layer": 16.339,
+     "tickets_zero": true
+    }
+   },
+   "launches_per_layer": {
+    "split": 3,
+    "fused": 1
+   },
+   "compiled": {
+    "t9b4_mxfp8_gemv2": [
+     {
+      "n_regs": 48,
+      "n_spills": 0,
+      "num_warps": 4,
+      "shared": 18432
+     }
+    ],
+    "t9b2r2_norm_row": [
+     {
+      "n_regs": 32,
+      "n_spills": 2,
+      "num_warps": 8,
+      "shared": 1024
+     },
+     {
+      "n_regs": 58,
+      "n_spills": 0,
+      "num_warps": 8,
+      "shared": 512
+     }
+    ],
+    "l10_qkv_tail (fold)": [
+     {
+      "n_regs": 54,
+      "n_spills": 0,
+      "num_warps": 4,
+      "shared": 9216
+     },
+     {
+      "n_regs": 48,
+      "n_spills": 0,
+      "num_warps": 4,
+      "shared": 9216
+     }
+    ],
+    "l10_qkv_tail2 (stage)": [
+     {
+      "n_regs": 56,
+      "n_spills": 0,
+      "num_warps": 4,
+      "shared": 9216
+     }
+    ]
+   },
+   "phases_us": {
+    "split.norm_rows (split - pair)": 10.07,
+    "fold.gemv+tickets (notail - pair)": 1.1,
+    "fold.tail (best - notail)": 7.744,
+    "stage.gemv+tickets (notail - pair)": 8.966,
+    "stage.tail (best - notail)": 3.497
+   },
+   "best": {
+    "fold": {
+     "variant": "fold_rp1",
+     "form": "fold",
+     "RP": 1,
+     "us_per_layer": 16.217,
+     "us_saved_vs_split": 1.227,
+     "ms_saved_per_step_40_layers": 0.0491,
+     "bit_identical": true,
+     "mismatches": [],
+     "tickets_zero": true
+    },
+    "stage": {
+     "variant": "stage_rp1",
+     "form": "stage",
+     "RP": 1,
+     "us_per_layer": 19.837,
+     "us_saved_vs_split": -2.393,
+     "ms_saved_per_step_40_layers": -0.0957,
+     "bit_identical": true,
+     "mismatches": [],
+     "tickets_zero": true
+    }
+   },
+   "best_fused": "fold_rp1",
+   "us_saved_per_layer": 1.227,
+   "ms_saved_per_step_40_layers": 0.0491,
+   "fused_beats_split": true,
+   "bit_identical_all": true,
+   "tickets_zero_all": true
+  },
+  "rows6": {
+   "config": {
+    "wq_a": {
+     "block_n": 32,
+     "ku": 2,
+     "num_warps": 4,
+     "num_stages": 4,
+     "split_k": 8,
+     "mma": 1
+    },
+    "wkv": {
+     "block_n": 32,
+     "ku": 2,
+     "num_warps": 4,
+     "num_stages": 4,
+     "split_k": 19,
+     "mma": 1
+    }
+   },
+   "pair_plan": {
+    "grid": [
+     56,
+     18
+    ],
+    "NSA": 8,
+    "NSB": 18,
+    "TA": 40,
+    "TB": 16,
+    "BLOCK_M": 16,
+    "BLOCK_N": 32,
+    "KU": 2,
+    "num_warps": 4,
+    "num_stages": 4
+   },
+   "us_per_layer": {
+    "pair": 8.197,
+    "q_norm_row": 4.968,
+    "kv_norm_row": 2.667,
+    "split": 17.891,
+    "fold_rp1": 57.149,
+    "fold_rp2": 55.367,
+    "fold_rp4": 41.477,
+    "fold_rp8": 42.37,
+    "fold_notail": 9.477,
+    "stage_rp1": 21.387,
+    "stage_rp2": 22.818,
+    "stage_rp4": 23.593,
+    "stage_rp8": 28.828,
+    "stage_notail": 17.54
+   },
+   "variants": {
+    "fold_rp1": {
+     "form": "fold",
+     "RP": 1,
+     "us_per_layer": 57.149,
+     "us_saved_vs_split": -39.258,
+     "ms_saved_per_step_40_layers": -1.5703,
+     "bit_identical": true,
+     "mismatches": [],
+     "tickets_zero": true
+    },
+    "fold_rp2": {
+     "form": "fold",
+     "RP": 2,
+     "us_per_layer": 55.367,
+     "us_saved_vs_split": -37.476,
+     "ms_saved_per_step_40_layers": -1.499,
+     "bit_identical": true,
+     "mismatches": [],
+     "tickets_zero": true
+    },
+    "fold_rp4": {
+     "form": "fold",
+     "RP": 4,
+     "us_per_layer": 41.477,
+     "us_saved_vs_split": -23.586,
+     "ms_saved_per_step_40_layers": -0.9434,
+     "bit_identical": true,
+     "mismatches": [],
+     "tickets_zero": true
+    },
+    "fold_rp8": {
+     "form": "fold",
+     "RP": 8,
+     "us_per_layer": 42.37,
+     "us_saved_vs_split": -24.479,
+     "ms_saved_per_step_40_layers": -0.9792,
+     "bit_identical": true,
+     "mismatches": [],
+     "tickets_zero": true
+    },
+    "fold_notail": {
+     "form": "fold",
+     "probe": "TAILS=False: GEMV + tickets (+ stage fold), no tail",
+     "us_per_layer": 9.477,
+     "tickets_zero": true
+    },
+    "stage_rp1": {
+     "form": "stage",
+     "RP": 1,
+     "us_per_layer": 21.387,
+     "us_saved_vs_split": -3.496,
+     "ms_saved_per_step_40_layers": -0.1398,
+     "bit_identical": true,
+     "mismatches": [],
+     "tickets_zero": true
+    },
+    "stage_rp2": {
+     "form": "stage",
+     "RP": 2,
+     "us_per_layer": 22.818,
+     "us_saved_vs_split": -4.926,
+     "ms_saved_per_step_40_layers": -0.1971,
+     "bit_identical": true,
+     "mismatches": [],
+     "tickets_zero": true
+    },
+    "stage_rp4": {
+     "form": "stage",
+     "RP": 4,
+     "us_per_layer": 23.593,
+     "us_saved_vs_split": -5.702,
+     "ms_saved_per_step_40_layers": -0.2281,
+     "bit_identical": true,
+     "mismatches": [],
+     "tickets_zero": true
+    },
+    "stage_rp8": {
+     "form": "stage",
+     "RP": 8,
+     "us_per_layer": 28.828,
+     "us_saved_vs_split": -10.937,
+     "ms_saved_per_step_40_layers": -0.4375,
+     "bit_identical": true,
+     "mismatches": [],
+     "tickets_zero": true
+    },
+    "stage_notail": {
+     "form": "stage",
+     "probe": "TAILS=False: GEMV + tickets (+ stage fold), no tail",
+     "us_per_layer": 17.54,
+     "tickets_zero": true
+    }
+   },
+   "launches_per_layer": {
+    "split": 3,
+    "fused": 1
+   },
+   "compiled": {
+    "t9b4_mxfp8_gemv2": [
+     {
+      "n_regs": 56,
+      "n_spills": 0,
+      "num_warps": 4,
+      "shared": 18432
+     }
+    ],
+    "t9b2r2_norm_row": [
+     {
+      "n_regs": 32,
+      "n_spills": 2,
+      "num_warps": 8,
+      "shared": 1024
+     },
+     {
+      "n_regs": 58,
+      "n_spills": 0,
+      "num_warps": 8,
+      "shared": 512
+     }
+    ],
+    "l10_qkv_tail (fold)": [
+     {
+      "n_regs": 90,
+      "n_spills": 0,
+      "num_warps": 4,
+      "shared": 9216
+     },
+     {
+      "n_regs": 114,
+      "n_spills": 0,
+      "num_warps": 4,
+      "shared": 9216
+     },
+     {
+      "n_regs": 180,
+      "n_spills": 0,
+      "num_warps": 4,
+      "shared": 9216
+     },
+     {
+      "n_regs": 255,
+      "n_spills": 88,
+      "num_warps": 4,
+      "shared": 9216
+     },
+     {
+      "n_regs": 56,
+      "n_spills": 0,
+      "num_warps": 4,
+      "shared": 9216
+     }
+    ],
+    "l10_qkv_tail2 (stage)": [
+     {
+      "n_regs": 62,
+      "n_spills": 0,
+      "num_warps": 4,
+      "shared": 9216
+     },
+     {
+      "n_regs": 72,
+      "n_spills": 0,
+      "num_warps": 4,
+      "shared": 9216
+     },
+     {
+      "n_regs": 95,
+      "n_spills": 0,
+      "num_warps": 4,
+      "shared": 9216
+     },
+     {
+      "n_regs": 200,
+      "n_spills": 0,
+      "num_warps": 4,
+      "shared": 9216
+     },
+     {
+      "n_regs": 64,
+      "n_spills": 0,
+      "num_warps": 4,
+      "shared": 9216
+     }
+    ]
+   },
+   "phases_us": {
+    "split.norm_rows (split - pair)": 9.695,
+    "fold.gemv+tickets (notail - pair)": 1.28,
+    "fold.tail (best - notail)": 32.0,
+    "stage.gemv+tickets (notail - pair)": 9.344,
+    "stage.tail (best - notail)": 3.846
+   },
+   "best": {
+    "fold": {
+     "variant": "fold_rp4",
+     "form": "fold",
+     "RP": 4,
+     "us_per_layer": 41.477,
+     "us_saved_vs_split": -23.586,
+     "ms_saved_per_step_40_layers": -0.9434,
+     "bit_identical": true,
+     "mismatches": [],
+     "tickets_zero": true
+    },
+    "stage": {
+     "variant": "stage_rp1",
+     "form": "stage",
+     "RP": 1,
+     "us_per_layer": 21.387,
+     "us_saved_vs_split": -3.496,
+     "ms_saved_per_step_40_layers": -0.1398,
+     "bit_identical": true,
+     "mismatches": [],
+     "tickets_zero": true
+    }
+   },
+   "best_fused": "stage_rp1",
+   "us_saved_per_layer": -3.496,
+   "ms_saved_per_step_40_layers": -0.1398,
+   "fused_beats_split": false,
+   "bit_identical_all": true,
+   "tickets_zero_all": true
+  },
+  "verdict": "R=1 split 17.44 vs fold_rp1 16.22 us/layer-call; R=6 split 17.89 vs stage_rp1 21.39 us/layer-call"
+ }
+}
