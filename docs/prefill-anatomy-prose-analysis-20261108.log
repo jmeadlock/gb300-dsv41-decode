@@ -1,0 +1,44 @@
+kernels 199390  runtime-api 407038  nvtx 14906  phases 2  role ranges 3847  layer ranges 40  memcpy 3973
+roles known
+
+[prefill] wall 6267.3 ms, GPU busy 1195.4 ms (19 %), idle 5071.9, kernels 199298, launch calls 199298, syncs 3792 (33.2 ms blocked)
+  moe.routed.gemm         878.26 ms    11016 launches
+  moe.routed.glue          90.43 ms    73440 launches
+  moe.other                86.27 ms    62744 launches
+  moe.routed.index         57.07 ms    25744 launches
+  moe.routed.quant         28.46 ms    11016 launches
+  moe.routed.combine       15.95 ms     7344 launches
+  glue.torch               11.96 ms     4891 launches
+  dense.proj               10.10 ms      160 launches
+  moe.shared                7.33 ms     1000 launches
+  moe.router                2.86 ms      680 launches
+  glue.mhc                  1.61 ms      240 launches
+  attn.sparse               1.43 ms       40 launches
+  attn.indexer              1.00 ms      497 launches
+  glue.quant_rope           0.72 ms      244 launches
+  attn.wo_a                 0.65 ms       40 launches
+  engram                    0.55 ms      124 launches
+  dense.head                0.43 ms        3 launches
+  attn.compressor           0.28 ms       75 launches
+  memcpy DtoD: 117.81 MB in 170 copies, 0.23 ms
+  memcpy DtoH: 0.14 MB in 3792 copies, 5.17 ms
+  role ranges (host wall incl. nested | kernels launched inside | their GPU ms):
+    moe          n     40 wall    6022.8 ms  launches   95832  gpu    159.3 ms  exclusive 2269.1 ms
+    expert.hot   n   3530 wall    3550.3 ms  launches   91780  gpu    955.0 ms
+    attn         n     40 wall     144.0 ms  launches    2722  gpu     16.9 ms
+    expert.cold  n    142 wall     143.4 ms  launches    3692  gpu     42.1 ms
+    shared       n     40 wall      40.4 ms  launches    1000  gpu      7.3 ms
+    gate         n     40 wall      19.6 ms  launches     680  gpu      2.9 ms
+    indexer      n      8 wall      18.6 ms  launches     497  gpu      1.0 ms
+    engram       n      2 wall       3.9 ms  launches     124  gpu      0.6 ms
+    compressor   n      4 wall       2.3 ms  launches      75  gpu      0.3 ms
+    head         n      1 wall       0.1 ms  launches       3  gpu      0.4 ms
+  expert.hot per call: n 3530, wall 1006 us, 26.0 launches, GPU 271 us, fp4_gemm 79.4 us/launch
+  expert.cold per call: n 142, wall 1010 us, 26.0 launches, GPU 297 us, fp4_gemm 88.4 us/launch
+  expert calls (ranges) 3672
+
+[seed_draft] wall 3.8 ms, GPU busy 0.5 ms (14 %), idle 3.3, kernels 91, launch calls 91, syncs 0 (0.0 ms blocked)
+  dense.proj                0.36 ms        4 launches
+  glue.torch                0.15 ms       80 launches
+  glue.quant_rope           0.02 ms        7 launches
+  memcpy DtoD: 0.26 MB in 7 copies, 0.01 ms
