@@ -1575,6 +1575,76 @@ def launch_topk_post(idx, clen, out, offset: int):
     out.copy_(indexer_post_torch(idx, clen.reshape(R_, 1) if rows else clen, offset).view(out.shape))
 
 
+# ------------------------------------------------------------------------------------------------ M2-L10: q/kv tail
+# docs/HANDOFF-M2-L10-QKV-TAIL.md; docs/M2-FUSED-CHAIN-DESIGN.md section 2.2 row L10. $DSV41_QKV_TAIL (read once per
+# build; `--qkv-tail` of bench/qkv_tail_bench.py sets it):
+#   split (default until the box gate): today's S2/S3 -- the wq_a || wkv pair GEMV (T9b-4), then q_norm + act_quant
+#          (t9b2r2_norm_row) in q_path and kv_norm + RoPE + QDQ + ring write (t9b2r2_norm_row) in kv_path: 3 launches.
+#   fused: ONE launch in q_path (runtime/gemv_mxfp8.l10_qkv_tail: the same pair GEMV, then per-output tickets -- the
+#          last CTA of each half runs that half's norm_row body in the R2 order, bit-identical by construction) that
+#          also writes this layer's kv ring rows; kv_path then has nothing left to launch. The step's freqs / ring slot
+#          / ring are the static step's own (StaticStep._c, _ring_of) -- the exact objects kv_path receives, which it
+#          asserts. Applies where the split path would pair (gemv_pair on, both halves on the GEMV); self-checked at
+#          build (fused == split bitwise on qr / q / s / the ring, twice: the ticket left at 0), else split with the
+#          reason (describe_r2()["qkv_tail"]).
+QKV_TAIL_ENV = "DSV41_QKV_TAIL"
+QKV_TAILS = ("split", "fused")
+QKV_TAIL_DEFAULT = "split"
+QKV_TICKETS = 256          # gemv_mxfp8.L10_TICKET_WORDS (restated: this module never imports it at load; tests check)
+# M2-L10-FIX: the fused launch's form is gemv_mxfp8.qkv_tail_form() ($DSV41_QKV_TAIL_FORM: stage (default) | fold, the
+# round-1 kernel that was 1.5 ms/step slower at 6 rows); read at every launch, so the build-time self-check below
+# checks the form the step runs.
+GEMV_MODULE = None         # tests: the shim-loaded gemv_mxfp8 for launch_qkv_tail's kernel path (default: the real one)
+
+
+def qkv_tail_mode() -> str:
+    v = (os.environ.get(QKV_TAIL_ENV) or QKV_TAIL_DEFAULT).strip()
+    if v not in QKV_TAILS:
+        raise ValueError(f"${QKV_TAIL_ENV}={v!r}: expected one of {QKV_TAILS}")
+    return v
+
+
+def _gm():
+    if GEMV_MODULE is not None:
+        return GEMV_MODULE
+    from runtime import gemv_mxfp8
+
+    return gemv_mxfp8
+
+
+def launch_qkv_tail(xq, wa, wb, *, q_nw, q_eps: float, q_ord: dict, qr, q, s, kv_nw, kv_eps: float, kv_ord: dict,
+                    ring, slot, rope, code_tab, ticket, tags=("wq_a", "wkv")):
+    """M2-L10: the q path and the kv path of one layer after the pair GEMV, R rows (R = xq's rows).
+    xq = act_quant(x) (q fp8 [.., R, K], s e8m0 [.., R, K/32]); wa / wb = attn.wq_a / attn.wkv (fp8 Linears with
+    .weight.scale); qr / q / s [1, R, QL] bf16 / fp8 / [1, R, QL/32] e8m0 out; ring (bf16 rows of HD) + slot [R] int64:
+    row t's kv goes to ring row slot[t]; rope = (freqs fp32 [rd/2, 2] or [R, rd/2, 2], rd, (re, im) modes) or None;
+    ticket int32 [QKV_TICKETS] (zero; left zero). One launch on CUDA (gemv_mxfp8.qkv_pair_tail) -> (result_a, result_b) of the
+    GEMV (bf16 or SplitK), or None when the pair cannot form there (the caller runs the split path). CPU: the split
+    path's own functions in order (gemv_pair, launch_norm_row x 2) -- the mirror, identical by definition."""
+    GM = _gm()
+    K = xq[0].size(-1)
+    x8, xs8 = xq[0].reshape(-1, K), xq[1].reshape(-1, K // BLOCK)
+    R_ = x8.size(0)
+    QL, HD = q_nw.numel(), kv_nw.numel()
+    if _kern(x8):
+        fr, rd, modes = rope if rope is not None else (None, 0, (0, 0))
+        fs = int(fr.stride(0)) if fr is not None and fr.dim() == 3 else 0
+        return GM.qkv_pair_tail(
+            x8, xs8, wa.weight, wa.weight.scale, wb.weight, wb.weight.scale, ticket=ticket, tab=code_tab, tags=tags,
+            q_tail=dict(nw=q_nw, qr=qr.view(R_, QL), q=q.view(R_, QL), s=s.view(R_, QL // BLOCK), eps=float(q_eps),
+                        fac=fac_of(QL), wf=float(QL), order=order_args(q_ord)),
+            kv_tail=dict(nw=kv_nw, ring=ring, slot=slot.reshape(-1), freqs=fr, FS=fs, rd=int(rd), modes=tuple(modes),
+                         eps=float(kv_eps), fac=fac_of(HD), wf=float(HD), order=order_args(kv_ord)))
+    ra, rb = GM.gemv_pair(x8, xs8, wa.weight, wa.weight.scale, wb.weight, wb.weight.scale, tags=tags)
+    one = R_ == 1
+    launch_norm_row(ra if hasattr(ra, "nsplit") else (ra.reshape(-1) if one else ra.reshape(R_, QL)), q_nw,
+                    qr.view(-1) if one else qr.view(R_, QL), eps=q_eps, ordd=q_ord, code_tab=code_tab,
+                    q=q.view(-1) if one else q.view(R_, QL), s=s.view(-1) if one else s.view(R_, QL // BLOCK))
+    launch_norm_row(rb if hasattr(rb, "nsplit") else (rb.reshape(-1) if one else rb.reshape(R_, HD)), kv_nw, ring,
+                    eps=kv_eps, ordd=kv_ord, code_tab=code_tab, slot=slot.reshape(-1), qdq=True, rope=rope)
+    return ra, rb
+
+
 # ------------------------------------------------------------------------------------------------ the R2 glue
 def _bits(t: torch.Tensor) -> torch.Tensor:
     t = t.contiguous()
@@ -1631,6 +1701,7 @@ class R2Glue:
         self.r2_bytes = {"gate_fp32": sum(t.numel() * 4 for t in self.gate_w.values()
                                           if t.data_ptr() not in {sm.moe.gate.weight.data_ptr() for sm in o.moes}),
                          "engram_wprod": sum(t.numel() * 4 for t in self.engram_wp.values())}
+        self._qkv_init()                       # M2-L10: $DSV41_QKV_TAIL (split | fused), fixed for this build
 
     def _r2_default_orders(self) -> None:
         """calibrate=False (the census): torch's own op on CPU, the predicted configuration on a device."""
@@ -2300,8 +2371,161 @@ class R2Glue:
         return self.linear_pre(xq, attn.wq_a, x)
 
     def q_path(self, attn, x, xq):
-        """qr = q_norm(wq_a(x)) (model.py:771) and act_quant(qr) for wq_b (model.py:772, 197) in one launch."""
+        """qr = q_norm(wq_a(x)) (model.py:771) and act_quant(qr) for wq_b (model.py:772, 197) in one launch.
+        M2-L10 (qkv_tail fused, inside a static step): the pair GEMV + this + the layer's kv path in ONE launch."""
+        if self._qkv_fused_ok(attn, xq):
+            ctx = self._step_kv(attn)
+            if ctx is not None:
+                r = self._qkv_launch(attn, xq, *ctx)
+                if r is not None:
+                    self._kv_pend = (id(attn), "tail") + tuple(ctx) + (r[2][1],)
+                    self.qkv_calls["fused"] += 1
+                    return r[0], r[1]
+            self.qkv_calls["split"] += 1
         return self._q_norm_quant(attn, self._q_input(attn, x, xq))
+
+    # M2-L10 ---------------------------------------------------------------------------------------------------------
+    def _qkv_init(self) -> None:
+        self.qkv_tail = qkv_tail_mode()
+        self.qkv_tail_why = None if self.qkv_tail == "fused" else f"${QKV_TAIL_ENV} = split (the default)"
+        self.qkv_calls = {"fused": 0, "split": 0}      # q_path calls in fused mode: one launch / fell back to split
+        self._qkv_ticket = (torch.zeros(QKV_TICKETS, dtype=torch.int32, device=self.dev)
+                            if self.qkv_tail == "fused" else None)   # allocated here: never inside a capture
+
+    def _qkv_fused_ok(self, attn, xq) -> bool:
+        """Mode fused, and the split path here would be the pair (+ the two fused norm rows)."""
+        return (getattr(self, "qkv_tail", "split") == "fused" and xq is not None and self.on("q_path")
+                and self.on("kv_path") and self.on("gemv_pair") and self._gemv_ok(xq, attn.wq_a, attn.wkv))
+
+    def _step_kv(self, attn):
+        """(freqs_cis, slot, ring) this layer's kv_path will be called with by the static step (StaticStep._attn:
+        c.freqs(attn.freqs_cis), c.p_win(), _ring_of[id(attn)] -- cached per step, the same objects), or None outside
+        a step (self-checks, other owners)."""
+        c = getattr(self.o, "_c", None)
+        rings = getattr(self.o, "_ring_of", None)
+        if c is None or not rings or id(attn) not in rings:
+            return None
+        return c.freqs(attn.freqs_cis), c.p_win(), rings[id(attn)]
+
+    def _qkv_launch(self, attn, xq, freqs_cis, slot, ring):
+        """launch_qkv_tail for this layer -> (qr, (q, s), (result_a, result_b)) or None (pair refused)."""
+        from runtime import patches
+
+        QL, rd = attn.q_lora_rank, attn.rope_head_dim
+        T_ = self._rows(xq)
+        dev = xq[0].device
+        qr = torch.empty(1, T_, QL, dtype=torch.bfloat16, device=dev)
+        q = torch.empty(1, T_, QL, dtype=FP8, device=dev)
+        s = torch.empty(1, T_, QL // BLOCK, dtype=E8, device=dev)
+        rope = None
+        if rd:                                 # as _kv_norm_write
+            fr = torch.view_as_real(freqs_cis)
+            fr = fr.reshape(-1, 2) if T_ == 1 else fr.reshape(T_, -1, 2).contiguous()
+            rope = (fr, rd, self.rope_fwd)
+        res = launch_qkv_tail(xq, attn.wq_a, attn.wkv, q_nw=attn.q_norm.weight, q_eps=attn.q_norm.eps,
+                              q_ord=self.orders["q"], qr=qr, q=q, s=s, kv_nw=attn.kv_norm.weight,
+                              kv_eps=attn.kv_norm.eps, kv_ord=self.orders["kv"], ring=ring, slot=slot, rope=rope,
+                              code_tab=self.code_tab, ticket=self._qkv_ticket)
+        if res is None:
+            return None
+        patches.count_gemv_routed(attn.wq_a.weight, xq[0])
+        patches.count_gemv_routed(attn.wkv.weight, xq[0])
+        return qr, (q, s), res
+
+    def _check_qkv_tail(self, cal: dict, g) -> None:
+        """Build-time gate of qkv_tail fused (after the T9b-4 parts' checks): needs q_path, kv_path and gemv_pair on,
+        then fused == split bitwise (_verify_qkv_tail); else split, with the reason."""
+        if self.qkv_tail != "fused":
+            cal["qkv_tail"] = self.qkv_tail_why
+            return
+        why = next((f"{c} is {self.status.get(c)}" for c in ("q_path", "kv_path", "gemv_pair") if not self.on(c)),
+                   None)
+        if why is None:
+            try:
+                why = self._verify_qkv_tail(g)
+            except Exception as e:  # a kernel that does not compile/run here: split, with the reason
+                why = f"self-check raised {type(e).__name__}: {str(e)[:300]}"
+        if why:
+            self.qkv_tail = "split"
+            self.qkv_tail_why = f"off: {why}"
+            self.log(f"[fused-glue] qkv_tail fused OFF: {why}")
+        if self.qkv_tail_why:
+            cal["qkv_tail"] = self.qkv_tail_why
+        else:
+            try:
+                form = _gm().qkv_tail_form()
+            except Exception as e:  # pragma: no cover - a bad $DSV41_QKV_TAIL_FORM is caught by the check above
+                form = f"? ({e})"
+            cal["qkv_tail"] = f"fused: equal to split (form {form}; qr, q, s, ring; ticket reset)"
+
+    def _verify_qkv_tail(self, g) -> Optional[str]:
+        """fused (launch_qkv_tail) vs split (the pair + _q_norm_quant + _kv_norm_write in force), at this step's
+        rows, bitwise on qr / q / s / the whole ring, each fused call made twice (the second after the first left the
+        ticket at 0). None = equal."""
+        o, R = self.o, self.R
+        attn = o.model.layers[0].attn
+        D, HD = o.model.layers[0].attn_norm.dim, attn.head_dim
+        Rr = self.rows
+        nslot = max(int(attn.window_size), 2 * Rr + 8)
+        prev = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(torch.bfloat16)
+            with o._active():
+                for t in range(3):
+                    x = self._cat_rows(lambda: self._stream(g, 1, D, -4, 6).view(1, 1, D)).to(self.dev)
+                    xq = R.act_quant(x, R.fp8_block_size, R.scale_fmt, R.scale_dtype)
+                    if not self._gemv_ok(xq, attn.wq_a, attn.wkv):
+                        return "wq_a / wkv do not take the GEMV in this step's scope"
+                    pos = 1 + 7 * t
+                    f = attn.freqs_cis[pos:pos + Rr]
+                    slot = torch.remainder(torch.arange(pos, pos + Rr, dtype=torch.long, device="cpu"),
+                                           nslot).to(self.dev)
+                    self._kv_pend = None
+                    qr0, (q0, s0) = self._q_norm_quant(attn, self._q_input(attn, x, xq))
+                    pend, self._kv_pend = self._kv_pend, None
+                    if pend is not None:
+                        kvr = pend[1]
+                    elif self.on("reduce_fold"):
+                        kvr = self._gemv_fold(xq, attn.wkv, "wkv")
+                    else:
+                        kvr = self.linear_pre(xq, attn.wkv, x)
+                    ring0 = torch.zeros(1, nslot, HD, dtype=torch.bfloat16, device=self.dev)
+                    self._kv_norm_write(attn, kvr, f, ring0, slot)
+                    for rep in range(2):
+                        ring1 = torch.zeros(1, nslot, HD, dtype=torch.bfloat16, device=self.dev)
+                        r = self._qkv_launch(attn, xq, f, slot, ring1)
+                        if r is None:
+                            return "the pair cannot form here (pair_plan: the halves' MMA forms differ)"
+                        qr1, (q1, s1), _ = r
+                        bad = [n for n, a, b in (("qr", qr1, qr0), ("q", q1, q0), ("s", s1, s0), ("ring", ring1, ring0))
+                               if not _same(a, b)]
+                        if bad:
+                            return f"{bad} differ from the split path (rows {Rr}, draw {t}, call {rep})"
+                        if self._qkv_ticket is not None and int(self._qkv_ticket.abs().sum()) != 0:
+                            return f"ticket not reset to 0 after the launch ({self._qkv_ticket.tolist()})"
+        finally:
+            torch.set_default_dtype(prev)
+            from runtime import patches
+
+            patches.fp8_gemv_stats(reset=True)
+        return None
+
+    def describe_qkv_tail(self) -> dict:
+        gm = {}
+        try:
+            gm = dict(_gm().L10_STATS)
+        except Exception:  # pragma: no cover - module without the M2-L10 kernel
+            pass
+        form = comp = None
+        try:
+            form = _gm().qkv_tail_form()
+            comp = {"/".join(str(x) for x in k): v for k, v in _gm().L10_COMPILED.items()}
+        except Exception:  # pragma: no cover - module without the M2-L10-FIX kernel / a bad $DSV41_QKV_TAIL_FORM
+            pass
+        return {"mode": getattr(self, "qkv_tail", None), "env": QKV_TAIL_ENV, "form": form, "compiled": comp,
+                "why": getattr(self, "qkv_tail_why", None),
+                "calls": dict(getattr(self, "qkv_calls", {})), "kernel_calls": gm,
+                "launches_per_layer": {"split": 3, "fused": 1}}
 
     def _kv_norm_write(self, attn, kvr, freqs_cis, ring, slot):
         """kv_norm + RoPE + QDQ + the ring write of T rows (slot [T]; M1-T10-PORT: freqs_cis [T, rd/2], row t at its
@@ -2320,6 +2544,12 @@ class R2Glue:
         the ring write in one launch. ring: the static step's own 256-slot ring (M1-T10 #20; default the reference
         window cache)."""
         pend, self._kv_pend = getattr(self, "_kv_pend", None), None
+        if pend is not None and pend[0] == id(attn) and isinstance(pend[1], str):   # M2-L10: the q path's launch
+            want_ring = attn.window_kv_cache if ring is None else ring           # wrote this layer's kv rows
+            if pend[2] is freqs_cis and pend[3] is slot and pend[4] is want_ring:
+                return
+            raise RuntimeError("kv_path: the fused q/kv tail (M2-L10) already wrote this layer's kv rows with the "
+                               "static step's freqs / ring slot / ring, but kv_path was called with other ones")
         if pend is not None and pend[0] == id(attn):                 # T9b-4: made by this layer's q path (pair)
             kvr = pend[1]
         elif xq is not None and self.on("reduce_fold") and self._gemv_ok(xq, attn.wkv):
@@ -2451,6 +2681,7 @@ class R2Glue:
             b.sf_pack_why = None if b.sf_pack else self.status.get("dg_sf_pack")
         if not self.on("dg_sf_pack") and b is not None and hasattr(b, "sf_pack"):
             b.sf_pack = False
+        self._check_qkv_tail(cal, g)            # M2-L10: after gemv_pair's own check
 
     def _r4_check(self, cal: dict, name: str, fn, g) -> None:
         r4 = cal.setdefault("r4", {})
@@ -2686,7 +2917,8 @@ class R2Glue:
                                  "cal_rows": getattr(self, "cal_rows", None), "step_rows": getattr(self, "rows", 1)},
                 "bytes": dict(getattr(self, "r2_bytes", {})), "indexer_score": INDEXER_SCORE_WHY,
                 "outcome": {c: self.numerics.get(c, {}).get("outcome") for c in R2_CLUSTERS if self.on(c)},
-                "fp32": describe_fp32(), "router_impl": self._describe_router_impl()}
+                "fp32": describe_fp32(), "router_impl": self._describe_router_impl(),
+                "qkv_tail": self.describe_qkv_tail()}
 
     def _describe_router_impl(self) -> dict:
         rp = getattr(self, "rplan", None)

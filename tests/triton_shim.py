@@ -368,6 +368,8 @@ def store(ptr, val, mask=None):
 
 STORES: list = []
 DIRTY: set = set()  # id() of the buffers a launch stored to (fp8 / uint8 / int64 ones are written back only then)
+SPIN: dict = {}     # (buffer, offsets) -> consecutive zero-adds (a spin-wait's polls), reset by any non-zero add
+SPIN_LIMIT = 10000
 
 
 def atomic_add(ptr, val, mask=None, sem=None, scope=None):
@@ -377,6 +379,16 @@ def atomic_add(ptr, val, mask=None, sem=None, scope=None):
     off = np.atleast_1d(ptr.off)
     m = np.ones(off.shape, bool) if mask is None else np.broadcast_to(_v(mask), off.shape)
     assert ((off[m] >= 0) & (off[m] < ptr.buf.size)).all(), "out-of-bounds atomic"
+    # M2-L10-FIX (l10_qkv_tail2's wait: `atomic_add(p, 0)` in a loop): programs run one after another here, so a
+    # wait that is not released at once never will be -- fail instead of hanging.
+    key = (id(ptr.buf), off.tobytes())
+    if np.all(np.asarray(_v(val)) == 0):
+        SPIN[key] = SPIN.get(key, 0) + 1
+        if SPIN[key] > SPIN_LIMIT:
+            SPIN.clear()
+            raise RuntimeError("shim: a spin-wait on an atomic was never released (it waits on a later program)")
+    else:
+        SPIN.clear()
     old = ptr.buf[off].copy()
     np.add.at(ptr.buf, off[m], np.broadcast_to(np.asarray(_v(val)), off.shape)[m].astype(ptr.buf.dtype))
     DIRTY.add(id(ptr.buf))
@@ -446,7 +458,8 @@ class JitFunction:
             g = tuple(grid) + (1,) * (3 - len(grid))
             self.launches.append({"grid": tuple(grid), "constexprs": {k: v for k, v in constexprs.items()
                                                                       if not isinstance(v, torch.Tensor)},
-                                  "enable_fp_fusion": enable_fp_fusion})
+                                  "enable_fp_fusion": enable_fp_fusion, "num_warps": num_warps,
+                                  "num_stages": num_stages})
             DIRTY.clear()
             for pid in itertools.product(*(range(n) for n in g)):
                 _PID[:] = list(pid)

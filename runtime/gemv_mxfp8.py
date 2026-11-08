@@ -1831,3 +1831,637 @@ if HAVE_TRITON:
                 _t9b6_tile(xq, xs, wb, sb, outb, wsb, cnt, M, NB, KB, PERB, NSB, pid_n - TA, ks, pid_n, stride_xm,
                            stride_xsm, stride_wbn, stride_sbn, stride_obm, outb, 0, BLOCK_M, BLOCK_N, KT, WIDE, EVENB,
                            SPLITB, CG, False, 2, 0, 0, 0, False)
+
+
+
+
+# ------------------------------------------------------------------------------------------------ M2-L10: q/kv tail
+# docs/HANDOFF-M2-L10-QKV-TAIL.md, docs/M2-FUSED-CHAIN-DESIGN.md section 2.2 row L10. The wq_a || wkv pair GEMV
+# (t9b4_mxfp8_gemv2's work, tile for tile: `_t9b4_gemv_tile`, unchanged) followed IN THE SAME LAUNCH by the two
+# consumers that today are their own launches (runtime/fused_glue_r2.py t9b2r2_norm_row, once per output):
+#   q   (half a, wq_a):  q_norm over q_lora_rank in the calibrated order -> qr bf16 + act_quant(qr) (q fp8, s e8m0);
+#   kv  (half b, wkv):   kv_norm over head_dim -> RoPE on the last rope_dim (bf16) -> act_quant QDQ -> ring[slot[t]].
+# Per-output ticket (the router plan's idiom, runtime/static_kernels.py m2_router_rows): every program of half h that
+# owns a (tile, split) fences (fence.acq_rel.gpu in every thread), syncs the CTA and takes an acq_rel ticket on
+# ticket[h]; the LAST of half h's TA*NSA (TB*NSB) programs fences again and runs half h's tail for all M rows, reading
+# the partials in t9b_splitk_reduce's order (from +0.0, split 0, 1, ...; bf16) -- `_l10_load`, which is `_t9b4_ld`
+# with L2 (.cg) loads -- and resets ticket[h] to 0 (a graph replay starts from 0). No grid barrier, no spin: nothing
+# waits on another CTA, so any grid size is safe.
+# Numerics: the GEMV half is the pair kernel's code under the pair kernel's launch options (Triton's default fp
+# fusion: the GEMV's T9b-1 numerics); the tails are t9b2r2_norm_row's body (launched there with enable_fp_fusion=False)
+# with the two products that feed an add written as explicit `mul.rn.f32` (`v * v` of the statistic, `sum * RN(1/w)`
+# of the mean), so no mul+add can contract to an FMA under this kernel's options -- every other op of the body has no
+# add fed by a multiply (the RoPE forms are already explicit). Same tree, same fp32 intermediates -> the same bits as
+# pair + norm_row + norm_row (tests/test_qkv_tail_cpu.py through the shim; tests/gpu/test_qkv_tail_gpu.py on the box).
+# The helpers below marked "verbatim" are copies of runtime/fused_glue_r2.py's (a jit function resolves its callees in
+# its own module; tests/test_qkv_tail_cpu.py asserts the sources are identical).
+L10_TICKETS = 2   # int32 per launch site: [0] = half a (q), [1] = half b (kv); 0 between launches
+# Rows per pass of the tails (speed only -- registers vs serial passes; every value bit-identical, tested): RP rows at
+# once in [RP, ...] tiles, M rows in ceil(M / RP) passes. $DSV41_QKV_TAIL_RP overrides; bench/qkv_tail_bench.py --rp
+# sweeps it on the box. Default 2 [A]: at the real q tile (T 256 x V 4) a pass holds ~24 fp32 registers per row per
+# thread at 4 warps, so 8 rows would spill and raise the whole kernel's register count (fewer GEMV CTAs per SM).
+L10_TAIL_RP = int(os.environ.get("DSV41_QKV_TAIL_RP", "2"))
+
+if HAVE_TRITON:
+    try:
+        from triton.language.extra import libdevice
+    except ImportError:  # pragma: no cover - older Triton layouts
+        from triton.language.extra.cuda import libdevice
+
+    # --- verbatim copies (runtime/fused_glue_r2.py)
+    @triton.jit
+    def _t9b2_code(amax, tab):
+        """e8m0 code of a block from its amax (a bf16 value as fp32): the reference's own code, by table."""
+        idx = (amax.to(tl.int32, bitcast=True) >> 16) & 0xFFFF
+        return tl.load(tab + idx).to(tl.int32)
+
+    @triton.jit
+    def _t9b2_pow2(code):
+        return (code << 23).to(tl.float32, bitcast=True)
+
+    @triton.jit
+    def _t9b2_ipow2(code):
+        return ((254 - code) << 23).to(tl.float32, bitcast=True)
+
+    @triton.jit
+    def _t9b2_q8(v, inv):
+        """fp8 e4m3 RNE of clamp(v * 2^-e, -448, 448) (v * inv is exact; the clamp never binds)."""
+        y = v * inv
+        y = tl.where(y > 448.0, 448.0, y)
+        y = tl.where(y < -448.0, -448.0, y)
+        return y.to(tl.float8e4nv, fp_downcast_rounding="rtne")
+
+    @triton.jit
+    def _t9b2_bf16(v):
+        return v.to(tl.bfloat16, fp_downcast_rounding="rtne").to(tl.float32)
+
+    @triton.jit
+    def _r2_offs(k, T: tl.constexpr, V: tl.constexpr, U: tl.constexpr):
+        """Element offsets [T, V] of tile k: (k*T + t)*V + v (vectorized) or (k*V + v)*T + t (U, unrolled)."""
+        t = tl.arange(0, T)[:, None]
+        v = tl.arange(0, V)[None, :]
+        if U:
+            o = v * T + t
+        else:
+            o = t * V + v
+        return k * (T * V) + o
+
+    @triton.jit
+    def _r2_col(acc, j, V: tl.constexpr):
+        """Column j of acc [T, V] (a sum of one value and exact zeros: exact; acc is never -0)."""
+        vv = tl.arange(0, V)[None, :]
+        return tl.sum(tl.where(vv == j, acc, 0.0), axis=1)
+
+    @triton.jit
+    def _r2_halve(s, N: tl.constexpr):
+        """[N] -> [N/2]: s[i] + s[i + N/2]."""
+        s2 = tl.reshape(s, [2, N // 2])
+        r = tl.arange(0, 2)[:, None]
+        return tl.sum(tl.where(r == 0, s2, 0.0), axis=0) + tl.sum(tl.where(r == 1, s2, 0.0), axis=0)
+
+    @triton.jit
+    def _r2_pairs(s, N: tl.constexpr):
+        """[N] -> [N/2]: s[2i] + s[2i + 1]."""
+        s2 = tl.reshape(s, [N // 2, 2])
+        c = tl.arange(0, 2)[None, :]
+        return tl.sum(tl.where(c == 0, s2, 0.0), axis=1) + tl.sum(tl.where(c == 1, s2, 0.0), axis=1)
+
+    @triton.jit
+    def _r2_level(s, N: tl.constexpr, DEC: tl.constexpr):
+        if N > 32:
+            out = _r2_halve(s, N)
+        else:
+            if DEC:
+                out = _r2_halve(s, N)
+            else:
+                out = _r2_pairs(s, N)
+        return out
+
+    @triton.jit
+    def _r2_finish(acc, T: tl.constexpr, V: tl.constexpr, DEC: tl.constexpr):
+        """acc [T, V] -> the scalar sum: fold the V accumulators left, then the tree over T."""
+        s = _r2_col(acc, 0, V)
+        for j in tl.static_range(V - 1):
+            s = s + _r2_col(acc, j + 1, V)
+        if T >= 512:
+            s = _r2_level(s, 512, DEC)
+        if T >= 256:
+            s = _r2_level(s, 256, DEC)
+        if T >= 128:
+            s = _r2_level(s, 128, DEC)
+        if T >= 64:
+            s = _r2_level(s, 64, DEC)
+        if T >= 32:
+            s = _r2_level(s, 32, DEC)
+        if T >= 16:
+            s = _r2_level(s, 16, DEC)
+        if T >= 8:
+            s = _r2_level(s, 8, DEC)
+        if T >= 4:
+            s = _r2_level(s, 4, DEC)
+        if T >= 2:
+            s = _r2_level(s, 2, DEC)
+        return tl.sum(s, axis=0)
+
+    # --- M2-L10 helpers
+    @triton.jit
+    def _l10_fence(v):
+        """fence.acq_rel.gpu in every thread that holds an element of v (int32); returns v (static_kernels._m2_fence,
+        verbatim body)."""
+        return tl.inline_asm_elementwise("fence.acq_rel.gpu;\n\tmov.b32 $0, $1;", "=r,r", [v], dtype=tl.int32,
+                                         is_pure=False, pack=1)
+
+    @triton.jit
+    def _l10_load(x, e, m, NS: tl.constexpr, XS):
+        """_t9b4_ld's value with L2 loads (.cg: the data was written by other CTAs of this launch): a bf16 load
+        (NS == 0), or bf16 of the sum of NS fp32 split partials x[j*XS + e] from +0.0 in split order."""
+        if NS == 0:
+            v = tl.load(x + e, mask=m, other=0.0, cache_modifier=".cg").to(tl.float32)
+        else:
+            acc = tl.zeros(e.shape, dtype=tl.float32)
+            for j in tl.static_range(NS):
+                acc = acc + tl.load(x + j * XS + e, mask=m, other=0.0, cache_modifier=".cg")
+            v = _t9b2_bf16(acc)
+        return v
+
+    @triton.jit
+    def _l10_fin(ssum, fac, wf, DIV: tl.constexpr):
+        """fused_glue_r2._r2_fin with the multiply explicit (the `+ eps` that follows cannot contract into it)."""
+        if DIV:
+            r = libdevice.div_rn(ssum, wf)
+        else:
+            r = _t9b2_mul_rn(ssum, fac)
+        return r
+
+    # --- verbatim copies (runtime/static_kernels.py, M2-T15: _r2_finish for RP rows at once, the same adds per row)
+    @triton.jit
+    def _m2_halve_rows(s, RP: tl.constexpr, N: tl.constexpr):
+        """[RP, N] -> [RP, N/2]: s[:, i] + s[:, i + N/2] (each side a sum of one value and exact zeros: exact)."""
+        s2 = tl.reshape(s, [RP, 2, N // 2])
+        r = tl.arange(0, 2)[None, :, None]
+        return tl.sum(tl.where(r == 0, s2, 0.0), axis=1) + tl.sum(tl.where(r == 1, s2, 0.0), axis=1)
+
+    @triton.jit
+    def _m2_pairs_rows(s, RP: tl.constexpr, N: tl.constexpr):
+        """[RP, N] -> [RP, N/2]: s[:, 2i] + s[:, 2i + 1]."""
+        s2 = tl.reshape(s, [RP, N // 2, 2])
+        c = tl.arange(0, 2)[None, None, :]
+        return tl.sum(tl.where(c == 0, s2, 0.0), axis=2) + tl.sum(tl.where(c == 1, s2, 0.0), axis=2)
+
+    @triton.jit
+    def _m2_level_rows(s, RP: tl.constexpr, N: tl.constexpr, DEC: tl.constexpr):
+        if N > 32:
+            out = _m2_halve_rows(s, RP, N)
+        else:
+            if DEC:
+                out = _m2_halve_rows(s, RP, N)
+            else:
+                out = _m2_pairs_rows(s, RP, N)
+        return out
+
+    @triton.jit
+    def _m2_finish_rows(acc, RP: tl.constexpr, T: tl.constexpr, V: tl.constexpr, DEC: tl.constexpr):
+        """acc [RP, T, V] -> [RP]: fold the V accumulators left, then the tree over T (= _r2_finish per row)."""
+        vv = tl.arange(0, V)[None, None, :]
+        s = tl.sum(tl.where(vv == 0, acc, 0.0), axis=2)
+        for j in tl.static_range(V - 1):
+            s = s + tl.sum(tl.where(vv == j + 1, acc, 0.0), axis=2)
+        if T >= 512:
+            s = _m2_level_rows(s, RP, 512, DEC)
+        if T >= 256:
+            s = _m2_level_rows(s, RP, 256, DEC)
+        if T >= 128:
+            s = _m2_level_rows(s, RP, 128, DEC)
+        if T >= 64:
+            s = _m2_level_rows(s, RP, 64, DEC)
+        if T >= 32:
+            s = _m2_level_rows(s, RP, 32, DEC)
+        if T >= 16:
+            s = _m2_level_rows(s, RP, 16, DEC)
+        if T >= 8:
+            s = _m2_level_rows(s, RP, 8, DEC)
+        if T >= 4:
+            s = _m2_level_rows(s, RP, 4, DEC)
+        if T >= 2:
+            s = _m2_level_rows(s, RP, 2, DEC)
+        return tl.sum(s, axis=1)
+
+    @triton.jit
+    def _l10_norm_rows(x, M, XS, nw, out, slot, q, s, freqs, FS, tab, eps, fac, wf,
+                       N: tl.constexpr, T: tl.constexpr, V: tl.constexpr, U: tl.constexpr, DEC: tl.constexpr,
+                       DIV: tl.constexpr, HAS_SLOT: tl.constexpr, HAS_Q: tl.constexpr, QDQ: tl.constexpr,
+                       RD: tl.constexpr, RE_MODE: tl.constexpr, IM_MODE: tl.constexpr, BB: tl.constexpr,
+                       NS: tl.constexpr, RP: tl.constexpr):
+        """runtime/fused_glue_r2.t9b2r2_norm_row's arithmetic (QQ on: both tails quantize) for the M token rows, RP
+        rows per pass (a leading [RP] row axis, rows >= M masked off; RP >= M: all rows in one pass). Per row it is
+        the same op sequence: the loads (_l10_load = _t9b4_ld's value), the statistic's tiles (_r2_offs) and tree
+        (_m2_finish_rows = _r2_finish per row), rsqrt, nw * (x * r) -> bf16, the RoPE pairs (row t's freqs, stride
+        FS), the act_quant code by table, then q / s (HAS_Q) and qr (not QDQ), or the QDQ'd row into ring row slot[t]
+        (QDQ + HAS_SLOT). The two products that feed adds are explicit mul.rn (block comment). RP is speed only
+        (registers vs passes): no value depends on which pass a row is in."""
+        for r0 in range(0, M, RP):
+            _l10_norm_pass(x, r0 + tl.arange(0, RP), M, XS, nw, out, slot, q, s, freqs, FS, tab, eps, fac, wf,
+                           N, T, V, U, DEC, DIV, HAS_SLOT, HAS_Q, QDQ, RD, RE_MODE, IM_MODE, BB, NS, RP)
+
+    @triton.jit
+    def _l10_norm_pass(x, rr, M, XS, nw, out, slot, q, s, freqs, FS, tab, eps, fac, wf,
+                       N: tl.constexpr, T: tl.constexpr, V: tl.constexpr, U: tl.constexpr, DEC: tl.constexpr,
+                       DIV: tl.constexpr, HAS_SLOT: tl.constexpr, HAS_Q: tl.constexpr, QDQ: tl.constexpr,
+                       RD: tl.constexpr, RE_MODE: tl.constexpr, IM_MODE: tl.constexpr, BB: tl.constexpr,
+                       NS: tl.constexpr, RP: tl.constexpr):
+        """One pass of _l10_norm_rows over the rows rr [RP] (rows >= M masked off)."""
+        rok = rr < M
+        acc = tl.zeros([RP, T, V], dtype=tl.float32)
+        for k in range((N + T * V - 1) // (T * V)):
+            e = _r2_offs(k, T, V, U)
+            m3 = rok[:, None, None] & (e < N)[None, :, :]
+            v = _l10_load(x, rr[:, None, None] * N + e[None, :, :], m3, NS, XS)
+            acc = acc + _t9b2_mul_rn(v, v)
+        r = libdevice.rsqrt(_l10_fin(_m2_finish_rows(acc, RP, T, V, DEC), fac, wf, DIV) + eps)    # [RP]
+        if HAS_SLOT:
+            rbase = tl.load(slot + rr, mask=rok, other=0) * N
+        else:
+            rbase = rr * N
+        for b0 in range(0, N // 32, BB):
+            bi = b0 + tl.arange(0, BB)
+            bok = bi < N // 32
+            ce = bi[:, None] * 32 + 2 * tl.arange(0, 16)[None, :]                                # [BB, 16]
+            m = rok[:, None, None] & (bok[:, None] & (ce >= 0))[None, :, :]                      # [RP, BB, 16]
+            xo = rr[:, None, None] * N + ce[None, :, :]
+            rb = r[:, None, None]
+            a = _t9b2_bf16(tl.load(nw + ce, mask=bok[:, None], other=0.0).to(tl.float32)[None, :, :]
+                           * (_l10_load(x, xo, m, NS, XS) * rb))
+            b = _t9b2_bf16(tl.load(nw + ce + 1, mask=bok[:, None], other=0.0).to(tl.float32)[None, :, :]
+                           * (_l10_load(x, xo + 1, m, NS, XS) * rb))
+            if RD > 0:
+                is_r = (ce >= N - RD)[None, :, :]
+                fi = tl.where(is_r, (ce[None, :, :] - (N - RD)) // 2, 0)
+                mr = m & is_r
+                fo = rr[:, None, None] * FS + 2 * fi
+                c = tl.load(freqs + fo, mask=mr, other=0.0)
+                d = tl.load(freqs + fo + 1, mask=mr, other=0.0)
+                a2 = tl.where(is_r, _t9b2_bf16(_t9b2_rope_re(a, b, c, d, RE_MODE)), a)
+                b2 = tl.where(is_r, _t9b2_bf16(_t9b2_rope_im(a, b, c, d, IM_MODE)), b)
+            else:
+                a2 = a
+                b2 = b
+            code = _t9b2_code(tl.maximum(tl.max(tl.abs(a2), axis=2), tl.max(tl.abs(b2), axis=2)), tab)   # [RP, BB]
+            inv = _t9b2_ipow2(code)[:, :, None]
+            qa = _t9b2_q8(a2, inv)
+            qb = _t9b2_q8(b2, inv)
+            if HAS_Q:
+                tl.store(q + xo, qa, mask=m)
+                tl.store(q + xo + 1, qb, mask=m)
+                tl.store(s + rr[:, None] * (N // 32) + bi[None, :], code.to(tl.uint8),
+                         mask=rok[:, None] & bok[None, :])
+            oo = rbase[:, None, None] + ce[None, :, :]
+            if QDQ:
+                sc = _t9b2_pow2(code)[:, :, None]
+                tl.store(out + oo, (qa.to(tl.float32) * sc).to(tl.bfloat16, fp_downcast_rounding="rtne"), mask=m)
+                tl.store(out + oo + 1, (qb.to(tl.float32) * sc).to(tl.bfloat16, fp_downcast_rounding="rtne"),
+                         mask=m)
+            else:
+                tl.store(out + oo, a2.to(tl.bfloat16), mask=m)
+                tl.store(out + oo + 1, b2.to(tl.bfloat16), mask=m)
+
+    @triton.jit
+    def l10_qkv_tail(xq, xs, wa, sa, outa, wsa, wb, sb, outb, wsb, M, NA, NB, KB, PERA, PERB, NSA, NSB, TA, TB,
+                     stride_xm, stride_xsm, stride_wan, stride_san, stride_oam, stride_wbn, stride_sbn, stride_obm,
+                     ticket, tab,
+                     qnw, qr, qq, qs, q_eps, q_fac, q_wf,
+                     kvnw, ring, slot, freqs, FS, kv_eps, kv_fac, kv_wf,
+                     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, KU: tl.constexpr, EVENA: tl.constexpr,
+                     EVENB: tl.constexpr, MMA: tl.constexpr, SPLITA: tl.constexpr, SPLITB: tl.constexpr,
+                     FT: tl.constexpr,
+                     QN: tl.constexpr, QT: tl.constexpr, QV: tl.constexpr, QU: tl.constexpr, QDEC: tl.constexpr,
+                     QDIV: tl.constexpr, QBB: tl.constexpr, QNS: tl.constexpr,
+                     KN: tl.constexpr, KT: tl.constexpr, KV: tl.constexpr, KUN: tl.constexpr, KDEC: tl.constexpr,
+                     KDIV: tl.constexpr, KBB: tl.constexpr, KNS: tl.constexpr, RD: tl.constexpr,
+                     RE_MODE: tl.constexpr, IM_MODE: tl.constexpr, RP: tl.constexpr, TAILS: tl.constexpr = True):
+        """M2-L10 (section comment): grid (TA + TB, max(NSA, NSB)) = t9b4_mxfp8_gemv2's. Program (pn, ks): the pair
+        kernel's tile; then the per-output ticket; the last program of half a runs the q tail (q_norm + act_quant ->
+        qr / qq / qs), the last of half b the kv tail (kv_norm + RoPE + QDQ -> ring[slot[t]]), each for all M rows
+        at once (_l10_norm_rows, RP = next_pow2(M)). QNS / KNS = the half's split count when it splits, else 0 (its
+        bf16 output is read). Every arm of a runtime `if` uses its own variable names. TAILS=False (bench phase probe
+        only, M2-L10-FIX): the GEMV + tickets without the tails' work -- no tail output is written."""
+        pid_n = tl.program_id(0)
+        ks = tl.program_id(1)
+        if pid_n < TA:
+            if ks < NSA:
+                _t9b4_gemv_tile(xq, xs, wa, sa, outa, wsa, M, NA, KB, PERA, pid_n, ks, stride_xm, stride_xsm,
+                                stride_wan, stride_san, stride_oam, BLOCK_M, BLOCK_N, KU, EVENA, MMA, SPLITA)
+                fza = _l10_fence(tl.zeros([FT], dtype=tl.int32))     # this tile's stores before the ticket
+                tl.debug_barrier()
+                olda = tl.atomic_add(ticket, 1 + tl.sum(fza, axis=0), sem="acq_rel", scope="gpu")
+                if olda == TA * NSA - 1:                             # the last of half a: every partial is in
+                    fza2 = _l10_fence(tl.zeros([FT], dtype=tl.int32))
+                    tl.debug_barrier()
+                    za = tl.sum(fza2, axis=0)                        # (0: the loads below depend on the fence)
+                    if TAILS:
+                        if QNS == 0:
+                            _l10_norm_rows(outa + za, M, 0, qnw, qr, qr, qq, qs, qnw, 0, tab, q_eps, q_fac, q_wf,
+                                           QN, QT, QV, QU, QDEC, QDIV, False, True, False, 0, 0, 0, QBB, 0, RP)
+                        else:
+                            _l10_norm_rows(wsa + za, M, M * QN, qnw, qr, qr, qq, qs, qnw, 0, tab, q_eps, q_fac, q_wf,
+                                           QN, QT, QV, QU, QDEC, QDIV, False, True, False, 0, 0, 0, QBB, QNS, RP)
+                    tl.store(ticket, 0)
+        else:
+            if ks < NSB:
+                _t9b4_gemv_tile(xq, xs, wb, sb, outb, wsb, M, NB, KB, PERB, pid_n - TA, ks, stride_xm, stride_xsm,
+                                stride_wbn, stride_sbn, stride_obm, BLOCK_M, BLOCK_N, KU, EVENB, MMA, SPLITB)
+                fzb = _l10_fence(tl.zeros([FT], dtype=tl.int32))
+                tl.debug_barrier()
+                oldb = tl.atomic_add(ticket + 1, 1 + tl.sum(fzb, axis=0), sem="acq_rel", scope="gpu")
+                if oldb == TB * NSB - 1:                             # the last of half b
+                    fzb2 = _l10_fence(tl.zeros([FT], dtype=tl.int32))
+                    tl.debug_barrier()
+                    zb = tl.sum(fzb2, axis=0)
+                    if TAILS:
+                        if KNS == 0:
+                            _l10_norm_rows(outb + zb, M, 0, kvnw, ring, slot, kvnw, kvnw, freqs, FS, tab, kv_eps,
+                                           kv_fac, kv_wf, KN, KT, KV, KUN, KDEC, KDIV, True, False, True, RD, RE_MODE,
+                                           IM_MODE, KBB, 0, RP)
+                        else:
+                            _l10_norm_rows(wsb + zb, M, M * KN, kvnw, ring, slot, kvnw, kvnw, freqs, FS, tab, kv_eps,
+                                           kv_fac, kv_wf, KN, KT, KV, KUN, KDEC, KDIV, True, False, True, RD, RE_MODE,
+                                           IM_MODE, KBB, KNS, RP)
+                    tl.store(ticket + 1, 0)
+
+
+# ------------------------------------------------------------------------------------------------ M2-L10-FIX: stage form
+# docs/HANDOFF-M2-L10-FIX.md. The round-1 kernel above (form "fold") was 1.5 ms/step SLOWER at 6 rows on the box
+# (headline 20.30 -> 21.80, docs/box-m2-round1-20261107.log): its whole tail -- for every row, the split-K fold of NS
+# fp32 partials (read twice: statistic, then apply), the norm, RoPE, QDQ -- runs on the ONE last CTA of each half,
+# ceil(M / RP) serial passes, where the split path ran it on M CTAs (t9b2r2_norm_row's grid is (R,)) [cause (a) of the
+# handoff; (d) "overlapped before" is not the mechanism: static_step._attn issues q_path / q_proj / kv_path in one
+# stream, nothing overlapped -- the parallelism the split path had was across rows]. Form "stage" keeps the ONE launch
+# and the bits, and moves the serial work off the single CTA:
+#   1. dynamic CTA ids: every CTA first takes v = atomic_add(ticket[0], 1). v < NWORK (= the pair grid's G0 x G1
+#      programs, v -> (pn, ks) = (v % G0, v // G0), the CUDA linear order of that grid): the pair kernel's tile,
+#      `_t9b4_gemv_tile`, unchanged. v >= NWORK: a TAIL CTA (2 x ceil(M / RP) of them: half a's row groups, then
+#      half b's).
+#   2. per-tile ticket (split halves): the last of a tile's NS split programs folds that tile's [M, BLOCK_N] partials
+#      in t9b_splitk_reduce's order (from +0.0, split 0, 1, ...) and stores the bf16 -- `_t9b4_ld`'s value exactly --
+#      into a bf16 [M, N] stage buffer (unsplit halves: the tile's bf16 store already is that buffer), then counts
+#      the tile done on ticket[1 + h]. The fold is spread over TA (TB) CTAs instead of one.
+#   3. tail CTA (half h, rows [j*RP, (j+1)*RP)): waits until ticket[1 + h] == TA (TB) -- every tile of its half
+#      folded -- then runs `_l10_norm_pass` (the round-1 tail body, unchanged) on the bf16 stage rows (NS = 0: one
+#      bf16 load per element, not NS fp32 ones). RP = 1 (default): one row per CTA, the split path's parallelism.
+#   Why the wait cannot deadlock (CUB's decoupled look-back argument): a tail CTA only waits on work items whose ids
+#   are smaller than its own, and an id is handed out only to a CTA that is already running, so everything it waits
+#   on is resident or done; no CTA ever waits on one that has not started. No grid barrier, no co-residency
+#   assumption, any grid size.
+#   Reset (a graph replay starts from 0): the last split CTA of a tile zeroes that tile's ticket; the last tail CTA
+#   (ticket[3] == number of tails - 1: by then every CTA has taken its id and every counter access of this launch is
+#   done) zeroes ticket[0:4]. One ticket buffer serves every layer's launch because launches on it never overlap
+#   (stream order); with PDL (M2-L5) a dependent launch must gdc-wait before its first ticket atomic.
+# Numerics: the GEMV is the pair kernel's code under its launch options; the fold is fp32 adds only (no product to
+# contract); the tail is `_l10_norm_pass` (round-1's, block comment above); bf16(fold) stored and reloaded is the fp32
+# value `_t9b4_ld` / `_l10_load` hand the norm. Same bits as pair + norm_row + norm_row, any program order
+# (tests/test_qkv_tail_cpu.py, shim; tests/gpu/test_qkv_tail_gpu.py, box).
+L10_FORMS = ("stage", "fold")
+L10_FORM_DEFAULT = "stage"
+L10_FORM_ENV = "DSV41_QKV_TAIL_FORM"
+L10_TICKET_WORDS = 256   # int32 words a caller allocates per launch site (either form): fold uses [0:2]; stage uses
+#                          [0:4] + one per column tile (4 + TA + TB <= 256: N up to 8064 at BLOCK_N 32)
+L10_STAGE_RP = int(os.environ.get("DSV41_QKV_TAIL_STAGE_RP", "1"))   # rows per tail CTA (stage form; speed only)
+
+
+def qkv_tail_form(form: Optional[str] = None) -> str:
+    v = (form or os.environ.get(L10_FORM_ENV) or L10_FORM_DEFAULT).strip()
+    if v not in L10_FORMS:
+        raise ValueError(f"${L10_FORM_ENV}={v!r}: expected one of {L10_FORMS}")
+    return v
+
+
+if HAVE_TRITON:
+
+    @triton.jit
+    def _l10_reduce_tile(ws, st, M, N, pid_n, NS: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+        """Tile pid_n's fold: st[m, n] = bf16 of the sum of the NS fp32 partials ws[j, m, n] from +0.0 in split order
+        (t9b_splitk_reduce / _t9b4_ld's value; .cg: written by other CTAs of this launch), m < M, n in the tile."""
+        rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        rm = tl.arange(0, BLOCK_M)
+        msk = (rm < M)[:, None] & (rn < N)[None, :]
+        e = rm[:, None] * N + rn[None, :]
+        acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        for j in tl.static_range(NS):
+            acc = acc + tl.load(ws + j * (M * N) + e, mask=msk, other=0.0, cache_modifier=".cg")
+        tl.store(st + e, acc.to(tl.bfloat16, fp_downcast_rounding="rtne"), mask=msk)
+
+    @triton.jit
+    def _l10_publish(ticket, HSLOT: tl.constexpr, tslot, ws, st, M, N, pid_n, NS: tl.constexpr, SPLIT: tl.constexpr,
+                     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, FT: tl.constexpr):
+        """After a (tile, split) program's stores: split halves take the tile's ticket; its last split folds the tile
+        into the stage buffer, zeroes the tile ticket and counts the tile on ticket[HSLOT]. Unsplit halves: count the
+        tile directly (its bf16 store is the stage buffer)."""
+        f1 = _l10_fence(tl.zeros([FT], dtype=tl.int32))                     # this program's stores before the ticket
+        tl.debug_barrier()
+        if SPLIT:
+            told = tl.atomic_add(ticket + tslot, 1 + tl.sum(f1, axis=0), sem="acq_rel", scope="gpu")
+            if told == NS - 1:                                              # the tile's last split: all partials in
+                f2 = _l10_fence(tl.zeros([FT], dtype=tl.int32))
+                tl.debug_barrier()
+                z2 = tl.sum(f2, axis=0)
+                tl.store(ticket + tslot, 0)
+                _l10_reduce_tile(ws + z2, st, M, N, pid_n, NS, BLOCK_M, BLOCK_N)
+                f3 = _l10_fence(tl.zeros([FT], dtype=tl.int32))             # the stage stores before the count
+                tl.debug_barrier()
+                tl.atomic_add(ticket + HSLOT, 1 + tl.sum(f3, axis=0), sem="acq_rel", scope="gpu")
+        else:
+            tl.atomic_add(ticket + HSLOT, 1 + tl.sum(f1, axis=0), sem="acq_rel", scope="gpu")
+
+    @triton.jit
+    def _l10_wait(ticket, HSLOT: tl.constexpr, target, FT: tl.constexpr):
+        """Spin until ticket[HSLOT] >= target (acquire), then a fence in every thread; -> 0 for the loads to depend
+        on. Only ever waits on smaller dynamic ids (section comment: no deadlock)."""
+        seen = tl.atomic_add(ticket + HSLOT, 0, sem="acquire", scope="gpu")
+        while seen < target:
+            seen = tl.atomic_add(ticket + HSLOT, 0, sem="acquire", scope="gpu")
+        tl.debug_barrier()
+        fw = _l10_fence(tl.zeros([FT], dtype=tl.int32))
+        tl.debug_barrier()
+        return tl.sum(fw, axis=0)
+
+    @triton.jit
+    def l10_qkv_tail2(xq, xs, wa, sa, outa, wsa, sta, wb, sb, outb, wsb, stb, M, NA, NB, KB, PERA, PERB, NSA, NSB,
+                      TA, TB, G0, NWORK, NTA, NTB,
+                      stride_xm, stride_xsm, stride_wan, stride_san, stride_oam, stride_wbn, stride_sbn, stride_obm,
+                      ticket, tab,
+                      qnw, qr, qq, qs, q_eps, q_fac, q_wf,
+                      kvnw, ring, slot, freqs, FS, kv_eps, kv_fac, kv_wf,
+                      BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, KU: tl.constexpr, EVENA: tl.constexpr,
+                      EVENB: tl.constexpr, MMA: tl.constexpr, SPLITA: tl.constexpr, SPLITB: tl.constexpr,
+                      FT: tl.constexpr,
+                      QN: tl.constexpr, QT: tl.constexpr, QV: tl.constexpr, QU: tl.constexpr, QDEC: tl.constexpr,
+                      QDIV: tl.constexpr, QBB: tl.constexpr, QNS: tl.constexpr,
+                      KN: tl.constexpr, KT: tl.constexpr, KV: tl.constexpr, KUN: tl.constexpr, KDEC: tl.constexpr,
+                      KDIV: tl.constexpr, KBB: tl.constexpr, KNS: tl.constexpr, RD: tl.constexpr,
+                      RE_MODE: tl.constexpr, IM_MODE: tl.constexpr, RP: tl.constexpr, TAILS: tl.constexpr = True):
+        """M2-L10-FIX stage form (section comment): grid (NWORK + NTA + NTB,), dynamic ids. sta / stb: the halves'
+        bf16 [M, N] stage rows (the bf16 output itself when the half does not split). ticket words: [0] ids, [1] / [2]
+        tiles folded of half a / b, [3] tails done, [4 + pn] the split ticket of column tile pn. QNS / KNS: the half's
+        split count when it splits (the fold's constexpr), else 1. TAILS=False: bench phase probe (no tail output)."""
+        v = tl.atomic_add(ticket, 1, sem="relaxed", scope="gpu")
+        if v < NWORK:
+            pid_n = v % G0
+            ks = v // G0
+            if pid_n < TA:
+                if ks < NSA:
+                    _t9b4_gemv_tile(xq, xs, wa, sa, outa, wsa, M, NA, KB, PERA, pid_n, ks, stride_xm, stride_xsm,
+                                    stride_wan, stride_san, stride_oam, BLOCK_M, BLOCK_N, KU, EVENA, MMA, SPLITA)
+                    _l10_publish(ticket, 1, 4 + pid_n, wsa, sta, M, NA, pid_n, QNS, SPLITA, BLOCK_M, BLOCK_N, FT)
+            else:
+                if ks < NSB:
+                    _t9b4_gemv_tile(xq, xs, wb, sb, outb, wsb, M, NB, KB, PERB, pid_n - TA, ks, stride_xm,
+                                    stride_xsm, stride_wbn, stride_sbn, stride_obm, BLOCK_M, BLOCK_N, KU, EVENB, MMA,
+                                    SPLITB)
+                    _l10_publish(ticket, 2, 4 + pid_n, wsb, stb, M, NB, pid_n - TA, KNS, SPLITB, BLOCK_M, BLOCK_N,
+                                 FT)
+        else:
+            j = v - NWORK
+            if j < NTA:
+                zq = _l10_wait(ticket, 1, TA, FT)
+                if TAILS:
+                    _l10_norm_pass(sta + zq, j * RP + tl.arange(0, RP), M, 0, qnw, qr, qr, qq, qs, qnw, 0, tab,
+                                   q_eps, q_fac, q_wf, QN, QT, QV, QU, QDEC, QDIV, False, True, False, 0, 0, 0, QBB, 0,
+                                   RP)
+            else:
+                zk = _l10_wait(ticket, 2, TB, FT)
+                if TAILS:
+                    _l10_norm_pass(stb + zk, (j - NTA) * RP + tl.arange(0, RP), M, 0, kvnw, ring, slot, kvnw, kvnw,
+                                   freqs, FS, tab, kv_eps, kv_fac, kv_wf, KN, KT, KV, KUN, KDEC, KDIV, True, False,
+                                   True, RD, RE_MODE, IM_MODE, KBB, 0, RP)
+            fd = _l10_fence(tl.zeros([FT], dtype=tl.int32))                 # this tail's stores before the count
+            tl.debug_barrier()
+            dn = tl.atomic_add(ticket + 3, 1 + tl.sum(fd, axis=0), sem="acq_rel", scope="gpu")
+            if dn == NTA + NTB - 1:                                         # the last CTA of the launch to count
+                tl.store(ticket, 0)
+                tl.store(ticket + 1, 0)
+                tl.store(ticket + 2, 0)
+                tl.store(ticket + 3, 0)
+
+
+def qkv_tail_plan(pp: dict, M: int, NA: int, NB: int, rp: Optional[int] = None, form: str = "fold") -> dict:
+    """The tail-side constexprs that depend only on the pair plan and M: which halves split (QNS / KNS: the split
+    count read in the tail, 0 = the bf16 output), the per-half ticket counts, the fence width, the tails' rows per
+    pass RP (min(next_pow2(M), rp or L10_TAIL_RP), a power of two; speed only) and their 32-block tiles (metadata;
+    the Mac tests check it). form "stage" (M2-L10-FIX): RP = rows per tail CTA (default L10_STAGE_RP), NTA = NTB =
+    ceil(M / RP) tail CTAs per half, NWORK = the pair grid's programs, ticket words needed 4 + TA + TB."""
+    out = {"QNS": int(pp["NSA"]) if pp["NSA"] > 1 else 0, "KNS": int(pp["NSB"]) if pp["NSB"] > 1 else 0,
+           "tickets": (int(pp["TA"]) * int(pp["NSA"]), int(pp["TB"]) * int(pp["NSB"])),
+           "FT": 32 * int(pp["num_warps"]), "RP": min(_np2(M), _np2(max(1, int(rp or L10_TAIL_RP)))),
+           "QBB": min(16, _np2(NA // BLOCK)), "KBB": min(16, _np2(NB // BLOCK)), "form": form}
+    if form == "stage":
+        rps = min(_np2(M), _np2(max(1, int(rp or L10_STAGE_RP))))
+        nt = -(-int(M) // rps)
+        g0, g1 = pp["grid"]
+        out.update(RP=rps, NTA=nt, NTB=nt, NWORK=int(g0) * int(g1), G0=int(g0),
+                   grid=(int(g0) * int(g1) + 2 * nt,), ticket_words=4 + int(pp["TA"]) + int(pp["TB"]))
+    return out
+
+
+def _np2(n: int) -> int:
+    return 1 << max(0, (int(n) - 1).bit_length())
+
+
+L10_STATS = {"fused": 0, "refused": 0, "stage": 0, "fold": 0}   # host-side counts of qkv_pair_tail calls: one launch
+#                                                                  (by form) / refused
+L10_COMPILED: Dict[tuple, dict] = {}   # (form, M, RP, TAILS) -> the compiled kernel's registers / spills (eager only)
+
+
+def kernel_meta(k) -> Optional[dict]:
+    """n_regs / n_spills / num_warps / shared of a Triton launch's returned CompiledKernel (None when unavailable:
+    the shim, other Triton versions)."""
+    if k is None:
+        return None
+    md = getattr(k, "metadata", None)
+    out = {"n_regs": getattr(k, "n_regs", None), "n_spills": getattr(k, "n_spills", None),
+           "num_warps": getattr(md, "num_warps", None), "shared": getattr(md, "shared", None)}
+    return out if any(v is not None for v in out.values()) else None
+
+
+def qkv_pair_tail(xq, xs, wa, sa, wb, sb, *, ticket: torch.Tensor, tab: torch.Tensor, q_tail: dict, kv_tail: dict,
+                  tags: Tuple[str, str] = ("", ""),
+                  configs: Tuple[Optional[GemvConfig], Optional[GemvConfig]] = (None, None),
+                  rp: Optional[int] = None, form: Optional[str] = None, tails: bool = True):
+    """M2-L10: gemv_pair(xq, xs, wa, sa, wb, sb) and both consumers in ONE launch (section comments). Kernel path only
+    (CUDA, or the shim with KERNELS_ON_CPU); the CPU mirror is runtime/fused_glue_r2.launch_qkv_tail's.
+      q_tail  = {nw [NA] bf16, qr [M, NA] bf16, q [M, NA] fp8, s [M, NA/32] e8m0, eps, fac, wf, order (T, V, U, DEC,
+                 DIV)}
+      kv_tail = {nw [NB] bf16, ring (bf16, rows of NB, contiguous), slot [M] int64, freqs fp32 [RD/2, 2] or
+                 [M, RD/2, 2] contiguous (None when RD == 0), FS (freqs row stride), rd, modes (re, im), eps, fac, wf,
+                 order}
+      ticket  = int32 [>= L10_TICKET_WORDS for form stage, >= L10_TICKETS for fold], zero (left zero by every launch).
+      form    = "stage" (M2-L10-FIX, default $DSV41_QKV_TAIL_FORM or L10_FORM_DEFAULT) | "fold" (round 1).
+      rp      = fold: the single tail CTA's rows per pass (default L10_TAIL_RP); stage: rows per tail CTA (default
+                L10_STAGE_RP). Speed only.
+      tails   = False: bench phase probe only (the GEMV + tickets, no tail output written).
+    The GEMV configs are gemv_pair's exactly (the same `_resolved` + `pair_plan`: tuned config, split-K, warps,
+    stages) -> (result_a, result_b) as gemv_pair's (bf16 [M, N] or SplitK, still valid after the launch), or None
+    when the halves cannot share a launch (pair_plan refuses: the caller runs the split path)."""
+    M, NA, K = check_operands(xq, xs, wa, sa)
+    _, NB, _ = check_operands(xq, xs, wb, sb)
+    if not _kern_gemv(xq):
+        raise RuntimeError("qkv_pair_tail: kernel path only (CUDA or the shim); the CPU mirror is fused_glue_r2's")
+    fm = qkv_tail_form(form)
+    if NA % BLOCK or NB % BLOCK or ticket.dtype != torch.int32 or ticket.numel() < L10_TICKETS:
+        raise ValueError(f"qkv_pair_tail: NA {NA} / NB {NB} must be 32-multiples, ticket int32 [{L10_TICKETS}]")
+    cfg_a = _resolved(NA, K, M, xq.device, configs[0])
+    cfg_b = _resolved(NB, K, M, xq.device, configs[1])
+    pp = pair_plan(cfg_a, cfg_b, M, NA, NB, K)
+    if pp is None:
+        L10_STATS["refused"] += 1
+        return None
+    tp = qkv_tail_plan(pp, M, NA, NB, rp, fm)
+    if fm == "stage" and ticket.numel() < tp["ticket_words"]:
+        raise ValueError(f"qkv_pair_tail: form stage needs {tp['ticket_words']} int32 ticket words, got "
+                         f"{ticket.numel()} (allocate L10_TICKET_WORDS)")
+    res, bufs = [], []
+    for w, ns, tag in ((wa, pp["NSA"], tags[0]), (wb, pp["NSB"], tags[1])):
+        N = w.size(0)
+        if ns > 1:
+            ws = workspace(xq.device, M, N, ns, tag or f"t9b4:{w.data_ptr():x}")
+            st = torch.empty(M, N, dtype=torch.bfloat16, device=xq.device) if fm == "stage" else ws
+            bufs.append((ws[0], ws, st))
+            res.append(SplitK(ws, ns))
+        else:
+            out = torch.empty(M, N, dtype=torch.bfloat16, device=xq.device)
+            bufs.append((out, out, out))
+            res.append(out)
+    qt, kt = q_tail, kv_tail
+    qo, ko = qt["order"], kt["order"]
+    rd = int(kt.get("rd", 0) or 0)
+    modes = tuple(kt.get("modes", (0, 0)))
+    fr = kt.get("freqs") if rd else None
+    L10_STATS["fused"] += 1
+    L10_STATS[fm] += 1
+    tail_args = (ticket, tab, qt["nw"], qt["qr"], qt["q"], qt["s"].view(torch.uint8), float(qt["eps"]),
+                 float(qt["fac"]), float(qt["wf"]), kt["nw"], kt["ring"], kt["slot"],
+                 fr if fr is not None else kt["nw"], int(kt.get("FS", 0) or 0), float(kt["eps"]), float(kt["fac"]),
+                 float(kt["wf"]))
+    strides = (xq.stride(0), xs.stride(0), wa.stride(0), sa.stride(0), bufs[0][0].stride(0), wb.stride(0),
+               sb.stride(0), bufs[1][0].stride(0))
+    ce = dict(BLOCK_M=pp["BLOCK_M"], BLOCK_N=pp["BLOCK_N"], KU=pp["KU"], EVENA=pp["EVENA"], EVENB=pp["EVENB"],
+              MMA=pp["MMA"], SPLITA=pp["NSA"] > 1, SPLITB=pp["NSB"] > 1, FT=tp["FT"],
+              QN=NA, QT=int(qo["T"]), QV=int(qo["V"]), QU=bool(qo["U"]), QDEC=bool(qo["DEC"]), QDIV=bool(qo["DIV"]),
+              QBB=tp["QBB"], KN=NB, KT=int(ko["T"]), KV=int(ko["V"]), KUN=bool(ko["U"]), KDEC=bool(ko["DEC"]),
+              KDIV=bool(ko["DIV"]), KBB=tp["KBB"], RD=rd, RE_MODE=int(modes[0]), IM_MODE=int(modes[1]), RP=tp["RP"],
+              TAILS=bool(tails), num_warps=pp["num_warps"], num_stages=pp["num_stages"])
+    if fm == "stage":
+        k = l10_qkv_tail2[tp["grid"]](
+            xq, xs.view(torch.uint8), wa, sa.view(torch.uint8), bufs[0][0], bufs[0][1], bufs[0][2], wb,
+            sb.view(torch.uint8), bufs[1][0], bufs[1][1], bufs[1][2], M, NA, NB, K // BLOCK, pp["PERA"], pp["PERB"],
+            pp["NSA"], pp["NSB"], pp["TA"], pp["TB"], tp["G0"], tp["NWORK"], tp["NTA"], tp["NTB"], *strides,
+            *tail_args, QNS=max(1, tp["QNS"]), KNS=max(1, tp["KNS"]), **ce)
+    else:
+        k = l10_qkv_tail[pp["grid"]](
+            xq, xs.view(torch.uint8), wa, sa.view(torch.uint8), bufs[0][0], bufs[0][1], wb, sb.view(torch.uint8),
+            bufs[1][0], bufs[1][1], M, NA, NB, K // BLOCK, pp["PERA"], pp["PERB"], pp["NSA"], pp["NSB"], pp["TA"],
+            pp["TB"], *strides, *tail_args, QNS=tp["QNS"], KNS=tp["KNS"], **ce)
+    key = (fm, int(M), int(tp["RP"]), bool(tails))
+    if key not in L10_COMPILED and not _capturing():
+        meta = kernel_meta(k)
+        if meta is not None:
+            L10_COMPILED[key] = meta
+    return res[0], res[1]
