@@ -892,6 +892,23 @@ class StaticStep:
                                     deterministic=self.dg_deterministic)
             self.dg.spare_added_B = added
             moe_cls = DGInplaceMoE
+        if self.moe_impl == "dg-mega":  # M2-L3 (runtime/dg_mega.py): ONE MegaMoE launch per layer, any rows <= T
+            from runtime import dg_mega as DM
+
+            if pool is None:
+                raise ValueError("moe_impl dg-mega needs the model's ExpertPool")
+            if self.rows > 1:  # compact cold index over the step's unique cold experts, overflow counted
+                s = int(os.environ.get(DM.SPARE_ENV, 0) or DEFAULT_SPARE_SLOTS_ROWS)
+                spare = min(max(s, 1), ns)
+                self._ovf_on = True
+            else:              # 1 row: <= k unique cold experts, never overflows ($DSV41_MEGA_SPARE may add more)
+                spare = max(k, int(os.environ.get(DM.SPARE_ENV, 0) or 0))
+            self.spare_slots = spare
+            added = pool.add_spare_slots(spare, self.model)  # before the pointer tables (storage moves)
+            self.dg = DM.DGMegaBuffers(self, shapes, sshapes, pool=pool, swiglu_limit=lim,
+                                       spare_slots=spare, deterministic=self.dg_deterministic)
+            self.dg.spare_added_B = added
+            moe_cls = DM.DGMegaMoE
         n_layers, n_exp = len(layers), moe0.n_routed_experts
         cold = torch.zeros(n_layers, n_exp, dtype=torch.long)
         gather_vec = os.environ.get(GATHER_IMPL_ENV, "vec") != "u8"
