@@ -41,6 +41,13 @@ ratios); the window stores `total_gpu_ms` and `total_emitted_tokens` and the sum
 total emitted tokens = X ms / N tokens = Y". The report carries a `receipt` block (bench/receipt.py: git commit +
 dirty-tree sha256, DSV41_* switches, impls, checkpoint config hash, fixture hash, torch/triton/cuda, driver, GPU uuid,
 SM/mem clocks at start and end, residency condition, start/end wall time).
+STEADY STATE (docs/HEADLINE-COLUMNS.md): with residency on (default) a second column is measured -- `--steady-state` /
+`--no-steady-state`. AFTER every headline cell (two_graphs, then one_graph) the loop is put back on the headline cell's
+graph count (a recapture when the last cell was the one-graph one; the policy is not touched) and the SAME cell (same 8
+prompts, same fast/parity reps) is re-run with the residency policy carried over, no reset. It lands in the separate
+top-level `steady_state` block (ms/step, verify + draft, tok/step, ms/token as total/total, cold share, swaps, streams
+exact vs the 1-row truth, self-replay, the `policy_steps_before` it was warmed by, delta vs the headline); `headline.*`
+and every key under it are unchanged. Extra box time is one more pass of the cell (about 3-4 min).
 The C1 instrument proper (nsys cudaProfilerApi range) is M1-T13; --profile TAG:FIRST:N opens that range around N steps
 of one prompt's first fast run, for `nsys profile --capture-range=cudaProfilerApi`.
 
@@ -83,6 +90,9 @@ CHARTER_BAR_MS = 5.0                                 # PROJECT.md bar
 MS_PER_TOKEN_DEF = ("total GPU ms / total emitted tokens: sum of the CUDA-event step times (verify graph + draft graph) "
                     "over the window's live steps, divided by the sum of tokens emitted in those steps "
                     "(accepted drafts + 1 per step), pooled over all prompts and fast reps")
+STEADY_STATE_DEF = ("steady_state = the headline cell run a SECOND time on the same 8 prompts with the residency "
+                    "policy state carried over (no reset): every headline cell has run before it, so the policy has "
+                    "seen `policy_steps_before` manager steps. Same instrument, same window, same ms/token definition")
 
 
 # ------------------------------------------------------------------------------------------------ pure helpers
@@ -372,6 +382,195 @@ def mode_gap_line(mg: Optional[dict]) -> Optional[str]:
     return s
 
 
+# ------------------------------------------------------------------------------------------------ steady state
+CELL_KEYS = {2: "two_graphs", 1: "one_graph", 0: "eager"}
+
+
+def resolve_steady_state(flag: Optional[bool], res_cfg, graphs: Sequence[int]) -> tuple:
+    """(enabled, why). flag: True = --steady-state, False = --no-steady-state, None = the default: ON when residency is
+    on, OFF otherwise (nothing warms up without the swap policy; an explicit --steady-state without residency runs the
+    pass anyway as a control -- it should equal the headline within noise)."""
+    if not graphs:
+        return False, "no cell to repeat"
+    if flag is False:
+        return False, "--no-steady-state"
+    if flag is True:
+        return True, "--steady-state" + ("" if res_cfg else " (residency off: a control pass, no policy to warm)")
+    if res_cfg is not None:
+        return True, "default: residency on"
+    return False, "default: residency off (no swap policy to warm; --steady-state forces a control pass)"
+
+
+def mgr_snapshot(rm) -> Optional[dict]:
+    """The residency manager's monotone counters right now (host side only: no flush, no sync, nothing perturbed)."""
+    if rm is None:
+        return None
+    try:
+        return {"host_steps": int(rm.host_steps), "swaps": int(sum(k for _, k in rm.swap_steps)),
+                "steps_with_swaps": len(rm.swap_steps), "issued": int(rm.stats.get("issued", 0)),
+                "published": int(rm.stats.get("published", 0)), "policy_swaps": int(rm.state.n_swaps),
+                "drains": int(rm.stats.get("drains", 0)), "drain_log_n": len(rm.drain_log),
+                "drain_log": [(r.get("host_steps"), r.get("cold_share")) for r in rm.drain_log]}
+    except Exception:  # noqa: BLE001 - telemetry never breaks a run
+        return None
+
+
+def mgr_delta(s0: Optional[dict], s1: Optional[dict]) -> Optional[dict]:
+    """What the manager did between two snapshots: manager steps, swaps issued (+ per step, steps with swaps), swaps
+    the policy decided and published, drains and their cold shares -- plus what had accumulated BEFORE (`*_before`)."""
+    if not s0 or not s1:
+        return None
+    n = s1["host_steps"] - s0["host_steps"]
+    cs = [c for _, c in s1["drain_log"][s0["drain_log_n"]:] if c is not None]
+    return {"manager_steps": n, "swaps": s1["swaps"] - s0["swaps"],
+            "swaps_per_step": (s1["swaps"] - s0["swaps"]) / n if n else None,
+            "steps_with_swaps": s1["steps_with_swaps"] - s0["steps_with_swaps"],
+            "issued": s1["issued"] - s0["issued"], "published": s1["published"] - s0["published"],
+            "policy_swaps": s1["policy_swaps"] - s0["policy_swaps"], "drains": s1["drains"] - s0["drains"],
+            "drain_cold_share": {"n": len(cs), "first": cs[0] if cs else None, "last": cs[-1] if cs else None,
+                                 "mean": _mean(cs)},
+            "policy_steps_before": s0["host_steps"], "swaps_before": s0["swaps"],
+            "policy_swaps_before": s0["policy_swaps"], "drains_before": s0["drains"]}
+
+
+def run_steady_state(loop, rm, prompts: Dict[str, dict], max_new: int, ng: int, *, reps: int, parity_reps: int,
+                     stop_on_eos: bool, rep: dict, log=print) -> dict:
+    """The steady-state pass: the headline cell (`ng` graphs: 2 / 1 / 0 = eager) once more, same prompts, same fast and
+    parity reps, with the residency policy exactly as the cells left it (no reset; the only touch is that
+    residency_report's flush already published in-flight swaps). Re-captures when the loop's graphs are not `ng`
+    (the one-graph cell ran last): capture() zeroes the loop's own counters, never the manager's. Returns
+    {"results", "snap0", "snap1", "recaptured", "capture", "overflow", "start_wall", "end_wall", "error"}."""
+    out: dict = {"results": {}, "snap0": None, "snap1": None, "recaptured": False, "capture": None, "overflow": None,
+                 "start_wall": time.time(), "error": None}
+    try:
+        if ng and getattr(loop, "n_graphs", None) != ng:
+            out["capture"] = loop.capture(n_graphs=ng)
+            out["recaptured"] = True
+        out["snap0"] = mgr_snapshot(rm)
+        ovf0 = loop.st.overflow_counts()
+        log(f"[steady-state] {CELL_KEYS.get(ng, ng)} again, residency carried over (policy steps before: "
+            f"{(out['snap0'] or {}).get('host_steps')}, recaptured {out['recaptured']})", flush=True)
+        out["results"] = run_prompts(loop, prompts, max_new, reps=max(1, reps), parity_reps=parity_reps,
+                                     stop_on_eos=stop_on_eos, errors=rep.setdefault("errors", []),
+                                     label=(f"steady-{ng}g" if ng else "steady-eager"), log=log)
+        out["snap1"] = mgr_snapshot(rm)
+        ovf1 = loop.st.overflow_counts()
+        if ovf1 is not None:
+            o0 = ovf0 or {}
+            out["overflow"] = dict(ovf1, steps=ovf1["steps"] - o0.get("steps", 0),
+                                   experts=ovf1["experts"] - o0.get("experts", 0),
+                                   steps_counted=ovf1["steps_counted"] - o0.get("steps_counted", 0))
+    except Exception:
+        out["error"] = traceback.format_exc()
+        rep.setdefault("errors", []).append({"stage": "steady-state", "traceback": out["error"]})
+        log(f"[steady-state] FAILED\n{out['error']}", file=sys.stderr, flush=True)
+    out["end_wall"] = time.time()
+    return out
+
+
+def steady_state_block(run: dict, prompts: Dict[str, dict], rep: dict, ng: int, stats_from: int, *, reps: int,
+                       parity_reps: int, why: str = "") -> dict:
+    """The top-level `steady_state` report block from run_steady_state's output and the finished headline report
+    (rep["prompts"], rep["headline"][cell]). Same checks as `aggregate`, for this pass alone: stream vs the 1-row truth,
+    self-replay (fast reps == parity reps, parity records byte-identical, logits digests equal), and the pass's tokens
+    / accept lengths equal to the headline cell's. Headline keys are read, never written."""
+    from runtime.generate import dump_record
+
+    key = CELL_KEYS.get(ng, str(ng))
+    res = run.get("results") or {}
+    per: Dict[str, dict] = {}
+    n_exact = n_replay = n_same = 0
+    for tag, p in prompts.items():
+        r = res.get(tag)
+        if not r or not (r.get("fast") or r.get("parity")):
+            continue
+        fast, par = r["fast"], r["parity"]
+        base = par[0] if par else fast[0]
+        ids_ = base["token_ids"]
+        s = compare_stream(ids_, p["r1_ids"], base.get("step_sha256"), p.get("r1_sha"), base.get("record"), p.get("r1_rec"))
+        replay = all(x["token_ids"] == ids_ and x["accepts"] == base["accepts"] for x in fast + par)
+        if len(par) > 1:
+            replay = replay and all(dump_record(x["record"]) == dump_record(par[0]["record"]) and
+                                    x["logits_sha256"] == par[0]["logits_sha256"] for x in par[1:])
+        sha = hashlib.sha256(json.dumps([int(t) for t in ids_]).encode()).hexdigest()
+        hp = (rep.get("prompts") or {}).get(tag) or {}
+        same = bool(hp) and hp.get("tokens_sha256") == sha and hp.get("accepts") == base["accepts"]
+        n_exact += bool(s["exact"])
+        n_replay += bool(replay)
+        n_same += same
+        per[tag] = {"tokens": len(ids_), "steps": base["steps"], "tokens_sha256": sha,
+                    "tokens_per_step": base["tokens_per_step"], "accepts": base["accepts"], "stream": s,
+                    "replay_ok": replay, "equal_headline_cell": same,
+                    "cold_share_by_rep": [x.get("cold_share") for x in fast], "window": window(fast, stats_from),
+                    "prefill_ms": [x["prefill_ms"] for x in fast], "wall_ms_fast": [x["wall_ms"] for x in fast]}
+    fastruns = [x for v in res.values() for x in v["fast"]]
+    w = window(fastruns, stats_from)
+    cold = cold_pooled(fastruns)
+    hw = ((rep.get("headline") or {}).get(key)) or {}
+    hm = (hw.get("ms_per_step") or {}).get("mean")
+    sm = (w.get("ms_per_step") or {}).get("mean")
+    vs = {"cell": key, "headline_ms_per_step": hm, "steady_ms_per_step": sm,
+          "delta_ms_per_step": (sm - hm) if (sm is not None and hm is not None) else None,
+          "delta_pct": ((sm - hm) / hm * 100) if (sm is not None and hm) else None,
+          "headline_ms_per_token": hw.get("ms_per_token"), "steady_ms_per_token": w.get("ms_per_token"),
+          "headline_tokens_per_step": hw.get("tokens_per_step"), "steady_tokens_per_step": w.get("tokens_per_step"),
+          "headline_cold_share": hw.get("cold_share"), "steady_cold_share": cold,
+          "streams_equal_headline_cell": n_same, "prompts": len(per)}
+    if w.get("ms_per_step_incl_manager") and hw.get("ms_per_step_incl_manager"):
+        vs["headline_ms_per_step_incl_manager"] = hw["ms_per_step_incl_manager"]
+        vs["steady_ms_per_step_incl_manager"] = w["ms_per_step_incl_manager"]
+        vs["delta_incl_manager_ms"] = w["ms_per_step_incl_manager"] - hw["ms_per_step_incl_manager"]
+    sw = mgr_delta(run.get("snap0"), run.get("snap1"))
+    return {"enabled": True, "why": why, "cell": key, "definition": STEADY_STATE_DEF, "ok": run.get("error") is None,
+            "order": "after every headline cell (two_graphs, then one_graph); residency policy carried over, no reset",
+            "stats_from_step": stats_from, "reps": max(1, reps), "parity_reps": parity_reps,
+            "metric": METRIC, "n_prompts": len(per),
+            "ms_per_6row_step_dspark_k5": sm, "ms_verify_graph": (w.get("ms_verify_graph") or {}).get("mean"),
+            "ms_draft_graph": (w.get("ms_draft_graph") or {}).get("mean"), "tokens_per_step": w.get("tokens_per_step"),
+            "ms_per_token": w.get("ms_per_token"), "total_gpu_ms": w.get("total_gpu_ms"),
+            "total_emitted_tokens": w.get("total_emitted_tokens"), "ms_per_token_definition": MS_PER_TOKEN_DEF,
+            "ms_per_step_incl_manager": w.get("ms_per_step_incl_manager"), "cold_share": cold,
+            "window": w, "swaps": sw, "policy_steps_before": (sw or {}).get("policy_steps_before"),
+            "streams": {"exact": n_exact, "prompts": len(per)}, "replay_ok": n_replay,
+            "overflow": run.get("overflow"), "vs_headline": vs, "prompts": per,
+            "recaptured": run.get("recaptured"), "capture": run.get("capture"), "error": run.get("error"),
+            "start_wall": run.get("start_wall"), "end_wall": run.get("end_wall"),
+            "wall_s": (run["end_wall"] - run["start_wall"]) if run.get("end_wall") and run.get("start_wall") else None}
+
+
+def steady_state_off_block(why: str) -> dict:
+    return {"enabled": False, "why": why, "definition": STEADY_STATE_DEF}
+
+
+def steady_state_lines(ss: Optional[dict]) -> List[str]:
+    if not ss:
+        return []
+    f = lambda x, d=2: "-" if x is None else f"{x:.{d}f}"  # noqa: E731
+    if not ss.get("enabled"):
+        return [f"  steady_state: off ({ss.get('why')})"]
+    v, sw = ss.get("vs_headline") or {}, ss.get("swaps") or {}
+    mgs = (f" [+ manager = {f(ss.get('ms_per_step_incl_manager'))}]" if ss.get("ms_per_step_incl_manager") is not None else "")
+    cs = lambda x: "-" if x is None else f"{x * 100:.2f}%"  # noqa: E731
+    lines = [f"  steady_state ({ss.get('cell')} again, residency carried over, after {ss.get('policy_steps_before')} manager "
+             f"steps): {f(ss.get('ms_per_6row_step_dspark_k5'))} ms/step{mgs} (verify {f(ss.get('ms_verify_graph'))} + draft "
+             f"{f(ss.get('ms_draft_graph'))}) | {f(ss.get('tokens_per_step'), 3)} tok/step | {f(ss.get('ms_per_token'))} ms/token"
+             f" | cold share {cs(ss.get('cold_share'))} (headline {cs(v.get('headline_cold_share'))}) | swaps "
+             f"{sw.get('swaps', '-')} ({f(sw.get('swaps_per_step'), 3)}/step over {sw.get('manager_steps', '-')} steps)"]
+    tg, tt = ss.get("total_gpu_ms"), ss.get("total_emitted_tokens")
+    if tg is not None and tt:
+        lines.append(f"  steady_state  ms/token = total GPU ms / total emitted tokens = {f(tg, 1)} ms / {tt} tokens = "
+                     f"{f(tg / tt, 3)}  [measured: CUDA events; window steps >= {ss.get('stats_from_step')}, "
+                     f"{(ss.get('window') or {}).get('steps')} steps]")
+    lines.append(f"  steady_state vs headline {ss.get('cell')}: {f(v.get('delta_ms_per_step'), 3)} ms/step "
+                 f"({f(v.get('delta_pct'))}%), ms/token {f(v.get('headline_ms_per_token'))} -> {f(v.get('steady_ms_per_token'))}"
+                 f"; tokens equal headline cell {v.get('streams_equal_headline_cell')}/{v.get('prompts')}")
+    st = ss.get("streams") or {}
+    lines.append(f"  steady_state streams exact vs 1-row: {st.get('exact')}/{st.get('prompts')}; self-replay ok: "
+                 f"{ss.get('replay_ok')}/{ss.get('n_prompts')}; overflow {(ss.get('overflow') or {}).get('steps', '-')}; "
+                 f"pass {f(ss.get('wall_s'), 0)} s" + (f"; FAILED: {str(ss['error'])[-120:]}" if ss.get("error") else ""))
+    return lines
+
+
 def summary_lines(rep: dict) -> List[str]:
     h = rep.get("headline") or {}
     f = lambda x, d=2: "-" if x is None else f"{x:.{d}f}"  # noqa: E731
@@ -406,6 +605,7 @@ def summary_lines(rep: dict) -> List[str]:
     mgl = mode_gap_line(rep.get("mode_gap"))
     if mgl:
         lines.append(mgl)
+    lines.extend(steady_state_lines(rep.get("steady_state")))
     lines.append(f"  vs Pg61 {PG61_MS_PER_STEP} ms/step (bar {CHARTER_BAR_MS}); prefill {f(h.get('prefill_ms_mean'), 1)} ms "
                  f"mean; HBM after build {rep.get('hbm_after_build_GiB')}")
     lines.append(f"  {'prompt':6s} {'tok':>4s} {'steps':>5s} {'tok/st':>6s} {'ms/step':>8s} {'ms/tok':>7s} "
@@ -474,6 +674,11 @@ def build_parser() -> argparse.ArgumentParser:
     add_cli_args(ap)
     ap.add_argument("--residency-ref", default=None,
                     help="the residency-off run's headline JSON: per prompt tokens/accepts equal, ms/step delta")
+    ap.add_argument("--steady-state", dest="steady_state", action="store_true", default=None,
+                    help="after the headline cells, re-run the headline cell with the residency state carried over -> "
+                         "the `steady_state` block (default ON when residency is on)")
+    ap.add_argument("--no-steady-state", dest="steady_state", action="store_false",
+                    help="headline columns only (no second pass)")
     ap.add_argument("--residency-audit", action="store_true",
                     help="end of run: sha256 of every moved expert (HBM and Grace copies) vs the checkpoint shards")
     return ap
@@ -644,7 +849,22 @@ def _mean(xs) -> Optional[float]:
     return sum(xs) / len(xs) if xs else None
 
 
-def residency_report(gen, a, rep: dict, results: Dict[int, Dict[str, dict]], graphs: Sequence[int]) -> dict:
+def residency_audit(gen, rep: dict, out: dict) -> None:
+    """--residency-audit: sha256 of every moved expert (HBM and Grace copies) vs the checkpoint shards -> out["audit"]."""
+    try:
+        from runtime.residency import golden_from_index
+
+        out["audit"] = gen.residency_mgr.audit(golden=golden_from_index(gen.model.runtime_load.index))
+        if not out["audit"]["ok"]:
+            rep["errors"].append({"stage": "residency_audit", "traceback": str(out["audit"]["errors"][:8])})
+    except Exception:
+        tb = traceback.format_exc()
+        print(f"[residency] audit FAILED\n{tb}", file=sys.stderr, flush=True)
+        rep["errors"].append({"stage": "residency_audit", "traceback": tb})
+
+
+def residency_report(gen, a, rep: dict, results: Dict[int, Dict[str, dict]], graphs: Sequence[int],
+                     audit: bool = True) -> dict:
     """A2-2 (docs/A2-2-BOX-PLAN.md): the manager's budget / HBM / stats / policy telemetry, swaps per step (mean, max
     vs the cap), the cold-share curve over the whole run -- per drain (the policy's cold picks / routed picks since
     the previous drain) and per sequence in run order (the step's cold-call counters, `cold_share_by_seq`) -- the
@@ -704,12 +924,8 @@ def residency_report(gen, a, rep: dict, results: Dict[int, Dict[str, dict]], gra
             out["vs_off"] = vs
             if vs["all_accepts_equal"] is False or vs["all_tokens_equal"] is False:
                 rep["errors"].append({"stage": "residency_vs_off", "traceback": f"residency on != off: {vs['prompts']}"})
-        if a.residency_audit:
-            from runtime.residency import golden_from_index
-
-            out["audit"] = rm.audit(golden=golden_from_index(gen.model.runtime_load.index))
-            if not out["audit"]["ok"]:
-                rep["errors"].append({"stage": "residency_audit", "traceback": str(out["audit"]["errors"][:8])})
+        if a.residency_audit and audit:
+            residency_audit(gen, rep, out)
     except Exception:
         tb = traceback.format_exc()
         print(f"[residency] report FAILED\n{tb}", file=sys.stderr, flush=True)
@@ -738,8 +954,15 @@ def _begin_receipt(a, impls: dict, map_path: Optional[str], argv) -> dict:
         res = config_from_args(a)
     except Exception:  # noqa: BLE001
         res = None
+    try:
+        g0 = [int(x) for x in a.graphs.split(",") if x.strip()] if a.mode == "graph" else [0]
+        on, why = resolve_steady_state(a.steady_state, res, g0)
+        ss = {"enabled": on, "why": why, "cell": CELL_KEYS.get(g0[0]) if g0 else None, "reps": max(1, a.reps),
+              "parity_reps": a.parity_reps, "stats_from_step": a.stats_from}
+    except Exception:  # noqa: BLE001
+        ss = None
     return _receipt.begin(argv=argv, impls=impls, model_dir=a.model_dir, fixture=a.fixture,
-                          residency=res, map_path=map_path, config_path=a.config)
+                          residency=res, map_path=map_path, config_path=a.config, steady_state=ss)
 
 
 def main(argv=None) -> int:
@@ -872,7 +1095,25 @@ def main(argv=None) -> int:
     # 3. compare + aggregate
     aggregate(rep, prompts, results, run_graphs, a.stats_from)
     if res_cfg is not None:
-        rep["residency"] = residency_report(gen, a, rep, results, run_graphs)   # before loop.close() restores the map
+        # before loop.close() restores the map; the headline cells' residency record, closed BEFORE the steady-state pass
+        # (the pass is its own block; --residency-audit runs after it so the audit covers every move)
+        rep["residency"] = residency_report(gen, a, rep, results, run_graphs, audit=False)
+    ss_on, ss_why = resolve_steady_state(a.steady_state, res_cfg, run_graphs)
+    if ss_on:
+        # STEADY STATE (docs/HEADLINE-COLUMNS.md): the headline cell again, residency carried over. After aggregate() and
+        # the residency report, so headline.*, prompts, streams and residency.* are exactly what they were without it.
+        ss_run = run_steady_state(loop, getattr(gen, "residency_mgr", None), prompts, a.max_new, run_graphs[0],
+                                  reps=a.reps, parity_reps=a.parity_reps, stop_on_eos=stop, rep=rep)
+        rep["steady_state"] = steady_state_block(ss_run, prompts, rep, run_graphs[0], a.stats_from, reps=a.reps,
+                                                 parity_reps=a.parity_reps, why=ss_why)
+        bad = [t for t, q in (rep["steady_state"].get("prompts") or {}).items() if not q["equal_headline_cell"]]
+        if bad:      # the policy moves experts, never numerics: the same prompts must emit the same tokens (residency_vs_off's rule)
+            rep["errors"].append({"stage": "steady_state_vs_headline",
+                                  "traceback": f"steady-state tokens/accept lengths differ from the headline cell: {bad}"})
+    else:
+        rep["steady_state"] = steady_state_off_block(ss_why)
+    if res_cfg is not None and a.residency_audit and rep.get("residency", {}).get("on"):
+        residency_audit(gen, rep, rep["residency"])
     rep["mode_gap"] = mode_gap(rep)             # LOOSE-1107: one_graph vs two_graphs, and why they differ if they do
     try:
         from draft_bench import pg61_tokens_per_chunk
@@ -882,7 +1123,7 @@ def main(argv=None) -> int:
         rep["pg61"] = None
     rep["hbm_end_GiB"] = _hbm(torch)
     os.makedirs(os.path.dirname(os.path.abspath(json_path)), exist_ok=True)
-    _receipt.finish(rep.get("receipt"))
+    _receipt.finish(rep.get("receipt"), steady_state=rep.get("steady_state"))
     slim = json.loads(json.dumps(rep, default=str))
     with open(json_path, "w") as f:
         json.dump(slim, f, indent=1)
