@@ -49,6 +49,8 @@ logits anyway.
 """
 from __future__ import annotations
 
+import atexit
+import json
 import os
 from typing import Callable, Dict, List, Optional
 
@@ -82,6 +84,7 @@ STAGE_BN = 64
 SF_PACK = 4
 KERNELS_ON_CPU = False                 # tests set it under tests/triton_shim.py: stage_proj launches the kernel body
 CPU_RESOLVE: Optional[Callable[[int], torch.Tensor]] = None   # tests: address -> uint8 tensor (the CPU contract path)
+HIST_ENV = "DSV41_STAGE_HIST"          # M3-S2: JSON path for the cold-count histogram instrument (StageOverlap.count)
 
 
 class StageCaptureError(RuntimeError):
@@ -325,6 +328,21 @@ class StageOverlap:
         self.stats = {"launches": 0, "proj_launches": 0, "ce_copies": 0, "host_syncs": 0, "waits": 0,
                       "shared_hoisted": 0}
         self.trace: Optional[list] = None   # tests: ("stage", layer, pj) / ("wait", layer, pj) / ("hoist", layer)
+        # M3-S2 instrument ($DSV41_STAGE_HIST=<json path>, off by default): per layer-call cold / hot unique counts
+        # and per-(layer, expert) cold hits, as device ops inside the step (captured: every replay counts), written
+        # to the path at exit (dump()). Off: count() returns at once, nothing is launched.
+        self.hist_path = os.environ.get(HIST_ENV) or None
+        self.hist = self.hot_sum = self.cold_hits = None
+        if self.hist_path:
+            P = int(owner.rows) * int(owner.topk)
+            E = int(getattr(getattr(owner, "pool", None), "n_experts", 0) or 0)
+            with torch.inference_mode(False), torch.no_grad():
+                self.hist = torch.zeros(self.n_layers, P + 1, dtype=torch.long, device=self.dev)
+                self.hot_sum = torch.zeros(self.n_layers, dtype=torch.long, device=self.dev)
+                self.cold_hits = torch.zeros(self.n_layers, max(E, 1), dtype=torch.long, device=self.dev)
+                self._ar_c = torch.arange(P + 1, dtype=torch.long, device=self.dev)
+                self._ar_e = torch.arange(max(E, 1), dtype=torch.long, device=self.dev)
+            _hist_register(self)
 
     @property
     def active(self) -> bool:
@@ -367,7 +385,7 @@ class StageOverlap:
                 f"(runtime/staging_overlap.py docstring); use kernel or kernel-overlap for graphs")
         if any(sm._stage_pending):
             raise RuntimeError(f"L{sm.layer}: the previous layer-call's forked staging was never joined")
-        n_work = b.stage_n_work()
+        n_work = b.stage_n_work(t)                       # M3-S2: per layer (a partial pool mixes the stores)
         plan = None
         if self.mode in ("ce", "ce-overlap"):
             plan = ce_plan(t, m, n_work)                 # host sync (eager only, checked above)
@@ -405,11 +423,116 @@ class StageOverlap:
         self.stats["shared_hoisted"] += 1
         self._note("hoist", sm.layer)
 
+    # ---------------------------------------------------------------- M3-S2 instrument ($DSV41_STAGE_HIST)
+    def count(self, sm, m: Dict[str, torch.Tensor]) -> None:
+        """Layer sm.layer's cold / hot unique counts of this layer-call into the histogram (device ops, no host
+        sync, graph-capturable; deterministic: one-hot adds, no atomics). cold = used slots with a compact cold index
+        (sidx >= 0, overflowing ones included), hot = used slots without. No-op unless $DSV41_STAGE_HIST is set."""
+        if self.hist is None:
+            return
+        assert self.hot_sum is not None and self.cold_hits is not None
+        l = int(sm.layer)
+        sidx, counts, uniq = m["sidx"], m["counts"], m["uniq"]
+        cold = sidx >= 0
+        n_cold = cold.long().sum()
+        n_hot = ((counts > 0) & ~cold).long().sum()
+        P1 = self.hist.size(1)
+        self.hist[l].add_(self._ar_c.eq(n_cold.clamp(max=P1 - 1)).long())
+        self.hot_sum[l].add_(n_hot)
+        if self.cold_hits.size(1) > 1:
+            hit = (uniq.view(-1, 1) == self._ar_e.view(1, -1)) & cold.view(-1, 1)
+            self.cold_hits[l].add_(hit.long().sum(0))
+
+    def hist_summary(self) -> Optional[dict]:
+        """HOST SYNC: the instrument's tensors -> a JSON-able summary (None when off)."""
+        if self.hist is None:
+            return None
+        assert self.hot_sum is not None and self.cold_hits is not None
+        h = self.hist.cpu()
+        calls = h.sum(1)
+        P1 = h.size(1)
+        cs = torch.arange(P1, dtype=torch.long, device="cpu")
+        tot = int(calls.sum())
+        allh = h.sum(0)
+        cold_tot = int((allh * cs).sum())
+        hot_tot = int(self.hot_sum.cpu().sum())
+        nz = [c for c in range(P1) if int(allh[c])]
+        hits = self.cold_hits.cpu()
+        top = {}
+        for n_ in (1, 2, 4, 8):
+            # cold hits per layer-call the n most-hit cold experts of each layer would remove if they were hot
+            k_ = min(n_, hits.size(1))
+            top[n_] = round(float(hits.topk(k_, dim=1).values.sum()) / max(tot, 1), 4)
+        return {"what": "per 6-row layer-call: cold = staged-or-overflowing cold unique experts, hot = used hot "
+                        "unique experts (every eager call and graph replay counted, warmup included)",
+                "layer_calls": tot, "P": P1 - 1, "hist_all": [int(v) for v in allh],
+                "cold_mean": round(cold_tot / max(tot, 1), 4), "hot_mean": round(hot_tot / max(tot, 1), 3),
+                "cold_max": max(nz) if nz else 0,
+                "p_cold_gt": {s: round(float(allh[s + 1:].sum()) / max(tot, 1), 6) for s in (4, 8, 12, 16)
+                              if s + 1 <= P1},
+                "per_layer_cold_mean": [round(float((h[l] * cs).sum()) / max(int(calls[l]), 1), 4)
+                                        for l in range(h.size(0))],
+                "per_layer_cold_max": [max([c for c in range(P1) if int(h[l, c])] or [0]) for l in range(h.size(0))],
+                "cold_removed_per_layer_call_by_top_n_hot": top,
+                "hist": [[int(v) for v in row] for row in h]}
+
+    def dump(self, path: Optional[str] = None) -> Optional[str]:
+        """Write hist_summary() to `path` (default $DSV41_STAGE_HIST); at exit for every live instrument
+        (_hist_dump_all)."""
+        p = path or self.hist_path
+        if self.hist is None or not p:
+            return None
+        try:
+            s = self.hist_summary()
+            assert s is not None
+            os.makedirs(os.path.dirname(os.path.abspath(p)), exist_ok=True)
+            with open(p, "w") as f:
+                json.dump(s, f, indent=1)
+            print(f"[stage-hist] {s['layer_calls']} layer-calls, cold mean {s['cold_mean']} max {s['cold_max']}, "
+                  f"hot mean {s['hot_mean']} -> {p}", flush=True)
+        except Exception as e:  # pragma: no cover - exit-time best effort
+            print(f"[stage-hist] dump failed: {type(e).__name__}: {e}", flush=True)
+            return None
+        return p
+
     def describe(self) -> dict:
         return {"mode": self.mode, "capturable": self.capturable, "overlap": self.overlap,
                 "outputs_valid": self.mode != DIAG_MODE,
                 "side_stream": self.side is not None, "nprog": [v or STAGE_NPROG for v in self.nprog],
-                "block_bytes": [v or VEC_BLOCK_BYTES for v in self.block_bytes], "stats": dict(self.stats)}
+                "block_bytes": [v or VEC_BLOCK_BYTES for v in self.block_bytes], "stats": dict(self.stats),
+                "hist": self.hist_path}
+
+
+# M3-S2: every live instrument, dumped once at exit -- per path the instance that counted the most layer-calls
+# (a driver may build the R-row step more than once); the others to <path>.<i>. hist_forget() drops one (tests).
+_HIST_LIVE: List["StageOverlap"] = []
+_HIST_ATEXIT = {"on": False}
+
+
+def _hist_register(ov: "StageOverlap") -> None:
+    if not _HIST_ATEXIT["on"]:
+        atexit.register(_hist_dump_all)
+        _HIST_ATEXIT["on"] = True
+    _HIST_LIVE.append(ov)
+
+
+def hist_forget(ov: "StageOverlap") -> None:
+    if ov in _HIST_LIVE:
+        _HIST_LIVE.remove(ov)
+
+
+def _hist_dump_all() -> None:
+    by: Dict[str, list] = {}
+    for ov in list(_HIST_LIVE):
+        if ov.hist is not None and ov.hist_path:
+            by.setdefault(ov.hist_path, []).append(ov)
+    for path, ovs in by.items():
+        try:
+            ovs.sort(key=lambda o: -int(o.hist.sum()))          # type: ignore[union-attr]
+        except Exception:  # pragma: no cover - exit-time best effort
+            pass
+        for i, ov in enumerate(ovs):
+            ov.dump(path if i == 0 else f"{path}.{i}")
 
 
 def build(owner, n_layers: int, mode: Optional[str] = None) -> StageOverlap:

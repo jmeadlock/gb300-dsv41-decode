@@ -25,6 +25,12 @@ expert -- the same methods, fused or not). What changes, per layer:
                      stale groups from earlier layers are never read.
             "resident": a packed copy of every layer's hot scales built once at construction (12.4 GiB on the real
                      model; only cold experts' scales are written per step).
+            "pool" (M1-T10-MOE, the R-row default request): one pool-owned packed copy shared by the builds
+                     (pool_packed_sf; 13.14 GiB at 295 hot + 24 spare x 40 layers -- pool_sf_layer_bytes). Falls back
+                     to "step" whole when it does not fit ($DSV41_SF_POOL_HEADROOM_GIB). M3-S2: $DSV41_SF_POOL_LAYERS
+                     (auto | N | list; default all = that rule) keeps the copy for the layers that fit and leaves the
+                     others "step" (sf_layer: per-layer store; the dedup lists hot slots in the work list only for
+                     step layers). Same scale bytes reach the GEMM either way: bit-identical by construction.
           fp32 resident scales would be 49.6 GiB (4 B/scale) and do not fit (hbm_plan()).
   stage   ONE launch per layer (runtime/static_kernels.py t9a2_stage_inplace; contract = stage_inplace_emulated below):
           group[j] = loc slot of ids[j] if hot else H + j; cold experts' weight rows (HBM or UVA host address, the same
@@ -48,6 +54,7 @@ from __future__ import annotations
 import contextlib
 import os
 import sys
+from collections.abc import Mapping
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -73,6 +80,12 @@ EXPECTED_M_ENV = "DSV41_ROWS_EXPECTED_M"             # psum / masked: the heuris
 SF_POOL_HEADROOM_ENV = "DSV41_SF_POOL_HEADROOM_GIB"  # pool / resident SF: keep this much HBM free, else "step"
 SF_POOL_HEADROOM_GIB = 6.0      # pool SF = hbm_plan's sf_packed_resident_B (12.8 GiB real model, S 16); the 6-row
                                 # receipts had 17.1 (S 16) / 22.7 (S 8) GiB free after build: capture needs margin
+# M3-S2 (docs/M3-S2-STAGING-BYTES.md): which layers' hot SF the pool copy holds when it does not fit whole.
+#   "all" (default, today): every layer or none (falls back to "step" whole); "auto": as many layers as fit above
+#   the headroom (ascending layer index, layers already packed first), the rest stay "step"; "N": at most N layers;
+#   "l0,l1,...": those layers (trimmed to what fits). Bytes only move: the GEMM reads the same SF values either way.
+SF_POOL_LAYERS_ENV = "DSV41_SF_POOL_LAYERS"
+SF_POOL_LAYERS_DEFAULT = "all"
 LAYOUT_CHECK_ENV = "DSV41_ROWS_LAYOUT_CHECK"         # "0": skip the build-time layout self-check
 MASKED_MAX_M = 128                                   # masked: max_m >= BLOCK_M (ABI memo)
 ROWS_GEMM_DEFAULT = "contiguous16"   # the R-row call shape (probe 2026-11-07, docs/dg-rows-spike-20261107.log)
@@ -484,8 +497,115 @@ def pool_sf_key(pool) -> tuple:
 
 def pool_sf_bytes(pool, N: Dict[str, int], C: Dict[str, int]) -> int:
     """Bytes of a whole-pool packed SF copy (every layer's H + S groups, three projections)."""
-    per = sum(N[p] * C[p] * 4 for p in PROJS)
-    return sum(int(pool.hbm_full[l]["w1"].size(0)) * per for l in range(pool.n_layers))
+    return sum(pool_sf_layer_bytes(pool, l, N, C) for l in range(pool.n_layers))
+
+
+def pool_sf_layer_bytes(pool, layer: int, N: Dict[str, int], C: Dict[str, int]) -> int:
+    """M3-S2: bytes of ONE layer's pool-owned packed SF copy: G = H + S groups x sum_p N_p * C_p int32 words.
+    Real model: 319 groups x (2304*40 + 2304*40 + 5120*18) words x 4 B = 319 x 1,105,920 B = 0.329 GiB; x 40 layers
+    = 13.14 GiB (the `[dg-inplace] sf_store pool needs 13.14 GiB` of every headline run)."""
+    return int(pool.hbm_full[layer]["w1"].size(0)) * sum(N[p] * C[p] * 4 for p in PROJS)
+
+
+def parse_sf_pool_layers(spec: Optional[str], n_layers: int):
+    """$DSV41_SF_POOL_LAYERS -> ("all", None) | ("auto", None) | ("count", N) | ("list", [layers])."""
+    s = (spec if spec is not None else os.environ.get(SF_POOL_LAYERS_ENV, SF_POOL_LAYERS_DEFAULT)).strip()
+    if s in ("", "all"):
+        return "all", None
+    if s == "auto":
+        return "auto", None
+    if "," in s or s.startswith("l") or s.startswith("L"):
+        ls = sorted({int(v.strip().lstrip("lL")) for v in s.split(",") if v.strip()})
+        if any(not 0 <= l < n_layers for l in ls):
+            raise ValueError(f"${SF_POOL_LAYERS_ENV}={s!r}: layers outside [0, {n_layers})")
+        return "list", ls
+    try:
+        n = int(s)
+    except ValueError:
+        raise ValueError(f"${SF_POOL_LAYERS_ENV}={s!r}: 'all', 'auto', a layer count or a comma list") from None
+    if n < 0:
+        raise ValueError(f"${SF_POOL_LAYERS_ENV}={s!r}: a negative layer count")
+    return "count", n
+
+
+def sf_pool_plan(spec: Optional[str], n_layers: int, layer_B: Sequence[int], step_B: int, free_B: Optional[int],
+                 head_B: int, cached: Sequence[int] = ()) -> dict:
+    """M3-S2: which layers get the pool-owned packed SF (the rest re-pack their used hot experts' SF every step, the
+    "step" store). layer_B[l] = one layer's copy (pool_sf_layer_bytes), step_B = the shared step tensor (allocated iff
+    any layer stays "step"), free_B = free HBM now (None: no budget, the Mac), head_B = $DSV41_SF_POOL_HEADROOM_GIB,
+    cached = layers whose copy already exists (cost 0). -> {"spec", "mode": "pool" (all layers) | "partial" |
+    "step" (none), "layers": sorted pooled layers, "need_B", "free_B", "head_B", "why"}.
+      all   : today's rule, unchanged: the whole copy (minus cached layers) fits with free - need >= head, else none.
+      auto  : the whole copy if it fits, else greedy -- cached layers, then ascending index -- while
+              free - (new layers' bytes + step_B) >= head.
+      count : auto capped at N layers (N >= n_layers = auto; 0 = none).
+      list  : the listed layers in ascending order, trimmed like auto.
+    Bytes only: the GEMM reads the same scale values from either store."""
+    kind, arg = parse_sf_pool_layers(spec, n_layers)
+    cached = sorted({int(l) for l in cached if 0 <= int(l) < n_layers})
+    cset = set(cached)
+    full_need = sum(int(layer_B[l]) for l in range(n_layers) if l not in cset)
+    out = {"spec": kind if arg is None else f"{kind}:{arg}", "free_B": free_B, "head_B": int(head_B),
+           "layer_B": int(max(layer_B)) if len(layer_B) else 0, "step_B": int(step_B), "full_need_B": full_need}
+
+    def done(mode, layers, need, why):
+        out.update(mode=mode, layers=sorted(layers), need_B=int(need), why=why)
+        return out
+
+    if kind == "all" or (kind == "auto" and (free_B is None or free_B - full_need >= head_B)):
+        if free_B is None or free_B - full_need >= head_B:
+            return done("pool", range(n_layers), full_need, None)
+        return done("step", [], 0, f"pool needs {full_need / GiB:.2f} GiB, {free_B / GiB:.2f} GiB free < "
+                                   f"{head_B / GiB:.1f} GiB headroom: using step")
+    if kind == "count" and arg == 0:
+        return done("step", [], 0, f"${SF_POOL_LAYERS_ENV}=0: no layer pooled")
+    order = cached + [l for l in range(n_layers) if l not in cset]
+    if kind == "list":
+        want = set(arg)
+        order = [l for l in order if l in want]
+    cap = len(order) if kind != "count" else min(int(arg), len(order))
+    picked, need = [], 0
+    for l in order:
+        if len(picked) >= cap:
+            break
+        add = 0 if l in cset else int(layer_B[l])
+        rest_step = len(picked) + 1 < n_layers           # some layer still uses the shared step tensor
+        if free_B is not None and free_B - (need + add + (step_B if rest_step else 0)) < head_B:
+            break
+        picked.append(l)
+        need += add
+    if not picked:
+        return done("step", [], 0, f"not one layer's pool SF ({out['layer_B'] / GiB:.3f} GiB) fits: "
+                                   f"{(free_B or 0) / GiB:.2f} GiB free - step SF {step_B / GiB:.2f} < "
+                                   f"{head_B / GiB:.1f} GiB headroom: using step")
+    if len(picked) == n_layers:
+        return done("pool", picked, need, None)
+    need += step_B
+    free_s = "n/a" if free_B is None else f"{free_B / GiB:.2f}"
+    return done("partial", picked, need,
+                f"partial pool: {len(picked)}/{n_layers} layers' hot SF pre-packed ({need / GiB:.2f} GiB incl. the "
+                f"{step_B / GiB:.2f} GiB step SF of the other {n_layers - len(picked)}; {free_s} GiB free, "
+                f"{head_B / GiB:.1f} GiB headroom; full copy {full_need / GiB:.2f} GiB)")
+
+
+class StepSFView(Mapping):
+    """M3-S2 partial pool: a "step" layer's view of the SHARED step SF ({proj: [G, N, C] slice}). Deliberately NOT a
+    dict: runtime/residency.py attach() registers a layer's t["sf"] as the target of a promoted expert's packed SF
+    only when it is a dict -- right for a pool layer (its own copy), wrong here (the shared tensor is re-packed by
+    every step layer each step; a residency write from the copy stream would race another layer's GEMM). A step
+    layer's promoted experts get their SF from the staging launch, as under a whole "step" store."""
+
+    def __init__(self, d: Dict[str, torch.Tensor]):
+        self._d = dict(d)
+
+    def __getitem__(self, k):
+        return self._d[k]
+
+    def __iter__(self):
+        return iter(self._d)
+
+    def __len__(self):
+        return len(self._d)
 
 
 def pool_packed_sf(pool, layer: int, N: Dict[str, int], C: Dict[str, int], device) -> Dict[str, torch.Tensor]:
@@ -612,10 +732,16 @@ class DGInplaceBuffers(DGBuffers):
             raise ValueError(f"dg-inplace staging assumes equal weight rows across projections, got {rw}")
         self.row_w = rw["w1"]
         self.sf_store_why: Optional[str] = None
+        self.sf_pool_plan: Optional[dict] = None   # M3-S2: sf_pool_plan()'s record (pool store only)
+        self.sf_pool_layers: Optional[Tuple[int, ...]] = None   # M3-S2: pooled layers when partial (None = all)
         if self.sf_store in ("pool", "resident"):
             self._check_sf_hbm()
+        # M3-S2: the store per layer ("pool" / "resident" / "step"); partial pool = some layers "step"
+        self.sf_layer: Dict[int, str] = {
+            l: ("step" if self.sf_store == "pool" and self.sf_pool_layers is not None
+                and l not in self.sf_pool_layers else self.sf_store) for l in range(pool.n_layers)}
         self.sf_shared: Dict[str, torch.Tensor] = {}
-        if self.sf_store == "step":
+        if any(v == "step" for v in self.sf_layer.values()):
             self.sf_shared = {p: packed_sf_zeros(self.G_max, self.N[p], self.C[p], d) for p in PROJS}
         self.layers: Dict[int, dict] = {}
         self.plan = hbm_plan(pool.n_layers, hot, pool.spare, {p: shapes[p] for p in PROJS},
@@ -641,22 +767,43 @@ class DGInplaceBuffers(DGBuffers):
     def _check_sf_hbm(self) -> None:
         """pool / resident SF: refuse to allocate if it would leave less than $DSV41_SF_POOL_HEADROOM_GIB of HBM
         free (the store falls back to "step", the reason in sf_store_why). A pool copy that already exists (another
-        build made it) costs nothing."""
+        build made it) costs nothing. M3-S2: with $DSV41_SF_POOL_LAYERS other than "all" (the default, today's
+        all-or-nothing rule) a pool copy that does not fit whole is kept for the layers that do (sf_pool_plan);
+        the store stays "pool", the other layers are "step" (sf_layer, sf_pool_layers)."""
         pool = self.pool
+        kind = parse_sf_pool_layers(None, pool.n_layers)[0] if self.sf_store == "pool" else "all"
         if self.sf_store == "pool":
             c = getattr(pool, "_dg_packed_sf", None)
             if c is not None and c["key"] == pool_sf_key(pool) and len(c["layers"]) == pool.n_layers:
                 return
         need = pool_sf_bytes(pool, self.N, self.C)
-        if self.dev.type != "cuda":
+        if self.dev.type != "cuda" and kind == "all":
             return
-        free, _ = torch.cuda.mem_get_info(self.dev)
+        free = torch.cuda.mem_get_info(self.dev)[0] if self.dev.type == "cuda" else None
         head = float(os.environ.get(SF_POOL_HEADROOM_ENV, SF_POOL_HEADROOM_GIB)) * GiB
-        if free - need < head:
-            self.sf_store_why = (f"{self.sf_store} needs {need / GiB:.2f} GiB, {free / GiB:.2f} GiB free < "
-                                 f"{head / GiB:.1f} GiB headroom: using step")
-            print(f"[dg-inplace] sf_store {self.sf_store_why}", file=sys.stderr, flush=True)
+        if kind == "all":
+            assert free is not None              # (the Mac returned above: no budget there, today's rule)
+            if free - need < head:
+                self.sf_store_why = (f"{self.sf_store} needs {need / GiB:.2f} GiB, {free / GiB:.2f} GiB free < "
+                                     f"{head / GiB:.1f} GiB headroom: using step")
+                print(f"[dg-inplace] sf_store {self.sf_store_why}", file=sys.stderr, flush=True)
+                self.sf_store = "step"
+            return
+        c = getattr(pool, "_dg_packed_sf", None)
+        cached = list(c["layers"]) if c is not None and c["key"] == pool_sf_key(pool) else []
+        layer_B = [pool_sf_layer_bytes(pool, l, self.N, self.C) for l in range(pool.n_layers)]
+        step_B = self.G_max * sum(self.N[p] * self.C[p] * 4 for p in PROJS)
+        plan = sf_pool_plan(None, pool.n_layers, layer_B, step_B, free, int(head), cached=cached)
+        self.sf_pool_plan = {k_: (round(v / GiB, 3) if k_.endswith("_B") and v is not None else v)
+                             for k_, v in plan.items()}
+        if plan["mode"] == "pool":
+            return
+        self.sf_store_why = plan["why"]
+        print(f"[dg-inplace] sf_store pool: {plan['why']}", file=sys.stderr, flush=True)
+        if plan["mode"] == "step":
             self.sf_store = "step"
+        else:
+            self.sf_pool_layers = tuple(plan["layers"])
 
     def _set_alignment(self, align: int) -> dict:
         """DeepGEMM's global BLOCK_M cap for contiguous layouts := ALIGN (utils_deep_gemm.py:398-413: a mismatch
@@ -701,9 +848,12 @@ class DGInplaceBuffers(DGBuffers):
                 raise ValueError(f"L{layer} {p}: pool {tuple(w[p].shape)} is not a contiguous [H+S, N, K/2]")
         if G < H + self.spare_limit:
             raise ValueError(f"L{layer}: {G} pool slots < H {H} + spare slots {self.spare_limit}")
-        if self.sf_store == "step":
+        store = self.sf_layer.get(layer, self.sf_store)
+        if store == "step":
             sf = {p: self.sf_shared[p][:G] for p in PROJS}
-        elif self.sf_store == "pool":
+            if self.sf_store == "pool":                  # M3-S2 partial pool: residency must not write here
+                sf = StepSFView(sf)
+        elif store == "pool":
             sf = pool_packed_sf(pool, layer, self.N, self.C, d)
         else:
             sf = {}
@@ -718,11 +868,24 @@ class DGInplaceBuffers(DGBuffers):
         for slot, e in enumerate(pool.hot[layer]):
             gt[e] = slot
         dsts = [w["w1"], w["w3"], w["w2"], sf["w1"], sf["w3"], sf["w2"]]
-        t = {"layer": layer, "H": H, "G": G, "w": w, "sf": sf, "gtab": gt.to(d),
+        t = {"layer": layer, "H": H, "G": G, "w": w, "sf": sf, "gtab": gt.to(d), "sf_store": store,
              "ptab6": torch.stack([ptabs[k_] for k_ in ORDER6]).contiguous(), "dsts": dsts,
              "dtab": torch.tensor([x.data_ptr() for x in dsts], dtype=torch.int64, device=d)}
         self.layers[layer] = t
         return t
+
+    # ---------------------------------------------------------------- M3-S2 per-layer store
+    def layer_store(self, t: Optional[dict] = None) -> str:
+        """The SF store of layer table t ("pool" / "resident" / "step"); None: the build's (any "step" layer under a
+        partial pool makes it "step" here -- the conservative superset for callers without a layer)."""
+        if t is not None:
+            return t.get("sf_store", self.sf_store)
+        return "step" if any(v == "step" for v in self.sf_layer.values()) else self.sf_store
+
+    def step_sf(self, t: Optional[dict] = None) -> bool:
+        """Does layer t's staging pack its USED HOT experts' scales every step (the dedup lists them in the work
+        list; static_kernels.stage_rows / staging_overlap.s1_stage_proj pack them)? True under the "step" store."""
+        return self.layer_store(t) == "step"
 
     # ---------------------------------------------------------------- per-step ops (graph-capturable)
     def stage(self, t: dict, ids: torch.Tensor, ids_out: Optional[torch.Tensor] = None,
@@ -733,12 +896,13 @@ class DGInplaceBuffers(DGBuffers):
 
         kw = {} if sidx is None else {"sidx": sidx, "spare": self.spare_limit, "ovf": ovf}
         stage_inplace(t["ptab6"], ids, t["gtab"], t["dtab"], t["dsts"], self.mi, t["H"], self.align, self.row_w,
-                      self.sf_dims, self.sf_store == "step", ids_out, **kw)
+                      self.sf_dims, self.step_sf(t), ids_out, **kw)
 
-    def stage_n_work(self) -> int:
+    def stage_n_work(self, t: Optional[dict] = None) -> int:
         """Work-list entries the R-row staging launch scans: staged cold slots only (<= spare budget) when the hot
-        scales are pre-packed, the used slots (<= R*k) under sf_store "step"."""
-        return self.pairs if self.sf_store == "step" else self.spare_limit
+        scales are pre-packed, the used slots (<= R*k) under sf_store "step". M3-S2: per layer table t (a partial
+        pool mixes both); None = the build's conservative answer."""
+        return self.pairs if self.step_sf(t) else self.spare_limit
 
     def stage_rows(self, t: dict, m: Dict[str, torch.Tensor]) -> None:
         """M1-T10-MOE: the R-row staging launch from the dedup's work list (cold weight rows + their scales; hot
@@ -746,7 +910,7 @@ class DGInplaceBuffers(DGBuffers):
         from runtime.static_kernels import stage_rows
 
         stage_rows(t["ptab6"], m["uniq"], t["gtab"], t["dtab"], t["dsts"], m["sidx"], m["wl"], t["H"], self.row_w,
-                   self.sf_dims, self.stage_n_work())
+                   self.sf_dims, self.stage_n_work(t))
 
     def _sfa(self, which: int, M: int):
         return self.xsp[which] if self.sf_pack else self.xs[which].view(M, -1)   # T9b-4: pre-packed (no DG convert)
@@ -1025,6 +1189,7 @@ class DGInplaceBuffers(DGBuffers):
         elif self.sf_store == "pool":
             c = getattr(self.pool, "_dg_packed_sf", None) or {"layers": {}}
             sf_b = sum(t.untyped_storage().nbytes() for sf in c["layers"].values() for t in sf.values())
+            sf_b += sum(t.untyped_storage().nbytes() for t in self.sf_shared.values())   # M3-S2 partial: + step SF
         else:
             sf_b = sum(t["sf"][p].untyped_storage().nbytes() for t in self.layers.values() for p in PROJS)
         pool = self.pool
@@ -1037,6 +1202,10 @@ class DGInplaceBuffers(DGBuffers):
                   "gemm_blocks": self.gemm_blocks, "gemm_m": self.gemm_blocks * self.block_rows,
                   "rowmatch": self.rowmatch,
                   "sf_store": self.sf_store, "sf_store_why": self.sf_store_why, "stage_n_work": self.stage_n_work(),
+                  "sf_layers": {s: sum(1 for v in self.sf_layer.values() if v == s)
+                                for s in sorted(set(self.sf_layer.values()))},
+                  "sf_pool_layers": None if self.sf_pool_layers is None else list(self.sf_pool_layers),
+                  "sf_pool_plan": self.sf_pool_plan,
                   "act_sf_packed": self.sf_pack, "act_sf_packed_why": None if self.sf_pack else self.sf_pack_why,
                   "spare_slots": self.pool.spare, "spare_limit": self.spare_limit, "G_max": self.G_max,
                   "max_m": self.block_rows,

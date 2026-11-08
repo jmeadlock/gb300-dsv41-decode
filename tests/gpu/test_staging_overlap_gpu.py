@@ -379,8 +379,116 @@ def test_probe_quick():
     assert rc == 0
 
 
+# ------------------------------------------------------------------------------------------------ M3-S2
+def test_m3s2_partial_pool_mini4():
+    """M3-S2 ($DSV41_SF_POOL_LAYERS, docs/M3-S2-STAGING-BYTES.md): on the device, the R-row store "pool" with
+    layers 0 and 2 pooled and 1, 3 "step" (and the whole pool) == the whole "step" store under `kernel`, eager and
+    as a captured graph, in kernel and kernel-overlap: torch.equal on logits, main_hidden, the whole caches, the
+    spare weight slots. Then the $DSV41_STAGE_HIST instrument in a captured kernel-overlap graph: outputs unchanged,
+    counts written. Every run starts from the same pre-base checkpoint (model buffers + spare slots)."""
+    _need_dg()
+    from runtime import dg_inplace as DI
+    from runtime import staging_overlap as SO
+
+    keys = (SO.STAGE_ENV, DI.SF_POOL_LAYERS_ENV, SO.HIST_ENV)
+    prev = {k: os.environ.get(k) for k in keys}
+    rec = {}
+    RESULTS["m3s2_partial_pool"] = rec
+
+    def env(k, v):
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+
+    def slots(pool):
+        return [pool.hbm_full[l][p][len(pool.hot[l]):].clone() for l in range(pool.n_layers) for p in DI.PROJS]
+
+    def same(a, b, sa, sb, what):
+        _assert_rows(a[0], b[0], what)
+        assert all(torch.equal(x, y) for x, y in zip(a[1], b[1])), (what, "main_hidden")
+        d = _state_diff(a[2], b[2])
+        assert not d, (what, "caches", d)
+        assert all(torch.equal(x, y) for x, y in zip(sa, sb)), (what, "spare slots")
+        COUNTS["gates"] += 1
+
+    try:
+        with _model("mini4") as (model, pool):
+            hid = (len(model.layers) - 1,)
+            n = 4
+            ids, toks = _toks(18, ROWS * n, 2027)
+            kw = dict(rows=ROWS, hidden_layers=hid, moe_impl="dg-inplace", spare_slots=8)
+            env(SO.STAGE_ENV, "kernel")
+            env(DI.SF_POOL_LAYERS_ENV, None)
+            env(SO.HIST_ENV, None)
+            pool._dg_packed_sf = None
+            st = _need_step(model, pool, rows_sf_store="step", **kw)
+            ck = _checkpoint(model, pool)
+            base = _static(model, st, ids, toks, n)
+            base_sl = slots(pool)
+            st.detach()
+            for mode in ("kernel", "kernel-overlap"):
+                for spec in ("0,2", None):
+                    env(SO.STAGE_ENV, mode)
+                    env(DI.SF_POOL_LAYERS_ENV, spec)
+                    pool._dg_packed_sf = None
+                    st = _need_step(model, pool, rows_sf_store="pool", **kw)
+                    b = st.dg
+                    tag = f"{mode}/{'partial' if spec else 'pool'}"
+                    want = (0, 2) if spec else None
+                    assert b.sf_store == "pool" and b.sf_pool_layers == want, (tag, b.sf_store, b.sf_pool_layers)
+                    _restore(model, pool, None, ck)
+                    a = _static(model, st, ids, toks, n)
+                    same(a, base, slots(pool), base_sl, f"{tag} eager vs step store")
+                    st.capture()
+                    _restore(model, pool, None, ck)
+                    g = _static(model, st, ids, toks, n, graph=True)
+                    same(g, base, slots(pool), base_sl, f"{tag} graph vs step store")
+                    ov = st.overflow_counts()
+                    assert ov["steps"] == 0, ov
+                    rec[tag] = {"sf_layers": b.describe()["sf_layers"], "why": b.sf_store_why}
+                    st.detach()
+            # the instrument, captured
+            path = os.path.join(REPO, "scratch", f"stage-hist-mini4-{time.strftime('%Y%m%d')}.json")
+            env(SO.STAGE_ENV, "kernel-overlap")
+            env(DI.SF_POOL_LAYERS_ENV, "0,2")
+            env(SO.HIST_ENV, path)
+            pool._dg_packed_sf = None
+            st = _need_step(model, pool, rows_sf_store="pool", **kw)
+            SO.hist_forget(st.stage_ov)
+            st.capture()
+            _restore(model, pool, None, ck)
+            g = _static(model, st, ids, toks, n, graph=True)
+            same(g, base, slots(pool), base_sl, "hist on: graph vs step store")
+            s = st.stage_ov.hist_summary()
+            assert s["layer_calls"] >= len(model.layers) * n and s["cold_max"] >= 1, s
+            assert st.stage_ov.dump() == path
+            rec["hist"] = {k_: s[k_] for k_ in ("layer_calls", "cold_mean", "cold_max", "hot_mean", "p_cold_gt")}
+            st.detach()
+    finally:
+        for k, v in prev.items():
+            env(k, v)
+    print("  m3s2 partial pool:", json.dumps(rec, default=str))
+
+
+def test_m3s2_bytes_probe_quick():
+    _need_dg()
+    import staging_bytes_bench as SB
+
+    out = os.path.join(REPO, "scratch", f"staging-bytes-probe-quick-{time.strftime('%Y%m%d')}.json")
+    rc = SB.main(["probe", "--rounds", "4", "--reps", "10", "--hot", "48", "--out", out])
+    rep = json.load(open(out))["probe"]
+    assert not rep["errors"], rep["errors"]
+    assert all(rep["checks"].values()), rep["checks"]
+    RESULTS["m3s2_probe_quick"] = {"serial_c0": rep["serial"].get("0") or rep["serial"].get(0),
+                                   "overlap_c0": rep["overlap"].get("0") or rep["overlap"].get(0)}
+    print("  m3s2 probe (quick):", json.dumps(RESULTS["m3s2_probe_quick"], default=str)[:1500])
+    assert rc == 0
+
+
 TESTS = [test_s1_stage_proj_on_device_equals_contract, test_ce_path_on_device_equals_kernel,
-         test_static6_modes_equal_kernel_mini4, test_probe_quick]
+         test_static6_modes_equal_kernel_mini4, test_probe_quick, test_m3s2_partial_pool_mini4,
+         test_m3s2_bytes_probe_quick]
 
 if __name__ == "__main__":
     import traceback
