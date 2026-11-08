@@ -6,8 +6,8 @@ Desk worker. Read in this order, in full: `docs/PORT-PLAN.md`; `reference/garner
 GEMM + top-k + hot/cold split + cold-row publish + finish seam), `fastpath/fastpath_megamoe.py`,
 `fastpath/hook/mega_peer_hook.py`, `fastpath/hook/peer_tier2.py`, `fastpath/hook/peer_fused2.py`, and whatever in
 `fastpath/peer3/` is Python. Then ours: `runtime/loader.py` (host tier: cudaHostRegister chunks, UVA alias),
-`runtime/staging.py` or wherever `m1_stage_rows` / the kernel-overlap stage lives (grep `DSV41_STAGE`),
-`runtime/residency.py`, `runtime/moe_dg.py` or the dg-inplace path (grep `dg-inplace`), and the receipts
+`runtime/host_tier.py`, `runtime/staging_overlap.py`, `runtime/expert_pool.py`, `runtime/static_kernels.py` (the `m1_stage_rows` staging kernel),
+`runtime/residency.py`, `runtime/dg_inplace.py`, `runtime/dg_mega.py`, `runtime/residency_policy.py`, and the receipts
 `docs/M3-S3-POOL-SF-LAYOUT.md`, `docs/C2C-PROBE-20261106.md`, `docs/A2-RESIDENCY-DESIGN.md`.
 
 ## The question
