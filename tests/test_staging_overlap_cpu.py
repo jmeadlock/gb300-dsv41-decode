@@ -718,3 +718,228 @@ def test_bench_model_subcommand_runs_on_cpu(tmp_path):
     assert mm["ms_per_step"]["kernel-overlap/nprog48"] < mm["ms_per_step"]["serial"]
     assert abs(mm["step_ms_E"]["serial"] - 20.304) < 1e-6
     assert not any(m == "vllm" or m.startswith("vllm.") for m in sys.modules)
+
+
+# ------------------------------------------------------------------------------------------------ M3-S2
+# docs/HANDOFF-M3-S2-STAGING-BYTES.md: the sf_store "pool" size derived, the partial pool ($DSV41_SF_POOL_LAYERS) is
+# bit-identical to both whole stores (alone and under residency, which must write promoted SF into pooled layers'
+# copies only), the cold-count histogram instrument ($DSV41_STAGE_HIST) counts what the step counters count and
+# changes nothing, the bench's CPU subcommands run.
+REAL_GROUP_B = 2304 * 40 * 4 * 2 + 5120 * 18 * 4          # one pool group's packed SF (w1 + w3 + w2) = 1,105,920 B
+GIB = 2 ** 30
+
+
+def test_m3s2_pool_sf_bytes_derivation():
+    class P:
+        n_layers = 40
+        hbm_full = {l: {"w1": torch.empty(295 + 24, 0)} for l in range(40)}
+
+    N, C = {"w1": 2304, "w3": 2304, "w2": 5120}, {"w1": 40, "w3": 40, "w2": 18}
+    assert REAL_GROUP_B == 1_105_920
+    assert DI.pool_sf_layer_bytes(P, 7, N, C) == 319 * REAL_GROUP_B
+    assert round(DI.pool_sf_bytes(P, N, C) / GIB, 2) == 13.14          # the headline log's "needs 13.14 GiB"
+
+
+def test_m3s2_sf_pool_plan_rules(monkeypatch):
+    LB = [319 * REAL_GROUP_B] * 40
+    sB = 319 * REAL_GROUP_B
+    free = int(4.93 * GIB)
+    plan = lambda spec, head, free=free, cached=(): DI.sf_pool_plan(spec, 40, LB, sB, free, int(head * GIB),  # noqa
+                                                                   cached=cached)
+    p = plan("all", 6.0)
+    assert p["mode"] == "step" and p["layers"] == [] and "using step" in p["why"]
+    assert plan("auto", 6.0)["mode"] == "step"                         # 4.93 GiB free < 6.0: not one layer
+    p = plan("auto", 2.0)                                               # today's box at headroom 2.0: 7 layers
+    assert p["mode"] == "partial" and p["layers"] == list(range(7))
+    assert p["need_B"] == 7 * LB[0] + sB and free - p["need_B"] >= 2 * GIB
+    assert free - (p["need_B"] + LB[0]) < 2 * GIB                       # an 8th would break the headroom
+    assert plan("3", 2.0)["layers"] == [0, 1, 2]
+    assert plan("5,39", 2.0)["layers"] == [5, 39]
+    assert plan("0", 2.0)["mode"] == "step"
+    p = plan("auto", 2.0, cached=[10, 11])                              # already-packed layers cost nothing, first
+    assert p["layers"][:0] == [] and {10, 11} <= set(p["layers"]) and len(p["layers"]) == 9
+    assert plan("auto", 2.0, free=None)["mode"] == "pool"               # no budget (the Mac): whole
+    assert plan("3", 2.0, free=None)["layers"] == [0, 1, 2]
+    assert plan("auto", 2.0, free=20 * GIB)["mode"] == "pool" and plan("all", 2.0, free=20 * GIB)["mode"] == "pool"
+    for bad in ("abc", "-1", "0,99"):
+        with pytest.raises(ValueError):
+            DI.parse_sf_pool_layers(bad, 40)
+    monkeypatch.delenv(DI.SF_POOL_LAYERS_ENV, raising=False)
+    assert DI.parse_sf_pool_layers(None, 40) == ("all", None)           # default = today's all-or-nothing rule
+
+
+def _m3s2_build(model, pool, monkeypatch, store, spec, **kw):
+    from runtime.static_step import StaticStep
+
+    pool._dg_packed_sf = None                                           # a fresh pool copy per build
+    if spec is None:
+        monkeypatch.delenv(DI.SF_POOL_LAYERS_ENV, raising=False)
+    else:
+        monkeypatch.setenv(DI.SF_POOL_LAYERS_ENV, spec)
+    return StaticStep(model, pool, max_pos=255, rows=6, moe_impl="dg-inplace", rows_sf_store=store, _allow_cpu=True,
+                      **kw)
+
+
+@pytest.mark.parametrize("mode", ["kernel", "kernel-overlap"])
+def test_m3s2_partial_pool_bit_identical(rows_dg, monkeypatch, mode):
+    """sf_store pool with layers 0 and 2 pooled, 1 and 3 "step" == whole pool == whole step: torch.equal on every
+    row's logits, main_hidden, caches and the spare-slot bytes; per-layer work lists (hot slots listed only in step
+    layers); a step layer's SF is a StepSFView (not a dict), a pool layer's the pool copy."""
+    model, pool, fk, fake = rows_dg("mini4")
+    monkeypatch.setattr(SO, "CPU_RESOLVE", _registry(pool).__getitem__)
+    monkeypatch.setenv(SO.STAGE_ENV, mode)
+    hid = (len(model.layers) - 1,)
+    n_layers = len(model.layers)
+    ids, toks = _tf_tokens(18, 18, 77)
+    outs, slots = {}, {}
+    for name, store, spec in (("step", "step", None), ("pool", "pool", None), ("partial", "pool", "0,2")):
+        st = _m3s2_build(model, pool, monkeypatch, store, spec, hidden_layers=hid)
+        b = st.dg
+        if name == "partial":
+            assert b.sf_store == "pool" and b.sf_pool_layers == (0, 2) and "partial pool" in b.sf_store_why
+            assert b.sf_layer == {0: "pool", 1: "step", 2: "pool", 3: "step"}
+            assert b.describe()["sf_layers"] == {"pool": 2, "step": 2} and b.sf_shared
+            for l in range(n_layers):
+                t = b.layers[l]
+                pooled = l in (0, 2)
+                assert isinstance(t["sf"], dict) == pooled and isinstance(t["sf"], DI.StepSFView) != pooled
+                assert b.stage_n_work(t) == (b.spare_limit if pooled else b.pairs) and b.step_sf(t) != pooled
+            assert b.stage_n_work() == b.pairs                         # no layer given: the conservative superset
+        elif name == "pool":
+            assert b.sf_store == "pool" and b.sf_pool_layers is None and not b.sf_shared
+            assert set(b.sf_layer.values()) == {"pool"}
+        else:
+            assert set(b.sf_layer.values()) == {"step"}
+        outs[name] = _static_run(model, st, ids, toks, 3)
+        for sm in st.moes:                                              # the last call's work list
+            m = sm.last
+            nw = b.stage_n_work(sm.t)
+            us = [int(u) for u in m["wl"][:nw].tolist() if u >= 0]
+            cold_only = all(int(m["sidx"][u]) >= 0 for u in us)
+            assert cold_only == (b.sf_layer[sm.layer] == "pool"), (name, sm.layer, us)
+        slots[name] = [pool.hbm_full[l][p][len(pool.hot[l]):].clone() for l in range(n_layers) for p in DI.PROJS]
+        st.detach()
+    for name in ("pool", "partial"):
+        a_, b_ = outs[name], outs["step"]
+        _assert_rows_equal(a_[0], b_[0], f"{mode}: {name} vs step")
+        assert all(torch.equal(x, y) for x, y in zip(a_[1], b_[1])), name
+        for k_ in b_[2]:
+            assert torch.equal(a_[2][k_], b_[2][k_]), (name, k_)
+        assert all(torch.equal(x, y) for x, y in zip(slots[name], slots["step"])), (name, "spare slots")
+
+
+def test_m3s2_partial_pool_with_residency_equals_off(emu, monkeypatch):
+    """Residency on a partial pool (layers 0, 2 pooled): attach registers the promoted-expert SF target for the
+    pooled layers ONLY (a write into the shared step SF would race other layers), and the 6-row step with forced
+    + policy swaps == the residency-off whole-step-store run, torch.equal on every row's logits; audit ok."""
+    import numpy as np
+
+    from runtime.residency import ResidencyConfig, ResidencyManager, golden_from_index, n_stage_for, sf_store_for
+    from test_dg_inplace_cpu import _fake_dg_contig
+    from test_dg_moe_cpu import _faithful_act_quant
+    from test_residency_cpu import _hot_cold_bias, _install
+    from test_residency_rows_cpu import _run6
+    from test_static_rows_cpu import _masked_rowwise
+
+    model, pool, _ = emu("mini4")
+    fake = _fake_dg_contig()
+    fake.m_grouped_fp8_fp4_gemm_nt_masked = _masked_rowwise(fake)
+    monkeypatch.setitem(sys.modules, "deep_gemm", fake)
+    monkeypatch.setattr(sys.modules["model"], "act_quant", _faithful_act_quant)
+    _install(monkeypatch, pool)
+    n = 8
+    ids, toks = _tf_tokens(17, 6 * n, 29)
+    st = _m3s2_build(model, pool, monkeypatch, "step", None)
+    off = _run6(model, st, ids, toks, n)
+    st.detach()
+    k = model.layers[0].ffn.n_activated_experts
+    cfg = ResidencyConfig(drain_n=2, min_abs=1.0, hyst=1.0, halflife=20.0, n_spare=2, n_demote=4, reserve_gib=0.0,
+                          force_random=2)
+    monkeypatch.setenv(DI.SF_POOL_LAYERS_ENV, "0,2")
+    rm = ResidencyManager(pool, model, cfg, n_stage=n_stage_for("dg-inplace", 6, k),
+                          sf_store=sf_store_for("dg-inplace", 6))
+    st = _m3s2_build(model, pool, monkeypatch, None, "0,2")
+    assert st.dg.sf_store == "pool" and st.dg.sf_pool_layers == (0, 2)
+    rm.attach(st)
+    assert sorted(rm.resident_sf) == [0, 2] and rm.sf_store_got == "pool"
+    rng = np.random.default_rng(2)
+    on = _run6(model, st, ids, toks, n, rm=rm, after=lambda s: rm.inject_counts(_hot_cold_bias(pool, rng, 30)))
+    _assert_rows_equal(on, off, "6-row partial pool + residency vs step store, residency off")
+    assert rm.stats["published"] > 0 and rm.state.n_swaps > 0
+    moved = {l for l in range(pool.n_layers) for e, s in rm.slot_of[l].items() if s >= len(pool.hot[l])}
+    assert moved & {0, 2} and moved & {1, 3}, moved                     # both kinds of layer had promotions
+    rm.flush()
+    a = rm.audit(golden=golden_from_index(model.runtime_load.index))
+    assert a["ok"], a["errors"][:5]
+    rm.close()
+    st.detach()
+
+
+def test_m3s2_hist_instrument(rows_dg, monkeypatch, tmp_path):
+    """$DSV41_STAGE_HIST: per layer-call cold / hot unique counts == the step's own routed counters (per layer), the
+    outputs unchanged, the JSON written by dump(); off by default (no tensors, nothing counted)."""
+    from runtime.static_step import StaticStep
+
+    model, pool, fk, fake = rows_dg("mini4")
+    monkeypatch.setattr(SO, "CPU_RESOLVE", _registry(pool).__getitem__)
+    hid = (len(model.layers) - 1,)
+    n_layers, n = len(model.layers), 3
+    ids, toks = _tf_tokens(18, 6 * n, 404)
+    outs = {}
+    for mode in ("kernel", "kernel-overlap"):
+        monkeypatch.setenv(SO.STAGE_ENV, mode)
+        for on in (False, True):
+            path = tmp_path / f"hist-{mode}.json"
+            if on:
+                monkeypatch.setenv(SO.HIST_ENV, str(path))
+            else:
+                monkeypatch.delenv(SO.HIST_ENV, raising=False)
+            st = StaticStep(model, pool, max_pos=511, rows=6, hidden_layers=hid, moe_impl="dg-inplace",
+                            _allow_cpu=True)
+            ov = st.stage_ov
+            try:
+                outs[(mode, on)] = _static_run(model, st, ids, toks, n)
+                if not on:
+                    assert ov.hist is None and ov.hist_summary() is None and ov.describe()["hist"] is None
+                    continue
+                s = ov.hist_summary()
+                hot_c, cold_c = st.routed_counts()
+                assert s["layer_calls"] == n_layers * n and s["P"] == 6 * st.topk
+                for l in range(n_layers):
+                    assert sum(c * v for c, v in enumerate(s["hist"][l])) == cold_c[l], (l, s["hist"][l], cold_c)
+                assert abs(s["hot_mean"] * s["layer_calls"] - sum(hot_c)) < 1e-6 * max(1, sum(hot_c)) + 0.5
+                assert sum(cold_c) > 0 and s["cold_max"] >= 1
+                assert ov.dump() == str(path) and json.load(open(path))["layer_calls"] == n_layers * n
+            finally:
+                if ov is not None and ov.hist is not None:
+                    SO.hist_forget(ov)
+                st.detach()
+        a_, b_ = outs[(mode, True)], outs[(mode, False)]
+        _assert_rows_equal(a_[0], b_[0], f"{mode}: hist on vs off")
+
+
+def test_m3s2_bench_cpu_subcommands(tmp_path):
+    sys.path.insert(0, os.path.join(REPO, "bench"))
+    import staging_bytes_bench as B
+
+    out = tmp_path / "b.json"
+    assert B.main(["all", "--out", str(out)]) == 0
+    d = json.load(open(out))
+    cen = d["census"]["counted"]
+    for key, v in cen.items():                                         # rows the contracts read per layer-call
+        c, h = v["cold"], v["hot"]
+        assert v["step"]["m1_stage_rows"].get("hot.scale", 0) == 3 * h, key
+        assert v["pool"]["m1_stage_rows"].get("hot.scale", 0) == 0, key
+        for st_ in ("step", "pool"):
+            for which in ("m1_stage_rows", "s1_stage_proj_x3"):
+                r = v[st_][which]
+                assert r.get("cold.weight", 0) == 3 * c and r.get("cold.scale", 0) == 3 * c and "hot.weight" not in r
+    cc = d["census"]["contract_check"]
+    assert cc["step_equal_pool"] and cc["step-h3_equal_pool"] and cc["listed_h3"] == cc["n_cold"] + 3, cc
+    assert d["pool_fit"]["pool_sf"]["total_GiB"] == 13.142
+    arm = [r for r in d["pool_fit"]["arms"] if r["pool_spare"] == 24 and r["headroom_GiB"] == 2.0
+           and r["spec"] == "auto"][0]
+    assert arm["mode"] == "partial" and arm["layers_pooled"] == 7
+    e = d["exposure"]
+    assert 15 < e["linear_fit"]["us_per_cold_expert_per_layer"] < 30 and e["linear_fit"]["zero_cold_ms"] > 1.0
+    assert not any(m == "vllm" or m.startswith("vllm.") for m in sys.modules)

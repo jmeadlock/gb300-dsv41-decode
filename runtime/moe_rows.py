@@ -761,6 +761,8 @@ class DGInplaceMoERows(DGMaskedMoERows):
         """Today's ONE staging launch, or (M3-S1, $DSV41_STAGE != kernel) the staging_overlap hook; in the overlap
         modes the shared expert (same kernels, same input) runs on the main stream while the side stream stages."""
         ov = self._ov
+        if ov is not None:
+            ov.count(self, m)                                          # M3-S2 instrument (no-op unless enabled)
         if ov is None or not ov.active:
             self.owner.dg.stage_rows(t, m)                             # 1 launch: staged cold c -> H + c (+ SF)
         elif ov.launch(self, t, m) and self._x_cur is not None:
@@ -792,7 +794,7 @@ class DGInplaceMoERows(DGMaskedMoERows):
         o, b, t = self.owner, self.owner.dg, self.t
         return {"gtab": t["gtab"], "H": int(t["H"]), "S": self.S, "dummy": self.dummy, "has_dummy": self.has_dummy,
                 "v2": True, "layout": b.layout, "mi": b.mi, "gl": b.gl, "G": int(t["G"]), "gscr": b.gscr,
-                "ovf": getattr(o, "ovf_step", None), "step_sf": b.sf_store == "step"}
+                "ovf": getattr(o, "ovf_step", None), "step_sf": b.step_sf(t)}   # M3-S2: per layer (partial pool)
 
     def _route_kw(self) -> dict:
         """dedup_fused's dg-inplace extras: the layer's hot-slot table, H, the spare budget, the stand-in id, and
