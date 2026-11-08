@@ -113,6 +113,16 @@ def KS():
     sys.modules.pop("pdl_kernels_under_shim", None)
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _runtime_kernels_pdl_off():
+    """M2-L5: the runtime kernels here are the probe's reference (today's launch); KS's module-wide `P.to` identity
+    patch cannot carry the runtime's own prefetch (tests/test_pdl_impl_cpu.py covers that), so pin $DSV41_PDL off
+    even when the suite runs under DSV41_PDL=on|prefetch."""
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("DSV41_PDL", "off")
+        yield
+
+
 @pytest.fixture(scope="module")
 def KG():
     return triton_shim.load_module_under_shim(os.path.join(REPO, "runtime", "gemv_mxfp8.py"), "gemv_under_shim_pdl")

@@ -67,6 +67,8 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from runtime import pdl as _pdl   # M2-L5: PDL / pre-wait prefetch switch ($DSV41_PDL, default off)
+
 try:  # GPU image only; the Mac tests use gemv_torch
     import triton
     import triton.language as tl
@@ -586,13 +588,36 @@ if HAVE_TRITON:
             r = _t9b_pow2(a) * _t9b_pow2(b)
         tl.store(out_ptr + i, r, mask=ok)
 
+    # --- M2-L5 (runtime/pdl.py): the pre-wait L2 weight prefetch. Verbatim copies in gemv_mxfp8.py, static_kernels.py
+    # and fused_glue_r2.py (tests/test_pdl_impl_cpu.py checks the sources are identical).
+    @triton.jit
+    def _pdl_pf_l2(ptr):
+        """prefetch.global.L2 of the 128 B line holding each address of the block: an L2 hint (nothing is read into a
+        register, no ordering, no fault for an in-bounds address)."""
+        return tl.inline_asm_elementwise("{ prefetch.global.L2 [$1]; mov.u32 $0, 0; }", "=r,l",
+                                         [ptr.to(tl.int64)], dtype=tl.int32, is_pure=False, pack=1)
+
+    @triton.jit
+    def _pdl_prefetch(base, r0, nrows, stride, c0, clen, NR: tl.constexpr, EPL: tl.constexpr, NL: tl.constexpr,
+                      CH: tl.constexpr):
+        """The 128 B lines of rows [r0, r0 + NR) (clamped to nrows - 1) x elements [c0, c0 + clen) of `base` (row
+        stride `stride` elements, EPL elements per line): NL line points per row (runtime.pdl.lines; the last point
+        clamped to the run's last element), CH points per row per chunk (runtime.pdl.chunk)."""
+        pf_r = tl.minimum(r0 + tl.arange(0, NR), nrows - 1).to(tl.int64)
+        for pf_c in tl.static_range(NL // CH):
+            pf_j = pf_c * CH + tl.arange(0, CH)
+            pf_o = c0 + tl.minimum(pf_j * EPL, clen - 1)
+            _pdl_pf_l2(base + pf_r[:, None] * stride + pf_o[None, :])
+
     @triton.jit
     def t9b_mxfp8_gemv(xq, xs, w, s, out, ws, M, N, KB, PER,
                        stride_xm, stride_xsm, stride_wn, stride_sn, stride_om, freqs,
                        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, KU: tl.constexpr, EVEN: tl.constexpr,
                        MMA: tl.constexpr, SPLIT: tl.constexpr, ROPE: tl.constexpr = False, HEAD_DIM: tl.constexpr = 2,
                        ROPE_DIM: tl.constexpr = 0, RE_MODE: tl.constexpr = 0, IM_MODE: tl.constexpr = 0,
-                       stride_fm=0, FROWS: tl.constexpr = False):
+                       stride_fm=0, FROWS: tl.constexpr = False, PDL: tl.constexpr = 0, PDL_PF: tl.constexpr = 0,
+                       PF_NL: tl.constexpr = 1, PF_CH: tl.constexpr = 1, PF_NS: tl.constexpr = 1,
+                       PF_SR: tl.constexpr = 1):
         """Program (pn, ks): output columns [pn*BLOCK_N, (pn+1)*BLOCK_N) for all M rows over K blocks
         [ks*PER, min((ks+1)*PER, KB)). Per K block (KU per loop iteration, unrolled, in K order): the [BLOCK_M, 32]
         activation tile and the [BLOCK_N, 32] weight tile, fp32 block partials for every (m, n) (tl.dot or broadcast
@@ -602,11 +627,22 @@ if HAVE_TRITON:
         (summed by t9b_splitk_reduce); else bf16 -> out. ROPE (T9b-2 #13, direct store only): the bf16-rounded values
         of every head's last ROPE_DIM columns are rotated in pairs by freqs (fp32 [ROPE_DIM/2, 2]) with the
         contraction form (RE_MODE, IM_MODE) torch's complex multiply uses, then rounded to bf16 -- exactly
-        apply_rotary_emb on the stored output; the accumulation above is untouched."""
+        apply_rotary_emb on the stored output; the accumulation above is untouched.
+        M2-L5 PDL (runtime/pdl.py): PDL_PF prefetches this program's weight / weight-scale slice into L2, then
+        gdc_wait() precedes the first load; the trigger at entry (PDL 1) or after the K loop (PDL 2)."""
         pid_n = tl.program_id(0)
         ks = tl.program_id(1)
         kb_lo = ks * PER
         kb_hi = tl.minimum(kb_lo + PER, KB)
+        if PDL_PF:
+            _pdl_prefetch(w, pid_n * BLOCK_N, N, stride_wn, kb_lo * 32, (kb_hi - kb_lo) * 32, BLOCK_N, 128, PF_NL,
+                          PF_CH)
+            _pdl_prefetch(s, (pid_n * BLOCK_N) // 32, (N + 31) // 32, stride_sn, kb_lo, kb_hi - kb_lo, PF_SR, 128,
+                          PF_NS, PF_NS)
+        if PDL > 0:
+            tl.extra.cuda.gdc_wait()
+        if PDL == 1:
+            tl.extra.cuda.gdc_launch_dependents()
         rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         n_ok = rn < N
         rn_in = tl.where(n_ok, rn, 0)
@@ -640,6 +676,8 @@ if HAVE_TRITON:
                 else:
                     acc = tl.where(kb < kb_hi, acc + q, acc)
         mask = m_ok[:, None] & n_ok[None, :]
+        if PDL == 2:
+            tl.extra.cuda.gdc_launch_dependents()
         if SPLIT:
             tl.store(ws + ks * M * N + rm[:, None] * N + rn[None, :], acc, mask=mask)
         elif ROPE:
@@ -667,11 +705,16 @@ if HAVE_TRITON:
     @triton.jit
     def t9b_splitk_reduce(ws, out, M, N, NSPLIT, stride_om, freqs, BLOCK_R: tl.constexpr, ROPE: tl.constexpr = False,
                           HEAD_DIM: tl.constexpr = 2, ROPE_DIM: tl.constexpr = 0, RE_MODE: tl.constexpr = 0,
-                          IM_MODE: tl.constexpr = 0, stride_fm=0, FROWS: tl.constexpr = False):
+                          IM_MODE: tl.constexpr = 0, stride_fm=0, FROWS: tl.constexpr = False,
+                          PDL: tl.constexpr = 0):
         """out[m, n] = bf16(((0 + ws[0, m, n]) + ws[1, m, n]) + ... + ws[NSPLIT-1, m, n]): fixed split order. ROPE
         (T9b-2 #13): each lane also sums its pair partner n ^ 1 in the same order (so both see the same two values),
         rounds both to bf16 and stores its own component of the rotated pair (columns outside RoPE: unchanged).
-        M1-T10-PORT FROWS: row m takes freqs row m (stride stride_fm), its own position."""
+        M1-T10-PORT FROWS: row m takes freqs row m (stride stride_fm), its own position. M2-L5: PDL (runtime/pdl.py)."""
+        if PDL > 0:
+            tl.extra.cuda.gdc_wait()
+        if PDL == 1:
+            tl.extra.cuda.gdc_launch_dependents()
         i = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
         ok = i < M * N
         acc = tl.zeros([BLOCK_R], dtype=tl.float32)
@@ -702,6 +745,8 @@ if HAVE_TRITON:
             tl.store(out + m * stride_om + n, tl.where(is_r, rot, x).to(tl.bfloat16), mask=ok)
         else:
             tl.store(out + m * stride_om + n, acc.to(tl.bfloat16), mask=ok)
+        if PDL == 2:
+            tl.extra.cuda.gdc_launch_dependents()
 
     # T9b-2: the RoPE helpers, a verbatim copy of runtime/fused_glue.py's (tests/test_fused_glue_cpu.py asserts the
     # source is identical): explicit mul.rn/add.rn/sub.rn PTX and tl.fma, so the result does not depend on this
@@ -832,11 +877,20 @@ def _launch(xq, xs, w, s, out, cfg: GemvConfig, ws, rope=None, reduce: bool = Tr
         xq, xs.view(torch.uint8), w, s.view(torch.uint8), out, ws, M, N, K // BLOCK, p["PER"],
         xq.stride(0), xs.stride(0), w.stride(0), s.stride(0), out.stride(0), freqs,
         BLOCK_M=p["BLOCK_M"], BLOCK_N=cfg.block_n, KU=cfg.ku, EVEN=p["EVEN"], MMA=bool(cfg.mma), SPLIT=p["SPLIT"],
-        num_warps=cfg.num_warps, num_stages=cfg.num_stages, **({} if p["SPLIT"] else rk))
+        num_warps=cfg.num_warps, num_stages=cfg.num_stages, **({} if p["SPLIT"] else rk),
+        **_pdl.kw("t9b_mxfp8_gemv", pf=lambda: gemv_pf(cfg.block_n, p["PER"])))
     if p["SPLIT"] and reduce:
         t9b_splitk_reduce[p["reduce_grid"]](ws, out, M, N, p["NSPLIT"], out.stride(0), freqs, BLOCK_R=REDUCE_BLOCK,
-                                            num_warps=4, **rk)
+                                            num_warps=4, **rk, **_pdl.kw("t9b_splitk_reduce"))
     return out
+
+
+def gemv_pf(block_n: int, per: int) -> dict:
+    """M2-L5: the pre-wait prefetch constexprs of one GEMV program's slice -- block_n weight rows x PER*32 bytes and
+    max(1, block_n/32) scale rows x PER bytes (runtime.pdl.lines / chunk)."""
+    nl = _pdl.lines(int(per) * BLOCK, 128)
+    return {"PF_NL": nl, "PF_CH": _pdl.chunk(nl, int(block_n)), "PF_NS": _pdl.lines(int(per), 128),
+            "PF_SR": max(1, int(block_n) // 32)}
 
 
 def linear_fp8(xq: torch.Tensor, xs: torch.Tensor, w: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
@@ -921,7 +975,8 @@ def materialize(r) -> torch.Tensor:
         return r.reduce_torch()
     out = torch.empty(r.M, r.N, dtype=torch.bfloat16, device=r.device)
     t9b_splitk_reduce[(-(-(r.M * r.N) // REDUCE_BLOCK),)](r.ws, out, r.M, r.N, r.nsplit, out.stride(0), out,
-                                                          BLOCK_R=REDUCE_BLOCK, num_warps=4)
+                                                          BLOCK_R=REDUCE_BLOCK, num_warps=4,
+                                                          **_pdl.kw("t9b_splitk_reduce"))
     return out
 
 
@@ -1005,7 +1060,8 @@ def _launch_pair(xq, xs, wa, sa, wb, sb, pp: dict, outa, wsa, outb, wsb) -> None
         outb.stride(0),
         BLOCK_M=pp["BLOCK_M"], BLOCK_N=pp["BLOCK_N"], KU=pp["KU"], EVENA=pp["EVENA"], EVENB=pp["EVENB"],
         MMA=pp["MMA"], SPLITA=pp["NSA"] > 1, SPLITB=pp["NSB"] > 1, num_warps=pp["num_warps"],
-        num_stages=pp["num_stages"])
+        num_stages=pp["num_stages"],
+        **_pdl.kw("t9b4_mxfp8_gemv2", pf=lambda: gemv_pf(pp["BLOCK_N"], max(pp["PERA"], pp["PERB"]))))
 
 
 PAIR_STATS = {"pair": 0, "split": 0}   # host-side counts of gemv_pair calls that took one launch / fell back to two
@@ -1093,11 +1149,36 @@ if HAVE_TRITON:
                          stride_xm, stride_xsm, stride_wan, stride_san, stride_oam, stride_wbn, stride_sbn,
                          stride_obm, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, KU: tl.constexpr,
                          EVENA: tl.constexpr, EVENB: tl.constexpr, MMA: tl.constexpr, SPLITA: tl.constexpr,
-                         SPLITB: tl.constexpr):
+                         SPLITB: tl.constexpr, PDL: tl.constexpr = 0, PDL_PF: tl.constexpr = 0,
+                         PF_NL: tl.constexpr = 1, PF_CH: tl.constexpr = 1, PF_NS: tl.constexpr = 1,
+                         PF_SR: tl.constexpr = 1):
         """T9b-4 (a): grid (TA + TB, max(NSA, NSB)). Program (pn, ks): pn < TA -> tile pn of weight a over its split
-        ks (if ks < NSA), else tile pn - TA of weight b (if ks < NSB). Each half: its own PER / NSPLIT / EVEN."""
+        ks (if ks < NSA), else tile pn - TA of weight b (if ks < NSB). Each half: its own PER / NSPLIT / EVEN.
+        M2-L5 PDL (runtime/pdl.py): PDL_PF prefetches the program's own half's slice (as t9b_mxfp8_gemv), then
+        gdc_wait(); the trigger at entry (PDL 1) or at the end (PDL 2: _t9b4_gemv_tile stays t9b_mxfp8_gemv's body)."""
         pid_n = tl.program_id(0)
         ks = tl.program_id(1)
+        if PDL_PF:
+            if pid_n < TA:
+                if ks < NSA:
+                    pfa_lo = ks * PERA
+                    pfa_hi = tl.minimum(pfa_lo + PERA, KB)
+                    _pdl_prefetch(wa, pid_n * BLOCK_N, NA, stride_wan, pfa_lo * 32, (pfa_hi - pfa_lo) * 32, BLOCK_N,
+                                  128, PF_NL, PF_CH)
+                    _pdl_prefetch(sa, (pid_n * BLOCK_N) // 32, (NA + 31) // 32, stride_san, pfa_lo, pfa_hi - pfa_lo,
+                                  PF_SR, 128, PF_NS, PF_NS)
+            else:
+                if ks < NSB:
+                    pfb_lo = ks * PERB
+                    pfb_hi = tl.minimum(pfb_lo + PERB, KB)
+                    _pdl_prefetch(wb, (pid_n - TA) * BLOCK_N, NB, stride_wbn, pfb_lo * 32, (pfb_hi - pfb_lo) * 32,
+                                  BLOCK_N, 128, PF_NL, PF_CH)
+                    _pdl_prefetch(sb, ((pid_n - TA) * BLOCK_N) // 32, (NB + 31) // 32, stride_sbn, pfb_lo,
+                                  pfb_hi - pfb_lo, PF_SR, 128, PF_NS, PF_NS)
+        if PDL > 0:
+            tl.extra.cuda.gdc_wait()
+        if PDL == 1:
+            tl.extra.cuda.gdc_launch_dependents()
         if pid_n < TA:
             if ks < NSA:
                 _t9b4_gemv_tile(xq, xs, wa, sa, outa, wsa, M, NA, KB, PERA, pid_n, ks, stride_xm, stride_xsm,
@@ -1106,3 +1187,5 @@ if HAVE_TRITON:
             if ks < NSB:
                 _t9b4_gemv_tile(xq, xs, wb, sb, outb, wsb, M, NB, KB, PERB, pid_n - TA, ks, stride_xm, stride_xsm,
                                 stride_wbn, stride_sbn, stride_obm, BLOCK_M, BLOCK_N, KU, EVENB, MMA, SPLITB)
+        if PDL == 2:
+            tl.extra.cuda.gdc_launch_dependents()

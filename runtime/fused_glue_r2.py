@@ -71,6 +71,8 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+from runtime import pdl as _pdl   # M2-L5: PDL / pre-wait prefetch switch ($DSV41_PDL, default off)
+
 # runtime/fused_glue.py imports this module to define FusedGlue (it inherits R2Glue), so nothing here imports it at
 # module level: its constants are restated (tests check they agree) and its torch helpers are reached lazily.
 BLOCK = 32                         # act_quant block (fused_glue.BLOCK)
@@ -958,6 +960,27 @@ if HAVE_TRITON:
                 acc = (a0 + a2) + (a1 + a3)
         return _t9b2_bf16(acc)
 
+    # --- M2-L5 (runtime/pdl.py): the pre-wait L2 weight prefetch. Verbatim copies in gemv_mxfp8.py, static_kernels.py
+    # and fused_glue_r2.py (tests/test_pdl_impl_cpu.py checks the sources are identical).
+    @triton.jit
+    def _pdl_pf_l2(ptr):
+        """prefetch.global.L2 of the 128 B line holding each address of the block: an L2 hint (nothing is read into a
+        register, no ordering, no fault for an in-bounds address)."""
+        return tl.inline_asm_elementwise("{ prefetch.global.L2 [$1]; mov.u32 $0, 0; }", "=r,l",
+                                         [ptr.to(tl.int64)], dtype=tl.int32, is_pure=False, pack=1)
+
+    @triton.jit
+    def _pdl_prefetch(base, r0, nrows, stride, c0, clen, NR: tl.constexpr, EPL: tl.constexpr, NL: tl.constexpr,
+                      CH: tl.constexpr):
+        """The 128 B lines of rows [r0, r0 + NR) (clamped to nrows - 1) x elements [c0, c0 + clen) of `base` (row
+        stride `stride` elements, EPL elements per line): NL line points per row (runtime.pdl.lines; the last point
+        clamped to the run's last element), CH points per row per chunk (runtime.pdl.chunk)."""
+        pf_r = tl.minimum(r0 + tl.arange(0, NR), nrows - 1).to(tl.int64)
+        for pf_c in tl.static_range(NL // CH):
+            pf_j = pf_c * CH + tl.arange(0, CH)
+            pf_o = c0 + tl.minimum(pf_j * EPL, clen - 1)
+            _pdl_pf_l2(base + pf_r[:, None] * stride + pf_o[None, :])
+
     # --- #1 + #5
     @triton.jit
     def t9b2r2_hc_norm(x, pre, nw, y, yf, xf, mrs, q, s, dq, ds, dq_gs, ds_gs, ds_cs, G, tab,
@@ -967,7 +990,8 @@ if HAVE_TRITON:
                        MT: tl.constexpr, MV: tl.constexpr, MU: tl.constexpr, MDEC: tl.constexpr, MDIV: tl.constexpr,
                        PASS_A: tl.constexpr, HAS_MIX: tl.constexpr, HAS_XF: tl.constexpr, HAS_YF: tl.constexpr,
                        QQ: tl.constexpr, HAS_Q: tl.constexpr, HAS_DG: tl.constexpr, BB: tl.constexpr,
-                       DG_PACK: tl.constexpr = False):
+                       DG_PACK: tl.constexpr = False, PDL: tl.constexpr = 0, PDL_PF: tl.constexpr = 0, PF_EPL: tl.constexpr = 64, PF_NL: tl.constexpr = 1,
+                       PF_CH: tl.constexpr = 1):
         """One program. x [HC, D] bf16 (the residual stream copies), pre [HC] fp32 (pre_mix), nw [D] (norm weight).
         A (PASS_A): xf = x.flatten().float() (HAS_XF) and mrs = rsqrt(mean(xf^2) + meps) in order M* (HAS_MIX:
         hc_mixes' statistic, model.py:954-955). B: y0 = hc_pre(x, pre) (bf16), var = mean(y0^2) in order N*,
@@ -977,6 +1001,12 @@ if HAVE_TRITON:
         T9b-4: t9b4_hc_norm is the same work over several programs (kept here for the fallback / A-B).
         M1-T10-PORT: grid axis 1 = token row t (1 at the one-row step): x / pre / y / yf / xf / mrs / q / s are row t
         of [R, ...] buffers (the statistic is per row, in the order calibrated at R rows)."""
+        if PDL_PF:
+            _pdl_prefetch(nw, 0, 1, 0, 0, D, 1, PF_EPL, PF_NL, PF_CH)
+        if PDL > 0:
+            tl.extra.cuda.gdc_wait()
+        if PDL == 1:
+            tl.extra.cuda.gdc_launch_dependents()
         t = tl.program_id(1)
         x = x + t * (HC * D)
         pre = pre + t * HC
@@ -1025,6 +1055,8 @@ if HAVE_TRITON:
                     for gi in range(G):
                         tl.store(dq + gi * dq_gs + cols, qv, mask=m)
                         _t9b4_store_code(ds, gi, bi, code, bok, ds_gs, ds_cs, DG_PACK)
+        if PDL == 2:
+            tl.extra.cuda.gdc_launch_dependents()
 
     # --- T9b-4 lever 1: the hc_norm work over 1 + ceil(D/32 / BB) programs (docs/HANDOFF-T9B4-RESIDUAL.md)
     @triton.jit
@@ -1088,13 +1120,22 @@ if HAVE_TRITON:
                      MT: tl.constexpr, MV: tl.constexpr, MU: tl.constexpr, MDEC: tl.constexpr, MDIV: tl.constexpr,
                      PASS_A: tl.constexpr, HAS_MIX: tl.constexpr, HAS_XF: tl.constexpr, HAS_YF: tl.constexpr,
                      QQ: tl.constexpr, HAS_Q: tl.constexpr, HAS_DG: tl.constexpr, DG_PACK: tl.constexpr,
-                     BB: tl.constexpr):
+                     BB: tl.constexpr, PDL: tl.constexpr = 0, PDL_PF: tl.constexpr = 0, PF_EPL: tl.constexpr = 64, PF_NL: tl.constexpr = 1,
+                     PF_CH: tl.constexpr = 1):
         """t9b2r2_hc_norm's outputs, bit for bit, from NAP (+1 with PASS_A) programs: program p < NAP recomputes the
         norm statistic (identical code -> identical r) and writes the 32-blocks [p*BB, (p+1)*BB); program NAP (PASS_A)
         writes xf and the mix statistic. The reduction ORDER is the calibrated one, untouched: the work is split, the
         sums are not (redundant statistic instead of a partitioned reduction + combine). M1-T10-PORT: grid axis 1 =
         token row t, as t9b2r2_hc_norm's."""
         pid = tl.program_id(0)
+        if PDL_PF:
+            if pid < NAP:
+                _pdl_prefetch(nw, 0, 1, 0, pid * (BB * 32), tl.minimum(BB * 32, D - pid * (BB * 32)), 1, PF_EPL,
+                              PF_NL, PF_CH)
+        if PDL > 0:
+            tl.extra.cuda.gdc_wait()
+        if PDL == 1:
+            tl.extra.cuda.gdc_launch_dependents()
         t = tl.program_id(1)
         x = x + t * (HC * D)
         pre = pre + t * HC
@@ -1113,6 +1154,8 @@ if HAVE_TRITON:
         else:
             _t9b4_hc_apply(x, pre, nw, y, yf, q, s, dq, ds, dq_gs, ds_gs, ds_cs, G, tab, eps, fac, wf, pid * BB,
                            D, HC, HCMODE, NT, NV, NU, NDEC, NDIV, HAS_YF, QQ, HAS_Q, HAS_DG, DG_PACK, BB)
+        if PDL == 2:
+            tl.extra.cuda.gdc_launch_dependents()
 
     # --- #3 / #6
     @triton.jit
@@ -1120,7 +1163,8 @@ if HAVE_TRITON:
                         N: tl.constexpr, T: tl.constexpr, V: tl.constexpr, U: tl.constexpr, DEC: tl.constexpr,
                         DIV: tl.constexpr, HAS_SLOT: tl.constexpr, QQ: tl.constexpr, HAS_Q: tl.constexpr,
                         QDQ: tl.constexpr, RD: tl.constexpr, RE_MODE: tl.constexpr, IM_MODE: tl.constexpr,
-                        BB: tl.constexpr, XS=0, NS: tl.constexpr = 0, FS=0):
+                        BB: tl.constexpr, XS=0, NS: tl.constexpr = 0, FS=0, PDL: tl.constexpr = 0, PDL_PF: tl.constexpr = 0, PF_EPL: tl.constexpr = 64, PF_NL: tl.constexpr = 1,
+                        PF_CH: tl.constexpr = 1):
         """One program: RMSNorm of one bf16 row x [N] (model.py:288-293, statistic in order T/V/U/DEC/DIV), then per
         32-block as even/odd pairs: RoPE on the last RD columns (RD > 0; the forward rotation by freqs [RD/2, 2],
         contraction forms RE/IM_MODE, bf16), act_quant QDQ in place (QDQ) -> out (+ slot[0] * N: the window ring
@@ -1128,6 +1172,12 @@ if HAVE_TRITON:
         fp32 split partials [NS, N] (split stride XS), reduced on load in the split-K reduce's order (_t9b4_ld).
         M1-T10-PORT: program t = token row t of R (one program at the one-row step): x / q / s / out row t (out:
         ring row slot[t] with HAS_SLOT), freqs row t (stride FS); split partials [NS, R, N]: row t inside each."""
+        if PDL_PF:
+            _pdl_prefetch(nw, 0, 1, 0, 0, N, 1, PF_EPL, PF_NL, PF_CH)
+        if PDL > 0:
+            tl.extra.cuda.gdc_wait()
+        if PDL == 1:
+            tl.extra.cuda.gdc_launch_dependents()
         t = tl.program_id(0)
         x = x + t * N
         q = q + t * N
@@ -1185,12 +1235,19 @@ if HAVE_TRITON:
             else:
                 tl.store(base + ce, a2.to(tl.bfloat16), mask=m)
                 tl.store(base + ce + 1, b2.to(tl.bfloat16), mask=m)
+        if PDL == 2:
+            tl.extra.cuda.gdc_launch_dependents()
 
     # --- #4
     @triton.jit
-    def t9b2r2_router_pre(sp, bias, sc, bsc, E, BLOCK_E: tl.constexpr, NT=0, ROWS: tl.constexpr = False):
+    def t9b2r2_router_pre(sp, bias, sc, bsc, E, BLOCK_E: tl.constexpr, NT=0, ROWS: tl.constexpr = False,
+                          PDL: tl.constexpr = 0):
         """scores = sqrt(softplus) (IEEE sqrt), biased = scores + bias (model.py:819, 824). M1-T10-PORT ROWS: R rows
         of E scores flattened (NT = R*E elements, bias index i % E)."""
+        if PDL > 0:
+            tl.extra.cuda.gdc_wait()
+        if PDL == 1:
+            tl.extra.cuda.gdc_launch_dependents()
         i = tl.program_id(0) * BLOCK_E + tl.arange(0, BLOCK_E)
         if ROWS:
             m = i < NT
@@ -1201,15 +1258,21 @@ if HAVE_TRITON:
         v = libdevice.sqrt_rn(tl.load(sp + i, mask=m, other=0.0))
         tl.store(sc + i, v, mask=m)
         tl.store(bsc + i, v + tl.load(bias + bi, mask=m, other=0.0), mask=m)
+        if PDL == 2:
+            tl.extra.cuda.gdc_launch_dependents()
 
     @triton.jit
     def t9b2r2_router_post(idx, sc, ids_out, w_out, K, rs, eps,
                            T: tl.constexpr, V: tl.constexpr, U: tl.constexpr, DEC: tl.constexpr, KP: tl.constexpr,
-                           SE=0):
+                           SE=0, PDL: tl.constexpr = 0):
         """One program: weights = scores[idx] (torch.topk's order), w = weights / (sum + eps) * route_scale
         (model.py:825-828, the sum in order T/V/U/DEC), then ascending by id (distinct ids: rank = how many are
         smaller) -> ids_out int64, w_out fp32. M1-T10-PORT: program t = token row t (idx / ids_out / w_out row t of
         [R, K], sc row t of [R, E], row stride SE); one program at the one-row step."""
+        if PDL > 0:
+            tl.extra.cuda.gdc_wait()
+        if PDL == 1:
+            tl.extra.cuda.gdc_launch_dependents()
         t = tl.program_id(0)
         idx = idx + t * K
         sc = sc + t * SE
@@ -1229,18 +1292,28 @@ if HAVE_TRITON:
         rank = tl.sum(tl.where(mj[None, :] & (ij[None, :] < ij[:, None]), 1, 0), axis=1)
         tl.store(ids_out + rank, ij, mask=mj)
         tl.store(w_out + rank, wj, mask=mj)
+        if PDL == 2:
+            tl.extra.cuda.gdc_launch_dependents()
 
     # --- #15
     @triton.jit
     def t9b2r2_engram_gate(x, kv, wp, z, eps, fac, wf, c, cmin,
                            D: tl.constexpr, T: tl.constexpr, V: tl.constexpr, U: tl.constexpr, DEC: tl.constexpr,
                            DIV: tl.constexpr, ST: tl.constexpr, SV: tl.constexpr, SU: tl.constexpr,
-                           SDEC: tl.constexpr, HC: tl.constexpr = 0):
+                           SDEC: tl.constexpr, HC: tl.constexpr = 0, PDL: tl.constexpr = 0,
+                           PDL_PF: tl.constexpr = 0, PF_EPL: tl.constexpr = 32, PF_NL: tl.constexpr = 1,
+                           PF_CH: tl.constexpr = 1):
         """Program i (hc copy): h = x[i].float(), key = kv[i*D:(i+1)*D].float(); rstd = rsqrt(mean(h^2) + eps) *
         rsqrt(mean(key^2) + eps) (order T/V/U/DEC/DIV); dot = sum((h * wp[i]) * key) (order S*) * rstd * c;
         z[i] = copysign(sqrt(max(|dot|, cmin)), dot) (model.py:357-362 up to the sigmoid). M1-T10-PORT: grid axis 1
         = token row t (x row t of [R, HC, D], kv row t of [R, (HC+1)*D], z row t of [R, HC]; HC given)."""
         i = tl.program_id(0)
+        if PDL_PF:
+            _pdl_prefetch(wp, i, i + 1, D, 0, D, 1, PF_EPL, PF_NL, PF_CH)
+        if PDL > 0:
+            tl.extra.cuda.gdc_wait()
+        if PDL == 1:
+            tl.extra.cuda.gdc_launch_dependents()
         t = tl.program_id(1)
         x = x + t * (HC * D)
         kv = kv + t * ((HC + 1) * D)
@@ -1271,11 +1344,18 @@ if HAVE_TRITON:
         sgn = (dot.to(tl.int32, bitcast=True) >> 31) << 31          # the sign bit, int32 (no int64 literal)
         zz = (sq.to(tl.int32, bitcast=True) & 0x7FFFFFFF) | sgn
         tl.store(z + i, zz.to(tl.float32, bitcast=True))
+        if PDL == 2:
+            tl.extra.cuda.gdc_launch_dependents()
 
     @triton.jit
-    def t9b2r2_engram_out(x, kv, gate, out, D: tl.constexpr, HC: tl.constexpr, BLOCK_C: tl.constexpr):
+    def t9b2r2_engram_out(x, kv, gate, out, D: tl.constexpr, HC: tl.constexpr, BLOCK_C: tl.constexpr,
+                          PDL: tl.constexpr = 0):
         """Program (pb, i): out[i] = bf16(h[i] + gate[i] * value) (model.py:365), value = kv[HC*D:]. M1-T10-PORT:
         grid axis 2 = token row t (x / out row t of [R, HC, D], kv row t of [R, (HC+1)*D], gate row t of [R, HC])."""
+        if PDL > 0:
+            tl.extra.cuda.gdc_wait()
+        if PDL == 1:
+            tl.extra.cuda.gdc_launch_dependents()
         pb = tl.program_id(0)
         i = tl.program_id(1)
         t = tl.program_id(2)
@@ -1289,13 +1369,19 @@ if HAVE_TRITON:
         v = tl.load(kv + HC * D + e, mask=m, other=0.0).to(tl.float32)
         o = h + tl.load(gate + i) * v
         tl.store(out + i * D + e, o.to(tl.bfloat16, fp_downcast_rounding="rtne"), mask=m)
+        if PDL == 2:
+            tl.extra.cuda.gdc_launch_dependents()
 
     # --- #14
     @triton.jit
-    def t9b2r2_topk_post(idx, clen, out, K, offset, KP: tl.constexpr, RB: tl.constexpr):
+    def t9b2r2_topk_post(idx, clen, out, K, offset, KP: tl.constexpr, RB: tl.constexpr, PDL: tl.constexpr = 0):
         """Program p: the ascending position (rank among the K distinct topk indices) of indices [p*RB, (p+1)*RB),
         and out[rank] = idx < clen ? idx + offset : -1 as int32 (model.py:580-581). M1-T10-PORT: grid axis 1 =
         token row t (idx / out row t of [R, K], clen[t] -- the [R, 1] compress_lens of the R-row step)."""
+        if PDL > 0:
+            tl.extra.cuda.gdc_wait()
+        if PDL == 1:
+            tl.extra.cuda.gdc_launch_dependents()
         p = tl.program_id(0)
         t = tl.program_id(1)
         idx = idx + t * K
@@ -1311,6 +1397,8 @@ if HAVE_TRITON:
         cl = tl.load(clen)
         v = tl.where(ii < cl, ii + offset, -1)
         tl.store(out + rank, v.to(tl.int32), mask=mi)
+        if PDL == 2:
+            tl.extra.cuda.gdc_launch_dependents()
 
 
 # ------------------------------------------------------------------------------------------------ launch wrappers
@@ -1369,10 +1457,13 @@ def launch_hc_norm(x, pre, nw, y, *, eps: float, norm_ord: dict, hc_mode: int, c
         rows = (R_,) if R_ > 1 else ()
         if split:
             nap = -(-(D // BLOCK) // HC_SPLIT_BB)
-            t9b4_hc_norm[(nap + (1 if pass_a else 0),) + rows](*args, nap, **ce, BB=HC_SPLIT_BB,
-                                                               num_warps=HC_SPLIT_WARPS, **LAUNCH)
+            t9b4_hc_norm[(nap + (1 if pass_a else 0),) + rows](
+                *args, nap, **ce, BB=HC_SPLIT_BB, num_warps=HC_SPLIT_WARPS, **LAUNCH,
+                **_pdl.kw("t9b4_hc_norm", pf=lambda: _pdl.pf_rows(HC_SPLIT_BB * BLOCK, nw.element_size(), 1)))
         else:
-            t9b2r2_hc_norm[(1,) + rows](*args, **ce, BB=8, num_warps=NORM_WARPS, **LAUNCH)
+            t9b2r2_hc_norm[(1,) + rows](*args, **ce, BB=8, num_warps=NORM_WARPS, **LAUNCH,
+                                        **_pdl.kw("t9b2r2_hc_norm",
+                                                  pf=lambda: _pdl.pf_rows(D, nw.element_size(), 1)))
         return
     xv = x.float().reshape(R_, HC * D)
     if xf is not None:
@@ -1433,7 +1524,7 @@ def launch_norm_row(x, nw, out, *, eps: float, ordd: dict, code_tab=None, slot=N
             N=N, T=a["T"], V=a["V"], U=a["U"], DEC=a["DEC"], DIV=a["DIV"], HAS_SLOT=slot is not None,
             QQ=q is not None or qdq, HAS_Q=q is not None, QDQ=bool(qdq), RD=RD, RE_MODE=int(modes[0]),
             IM_MODE=int(modes[1]), BB=min(16, _np2(N // 32)), XS=int(XS), NS=int(NS), **fs, num_warps=NORM_WARPS,
-            **LAUNCH)
+            **LAUNCH, **_pdl.kw("t9b2r2_norm_row", pf=lambda: _pdl.pf_rows(N, nw.element_size(), 1)))
         return
     if NS:
         x = x.reduce_torch()
@@ -1464,7 +1555,8 @@ def launch_router_pre(sp, bias, sc, bsc):
     if _kern(sp):
         BLOCK_E = min(1024, _np2(E))
         rk = dict(NT=int(NT), ROWS=True) if NT != E else {}
-        t9b2r2_router_pre[(triton.cdiv(NT, BLOCK_E),)](sp, bias, sc, bsc, E, BLOCK_E=BLOCK_E, **rk, **LAUNCH)
+        t9b2r2_router_pre[(triton.cdiv(NT, BLOCK_E),)](sp, bias, sc, bsc, E, BLOCK_E=BLOCK_E, **rk, **LAUNCH,
+                                                       **_pdl.kw("t9b2r2_router_pre"))
         return
     v = sp.sqrt()
     sc.copy_(v)
@@ -1481,7 +1573,7 @@ def launch_router_post(idx, sc, ids_out, w_out, *, ordd: dict, eps: float, rs: f
         a = order_args(ordd)
         se = {"SE": int(sc.stride(0))} if rows else {}
         t9b2r2_router_post[(R_,)](idx, sc, ids_out, w_out, K, float(rs), float(eps), T=a["T"], V=a["V"], U=a["U"],
-                                  DEC=a["DEC"], KP=_np2(K), **se, **LAUNCH)
+                                  DEC=a["DEC"], KP=_np2(K), **se, **LAUNCH, **_pdl.kw("t9b2r2_router_post"))
         return
     ids, w = router_post_torch(idx, sc, ordd, eps, rs)
     ids_out.copy_(ids.view(ids_out.shape))
@@ -1498,7 +1590,8 @@ def launch_engram_gate(x, kv, wp, z, *, eps: float, ordd: dict, sordd: dict, c: 
         t9b2r2_engram_gate[(HC,) + ((R_,) if R_ > 1 else ())](
             x, kv, wp, z, float(eps), fac_of(D), float(D), float(c), float(cmin), D=D, T=a["T"], V=a["V"], U=a["U"],
             DEC=a["DEC"], DIV=a["DIV"], ST=sa["T"], SV=sa["V"], SU=sa["U"], SDEC=sa["DEC"],
-            **({"HC": HC} if R_ > 1 else {}), num_warps=NORM_WARPS, **LAUNCH)
+            **({"HC": HC} if R_ > 1 else {}), num_warps=NORM_WARPS, **LAUNCH,
+            **_pdl.kw("t9b2r2_engram_gate", pf=lambda: _pdl.pf_rows(D, wp.element_size(), 1)))
         return
     key = kv.reshape(R_, (HC + 1) * D)[:, : HC * D].float().reshape(R_, HC, D)
     zz = engram_gate_torch(x.float().reshape(R_, HC, D) if R_ > 1 else x.float(), key if R_ > 1 else key[0], wp,
@@ -1516,7 +1609,7 @@ def launch_engram_out(x, kv, gate, out):
     R_ = x.numel() // (HC * D)
     if _kern(x):
         t9b2r2_engram_out[(triton.cdiv(D, ENGRAM_BLOCK), HC) + ((R_,) if R_ > 1 else ())](
-            x, kv, gate, out, D=D, HC=HC, BLOCK_C=ENGRAM_BLOCK, **LAUNCH)
+            x, kv, gate, out, D=D, HC=HC, BLOCK_C=ENGRAM_BLOCK, **LAUNCH, **_pdl.kw("t9b2r2_engram_out"))
         return
     v = kv.reshape(R_, (HC + 1) * D)[:, HC * D:].float().view(R_, 1, D)
     res = (x.float().reshape(R_, HC, D) + gate.reshape(R_, HC, 1) * v).to(torch.bfloat16)
@@ -1535,7 +1628,8 @@ def launch_topk_post(idx, clen, out, offset: int):
     if _kern(idx):
         RB = min(TOPK_RB, _np2(K))
         t9b2r2_topk_post[(triton.cdiv(K, RB),) + ((R_,) if rows else ())](idx, clen, out, K, int(offset), KP=_np2(K),
-                                                                         RB=RB, **LAUNCH)
+                                                                         RB=RB, **LAUNCH,
+                                                                         **_pdl.kw("t9b2r2_topk_post"))
         return
     out.copy_(indexer_post_torch(idx, clen.reshape(R_, 1) if rows else clen, offset).view(out.shape))
 

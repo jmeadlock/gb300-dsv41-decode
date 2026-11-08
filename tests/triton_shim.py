@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
+import inspect
 import itertools
 import sys
 import types
@@ -127,6 +128,17 @@ class P:
 
     def __sub__(self, o):  # M1-T10-MOE: `ptr + t - 1` (the warp dedup's neighbour load)
         return P(self.buf, self.off - np.asarray(_v(o)).astype(np.int64))
+
+    def to(self, dtype, **kw):  # M2-L5: `ptr.to(tl.int64)` -- the address operand of the prefetch asm
+        assert dtype is int64, dtype
+        return _Addr(self.buf, self.off)
+
+
+class _Addr:
+    """M2-L5: a block of addresses (a P cast to int64) -- only the prefetch asm stand-in consumes it."""
+
+    def __init__(self, buf, off):
+        self.buf, self.off = buf, np.asarray(off, dtype=np.int64)
 
 
 class _DT:
@@ -281,6 +293,12 @@ def inline_asm_elementwise(asm, constraints, args, dtype, is_pure, pack):
     """Only the single-instruction fp32 forms runtime/fused_glue.py uses (`mul.rn.f32 $0, $1, $2;` etc.), and
     M2-T15's fence (`fence.acq_rel.gpu; mov.b32 $0, $1;`, runtime/static_kernels._m2_fence): the identity here
     (programs run one after another, every store is visible to the next)."""
+    if "prefetch.global.L2" in asm:   # M2-L5 runtime/*.py _pdl_pf_l2: record, check in bounds, no value
+        assert dtype is int32 and pack == 1 and len(args) == 1 and not is_pure and isinstance(args[0], _Addr), asm
+        a = args[0]
+        assert ((a.off >= 0) & (a.off < a.buf.size)).all(), "prefetch of an out-of-bounds address"
+        _PROG["prefetch"].append((id(a.buf), a.off.reshape(-1).copy(), _PROG["waited"]))
+        return T(np.zeros(a.off.shape, dtype=np.int32))
     op = asm.split()[0]
     if op == "fence.acq_rel.gpu;":
         assert dtype is int32 and pack == 1 and len(args) == 1 and not is_pure, asm
@@ -344,8 +362,15 @@ def _log1p(x):
     return T(np.log1p(np.asarray(_v(x), dtype=np.float32)).astype(np.float32))
 
 
+def _access(kind, buf):
+    """M2-L5: a load / store / atomic of the current program -- recorded when it precedes the program's gdc_wait."""
+    if not _PROG["waited"]:
+        _PROG["prewait"].append((kind, id(buf)))
+
+
 def load(ptr, mask=None, other=None, cache_modifier=None, volatile=False, eviction_policy=None):
     # (M2-T15: cache_modifier=".cg" -- an L2 read -- is a caching hint; programs here share one memory)
+    _access("load", ptr.buf)
     vals = ptr.buf[np.clip(ptr.off, 0, ptr.buf.size - 1)]
     if mask is None:
         assert ((ptr.off >= 0) & (ptr.off < ptr.buf.size)).all(), "unmasked out-of-bounds load"
@@ -356,6 +381,7 @@ def load(ptr, mask=None, other=None, cache_modifier=None, volatile=False, evicti
 
 
 def store(ptr, val, mask=None):
+    _access("store", ptr.buf)
     v = np.broadcast_to(_v(val), ptr.off.shape)
     m = np.ones(ptr.off.shape, bool) if mask is None else np.broadcast_to(_v(mask), ptr.off.shape)
     off = ptr.off[m]
@@ -368,12 +394,29 @@ def store(ptr, val, mask=None):
 
 STORES: list = []
 DIRTY: set = set()  # id() of the buffers a launch stored to (fp8 / uint8 / int64 ones are written back only then)
+# M2-L5 (runtime/pdl.py): the current program's PDL state. Outside a launch_pdl launch `waited` is True (no checks).
+_PROG = {"waited": True, "pdl": False, "waits": 0, "triggers": 0, "prewait": [], "prefetch": []}
+
+
+def _gdc_wait():
+    """tl.extra.cuda.gdc_wait() (griddepcontrol.wait): only legal in a launch_pdl launch; marks the program waited."""
+    assert _PROG["pdl"], "gdc_wait() in a launch without launch_pdl=True"
+    _PROG["waits"] += 1
+    _PROG["waited"] = True
+
+
+def _gdc_launch_dependents():
+    """tl.extra.cuda.gdc_launch_dependents() (griddepcontrol.launch_dependents): only after the program's wait."""
+    assert _PROG["pdl"], "gdc_launch_dependents() in a launch without launch_pdl=True"
+    assert _PROG["waits"] >= 1, "gdc_launch_dependents() before gdc_wait()"
+    _PROG["triggers"] += 1
 
 
 def atomic_add(ptr, val, mask=None, sem=None, scope=None):
     """M1-T10-FIX2 (t9a2_stage_inplace's overflow counter): scalar or block add at the pointer(s); returns the old
     value(s). Programs run one after another here, so the read-modify-write is trivially atomic (M2-T15's ticket:
     sem / scope accepted, program order already is their order)."""
+    _access("atomic", ptr.buf)
     off = np.atleast_1d(ptr.off)
     m = np.ones(off.shape, bool) if mask is None else np.broadcast_to(_v(mask), off.shape)
     assert ((off[m] >= 0) & (off[m] < ptr.buf.size)).all(), "out-of-bounds atomic"
@@ -425,7 +468,7 @@ class JitFunction:
         return self.fn(*a, **k)
 
     def __getitem__(self, grid):
-        def launch(*args, num_warps=None, num_stages=None, enable_fp_fusion=None, **constexprs):
+        def launch(*args, num_warps=None, num_stages=None, enable_fp_fusion=None, launch_pdl=False, **constexprs):
             bufs = {}
             conv = []
 
@@ -443,18 +486,64 @@ class JitFunction:
                 conv.append(cv(x))
             # M1-T10-PORT: tensor (pointer) arguments passed by keyword, as the real launcher accepts them
             kw = {k: (cv(v) if isinstance(v, torch.Tensor) else v) for k, v in constexprs.items()}
+            # M2-L5: which parameter names each buffer stands for (prefetch attribution)
+            pnames = list(inspect.signature(self.fn).parameters)
+            alias = {}
+            for i, x in enumerate(args):
+                if isinstance(x, torch.Tensor):
+                    alias.setdefault(id(bufs[(x.data_ptr(), x.dtype)][1]), set()).add(pnames[i])
+            for k, x in constexprs.items():
+                if isinstance(x, torch.Tensor):
+                    alias.setdefault(id(bufs[(x.data_ptr(), x.dtype)][1]), set()).add(k)
             g = tuple(grid) + (1,) * (3 - len(grid))
-            self.launches.append({"grid": tuple(grid), "constexprs": {k: v for k, v in constexprs.items()
-                                                                      if not isinstance(v, torch.Tensor)},
-                                  "enable_fp_fusion": enable_fp_fusion})
+            rec = {"grid": tuple(grid), "constexprs": {k: v for k, v in constexprs.items()
+                                                       if not isinstance(v, torch.Tensor)},
+                   "enable_fp_fusion": enable_fp_fusion, "launch_pdl": bool(launch_pdl), "kernel": self.fn.__name__,
+                   "prefetch_params": set(), "prefetch_points": 0, "programs": 0, "prefetch_offs": [],
+                   "tensors": {}}
+            for i, x in enumerate(args):
+                if isinstance(x, torch.Tensor):
+                    rec["tensors"][pnames[i]] = (x.data_ptr(), x.element_size())
+            for k, x in constexprs.items():
+                if isinstance(x, torch.Tensor):
+                    rec["tensors"][k] = (x.data_ptr(), x.element_size())
+            self.launches.append(rec)
+            LAUNCHES.append(rec)
+            if len(LAUNCHES) > 4096:
+                del LAUNCHES[:2048]
             DIRTY.clear()
-            for pid in itertools.product(*(range(n) for n in g)):
-                _PID[:] = list(pid)
-                self.fn(*conv, **kw)
+            try:
+                for pid in itertools.product(*(range(n) for n in g)):
+                    _PID[:] = list(pid)
+                    _PROG.update(waited=not launch_pdl, pdl=bool(launch_pdl), waits=0, triggers=0, prewait=[],
+                                 prefetch=[])
+                    self.fn(*conv, **kw)
+                    rec["programs"] += 1
+                    if launch_pdl:   # M2-L5 invariants (runtime/pdl.py "Hazards"), per program
+                        nm = self.fn.__name__
+                        KERNEL_NAMES_PDL.add(nm)
+                        assert _PROG["waits"] == 1, f"{nm} program {pid}: {_PROG['waits']} gdc_wait() (want 1)"
+                        assert _PROG["triggers"] == 1, \
+                            f"{nm} program {pid}: {_PROG['triggers']} gdc_launch_dependents() (want 1)"
+                        assert not _PROG["prewait"], f"{nm} program {pid}: {_PROG['prewait'][:4]} before gdc_wait()"
+                        assert not any(w for _, _, w in _PROG["prefetch"]), f"{nm} program {pid}: prefetch after wait"
+                    for bid, offs, _ in _PROG["prefetch"]:
+                        names = frozenset(alias.get(bid, {"?"}))
+                        rec["prefetch_params"] |= names
+                        rec["prefetch_points"] += int(offs.size)
+                        if KEEP_PREFETCH:
+                            rec["prefetch_offs"].append((tuple(pid), names, offs))
+            finally:
+                _PROG.update(waited=True, pdl=False, waits=0, triggers=0, prewait=[], prefetch=[])
             for t, b in bufs.values():  # write back (untouched elements round-trip exactly)
                 if t.dtype in (torch.float32, torch.bfloat16) or id(b) in DIRTY:
                     _write_back(t, b)
         return launch
+
+
+LAUNCHES: list = []   # M2-L5: the recent launch records of every jit function (tests clear it; capped)
+KEEP_PREFETCH = False  # M2-L5: keep each program's prefetch offsets in rec["prefetch_offs"] (tests/test_pdl_impl_cpu.py)
+KERNEL_NAMES_PDL: set = set()   # M2-L5: names of every kernel launched with launch_pdl=True in this process
 
 
 def jit(fn):
@@ -481,20 +570,27 @@ def _modules():
     ld.exp, ld.log1p = _exp, _log1p                                  # M2-T15 softplus
     ex.libdevice = ld
     tl.extra = ex
+    cu = types.ModuleType("triton.language.extra.cuda")       # M2-L5: griddepcontrol stand-ins (runtime/pdl.py)
+    cu.gdc_wait, cu.gdc_launch_dependents = _gdc_wait, _gdc_launch_dependents
+    cu.libdevice = ld
+    ex.cuda = cu
     tr.next_power_of_2 = lambda n: 1 if int(n) <= 1 else 1 << (int(n) - 1).bit_length()  # (this module shadows max)
     return tr, tl
 
 
-_SHIM_KEYS = ("triton", "triton.language", "triton.language.extra", "triton.language.extra.libdevice")
+_SHIM_KEYS = ("triton", "triton.language", "triton.language.extra", "triton.language.extra.libdevice",
+              "triton.language.extra.cuda")
 
 
 @contextlib.contextmanager
 def installed():
-    """sys.modules['triton'] / ['triton.language'] (+ .extra.libdevice) = the shim for the duration (restored after)."""
+    """sys.modules['triton'] / ['triton.language'] (+ .extra.libdevice, .extra.cuda) = the shim for the duration
+    (restored after)."""
     saved = {k: sys.modules.get(k) for k in _SHIM_KEYS}
     tr, tl = _modules()
     sys.modules["triton"], sys.modules["triton.language"] = tr, tl
     sys.modules["triton.language.extra"], sys.modules["triton.language.extra.libdevice"] = tl.extra, tl.extra.libdevice
+    sys.modules["triton.language.extra.cuda"] = tl.extra.cuda
     try:
         yield tr
     finally:

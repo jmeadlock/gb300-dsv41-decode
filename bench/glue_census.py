@@ -41,7 +41,7 @@ import os
 import sys
 import tempfile
 import time
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TESTS = os.path.join(REPO, "tests")
@@ -396,9 +396,10 @@ def summarize(events, n_steps: int, model) -> dict:
     return out
 
 
-def run_path(path: str, R, model, pool, ids: List[int], steps: int, rows: int = 1) -> dict:
+def run_path(path: str, R, model, pool, ids: List[int], steps: int, rows: int = 1, edges: Optional[dict] = None) -> dict:
     """rows > 1 (M1-T10-PORT): the static paths are built as StaticStep(rows=R) and counted on teacher-forced R-row
-    steps (R tokens per step, P0 advancing by R); eager-ref is one-row only."""
+    steps (R tokens per step, P0 advancing by R); eager-ref is one-row only. edges (M2-L5): {"today": bool} -> also
+    the PDL edge census of the counted steps (report key "edges")."""
     from runtime.static_step import StaticStep
     from runtime import patches
 
@@ -422,6 +423,7 @@ def run_path(path: str, R, model, pool, ids: List[int], steps: int, rows: int = 
         out_ids, logits, _ = model(torch.tensor([ids]), 0)
     tok = int(out_ids[0])
     C.events = []
+    bounds = []
     # Decode under no_grad, NOT inference_mode: under inference_mode composite ops (F.linear, einsum, .float(), type_as,
     # F.pad, ...) reach the dispatch mode undecomposed and same-dtype casts look like copies; under no_grad the mode
     # sees the primitive aten ops each composite really launches. The reference's @inference_mode decorators are
@@ -432,6 +434,7 @@ def run_path(path: str, R, model, pool, ids: List[int], steps: int, rows: int = 
     try:
         with torch.no_grad(), C:
             for k in range(steps):
+                bounds.append(len(C.events))
                 pos = len(ids) + k
                 if st is None:
                     x = torch.tensor([[tok]])
@@ -471,6 +474,10 @@ def run_path(path: str, R, model, pool, ids: List[int], steps: int, rows: int = 
     if patches.fp8_linear_gemv_enabled():
         patches.fp8_linear_gemv(False)
     out = summarize(ev, steps, model)
+    if edges is not None:
+        bounds.append(len(ev))
+        out["edges"] = edge_census([ev[bounds[i]:bounds[i + 1]] for i in range(steps)],
+                                   today=bool(edges.get("today", True)), rows=rows)
     if glue is not None:
         out["fused_glue"] = {k: glue[k] for k in ("clusters", "modes")}
         out["fused_glue"]["r2"] = {k: glue["r2"][k] for k in ("orders", "outcome")}
@@ -561,6 +568,115 @@ def _print_table(title: str, t: dict, k_before: str, k_after: str) -> None:
     print(f"  {'sum over clusters':38s}{'':18s}{t['removed_by_clusters']:9.1f}")
 
 
+# ------------------------------------------------------------------------------------------------ M2-L5 edge census
+# docs/HANDOFF-M2-L5-PDL-IMPL.md (3): the kernel-to-kernel edges of one step, classified for PDL (runtime/pdl.py
+# classify_edges): owned -> owned (a full PDL edge), borrowed / torch -> owned (programmatic, implicit trigger), and the
+# subset into prefetching consumers; then MODEL ms = edges x the probe's us/edge (docs/pdl-probe-clean-20261107.json).
+# The step is ONE stream, so its graph edges are the consecutive launch pairs of the census's op sequence (allocs,
+# views and syncs launch nothing). CPU-census caveats (the box graph census, runtime/pdl.graph_census on the captured
+# graph, is the authoritative count): a split-K GEMV counts one launch here (its reduce, when not folded into the
+# consumer, is a second owned kernel on the box: an extra owned -> owned edge -- this census undercounts); the paths are
+# the census's emulated ones (dg-masked MoE / reference attention: the same owned / borrowed classes as today's
+# dg-inplace / FlashMLA step, not the same op-for-op sequence).
+# `--today` (default on with --edges) applies today's two production forms the CPU path cannot run: $DSV41_FP32_IMPL=fixed
+# (mixes / head / compressor as one t9b5/t9b8 kernel each: fused_glue_r2.launch_fixed_dot counted as a kernel) and the
+# router plan-gemv form (router_plan.py: every launch in the `moe.route` region -> m2_gate_fp32 + m2_router_rows; at
+# R > 1 the separate dedup launch is folded into m2_router_rows' last row program, the "ticket" form).
+CENSUS_TO_PDL = {"mxfp8_gemv": "t9b_mxfp8_gemv", "mxfp8_gemv_rope": "t9b_mxfp8_gemv",
+                 "mxfp8_gemv_pair": "t9b4_mxfp8_gemv2"}
+FIXED_SITE_KERNEL = {"head": "t9b5_head_fp32", "mix": "t9b5_mix_fp32", "comp": "t9b8_comp_fp32"}
+ROUTE_FORM = ("K:m2_gate_fp32", "softplus", "K:m2_router_rows")   # torch F.softplus kept (LEDGER 12:43: in-kernel differs)
+
+
+def launch_sequence(events, today: bool = True, rows: int = 1) -> List[str]:
+    """The step's launches in issue order ('K:<owned name>' for our kernels, 'K:<name>' for borrowed kernels, the aten
+    op name for a torch launch), with the --today substitutions."""
+    seq: List[str] = []
+    in_route = False
+    for stack, cls, name in events:
+        if cls not in ("launch", "kernel"):
+            continue
+        if today and "moe.route" in stack:
+            if not in_route:
+                seq.extend(ROUTE_FORM)
+                in_route = True
+            continue
+        in_route = False
+        if today and rows > 1 and name in ("K:m1_dedup_warp", "K:m1_dedup_routes"):
+            continue
+        if cls == "kernel":
+            n = name[2:]
+            seq.append("K:" + CENSUS_TO_PDL.get(n, n))
+        else:
+            seq.append(name)
+    return seq
+
+
+def edge_census(step_events, today: bool = True, rows: int = 1) -> dict:
+    """Per-step edge classes (runtime/pdl.classify_edges) for PDL on and prefetch, the MODEL ms, and the top owned ->
+    owned pairs. step_events: one event list per counted step (edges stay within a step: replays are separate graph
+    launches)."""
+    from runtime import pdl
+
+    n_steps = max(1, len(step_events))
+    seqs = [launch_sequence(ev, today, rows) for ev in step_events]
+    pairs = [p for s in seqs for p in zip(s, s[1:])]
+    out = {"launches_per_step": round(sum(len(s) for s in seqs) / n_steps, 1),
+           "edges_per_step": round(len(pairs) / n_steps, 1), "today_forms": bool(today), "steps": n_steps}
+    for mode in ("on", "prefetch"):
+        cfg = pdl.Config(mode, "entry", frozenset(), frozenset(), frozenset())
+        c = pdl.classify_edges(pairs, cfg)
+        per = {k: (round(v / n_steps, 1) if isinstance(v, (int, float)) else v) for k, v in c.items()
+               if k != "by_consumer"}
+        per["by_consumer"] = {f: {k: round(v / n_steps, 1) for k, v in d.items()} for f, d in c["by_consumer"].items()}
+        out[mode] = per
+        out[f"model_{mode}"] = pdl.model_ms(per, mode)
+    top: Dict[str, int] = collections.Counter()
+    for a, b in pairs:
+        if pdl.owned_name(a) and pdl.owned_name(b):
+            top[f"{pdl.owned_name(a)} -> {pdl.owned_name(b)}"] += 1
+    out["top_owned_pairs_per_step"] = {k: round(v / n_steps, 1) for k, v in top.most_common(15)}
+    return out
+
+
+def print_edges(path: str, e: dict) -> None:
+    from runtime import pdl
+
+    print(f"M2-L5 edge census [{path}] (CPU census{' + today forms' if e['today_forms'] else ''}): "
+          f"{e['launches_per_step']} launches, {e['edges_per_step']} edges per step")
+    for line in pdl.census_lines(e["prefetch"], tag=f" {path}"):
+        print("  " + line)
+    for mode in ("on", "prefetch"):
+        m = e[f"model_{mode}"]
+        print(f"  MODEL {mode:8s}: {m['mixed']['on_ms' if mode == 'on' else 'prefetch_ms']:.3f} ms/step (probe mixed; "
+              f"A {m['A']['on_ms' if mode == 'on' else 'prefetch_ms']:.3f} .. B "
+              f"{m['B']['on_ms' if mode == 'on' else 'prefetch_ms']:.3f})"
+              + (f"; borrowed-producer GEMV prefetch upper bound +{m['mixed']['prefetch_borrowed_upper_ms']:.3f}"
+                 if mode == "prefetch" else ""))
+    print("  top owned->owned pairs/step: " + ", ".join(f"{k} {v}" for k, v in
+                                                       list(e["top_owned_pairs_per_step"].items())[:8]))
+
+
+def install_today(R) -> callable:
+    """--today: count fused_glue_r2.launch_fixed_dot (the $DSV41_FP32_IMPL=fixed sites) as ONE kernel each."""
+    from runtime import fused_glue_r2
+
+    orig = fused_glue_r2.launch_fixed_dot
+
+    def w(x, w_, out, *, site, scale=None):
+        C.add("kernel", "K:" + FIXED_SITE_KERNEL[site])
+        C.paused += 1
+        try:
+            return orig(x, w_, out, site=site, scale=scale)
+        finally:
+            C.paused -= 1
+    fused_glue_r2.launch_fixed_dot = w
+
+    def restore():
+        fused_glue_r2.launch_fixed_dot = orig
+    return restore
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="per-step torch-op census of the decode paths (CPU)")
     ap.add_argument("--json", default=os.path.join(REPO, "scratch", "glue-census.json"))
@@ -569,7 +685,13 @@ def main(argv=None) -> int:
                     "static-dg-gemv-fused-r1,static-dg-gemv-fused-r2,static-dg-gemv-fused (rows > 1: the static "
                     "paths static-dg-gemv,static-dg-gemv-fused)")
     ap.add_argument("--rows", type=int, default=1, help="M1-T10-PORT: count the R-row teacher-forced step (e.g. 6)")
+    ap.add_argument("--edges", action="store_true", help="M2-L5: also the PDL edge census per path (runtime/pdl.py)")
+    ap.add_argument("--no-today", action="store_true", help="M2-L5 --edges: count the CPU path as-is, without "
+                    "today's fixed-fp32 sites ($DSV41_FP32_IMPL=fixed) and the plan-gemv router form")
     a = ap.parse_args(argv)
+    today = a.edges and not a.no_today
+    if today:
+        os.environ["DSV41_FP32_IMPL"] = "fixed"   # T9b-5/T9b-8: today's headline form (before any build)
     if a.paths is None:
         a.paths = ("static-dg-gemv,static-dg-gemv-fused" if a.rows > 1 else
                    "eager-ref,static-ref,static-dg-gemv,static-dg-gemv-fused-r1,static-dg-gemv-fused-r2,"
@@ -592,16 +714,21 @@ def main(argv=None) -> int:
         fake.m_grouped_fp8_fp4_gemm_nt_masked = kernel(fn, "dg_masked_gemm", lambda *x, **y: [])
         sys.modules["deep_gemm"] = fake
         restore = install(R)
+        restore_today = install_today(R) if today else (lambda: None)
         prev = torch.get_default_dtype()
         try:
             ids = list(range(40, 56))
             res = {}
             for path in a.paths.split(","):
-                res[path] = run_path(path, R, model, pool, ids, a.steps, rows=a.rows)
+                res[path] = run_path(path, R, model, pool, ids, a.steps, rows=a.rows,
+                                     edges={"today": today} if a.edges else None)
                 print(f"{path:16s} launches/step {res[path]['launches_per_step']:8.1f} "
                       f"(+allocs with fills on: {res[path]['launches_per_step_fills_on']:8.1f}); "
                       f"classes {res[path]['per_step']}", flush=True)
+                if a.edges:
+                    print_edges(path, res[path]["edges"])
         finally:
+            restore_today()
             restore()
             torch.set_default_dtype(prev)
     report = {"date": time.strftime("%Y-%m-%d %H:%M:%S %Z"), "config": {k: cfg[k] for k in (

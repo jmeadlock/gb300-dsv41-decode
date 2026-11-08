@@ -52,6 +52,8 @@ from typing import Dict, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+from runtime import pdl as _pdl   # M2-L5: PDL switch ($DSV41_PDL, default off)
+
 try:  # GPU image only; the Mac runs the torch mapping (and tests/triton_shim.py for the kernel body)
     import triton
     import triton.language as tl
@@ -137,7 +139,7 @@ if HAVE_TRITON:
                         mm_o, ids_o, uval_o, gtab, stage_o, sidx_o, tags_o, dummy,
                         P, K, NR, BR, H, S,
                         KP: tl.constexpr, NRP: tl.constexpr, HAS_MM: tl.constexpr, HAS_CTR: tl.constexpr,
-                        INPL: tl.constexpr, HAS_DUMMY: tl.constexpr):
+                        INPL: tl.constexpr, HAS_DUMMY: tl.constexpr, PDL: tl.constexpr = 0):
         """ONE program: dedup_routes' whole mapping for P = R*k (row r, choice j) pairs, by compare matrices over
         [KP, KP] (no sort / cumsum primitive): pair i's stable sorted position = #{id_j < id_i} + #{j < i, id_j ==
         id_i}; its rank = the second term; its slot = #{distinct ids < id_i}; counts[u] = #{pairs in slot u};
@@ -146,7 +148,12 @@ if HAVE_TRITON:
         counters' rows (ids_step = uniq, uvalid_step = counts > 0). INPL (dg-inplace): g = gtab[uniq]; the compact
         cold index c = cumsum(cold) - 1 (moe_rows.compact_cold), sidx / group / ok, the stage ids (unused slots ->
         the hot stand-in `dummy` with HAS_DUMMY) and the m_indices tags [P, NR] (row < counts of an ok slot: group,
-        else -1)."""
+        else -1).
+        M2-L5: PDL (runtime/pdl.py): gdc_wait first, before any load."""
+        if PDL > 0:
+            tl.extra.cuda.gdc_wait()
+        if PDL == 1:
+            tl.extra.cuda.gdc_launch_dependents()
         ii = tl.arange(0, KP)
         okp = ii < P
         v = tl.load(idx + ii, mask=okp, other=0).to(tl.int64)
@@ -202,6 +209,8 @@ if HAVE_TRITON:
             rr = tl.arange(0, NRP)
             tag = tl.where(rr[None, :] < n_ok[:, None], grp[:, None], -1).to(tl.int32)
             tl.store(tags_o + ii[:, None] * NR + rr[None, :], tag, mask=okp[:, None] & (rr[None, :] < NR))
+        if PDL == 2:
+            tl.extra.cuda.gdc_launch_dependents()
 
     @triton.jit
     def m1_dedup_warp(idx, w, uniq_o, counts_o, valid_o, slot_o, rank_o, prow_o, pw_o, arow_o, posmat_o,
@@ -209,7 +218,7 @@ if HAVE_TRITON:
                       P, K, NR, BR, H, S, TS, G, GSCR,
                       KP: tl.constexpr, NRP: tl.constexpr, HAS_MM: tl.constexpr, HAS_CTR: tl.constexpr,
                       INPL: tl.constexpr, HAS_DUMMY: tl.constexpr, LAYOUT: tl.constexpr, HAS_TAGS: tl.constexpr,
-                      HAS_WL: tl.constexpr, STEP_SF: tl.constexpr, HAS_OVF: tl.constexpr):
+                      HAS_WL: tl.constexpr, STEP_SF: tl.constexpr, HAS_OVF: tl.constexpr, PDL: tl.constexpr = 0):
         """M1-T10-MOE: m1_dedup_routes' mapping in ONE program of ONE warp (num_warps=1: every 1-D op below is a
         register / warp-shuffle op; the [KP, KP] compare matrices are gone except psum's group ranks). Keys
         id * KP + i (unique, so the bitonic tl.sort is the stable sort-by-id of dedup_routes); run starts by
@@ -221,7 +230,13 @@ if HAVE_TRITON:
         (row stride TS; HAS_TAGS), and the per-slot A block of the psum (LAYOUT 1: ok slots by ascending group, the
         G-entry psum written to gl) / masked (LAYOUT 2: block = group, masked_m [G] zeroed then scattered to gl)
         layouts -> arow = block * BR + rank (masked: pairs of an overflowing slot -> scratch block GSCR). posmat by
-        a second sort of (row, sorted position) keys carrying arow in the low 16 bits."""
+        a second sort of (row, sorted position) keys carrying arow in the low 16 bits.
+        M2-L5: PDL (runtime/pdl.py) when launched; called as a device function (m2_router_rows / m2_router_plan's
+        PLAN tail) PDL keeps its default 0, so no gdc_* instruction is inlined there."""
+        if PDL > 0:
+            tl.extra.cuda.gdc_wait()
+        if PDL == 1:
+            tl.extra.cuda.gdc_launch_dependents()
         t = tl.arange(0, KP)
         okt = t < P
         v = tl.load(idx + t, mask=okt, other=0).to(tl.int32)
@@ -331,6 +346,8 @@ if HAVE_TRITON:
         tl.store(pw_o + t, tl.load(w + perm, mask=okt, other=0.0), mask=okt)
         s2 = tl.sort(tl.where(okt, ((prow * KP + t) << 16) | arow, (1 << 30) + t))
         tl.store(posmat_o + t, s2 & 0xFFFF, mask=okt)
+        if PDL == 2:
+            tl.extra.cuda.gdc_launch_dependents()
 
 
 def _np2(n: int) -> int:
@@ -480,7 +497,8 @@ def dedup_fused(buf: DedupBuffers, indices: torch.Tensor, weights: torch.Tensor,
             P, k, R_, int(block_rows), int(inpl["H"]) if inpl is not None else 0,
             int(inpl["S"]) if inpl is not None else 0,
             KP=_np2(P), NRP=_np2(R_), HAS_MM=mm is not None, HAS_CTR=ids_step is not None,
-            INPL=inpl is not None, HAS_DUMMY=bool(inpl is not None and inpl["has_dummy"]), num_warps=4)
+            INPL=inpl is not None, HAS_DUMMY=bool(inpl is not None and inpl["has_dummy"]), num_warps=4,
+            **_pdl.kw("m1_dedup_routes"))
         if v2:
             _apply_extras(buf, out, rows_layout(out, inpl, block_rows, R_, k), inpl, mi, block_rows, R_)
         return out
@@ -531,7 +549,7 @@ def _launch_warp(buf, idx, wt, R_, k, block_rows, mm, ids_step, uval, inpl, v2, 
         KP=buf.KP, NRP=_np2(R_), HAS_MM=mm is not None, HAS_CTR=ids_step is not None, INPL=has_in,
         HAS_DUMMY=bool(has_in and inpl["has_dummy"]), LAYOUT=LAYOUT_IDS[lay] if v2 else 0,
         HAS_TAGS=has_in and (not v2 or lay == "contiguous"), HAS_WL=v2, STEP_SF=bool(v2 and inpl.get("step_sf")),
-        HAS_OVF=ovf is not None, num_warps=1)
+        HAS_OVF=ovf is not None, num_warps=1, **_pdl.kw("m1_dedup_warp"))
 
 
 def combine_rows(out_rows: torch.Tensor, posmat: torch.Tensor, x: torch.Tensor) -> torch.Tensor:

@@ -39,6 +39,8 @@ import torch
 import triton
 import triton.language as tl
 
+from runtime import pdl as _pdl   # M2-L5: PDL / pre-wait prefetch switch ($DSV41_PDL, default off)
+
 HAVE_TRITON = True         # (tests/triton_shim.load_module_under_shim asserts it)
 GATHER_BLOCK = 8192        # bytes per program of the _u8 kernels (bench/moe_static_spike.py:126)
 VEC_BLOCK_BYTES = int(os.environ.get("DSV41_GATHER_BLOCK_BYTES", "8192"))  # bytes per program, vec kernels
@@ -71,9 +73,37 @@ def _vec_failed(e: Exception) -> None:
 
 
 # ------------------------------------------------------------------------------------------------ T8 / T9b-2 (u8)
+# M2-L5 (runtime/pdl.py): every kernel of this file that the step launches takes PDL (0 off, 1 gdc_wait +
+# gdc_launch_dependents at entry, 2 wait at entry + trigger at the end) -- the wait is the first device operation, before
+# any load -- and the fixed-order fp32 dots also PDL_PF (pre-wait L2 prefetch of the program's weight rows).
 @triton.jit
-def t8_gather_rows_u8(ptab, ids, dst, row_bytes: tl.constexpr, BLOCK: tl.constexpr):
+def _pdl_pf_l2(ptr):
+    """prefetch.global.L2 of the 128 B line holding each address of the block: an L2 hint (nothing is read into a
+    register, no ordering, no fault for an in-bounds address)."""
+    return tl.inline_asm_elementwise("{ prefetch.global.L2 [$1]; mov.u32 $0, 0; }", "=r,l",
+                                     [ptr.to(tl.int64)], dtype=tl.int32, is_pure=False, pack=1)
+
+
+@triton.jit
+def _pdl_prefetch(base, r0, nrows, stride, c0, clen, NR: tl.constexpr, EPL: tl.constexpr, NL: tl.constexpr,
+                  CH: tl.constexpr):
+    """The 128 B lines of rows [r0, r0 + NR) (clamped to nrows - 1) x elements [c0, c0 + clen) of `base` (row
+    stride `stride` elements, EPL elements per line): NL line points per row (runtime.pdl.lines; the last point
+    clamped to the run's last element), CH points per row per chunk (runtime.pdl.chunk)."""
+    pf_r = tl.minimum(r0 + tl.arange(0, NR), nrows - 1).to(tl.int64)
+    for pf_c in tl.static_range(NL // CH):
+        pf_j = pf_c * CH + tl.arange(0, CH)
+        pf_o = c0 + tl.minimum(pf_j * EPL, clen - 1)
+        _pdl_pf_l2(base + pf_r[:, None] * stride + pf_o[None, :])
+
+
+@triton.jit
+def t8_gather_rows_u8(ptab, ids, dst, row_bytes: tl.constexpr, BLOCK: tl.constexpr, PDL: tl.constexpr = 0):
     """The T8 kernel (bench/moe_static_spike.py:117-130), unchanged: one byte per lane."""
+    if PDL > 0:
+        tl.extra.cuda.gdc_wait()
+    if PDL == 1:
+        tl.extra.cuda.gdc_launch_dependents()
     j = tl.program_id(0)
     blk = tl.program_id(1)
     e = tl.load(ids + j)
@@ -82,12 +112,18 @@ def t8_gather_rows_u8(ptab, ids, dst, row_bytes: tl.constexpr, BLOCK: tl.constex
     m = off < row_bytes
     v = tl.load(src + off, mask=m)
     tl.store(dst + j * row_bytes + off, v, mask=m)
+    if PDL == 2:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
 def t9b2_gather_tables_u8(ptab, ids, dtab, ids_out, E, row_w, row_s, NBW, BLOCK: tl.constexpr,
-                          SCALE_F32: tl.constexpr, IDS: tl.constexpr):
+                          SCALE_F32: tl.constexpr, IDS: tl.constexpr, PDL: tl.constexpr = 0):
     """The T9b-2 kernel, unchanged (contract: t9b2_gather_tables)."""
+    if PDL > 0:
+        tl.extra.cuda.gdc_wait()
+    if PDL == 1:
+        tl.extra.cuda.gdc_launch_dependents()
     j = tl.program_id(0)
     blk = tl.program_id(1)
     p = tl.program_id(2)
@@ -117,13 +153,20 @@ def t9b2_gather_tables_u8(ptab, ids, dtab, ids_out, E, row_w, row_s, NBW, BLOCK:
         if blk == 0:
             if p == 0:
                 tl.store(ids_out + j, e)
+    if PDL == 2:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 # ------------------------------------------------------------------------------------------------ T9b-3a (vec)
 @triton.jit
-def t8_gather_rows(ptab, ids, dst, ROW_WORDS: tl.constexpr, BLOCK: tl.constexpr, EVEN: tl.constexpr):
+def t8_gather_rows(ptab, ids, dst, ROW_WORDS: tl.constexpr, BLOCK: tl.constexpr, EVEN: tl.constexpr,
+                   PDL: tl.constexpr = 0):
     """Program (j, blk): int64 words [blk*BLOCK, (blk+1)*BLOCK) of row ptab[ids[j]] -> the same words of slot j of
     dst (int64 view). Row address 16-B aligned (host-checked) and declared so -> 16-B vector loads/stores."""
+    if PDL > 0:
+        tl.extra.cuda.gdc_wait()
+    if PDL == 1:
+        tl.extra.cuda.gdc_launch_dependents()
     j = tl.program_id(0)
     blk = tl.program_id(1)
     e = tl.load(ids + j)
@@ -135,12 +178,14 @@ def t8_gather_rows(ptab, ids, dst, ROW_WORDS: tl.constexpr, BLOCK: tl.constexpr,
     else:
         m = off < ROW_WORDS
         tl.store(d + off, tl.load(src + off, mask=m), mask=m)
+    if PDL == 2:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
 def t9b2_gather_tables(ptab, ids, dtab, ids_out, E, ROW_W: tl.constexpr, ROW_S: tl.constexpr, NBW: tl.constexpr,
                        BW: tl.constexpr, BS: tl.constexpr, EVEN_W: tl.constexpr, EVEN_S: tl.constexpr,
-                       SCALE_F32: tl.constexpr, IDS: tl.constexpr):
+                       SCALE_F32: tl.constexpr, IDS: tl.constexpr, PDL: tl.constexpr = 0):
     """One launch for a layer's six staging tables. ptab: int64 [6, E] source row addresses (w1, w3, w2 weights, then
     their scales); dtab: int64 [6] destination bases. Program (j, blk, p): blk < NBW copies int64 words
     [blk*BW, ...) of projection p's weight row ids[j] (ROW_W words); blk >= NBW handles its scale row (ROW_S bytes):
@@ -148,6 +193,10 @@ def t9b2_gather_tables(ptab, ids, dtab, ids_out, E, ROW_W: tl.constexpr, ROW_S: 
     (SCALE_F32 1: 0 -> 2^-127, 255 -> NaN, else code << 23 -- runtime/dg_moe.py's convert_scales, which this
     replaces) at destination slot j. IDS: program (j, 0, 0) also writes ids[j] to ids_out[j] (StaticStep.ids_step's
     row). All row addresses 16-B aligned (host-checked) and declared so -> 16-B vectors per lane."""
+    if PDL > 0:
+        tl.extra.cuda.gdc_wait()
+    if PDL == 1:
+        tl.extra.cuda.gdc_launch_dependents()
     j = tl.program_id(0)
     blk = tl.program_id(1)
     p = tl.program_id(2)
@@ -194,6 +243,8 @@ def t9b2_gather_tables(ptab, ids, dtab, ids_out, E, ROW_W: tl.constexpr, ROW_S: 
         if blk == 0:
             if p == 0:
                 tl.store(ids_out + j, e)
+    if PDL == 2:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 # ------------------------------------------------------------------------------------------------ wrappers
@@ -221,14 +272,15 @@ def gather_rows(ptab: torch.Tensor, ids: torch.Tensor, dst: torch.Tensor, row_by
         words = row_bytes // 8
         try:
             t8_gather_rows[(k, triton.cdiv(words, bw))](ptab, ids, dst.view(torch.int64), words, bw,
-                                                        words % bw == 0, num_warps=int(num_warps or VEC_WARPS))
+                                                        words % bw == 0, num_warps=int(num_warps or VEC_WARPS),
+                                                        **_pdl.kw("t8_gather_rows"))
             return
         except Exception as e:
             if explicit:
                 raise
             _vec_failed(e)
     t8_gather_rows_u8[(k, triton.cdiv(row_bytes, GATHER_BLOCK))](ptab, ids, dst.view(torch.uint8), row_bytes,
-                                                                 GATHER_BLOCK)
+                                                                 GATHER_BLOCK, **_pdl.kw("t8_gather_rows_u8"))
 
 
 def gather_tables(ptab6: torch.Tensor, ids: torch.Tensor, dtab: torch.Tensor, dsts, row_w: int, row_s: int,
@@ -256,7 +308,8 @@ def gather_tables(ptab6: torch.Tensor, ids: torch.Tensor, dtab: torch.Tensor, ds
         try:
             t9b2_gather_tables[(k, nbw + nbs, 3)](ptab6, ids, dtab, io, ptab6.size(1), ww, row_s, nbw, bw, bs,
                                                  ww % bw == 0, even_s, bool(scale_f32), ids_out is not None,
-                                                 num_warps=int(num_warps or VEC_WARPS))
+                                                 num_warps=int(num_warps or VEC_WARPS),
+                                                 **_pdl.kw("t9b2_gather_tables"))
             return
         except Exception as e:
             if explicit:
@@ -265,12 +318,19 @@ def gather_tables(ptab6: torch.Tensor, ids: torch.Tensor, dtab: torch.Tensor, ds
     nbw = triton.cdiv(row_w, GATHER_BLOCK)
     nbs = triton.cdiv(row_s, GATHER_BLOCK)
     t9b2_gather_tables_u8[(k, nbw + nbs, 3)](ptab6, ids, dtab, io, ptab6.size(1), row_w, row_s, nbw, GATHER_BLOCK,
-                                            bool(scale_f32), ids_out is not None)
+                                            bool(scale_f32), ids_out is not None,
+                                            **_pdl.kw("t9b2_gather_tables_u8"))
 
 
 @triton.jit
-def t8_step_marker(ctr):
+def t8_step_marker(ctr, PDL: tl.constexpr = 0):
+    if PDL > 0:
+        tl.extra.cuda.gdc_wait()
+    if PDL == 1:
+        tl.extra.cuda.gdc_launch_dependents()
     tl.store(ctr, tl.load(ctr) + 1)
+    if PDL == 2:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 # ------------------------------------------------------------------------------------------------ T9a-2 (dg-inplace)
@@ -303,7 +363,7 @@ def _t9a2_pack_scales(ptab, dtab, e, E, p, grp, q, N13, C13, N2, C2, BN: tl.cons
 def t9a2_stage_inplace(ptab, ids, gtab, dtab, mi, ids_out, sidx, ovf, E, H, S, ALIGN, N13, C13, N2, C2,
                        ROW_W: tl.constexpr, BW: tl.constexpr, NBW: tl.constexpr, BN: tl.constexpr,
                        BC: tl.constexpr, NPROG: tl.constexpr, EVEN_W: tl.constexpr, ALL_SCALES: tl.constexpr,
-                       IDS: tl.constexpr, SIDX: tl.constexpr):
+                       IDS: tl.constexpr, SIDX: tl.constexpr, PDL: tl.constexpr = 0):
     """T9a-2: one launch per layer before its three contiguous grouped GEMMs (runtime/dg_inplace.py). Program
     (j, q, p): e = ids[j] (sorted routed id), g = gtab[e] (its hot pool slot, or -1 = cold). Spare index c = j
     (SIDX 0, the 1-row step: k slots, S = k spares) or c = sidx[j] (SIDX 1, M1-T10-FIX2's 6-row step: the compact
@@ -315,6 +375,10 @@ def t9a2_stage_inplace(ptab, ids, gtab, dtab, mi, ids_out, sidx, ovf, E, H, S, A
     [H+S', N, K/2] weight pool at dtab[p] (int64 words, 16-B vectors as t8_gather_rows). Scales: hot + staged cold
     (ALL_SCALES, the shared packed SF of sf_store "step") or staged cold only ("resident"): _t9a2_pack_scales. Row
     addresses 16-B aligned (host-checked)."""
+    if PDL > 0:
+        tl.extra.cuda.gdc_wait()
+    if PDL == 1:
+        tl.extra.cuda.gdc_launch_dependents()
     j = tl.program_id(0)
     q = tl.program_id(1)
     p = tl.program_id(2)
@@ -357,6 +421,8 @@ def t9a2_stage_inplace(ptab, ids, gtab, dtab, mi, ids_out, sidx, ovf, E, H, S, A
     else:
         if stage:
             _t9a2_pack_scales(ptab, dtab, e, E, p, grp, q, N13, C13, N2, C2, BN, BC, NPROG)
+    if PDL == 2:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def stage_inplace(ptab6: torch.Tensor, ids: torch.Tensor, gtab: torch.Tensor, dtab: torch.Tensor, dsts, mi,
@@ -391,19 +457,20 @@ def stage_inplace(ptab6: torch.Tensor, ids: torch.Tensor, gtab: torch.Tensor, dt
                                     sidx if use_sidx else ids, ovf if use_sidx else mi,
                                     ptab6.size(1), int(H), S, int(align), int(n13), int(c13), int(n2), int(c2),
                                     ww, bw, nbw, STAGE_BN, bc, npg, even, bool(all_scales), ids_out is not None,
-                                    use_sidx, num_warps=int(num_warps or VEC_WARPS))
+                                    use_sidx, num_warps=int(num_warps or VEC_WARPS),
+                                    **_pdl.kw("t9a2_stage_inplace"))
 
 
 def step_marker(ctr: torch.Tensor) -> None:
     """One program, one warp: `ctr[0] += 1`. Fixed kernel name `t8_step_marker` for nsys."""
-    t8_step_marker[(1,)](ctr, num_warps=1)
+    t8_step_marker[(1,)](ctr, num_warps=1, **_pdl.kw("t8_step_marker"))
 
 
 # ------------------------------------------------------------------------------------------------ M1-T10-MOE (rows)
 @triton.jit
 def m1_stage_rows(ptab, uniq, gtab, sidx, wl, dtab, E, H, N13, C13, N2, C2,
                   ROW_W: tl.constexpr, BW: tl.constexpr, NBW: tl.constexpr, BN: tl.constexpr, BC: tl.constexpr,
-                  NPROG: tl.constexpr, EVEN_W: tl.constexpr):
+                  NPROG: tl.constexpr, EVEN_W: tl.constexpr, PDL: tl.constexpr = 0):
     """M1-T10-MOE: the R-row dg-inplace staging launch, driven by the dedup's work list. Program (j, q, p): slot
     u = wl[j] (-1: nothing to do -- the program exits at once), expert e = uniq[u], g = gtab[e]. A cold slot (g < 0;
     the dedup lists only staged ones, compact index c = sidx[u] < spare budget) copies 8-KiB weight blocks q,
@@ -412,6 +479,10 @@ def m1_stage_rows(ptab, uniq, gtab, sidx, wl, dtab, E, H, N13, C13, N2, C2,
     group g. So the scale work is once per unique expert (<= U slots, not R*k blocks) and, with the hot SF
     pre-packed (sf_store "pool" / "resident"), only cold experts are touched at all. m_indices, the overflow count
     and the stage ids are the dedup's (moe_rows.m1_dedup_warp). Contract: dg_inplace.stage_rows_emulated."""
+    if PDL > 0:
+        tl.extra.cuda.gdc_wait()
+    if PDL == 1:
+        tl.extra.cuda.gdc_launch_dependents()
     j = tl.program_id(0)
     q = tl.program_id(1)
     p = tl.program_id(2)
@@ -436,6 +507,8 @@ def m1_stage_rows(ptab, uniq, gtab, sidx, wl, dtab, E, H, N13, C13, N2, C2,
                     rm_m = rm_off < ROW_W
                     tl.store(r_row + rm_off, tl.load(r_src + rm_off, mask=rm_m), mask=rm_m)
         _t9a2_pack_scales(ptab, dtab, e, E, p, grp, q, N13, C13, N2, C2, BN, BC, NPROG)
+    if PDL == 2:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def stage_rows(ptab6: torch.Tensor, uniq: torch.Tensor, gtab: torch.Tensor, dtab: torch.Tensor, dsts,
@@ -459,7 +532,7 @@ def stage_rows(ptab6: torch.Tensor, uniq: torch.Tensor, gtab: torch.Tensor, dtab
     even = ww % bw == 0 and nbw % npg == 0
     m1_stage_rows[(nw, npg, 3)](ptab6, uniq, gtab, sidx, wl, dtab, ptab6.size(1), int(H), int(n13), int(c13),
                                 int(n2), int(c2), ww, bw, nbw, STAGE_BN, bc, npg, even,
-                                num_warps=int(num_warps or VEC_WARPS))
+                                num_warps=int(num_warps or VEC_WARPS), **_pdl.kw("m1_stage_rows"))
 
 
 # ------------------------------------------------------------------------------------------------ T9b-5 (fp32 fixed)
@@ -567,19 +640,42 @@ def _t9b5_dot(x, w, out, sc, R, N, sxr, swn, sor, NK: tl.constexpr, KB: tl.const
 
 @triton.jit
 def t9b5_head_fp32(x, w, out, sc, R, N, sxr, swn, sor, NK: tl.constexpr, KB: tl.constexpr, BN: tl.constexpr,
-                   RB: tl.constexpr, U: tl.constexpr, HAS_SC: tl.constexpr):
-    """The head (model.py:1014): logits [R, V] = x [R, D] . W [V, D]^T (named launch for nsys)."""
+                   RB: tl.constexpr, U: tl.constexpr, HAS_SC: tl.constexpr, PDL: tl.constexpr = 0,
+                   PDL_PF: tl.constexpr = 0, PF_EPL: tl.constexpr = 32, PF_NL: tl.constexpr = 1,
+                   PF_CH: tl.constexpr = 1):
+    """The head (model.py:1014): logits [R, V] = x [R, D] . W [V, D]^T (named launch for nsys). M2-L5: PDL_PF
+    prefetches the program's BN weight rows, then gdc_wait (runtime/pdl.py)."""
+    if PDL_PF:
+        _pdl_prefetch(w, tl.program_id(0) * BN, N, swn, 0, NK * KB, BN, PF_EPL, PF_NL, PF_CH)
+    if PDL > 0:
+        tl.extra.cuda.gdc_wait()
+    if PDL == 1:
+        tl.extra.cuda.gdc_launch_dependents()
     _t9b5_dot(x, w, out, sc, R, N, sxr, swn, sor, NK, KB, BN, RB, U, HAS_SC)
+    if PDL == 2:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
 def t9b5_mix_fp32(x, w, out, sc, R, N, sxr, swn, sor, NK: tl.constexpr, KB: tl.constexpr, BN: tl.constexpr,
-                  RB: tl.constexpr, U: tl.constexpr, HAS_SC: tl.constexpr):
-    """The mHC mixes (model.py:956): [R, mix_hc] = (x [R, hc*D] . hc_fn^T) * rsqrt[R] (named launch for nsys)."""
+                  RB: tl.constexpr, U: tl.constexpr, HAS_SC: tl.constexpr, PDL: tl.constexpr = 0,
+                  PDL_PF: tl.constexpr = 0, PF_EPL: tl.constexpr = 32, PF_NL: tl.constexpr = 1,
+                  PF_CH: tl.constexpr = 1):
+    """The mHC mixes (model.py:956): [R, mix_hc] = (x [R, hc*D] . hc_fn^T) * rsqrt[R] (named launch for nsys).
+    M2-L5: PDL_PF prefetches the program's BN rows of hc_fn, then gdc_wait (runtime/pdl.py)."""
+    if PDL_PF:
+        _pdl_prefetch(w, tl.program_id(0) * BN, N, swn, 0, NK * KB, BN, PF_EPL, PF_NL, PF_CH)
+    if PDL > 0:
+        tl.extra.cuda.gdc_wait()
+    if PDL == 1:
+        tl.extra.cuda.gdc_launch_dependents()
     _t9b5_dot(x, w, out, sc, R, N, sxr, swn, sor, NK, KB, BN, RB, U, HAS_SC)
+    if PDL == 2:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 T9B5_KERNELS = {"head": t9b5_head_fp32, "mix": t9b5_mix_fp32}
+T9B5_PDL_NAMES = {"head": "t9b5_head_fp32", "mix": "t9b5_mix_fp32", "comp": "t9b8_comp_fp32"}   # runtime.pdl.KERNELS
 
 
 def _t9b5_env_cfg() -> dict:
@@ -643,7 +739,8 @@ def fixed_dot(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor, *, kb: int, s
     u = max(1, min(int(u), nk))
     T9B5_KERNELS[site][(triton.cdiv(N, bn), triton.cdiv(R, rb))](
         x, w, out, scale if scale is not None else out, R, N, x.stride(0), w.stride(0), out.stride(0),
-        nk, kb, bn, rb, u, scale is not None, num_warps=nw, num_stages=ns, enable_fp_fusion=False)
+        nk, kb, bn, rb, u, scale is not None, num_warps=nw, num_stages=ns, enable_fp_fusion=False,
+        **_pdl.kw(T9B5_PDL_NAMES[site], pf=lambda: _pdl.pf_rows(K, w.element_size(), bn)))
 
 
 # ------------------------------------------------------------------------------------------------ T9b-8 (compressor)
@@ -658,10 +755,20 @@ def fixed_dot(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor, *, kb: int, s
 # speed-only (UNTUNED starting point; override "comp:<RB>=BN,U,nw,ns" in $DSV41_T9B5_CFG).
 @triton.jit
 def t9b8_comp_fp32(x, w, out, sc, R, N, sxr, swn, sor, NK: tl.constexpr, KB: tl.constexpr, BN: tl.constexpr,
-                   RB: tl.constexpr, U: tl.constexpr, HAS_SC: tl.constexpr):
+                   RB: tl.constexpr, U: tl.constexpr, HAS_SC: tl.constexpr, PDL: tl.constexpr = 0,
+                   PDL_PF: tl.constexpr = 0, PF_EPL: tl.constexpr = 32, PF_NL: tl.constexpr = 1,
+                   PF_CH: tl.constexpr = 1):
     """The ratio-2 compressor's wkv / wgate (model.py:464-465): [R, head_dim] = x [R, D] . W [head_dim, D]^T (named
-    launch for nsys)."""
+    launch for nsys). M2-L5: PDL_PF prefetches the program's BN weight rows, then gdc_wait (runtime/pdl.py)."""
+    if PDL_PF:
+        _pdl_prefetch(w, tl.program_id(0) * BN, N, swn, 0, NK * KB, BN, PF_EPL, PF_NL, PF_CH)
+    if PDL > 0:
+        tl.extra.cuda.gdc_wait()
+    if PDL == 1:
+        tl.extra.cuda.gdc_launch_dependents()
     _t9b5_dot(x, w, out, sc, R, N, sxr, swn, sor, NK, KB, BN, RB, U, HAS_SC)
+    if PDL == 2:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 T9B5_KERNELS["comp"] = t9b8_comp_fp32
@@ -1044,8 +1151,14 @@ def m2_router_plan(x, gw, raw, bias, sc, bsc, tk, net, ticket, ids_o, w_o,
                    OT: tl.constexpr, OV: tl.constexpr, OU: tl.constexpr, ODEC: tl.constexpr,
                    PLAN: tl.constexpr, DKP: tl.constexpr, NRP: tl.constexpr, HAS_MM: tl.constexpr,
                    HAS_CTR: tl.constexpr, INPL: tl.constexpr, HAS_DUMMY: tl.constexpr, LAYOUT: tl.constexpr,
-                   HAS_TAGS: tl.constexpr, HAS_WL: tl.constexpr, STEP_SF: tl.constexpr, HAS_OVF: tl.constexpr):
-    """M2-T15: the router (+ GEMV: the gate mm) (+ PLAN: the R-row MoE plan) in one launch (section comment)."""
+                   HAS_TAGS: tl.constexpr, HAS_WL: tl.constexpr, STEP_SF: tl.constexpr, HAS_OVF: tl.constexpr,
+                   PDL: tl.constexpr = 0):
+    """M2-T15: the router (+ GEMV: the gate mm) (+ PLAN: the R-row MoE plan) in one launch (section comment).
+    M2-L5: PDL (runtime/pdl.py) -- the wait is above the GEMV and the ticket."""
+    if PDL > 0:
+        tl.extra.cuda.gdc_wait()
+    if PDL == 1:
+        tl.extra.cuda.gdc_launch_dependents()
     if GEMV:
         _t9b5_dot(x, gw, raw, raw, R, E, sxr, swn, E, NK, KB, BN, RB, U, False)
         fz = _m2_fence(tl.zeros([FT], dtype=tl.int32))
@@ -1066,6 +1179,8 @@ def m2_router_plan(x, gw, raw, bias, sc, bsc, tk, net, ticket, ids_o, w_o,
                  mm_o, ids_s, uval_o, gtab, stage_o, sidx_o, tags_o, wl_o, gl_o, ovf, scr, dummy,
                  BR, H, S, TS, G, GSCR, SOFTPLUS, RP, EP, KC, KP, OT, OV, OU, ODEC,
                  PLAN, DKP, NRP, HAS_MM, HAS_CTR, INPL, HAS_DUMMY, LAYOUT, HAS_TAGS, HAS_WL, STEP_SF, HAS_OVF)
+    if PDL == 2:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -1077,9 +1192,15 @@ def m2_router_rows(raw, bias, sc, bsc, tk, net, ticket, ids_o, w_o, R, E, rs, ep
                    KP: tl.constexpr, OT: tl.constexpr, OV: tl.constexpr, OU: tl.constexpr, ODEC: tl.constexpr,
                    PLAN: tl.constexpr, DKP: tl.constexpr, NRP: tl.constexpr, HAS_MM: tl.constexpr,
                    HAS_CTR: tl.constexpr, INPL: tl.constexpr, HAS_DUMMY: tl.constexpr, LAYOUT: tl.constexpr,
-                   HAS_TAGS: tl.constexpr, HAS_WL: tl.constexpr, STEP_SF: tl.constexpr, HAS_OVF: tl.constexpr):
+                   HAS_TAGS: tl.constexpr, HAS_WL: tl.constexpr, STEP_SF: tl.constexpr, HAS_OVF: tl.constexpr,
+                   PDL: tl.constexpr = 0):
     """M2-T15 fix (section comment): grid (R,), program r routes row r; PLAN: the last program to arrive runs
-    m1_dedup_warp on all R rows' ids_o / w_o and resets the ticket."""
+    m1_dedup_warp on all R rows' ids_o / w_o and resets the ticket. M2-L5: PDL (runtime/pdl.py) -- the wait is above
+    every load and the ticket; the inlined m1_dedup_warp keeps its PDL default 0 (no gdc_* inside)."""
+    if PDL > 0:
+        tl.extra.cuda.gdc_wait()
+    if PDL == 1:
+        tl.extra.cuda.gdc_launch_dependents()
     r0 = tl.program_id(0)
     _m2_route(raw, bias, sc, bsc, tk, net, ids_o, w_o, R, E, rs, eps, r0, SOFTPLUS, 1, EP, KC, KP, OT, OV, OU, ODEC)
     if PLAN:
@@ -1095,13 +1216,25 @@ def m2_router_rows(raw, bias, sc, bsc, tk, net, ticket, ids_o, w_o, R, E, rs, ep
                           R * KC, KC, R, BR, H, S, TS, G, GSCR,
                           DKP, NRP, HAS_MM, HAS_CTR, INPL, HAS_DUMMY, LAYOUT, HAS_TAGS, HAS_WL, STEP_SF, HAS_OVF)
             tl.store(ticket, 0)
+    if PDL == 2:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
 def m2_gate_fp32(x, w, out, R, N, sxr, swn, sor, NK: tl.constexpr, KB: tl.constexpr, BN: tl.constexpr,
-                 RB: tl.constexpr, U: tl.constexpr):
-    """plan-gemv's gate scores (model.py:819's x.float() @ W^T): T9b-5's fixed-order fp32 dot, its own launch name."""
+                 RB: tl.constexpr, U: tl.constexpr, PDL: tl.constexpr = 0, PDL_PF: tl.constexpr = 0,
+                 PF_EPL: tl.constexpr = 32, PF_NL: tl.constexpr = 1, PF_CH: tl.constexpr = 1):
+    """plan-gemv's gate scores (model.py:819's x.float() @ W^T): T9b-5's fixed-order fp32 dot, its own launch name.
+    M2-L5: PDL_PF prefetches the program's BN gate-weight rows, then gdc_wait (runtime/pdl.py)."""
+    if PDL_PF:
+        _pdl_prefetch(w, tl.program_id(0) * BN, N, swn, 0, NK * KB, BN, PF_EPL, PF_NL, PF_CH)
+    if PDL > 0:
+        tl.extra.cuda.gdc_wait()
+    if PDL == 1:
+        tl.extra.cuda.gdc_launch_dependents()
     _t9b5_dot(x, w, out, out, R, N, sxr, swn, sor, NK, KB, BN, RB, U, False)
+    if PDL == 2:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -1160,7 +1293,8 @@ def gate_dot(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor, *, kb: int, cf
     u = max(1, min(int(u), nk))
     m2_gate_fp32[(triton.cdiv(N, bn), triton.cdiv(R, rb))](
         x, w, out, R, N, x.stride(0), w.stride(0), out.stride(0), nk, kb, bn, rb, u,
-        num_warps=nw, num_stages=ns, enable_fp_fusion=False)
+        num_warps=nw, num_stages=ns, enable_fp_fusion=False,
+        **_pdl.kw("m2_gate_fp32", pf=lambda: _pdl.pf_rows(K, w.element_size(), bn)))
 
 
 def _plan_kw(plan: Optional[dict], ids: torch.Tensor):
@@ -1196,7 +1330,8 @@ def router_rows_launch(raw: torch.Tensor, bias: torch.Tensor, ws: dict, ids: tor
         raw, bias, ws["sc"], ws["bsc"], ws["tk"], ws["net"], ws["ticket"], ids, w, int(R), int(E), float(rs),
         float(eps), *ptrs, *ints,
         FT=32 * nw, SOFTPLUS=int(softplus), EP=EP, KC=int(K), KP=KP, OT=int(order["T"]), OV=int(order["V"]),
-        OU=bool(order["U"]), ODEC=bool(order["DEC"]), num_warps=nw, enable_fp_fusion=False, **cx)
+        OU=bool(order["U"]), ODEC=bool(order["DEC"]), num_warps=nw, enable_fp_fusion=False, **cx,
+        **_pdl.kw("m2_router_rows"))
 
 
 def router_plan_launch(raw: torch.Tensor, bias: torch.Tensor, ws: dict, ids: torch.Tensor, w: torch.Tensor, *,
@@ -1242,4 +1377,5 @@ def router_plan_launch(raw: torch.Tensor, bias: torch.Tensor, ws: dict, ids: tor
         x, gw, raw, bias, ws["sc"], ws["bsc"], ws["tk"], ws["net"], ws["ticket"], ids, w,
         int(R), int(E), xs, ws_, float(rs), float(eps), nprog, *ptrs, *ints,
         SOFTPLUS=int(softplus), RP=RP, EP=EP, KC=int(K), KP=KP, OT=int(order["T"]), OV=int(order["V"]),
-        OU=bool(order["U"]), ODEC=bool(order["DEC"]), num_warps=nw, enable_fp_fusion=False, **g, **cx)
+        OU=bool(order["U"]), ODEC=bool(order["DEC"]), num_warps=nw, enable_fp_fusion=False, **g, **cx,
+        **_pdl.kw("m2_router_plan"))

@@ -61,6 +61,8 @@ from typing import Callable, Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+from runtime import pdl as _pdl   # M2-L5: PDL switch ($DSV41_PDL, default off)
+
 def _cpu_default(fn):
     """Synthetic-input builders were written under a CPU default device; at runtime the default device is cuda.
     Run them with a CPU default so every bare constructor (tensor/arange/zeros/rand) lands on the CPU; callers move."""
@@ -393,13 +395,18 @@ if HAVE_TRITON:
 
     @triton.jit
     def t9b2_act_quant_bcast(x, x_rs, q, q_gs, s, s_gs, G, KB, tab, BB: tl.constexpr, S_F32: tl.constexpr,
-                             s_cs=0, S_PACK: tl.constexpr = False, xi=0, oi=0, IDX: tl.constexpr = False):
+                             s_cs=0, S_PACK: tl.constexpr = False, xi=0, oi=0, IDX: tl.constexpr = False,
+                             PDL: tl.constexpr = 0):
         """Program (pb, r): 32-blocks [pb*BB, (pb+1)*BB) of input row r (bf16, row stride x_rs) -> fp8 values and the
         block scales (fp32 value or uint8 e8m0 code) written to output rows r*G + g for g < G (strides q_gs, s_gs):
         dg_act writes one activation row into row 0 of every DeepGEMM group this way. T9b-4 S_PACK: the codes go
         into DeepGEMM's packed MN-major SF bytes (_t9b4_store_code; s_gs / s_cs in bytes). M1-T10-PORT IDX: program
         r is the R-row MoE's sorted pair r: input row xi[r] (its token row) -> output row oi[r] (its A row), G = 1 --
         the act_quant of the R rows + the index_select / index_copy scatter of runtime/moe_rows.py in one launch."""
+        if PDL > 0:
+            tl.extra.cuda.gdc_wait()
+        if PDL == 1:
+            tl.extra.cuda.gdc_launch_dependents()
         pb = tl.program_id(0)
         r = tl.program_id(1)
         bi = pb * BB + tl.arange(0, BB)
@@ -431,12 +438,14 @@ if HAVE_TRITON:
                     tl.store(s + o * s_gs + bi, _t9b2_pow2(code), mask=bok)
                 else:
                     tl.store(s + o * s_gs + bi, code.to(tl.uint8), mask=bok)
+        if PDL == 2:
+            tl.extra.cuda.gdc_launch_dependents()
 
     @triton.jit
     def t9b2_swiglu_quant(g, g_gs, u, u_gs, w, q, q_gs, s, s_gs, KB, silu_tab, tab, lim,
                           BB: tl.constexpr, HAS_W: tl.constexpr, HAS_LIM: tl.constexpr, S_F32: tl.constexpr,
                           s_cs=0, GS=0, US=0, S_PACK: tl.constexpr = False, NSG: tl.constexpr = 0,
-                          NSU: tl.constexpr = 0, ri=0, IDX: tl.constexpr = False):
+                          NSU: tl.constexpr = 0, ri=0, IDX: tl.constexpr = False, PDL: tl.constexpr = 0):
         """Program (pb, j): group/row j, 32-blocks [pb*BB, (pb+1)*BB). gate/up bf16 -> silu(clamp(gate)) by table,
         clamp(up), silu*up, (w[j] *), bf16 RNE, then act_quant -> fp8 q and the scale (fp32 or e8m0 code). T9b-4:
         NSG / NSU > 0 = gate / up are the GEMV's fp32 split partials (split strides GS / US) reduced on load in the
@@ -444,6 +453,10 @@ if HAVE_TRITON:
         M1-T10-PORT IDX: program j is the R-row MoE's sorted pair j: gate / up / q / s rows ri[j] (its A row), the
         weight w[j] (its routing weight in sorted-pair order) -- runtime/moe_rows.py's index_select + glue +
         act_quant + index_copy in one launch."""
+        if PDL > 0:
+            tl.extra.cuda.gdc_wait()
+        if PDL == 1:
+            tl.extra.cuda.gdc_launch_dependents()
         pb = tl.program_id(0)
         j = tl.program_id(1)
         bi = pb * BB + tl.arange(0, BB)
@@ -483,12 +496,19 @@ if HAVE_TRITON:
                 tl.store(s + j * s_gs + bi, _t9b2_pow2(code), mask=bok)
             else:
                 tl.store(s + j * s_gs + bi, code.to(tl.uint8), mask=bok)
+        if PDL == 2:
+            tl.extra.cuda.gdc_launch_dependents()
 
     @triton.jit
-    def t9b2_moe_combine(d, d_gs, KS, sh, out, N, BLOCK_C: tl.constexpr, pidx=0, IDX: tl.constexpr = False):
+    def t9b2_moe_combine(d, d_gs, KS, sh, out, N, BLOCK_C: tl.constexpr, pidx=0, IDX: tl.constexpr = False,
+                         PDL: tl.constexpr = 0):
         """out = bf16(((0 + d[0]) + d[1] + ... + d[KS-1]) + sh), fp32 adds in slot order. M1-T10-PORT IDX: program
         (pb, t) = token row t of the R-row MoE: its KS rows of d are pidx[t*KS + j] (runtime/moe_rows.py `posmat`:
         its pairs' A rows in ascending expert id), sh / out are row t -- combine_rows + `+= shared` + type_as."""
+        if PDL > 0:
+            tl.extra.cuda.gdc_wait()
+        if PDL == 1:
+            tl.extra.cuda.gdc_launch_dependents()
         i = tl.program_id(0) * BLOCK_C + tl.arange(0, BLOCK_C)
         ok = i < N
         acc = tl.zeros([BLOCK_C], dtype=tl.float32)
@@ -503,11 +523,18 @@ if HAVE_TRITON:
                 acc = acc + tl.load(d + j * d_gs + i, mask=ok, other=0.0).to(tl.float32)
             acc = acc + tl.load(sh + i, mask=ok, other=0.0).to(tl.float32)
             tl.store(out + i, acc.to(tl.bfloat16, fp_downcast_rounding="rtne"), mask=ok)
+        if PDL == 2:
+            tl.extra.cuda.gdc_launch_dependents()
 
     @triton.jit
-    def t9b2_hc_post(x, res, post, comb, out, D, HC: tl.constexpr, BLOCK_C: tl.constexpr, MODE: tl.constexpr):
+    def t9b2_hc_post(x, res, post, comb, out, D, HC: tl.constexpr, BLOCK_C: tl.constexpr, MODE: tl.constexpr,
+                     PDL: tl.constexpr = 0):
         """Program (pb, j, t): out[t, j, i] = bf16(post[t, j]*x[t, i] + sum_r comb[t, r, j]*res[t, r, i]) (sum
         order: MODE); token row t (M1-T10-FIX: grid axis 2 = rows, 1 at the one-row step) offsets every pointer."""
+        if PDL > 0:
+            tl.extra.cuda.gdc_wait()
+        if PDL == 1:
+            tl.extra.cuda.gdc_launch_dependents()
         pb = tl.program_id(0)
         j = tl.program_id(1)
         t = tl.program_id(2)
@@ -534,14 +561,20 @@ if HAVE_TRITON:
             else:
                 sacc = (a0 + a2) + (a1 + a3)
         tl.store(out + j * D + i, (p + sacc).to(tl.bfloat16, fp_downcast_rounding="rtne"), mask=ok)
+        if PDL == 2:
+            tl.extra.cuda.gdc_launch_dependents()
 
     @triton.jit
     def t9b2_o_rope_qdq(o, NB, freqs, tab, HD: tl.constexpr, RD: tl.constexpr, BB: tl.constexpr,
-                        RE_MODE: tl.constexpr, IM_MODE: tl.constexpr, FS=0):
+                        RE_MODE: tl.constexpr, IM_MODE: tl.constexpr, FS=0, PDL: tl.constexpr = 0):
         """In place on one bf16 row of NB 32-blocks (heads of HD, RoPE on the last RD of each): program pb takes
         blocks [pb*BB, (pb+1)*BB) as even/odd element pairs; rope columns get the INVERSE rotation by (c, -d)
         rounded to bf16; then the block's act_quant QDQ, bf16(fp32(q) * s), is stored back. M1-T10-PORT: grid axis
         1 = token row t (1 at the one-row step): row t of o (stride NB*32) with its own freqs row (stride FS)."""
+        if PDL > 0:
+            tl.extra.cuda.gdc_wait()
+        if PDL == 1:
+            tl.extra.cuda.gdc_launch_dependents()
         pb = tl.program_id(0)
         t = tl.program_id(1)
         o = o + t * (NB * 32)
@@ -567,6 +600,8 @@ if HAVE_TRITON:
         yb = (_t9b2_q8(br, inv).to(tl.float32) * sc).to(tl.bfloat16, fp_downcast_rounding="rtne")
         tl.store(o + ce, ya, mask=m)
         tl.store(o + ce + 1, yb, mask=m)
+        if PDL == 2:
+            tl.extra.cuda.gdc_launch_dependents()
 
     @triton.jit
     def t9b2_rope_probe(a, b, c, d, out, n, BLOCK_P: tl.constexpr):
@@ -644,7 +679,8 @@ def launch_act_quant_bcast(x, q, s, code_tab, groups: int, src_rows=None, dst_ro
         P = src_rows.numel() if idx else R_
         t9b2_act_quant_bcast[(triton.cdiv(KB, AQ_BB), P)](
             x, x.stride(0), q, q.stride(0), su, s_gs, int(groups), KB, code_tab, BB=AQ_BB, S_F32=s_f32,
-            s_cs=int(s_cs), S_PACK=pk, **(dict(xi=src_rows, oi=dst_rows, IDX=True) if idx else {}), **LAUNCH)
+            s_cs=int(s_cs), S_PACK=pk, **(dict(xi=src_rows, oi=dst_rows, IDX=True) if idx else {}), **LAUNCH,
+            **_pdl.kw("t9b2_act_quant_bcast"))
         return
     qv, code = act_quant_torch(x.float(), code_tab)
     if idx:
@@ -683,7 +719,7 @@ def launch_swiglu_quant(g, u, w, q, s, silu_tab, code_tab, lim: float, rows_idx=
             gt, g_gs, ut, u_gs, w if w is not None else gt, q, q.stride(0), su, s_gs, KB,
             silu_tab, code_tab, float(lim), BB=AQ_BB, HAS_W=w is not None, HAS_LIM=lim > 0, S_F32=s_f32,
             s_cs=int(s_cs), GS=int(gs), US=int(us), S_PACK=pk, NSG=int(nsg), NSU=int(nsu),
-            **(dict(ri=rows_idx, IDX=True) if idx else {}), **LAUNCH)
+            **(dict(ri=rows_idx, IDX=True) if idx else {}), **LAUNCH, **_pdl.kw("t9b2_swiglu_quant"))
         return
     if idx:
         ri = rows_idx.reshape(-1)
@@ -714,7 +750,7 @@ def launch_moe_combine(rows, shared, out, posmat=None):
         if _kern(rows):
             t9b2_moe_combine[(triton.cdiv(N, COMBINE_BLOCK), R_)](rows, rows.stride(0), KS, shared, out, N,
                                                                   BLOCK_C=COMBINE_BLOCK, pidx=posmat, IDX=True,
-                                                                  **LAUNCH)
+                                                                  **LAUNCH, **_pdl.kw("t9b2_moe_combine"))
             return out
         y = torch.zeros(R_, N, dtype=torch.float32, device=rows.device)
         for j in range(KS):
@@ -723,7 +759,8 @@ def launch_moe_combine(rows, shared, out, posmat=None):
     KS, N = rows.shape
     if _kern(rows):
         t9b2_moe_combine[(triton.cdiv(N, COMBINE_BLOCK),)](rows, rows.stride(0), KS, shared, out, N,
-                                                            BLOCK_C=COMBINE_BLOCK, **LAUNCH)
+                                                            BLOCK_C=COMBINE_BLOCK, **LAUNCH,
+                                                            **_pdl.kw("t9b2_moe_combine"))
         return out
     return out.copy_(combine_torch(rows, shared))
 
@@ -735,7 +772,7 @@ def launch_hc_post(x, res, post, comb, out, mode: int):
     T_ = res.numel() // (HC * D)
     if _kern(x):
         t9b2_hc_post[(triton.cdiv(D, HC_BLOCK), HC, T_)](x, res, post, comb, out, D, HC=HC, BLOCK_C=HC_BLOCK,
-                                                         MODE=int(mode), **LAUNCH)
+                                                         MODE=int(mode), **LAUNCH, **_pdl.kw("t9b2_hc_post"))
         return out
     xs, rs, ps, cs = x.reshape(T_, D), res.reshape(T_, HC, D), post.reshape(T_, HC), comb.reshape(T_, HC, HC)
     return out.copy_(torch.stack([hc_post_torch(xs[t], rs[t], ps[t], cs[t], mode) for t in range(T_)])
@@ -753,7 +790,8 @@ def launch_o_rope_qdq(o_row, freqs_real, code_tab, head_dim: int, rope_dim: int,
         grid = (triton.cdiv(NB, AQ_BB), R_) if rows else (triton.cdiv(NB, AQ_BB),)
         fs = {"FS": int(freqs_real.stride(0))} if rows and freqs_real.dim() == 3 else {}
         t9b2_o_rope_qdq[grid](o_row, NB, freqs_real, code_tab, HD=head_dim, RD=rope_dim, BB=AQ_BB,
-                              RE_MODE=int(modes[0]), IM_MODE=int(modes[1]), **fs, **LAUNCH)
+                              RE_MODE=int(modes[0]), IM_MODE=int(modes[1]), **fs, **LAUNCH,
+                              **_pdl.kw("t9b2_o_rope_qdq"))
         return o_row
     if rows:
         for t in range(R_):
