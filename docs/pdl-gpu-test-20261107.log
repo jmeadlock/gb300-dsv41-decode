@@ -1,0 +1,12 @@
+  preflight: sparse_attn JIT targets (none introspectable); window idx on cuda:0; direct call on cuda OK
+  mode               6-row eager  graph replay  1-row 1r graph 6r==1r rows  ms/replay    delta
+  off                        ref     ok      -    ref        -    18/18        0.9021         
+Traceback (most recent call last):
+  File "/work/tests/gpu/test_pdl_gpu.py", line 189, in <module>
+    test_pdl_modes_bit_identical_to_off_graph_replay_rows_census_timing()
+  File "/work/tests/gpu/test_pdl_gpu.py", line 157, in test_pdl_modes_bit_identical_to_off_graph_replay_rows_census_timing
+    _same_run(r["e6"], base["e6"], f"{label}: 6-row eager vs off")
+  File "/work/tests/gpu/test_pdl_gpu.py", line 139, in _same_run
+    assert set(a[2]) == set(b[2]) and all(torch.equal(a[2][k], b[2][k]) for k in b[2]), f"{what}: caches"
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: on+entry: 6-row eager vs off: caches
