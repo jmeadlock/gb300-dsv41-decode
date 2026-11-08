@@ -786,7 +786,7 @@ def main(argv=None) -> int:
         if a.pool_spare is not None:
             n = max(n, a.pool_spare)
         elif config_from_args(a) is not None:
-            n = max(n, 24)   # residency default-on (11/07): 16 staging + 8 residency, the measured config
+            n = max(n, 20)   # 11/07 arm C: 16 staging + 4 residency leaves HBM for 17 layers of pooled SF (19.06 ms/step)
         if config_from_args(a) is not None:
             # A2-2 FIX: the staging keeps `stage` of the pool's slots (--residency-stage, else --spare-slots, else 8)
             # and residency promotes into the REST: the default pool (16) already holds 8 -- no new allocation. Only

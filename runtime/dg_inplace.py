@@ -78,14 +78,14 @@ ROWS_SF_STORE_DEFAULT = "pool"
 PSUM_ALIGN_ENV = "DSV41_ROWS_PSUM_ALIGN"             # psum: group-start alignment (= the kernel's BLOCK_M)
 EXPECTED_M_ENV = "DSV41_ROWS_EXPECTED_M"             # psum / masked: the heuristic's expected rows per group
 SF_POOL_HEADROOM_ENV = "DSV41_SF_POOL_HEADROOM_GIB"  # pool / resident SF: keep this much HBM free, else "step"
-SF_POOL_HEADROOM_GIB = 6.0      # pool SF = hbm_plan's sf_packed_resident_B (12.8 GiB real model, S 16); the 6-row
+SF_POOL_HEADROOM_GIB = 2.0   # 11/07 box: 6.0 -> 2.0 with the partial pool (docs/headline-s2-C-20261108.json); was 6.0
                                 # receipts had 17.1 (S 16) / 22.7 (S 8) GiB free after build: capture needs margin
 # M3-S2 (docs/M3-S2-STAGING-BYTES.md): which layers' hot SF the pool copy holds when it does not fit whole.
 #   "all" (default, today): every layer or none (falls back to "step" whole); "auto": as many layers as fit above
 #   the headroom (ascending layer index, layers already packed first), the rest stay "step"; "N": at most N layers;
 #   "l0,l1,...": those layers (trimmed to what fits). Bytes only move: the GEMM reads the same SF values either way.
 SF_POOL_LAYERS_ENV = "DSV41_SF_POOL_LAYERS"
-SF_POOL_LAYERS_DEFAULT = "all"
+SF_POOL_LAYERS_DEFAULT = "auto"   # 11/07 box: pack as many layers' hot SF as fit (arm C: 19.06 vs 19.31, bit-identical)
 LAYOUT_CHECK_ENV = "DSV41_ROWS_LAYOUT_CHECK"         # "0": skip the build-time layout self-check
 MASKED_MAX_M = 128                                   # masked: max_m >= BLOCK_M (ABI memo)
 ROWS_GEMM_DEFAULT = "contiguous16"   # the R-row call shape (probe 2026-11-07, docs/dg-rows-spike-20261107.log)

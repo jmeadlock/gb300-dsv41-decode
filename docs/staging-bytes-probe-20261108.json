@@ -1,0 +1,131 @@
+{
+ "probe": {
+  "date": "2026-11-08 06:33:31 UTC",
+  "argv": [
+   "probe",
+   "--out",
+   "scratch/staging-bytes-probe.json"
+  ],
+  "errors": [],
+  "label": {
+   "A": "[M] serial launches, synthetic real shapes, graph replay, distinct cold experts per round",
+   "B": "[M] kernel-overlap vs the real DeepGEMM contiguous16 chain + a bf16 shared-expert STAND-IN",
+   "C": "[M] c = 0, step-style work list truncated to h hot slots",
+   "D": "[M] step-style vs pool-style: slot / SF / GEMM-output bytes"
+  },
+  "setup": {
+   "H": 128,
+   "S": 16,
+   "rounds": 16,
+   "unique": 22,
+   "host": "hostbuffer",
+   "hot_listed_c0": 22,
+   "runtime_cfg": [
+    [
+     48,
+     8192
+    ],
+    [
+     16,
+     32768
+    ],
+    [
+     16,
+     32768
+    ]
+   ]
+  },
+  "serial": {
+   "0": {
+    "m1_stage_rows/pool": 2.82,
+    "s1_proj_x3/pool": 3.59,
+    "m1_stage_rows/step": 24.63,
+    "s1_proj_x3/step": 29.7,
+    "hot_scale_pack_x3/step": 28.29,
+    "hot_sf_term_m1_us": 21.8,
+    "hot_sf_term_s1_us": 26.11
+   },
+   "1": {
+    "m1_stage_rows/pool": 52.42,
+    "s1_proj_x3/pool": 74.61,
+    "m1_stage_rows/step": 57.72,
+    "s1_proj_x3/step": 81.56,
+    "hot_scale_pack_x3/step": 28.96,
+    "hot_sf_term_m1_us": 5.3,
+    "hot_sf_term_s1_us": 6.95
+   },
+   "2": {
+    "m1_stage_rows/pool": 100.28,
+    "s1_proj_x3/pool": 114.66,
+    "m1_stage_rows/step": 103.45,
+    "s1_proj_x3/step": 117.05,
+    "hot_scale_pack_x3/step": 29.31,
+    "hot_sf_term_m1_us": 3.17,
+    "hot_sf_term_s1_us": 2.39
+   }
+  },
+  "overlap": {
+   "0": {
+    "gemm-only": {
+     "us_per_layer": 137.18,
+     "exposed_us": 0.0
+    },
+    "kernel-overlap/pool": {
+     "us_per_layer": 140.52,
+     "exposed_us": 3.34
+    },
+    "kernel-overlap/step": {
+     "us_per_layer": 155.95,
+     "exposed_us": 18.77
+    },
+    "pooled_layer_saves_us": 15.42
+   },
+   "1": {
+    "gemm-only": {
+     "us_per_layer": 137.03,
+     "exposed_us": 0.0
+    },
+    "kernel-overlap/pool": {
+     "us_per_layer": 163.82,
+     "exposed_us": 26.79
+    },
+    "kernel-overlap/step": {
+     "us_per_layer": 174.85,
+     "exposed_us": 37.82
+    },
+    "pooled_layer_saves_us": 11.02
+   },
+   "2": {
+    "gemm-only": {
+     "us_per_layer": 137.24,
+     "exposed_us": 0.0
+    },
+    "kernel-overlap/pool": {
+     "us_per_layer": 184.71,
+     "exposed_us": 47.47
+    },
+    "kernel-overlap/step": {
+     "us_per_layer": 198.69,
+     "exposed_us": 61.45
+    },
+    "pooled_layer_saves_us": 13.98
+   }
+  },
+  "hot_sweep": {
+   "gemm_only_us": 137.21,
+   "n_hot": 22,
+   "exposed_us_by_h": {
+    "0": 3.77,
+    "5": 5.87,
+    "11": 8.12,
+    "16": 10.13,
+    "22": 18.72
+   }
+  },
+  "checks": {
+   "slots": true,
+   "sf_all": true,
+   "d": true
+  }
+ }
+}

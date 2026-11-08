@@ -395,7 +395,8 @@ def test_headline_residency_flags_and_window():
 
     cfg = config_from_args(a)
     assert cfg["drain_n"] == 64 and cfg["swaps_per_barrier"] == 3 and cfg["n_spare"] == 2 and a.residency_audit
-    assert config_from_args(ap.parse_args(["--model-dir", "/m"])) is None
+    assert config_from_args(ap.parse_args(["--model-dir", "/m"])) is not None   # default ON since 11/07
+    assert config_from_args(ap.parse_args(["--model-dir", "/m", "--residency", "off"])) is None
     runs = [{"step_ms": [10.0] * 3 + [20.0, 30.0], "verify_ms": [6.0] * 3 + [12.0, 18.0],
              "draft_ms": [4.0] * 3 + [8.0, 12.0], "accepts": [0, 1, 2, 3, 4], "mgr_ms": [0.1, 0.1, 0.1, 0.2, 0.4]}]
     w = B.window(runs, 3)
