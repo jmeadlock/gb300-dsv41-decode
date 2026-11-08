@@ -26,6 +26,11 @@ Where a field comes from:
   clocks_*           nvidia-smi --query-gpu=clocks.sm,clocks.mem (MHz) at begin() and at finish(): the receipt for
                      'was the GPU throttled / idle-clocked during this number'.
   residency          one line: the A2-2 residency condition ('off, static map <path>' or the config).
+  steady_state_*     docs/HEADLINE-COLUMNS.md: `steady_state_condition` one line, known at begin() ('on: cell two_graphs, ...',
+                     'off (<why>)', or 'n/a' for a tool without the pass); `steady_state` the pass's measured block, stamped
+                     by finish(rc, steady_state=<the report's block>): ms/step, verify+draft, tok/step, ms/token with its
+                     two totals, cold share, swaps, streams exact vs 1-row, self-replay, policy steps before, wall time.
+                     None when the pass did not run; the full block (per prompt, window) stays in the report JSON.
   lease              RECEIPT_LEASE (exported by lease.sh when this process runs under the box lock; None otherwise).
   start/end          wall-clock time.time() + ISO local time; wall_s = end - start.
 """
@@ -53,7 +58,7 @@ RECEIPT_FIELDS = (
     "torch_version", "triton_version", "cuda_version",
     "driver_version", "gpu_name", "gpu_uuid",
     "clocks_sm_mhz_start", "clocks_mem_mhz_start", "clocks_sm_mhz_end", "clocks_mem_mhz_end",
-    "residency_condition", "lease",
+    "residency_condition", "steady_state_condition", "steady_state", "lease",
     "start_wall", "start_iso", "end_wall", "end_iso", "wall_s",
     "receipt_errors",
 )
@@ -134,10 +139,40 @@ def residency_condition(residency: Any = None, map_path: Optional[str] = None) -
     return "on " + ", ".join(f"{k}={cfg[k]}" for k in sorted(cfg)) + (f" (map {map_path})" if map_path else "")
 
 
+def steady_state_condition(cfg: Optional[dict] = None) -> str:
+    """One line for the steady-state pass: 'n/a' (cfg None: a tool without the pass), 'off (<why>)', or 'on: <cell> ...'."""
+    if cfg is None:
+        return "n/a"
+    if not cfg.get("enabled"):
+        return f"off ({cfg.get('why')})"
+    return (f"on: {cfg.get('cell')} again after the headline cells, residency state carried over (no reset), "
+            f"reps {cfg.get('reps')} + parity {cfg.get('parity_reps')}, window steps >= {cfg.get('stats_from_step')} "
+            f"({cfg.get('why')})")
+
+
+STEADY_STATE_KEYS = ("cell", "ms_per_6row_step_dspark_k5", "ms_verify_graph", "ms_draft_graph", "tokens_per_step",
+                     "ms_per_token", "total_gpu_ms", "total_emitted_tokens", "ms_per_step_incl_manager", "cold_share",
+                     "policy_steps_before", "replay_ok", "n_prompts", "wall_s", "start_wall", "end_wall", "ok", "error")
+
+
+def steady_state_summary(block: Optional[dict]) -> Optional[dict]:
+    """The receipt's compact copy of the report's `steady_state` block (None when the pass did not run)."""
+    if not isinstance(block, dict) or not block.get("enabled"):
+        return None
+    sw = block.get("swaps") or {}
+    out = {k: block.get(k) for k in STEADY_STATE_KEYS}
+    out.update(swaps=sw.get("swaps"), swaps_per_step=sw.get("swaps_per_step"), manager_steps=sw.get("manager_steps"),
+               streams_exact=(block.get("streams") or {}).get("exact"), streams_prompts=(block.get("streams") or {}).get("prompts"),
+               delta_ms_per_step_vs_headline=(block.get("vs_headline") or {}).get("delta_ms_per_step"),
+               overflow_steps=(block.get("overflow") or {}).get("steps"))
+    return out
+
+
 # ------------------------------------------------------------------------------------------------ begin / finish
 def begin(argv: Optional[Sequence[str]] = None, impls: Optional[dict] = None, model_dir: Optional[str] = None,
           fixture: Optional[str] = None, residency: Any = None, map_path: Optional[str] = None,
-          config_path: Optional[str] = None, repo: str = REPO, env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+          config_path: Optional[str] = None, repo: str = REPO, env: Optional[Dict[str, str]] = None,
+          steady_state: Optional[dict] = None) -> Dict[str, Any]:
     """The receipt as of the start of a run (call right after argument parsing, before the build). Never raises."""
     rc: Dict[str, Any] = {k: None for k in RECEIPT_FIELDS}
     errs: List[str] = []
@@ -182,16 +217,22 @@ def begin(argv: Optional[Sequence[str]] = None, impls: Optional[dict] = None, mo
     if c:
         rc.update(clocks_sm_mhz_start=c["sm"], clocks_mem_mhz_start=c["mem"])
     rc["residency_condition"] = residency_condition(residency, map_path)
+    rc["steady_state_condition"] = probe("steady_state_condition", lambda: steady_state_condition(steady_state))
     rc["lease"] = (env if env is not None else os.environ).get("RECEIPT_LEASE")
     rc["receipt_errors"] = errs
     return rc
 
 
-def finish(rc: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def finish(rc: Optional[Dict[str, Any]], steady_state: Optional[dict] = None) -> Optional[Dict[str, Any]]:
     """Add the end wall time, wall_s and the end clocks (in place; returns rc). Call just before the JSON write.
-    Total; a None receipt is returned as is."""
+    steady_state: the report's `steady_state` block -> rc["steady_state"] (steady_state_summary). Total; a None receipt
+    is returned as is."""
     if not isinstance(rc, dict):
         return rc
+    try:
+        rc["steady_state"] = steady_state_summary(steady_state)
+    except Exception as e:  # noqa: BLE001
+        rc.setdefault("receipt_errors", []).append(f"steady_state: {type(e).__name__}: {str(e)[:200]}")
     now = time.time()
     rc["end_wall"] = now
     rc["end_iso"] = time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(now))
@@ -212,13 +253,22 @@ def fields_present(rc: dict) -> int:
     return sum(1 for k in RECEIPT_FIELDS if k != "receipt_errors" and rc.get(k) is not None)
 
 
+def _steady_tail(rc: dict) -> str:
+    ss = rc.get("steady_state")
+    if not isinstance(ss, dict):
+        return ""
+    ms = ss.get("ms_per_6row_step_dspark_k5")
+    return f" | steady-state {ss.get('cell')} {'-' if ms is None else format(ms, '.2f')} ms/step"
+
+
 def summary_line(rc: Optional[dict]) -> str:
     if not rc:
         return "receipt: none"
     return (f"receipt: {str(rc.get('git_commit'))[:10]}{'+dirty ' + str(rc.get('git_dirty_sha256'))[:8] if rc.get('git_dirty') else ''} | "
             f"torch {rc.get('torch_version')} triton {rc.get('triton_version')} cuda {rc.get('cuda_version')} drv {rc.get('driver_version')} | "
             f"{rc.get('gpu_uuid')} sm {rc.get('clocks_sm_mhz_start')}->{rc.get('clocks_sm_mhz_end')} MHz | "
-            f"{fields_present(rc)}/{len(RECEIPT_FIELDS) - 1} fields, {len(rc.get('receipt_errors') or [])} probe errors")
+            f"{fields_present(rc)}/{len(RECEIPT_FIELDS) - 1} fields, {len(rc.get('receipt_errors') or [])} probe errors"
+            + _steady_tail(rc))
 
 
 if __name__ == "__main__":      # python3 bench/receipt.py -> print the receipt this checkout/box would stamp now
