@@ -3,7 +3,7 @@
 set -u
 flock -w 36000 ~/dsv41/box.lock bash -c '
 while docker ps --format "{{.Names}}" | grep -q .; do sleep 20; done
-S=$HOME/dsv41/decode/scratch; M=/models/DeepSeek-V4.1-Flash-1017-1bae0e1088993b9b82de08f59de5be5a34e42170; W=$HOME/dsv41/wt-m3-s1
+S=$HOME/dsv41/decode/scratch; M=/models/DeepSeek-V4.1-Flash-1017-1bae0e1088993b9b82de08f59de5be5a34e42170; W=$HOME/dsv41/wt-m3s1
 git -C $HOME/dsv41/decode fetch -q origin m3-s1:m3-s1 2>/dev/null || git -C $HOME/dsv41/decode fetch -q origin
 [ -d $W ] || git -C $HOME/dsv41/decode worktree add -q $W m3-s1
 cd $W && git pull -q origin m3-s1; ln -sfn $S scratch; git log --oneline -1 | cut -c1-60
