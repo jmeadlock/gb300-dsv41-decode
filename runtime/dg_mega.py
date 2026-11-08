@@ -551,7 +551,10 @@ class DGMegaBuffers:
 
     def __init__(self, owner, shapes, sshapes, *, pool, swiglu_limit: float, spare_slots: int,
                  max_tokens: Optional[int] = None, shared: Optional[str] = None, sf_major: Optional[str] = None,
-                 l1_store: Optional[str] = None, deterministic: bool = True, dg=None):
+                 l1_store: Optional[str] = None, deterministic: bool = True, dg=None,
+                 layers: Optional[Sequence[int]] = None):
+        """layers: the layers this build will serve (default: every pool layer). The HBM plan and its check count
+        only these -- M3-N1's MegaSubstitution builds a few layers on top of a running non-mega step."""
         if pool is None:
             raise ValueError("dg-mega needs the ExpertPool (it reads the pool's w2 in place)")
         self.owner, self.pool, self.dev = owner, pool, owner.dev
@@ -586,8 +589,9 @@ class DGMegaBuffers:
             raise ValueError(f"spare_slots {self.S}: the pool has {pool.spare} spare slots (add_spare_slots first)")
         self.dg = dg if dg is not None else _import_dg()
         self.deterministic = _set_deterministic(self.dg, deterministic)
-        G = [int(pool.hbm_full[l]["w2"].size(0)) for l in range(pool.n_layers)]
-        self.plan = hbm_bytes(pool.n_layers, G, self.dim, self.inter, self.l1_store)
+        self.plan_layers = list(range(pool.n_layers)) if layers is None else sorted({int(l) for l in layers})
+        G = [int(pool.hbm_full[l]["w2"].size(0)) for l in self.plan_layers]
+        self.plan = hbm_bytes(len(self.plan_layers), G, self.dim, self.inter, self.l1_store)
         self._check_hbm()
         self.layers: Dict[int, dict] = {}
         self.syms: Dict[int, object] = {}
@@ -793,9 +797,12 @@ class DGMegaMoE:
     """One layer's MoE through MegaMoE. StaticMoE's interface (called by the patched MoE.forward while the owner
     runs a step); works for any R <= T rows (the 1-row and the R-row StaticStep use the same class)."""
 
-    def __init__(self, owner, moe, layer: int, ptabs: Dict[Tuple[str, str], torch.Tensor]):
+    def __init__(self, owner, moe, layer: int, ptabs: Dict[Tuple[str, str], torch.Tensor], bufs=None):
+        """bufs: the DGMegaBuffers to use (default owner.dg; M3-N1's MegaSubstitution passes its own, because the
+        owner is a non-mega step whose `dg` is another impl's buffers)."""
         self.owner, self.moe, self.layer, self.ptabs = owner, moe, layer, ptabs
-        self.t = owner.dg.layer_tables(layer, ptabs, moe)
+        self.b = bufs if bufs is not None else owner.dg
+        self.t = self.b.layer_tables(layer, ptabs, moe)
         self.last: Dict[str, torch.Tensor] = {}
 
     @property
@@ -817,7 +824,7 @@ class DGMegaMoE:
         return ids.long(), torch.gather(weights, -1, order)
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        o, moe, b, R = self.owner, self.moe, self.owner.dg, self.owner.R
+        o, moe, b, R = self.owner, self.moe, self.b, self.owner.R
         shape = x.size()
         x = x.view(-1, moe.dim)                                                       # model.py:893
         R_ = x.size(0)
@@ -847,3 +854,99 @@ class DGMegaMoE:
         if glue is not None and glue.on("swiglu_shared"):
             return glue.shared_expert(self.moe.shared_experts, x)
         return self.moe.shared_experts(x)
+
+
+# ------------------------------------------------------------------------------------------------ M3-N1 substitution
+class MegaSubstitution:
+    """M3-N1 (docs/HANDOFF-M3-N1-MEGAMOE-NUMERICS.md (3), docs/M2-L3-NUMERICS.md): MegaMoE on a FEW layers of a
+    running non-mega StaticStep -- e.g. the production dg-inplace 1-row step -- with every other layer untouched.
+
+    Per substituted layer: an interleaved L1 COPY of the pool's own w1/w3 (G = the pool's H + spare slots; the same
+    bytes the checkpoint holds, built on the device in `layer_tables`), the SF copies, the pool's w2 used in place,
+    and the step's own pointer tables for cold staging into the pool's spare slots. The layer's own impl no longer
+    runs while substituted, so its spare slots are free for MegaMoE's staging (each call re-stages; the original
+    impl re-stages its own cold experts on every call too). The pool layout is NOT touched (no option A).
+    HBM: `bufs.plan` (3.3 GiB + 0.3 GiB SF per layer at G = 301), checked against mem_get_info before any copy;
+    a refusal raises RuntimeError naming what was needed and what was free.
+
+        sub = MegaSubstitution(st, [0, 10]); ...; sub.restore()          # or: with MegaSubstitution(st, [0]): ...
+
+    Graph mode: graphs captured before the substitution still replay the old MoE launches -- release_graphs() and
+    recapture after substituting (and again after restore()). Static-eager mode needs nothing.
+    """
+
+    def __init__(self, st, layers: Sequence[int], *, shared: str = "gemv", sf_major: Optional[str] = None,
+                 spare_slots: Optional[int] = None, max_tokens: Optional[int] = None, dg=None, warmup: bool = True):
+        pool = getattr(st, "pool", None)
+        if pool is None:
+            raise ValueError("MegaSubstitution needs the step's ExpertPool")
+        layers = sorted({int(l) for l in layers})
+        if not layers or not all(0 <= l < len(st.moes) for l in layers):
+            raise ValueError(f"layers {layers}: the step has {len(st.moes)} MoE layers")
+        S = int(spare_slots or getattr(st, "spare_slots", None) or st.topk)
+        S = min(S, int(pool.spare))
+        if S < 1:
+            raise ValueError("the pool has no spare slots for MegaMoE's cold staging (a dg impl adds them)")
+        moe0 = st.moes[layers[0]].moe
+        ex0 = next(e for e in moe0.experts if e is not None)
+        shapes = {p: tuple(getattr(ex0, p).weight.shape) for p in ("w1", "w3", "w2")}
+        sshapes = {p: tuple(getattr(ex0, p).scale.shape) for p in ("w1", "w3", "w2")}
+        self.st, self.layers, self.S = st, layers, S
+        self.orig: Dict[int, object] = {}
+        self.bufs = DGMegaBuffers(st, shapes, sshapes, pool=pool, swiglu_limit=moe0.shared_experts.swiglu_limit,
+                                  spare_slots=S, max_tokens=max_tokens, shared=shared, sf_major=sf_major,
+                                  l1_store="copy", deterministic=getattr(st, "dg_deterministic", True), dg=dg,
+                                  layers=layers)
+        try:
+            for l in layers:
+                old = st.moes[l]
+                ptabs = getattr(old, "ptabs", None)
+                if ptabs is None:
+                    raise ValueError(f"L{l}: {type(old).__name__} has no pointer tables")
+                new = DGMegaMoE(st, old.moe, l, ptabs, bufs=self.bufs)
+                self.orig[l] = old
+                self._bind(l, old, new)
+            if warmup:
+                self.bufs.warmup()
+        except BaseException:
+            self.restore()
+            raise
+
+    def _bind(self, l: int, old, new) -> None:
+        st = self.st
+        st.moes[l] = new
+        moe = old.moe
+        sms = moe.__dict__.setdefault("_static_moes", {})
+        if sms.get(id(st)) is old or id(st) not in sms:
+            sms[id(st)] = new
+        if moe.__dict__.get("_static_moe") is old:
+            moe.__dict__["_static_moe"] = new
+
+    @property
+    def moes(self) -> Dict[int, "DGMegaMoE"]:
+        return {l: self.st.moes[l] for l in self.orig}
+
+    def restore(self) -> None:
+        """Rebind the original MoE objects and free the copies (idempotent)."""
+        for l, old in list(self.orig.items()):
+            self._bind(l, self.st.moes[l], old)
+        self.orig.clear()
+        b = getattr(self, "bufs", None)
+        if b is not None:
+            b.layers.clear()
+            b.syms.clear()
+            self.bufs = None
+            if self.st.dev.type == "cuda":
+                torch.cuda.synchronize(self.st.dev)
+                torch.cuda.empty_cache()
+
+    def describe(self) -> dict:
+        d = self.bufs.describe() if self.bufs is not None else {}
+        return {"layers": self.layers, "spare": self.S, "active": bool(self.orig), "bufs": d}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.restore()
+        return False

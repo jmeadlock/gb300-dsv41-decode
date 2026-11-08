@@ -16,10 +16,20 @@ missing/broken deep_gemm FAILS (it is what is under test).
 `dg-mega` is not yet in static_step.MOE_IMPLS / generate.MOE_IMPLS (files outside M2-L3's ownership): the tests add it
 for their own duration. Run on the box (orchestrator) exactly as tests/gpu/test_dg_inplace_gpu.py:
   ... --entrypoint python3 vllm/vllm-openai:v0.31.0 tests/gpu/test_dg_mega_gpu.py
+
+M3-N1 (bench/dg_mega_numerics.py, runtime/dg_mega.MegaSubstitution; docs/M2-L3-NUMERICS.md):
+  * GPU: MegaSubstitution on ONE layer of a dg-inplace step == that layer of a full dg-mega step, bitwise (R = 1 and
+    6), and restore() gives the dg-inplace output back bitwise;
+  * CPU (`test_cpu_*`, run by `pytest tests/` on the Mac -- this is the one test file M3-N1 owns): the quantizers
+    and SwiGLU formulas against the existing emulations, the stage decomposition on a synthetic layer (tm_fix ==
+    ours bitwise, tm's L2-input bytes differ, the l2_acts matcher on shuffled rows), the kernel patch on the vendored
+    .cuh and patch-dg's copy, and MegaSubstitution on the emulated mini step with the contract-checking fake
+    MegaMoE (bitwise vs the oracle; restore() bit-identical to before).
 """
 from __future__ import annotations
 
 import contextlib
+import math
 import os
 import random
 import sys
@@ -309,9 +319,294 @@ def test_mini_end_to_end_mini4():
     _mini_end_to_end("mini4")
 
 
+# ------------------------------------------------------------------------------------------------ M3-N1 (GPU)
+def _substitution_gate(kind):
+    """MegaSubstitution on layer 0 of a dg-inplace step == layer 0 of a full dg-mega step (bitwise, R = 6 and each
+    row alone); restore() -> the dg-inplace outputs bitwise as before."""
+    _need_dg()
+    from runtime import dg_mega as DM
+    from runtime.static_step import StaticStep
+
+    with _model(kind) as (model, tokdir), _mega_enabled():
+        pool = model.runtime_load.pool
+        D = model.layers[0].ffn.dim
+        sti = StaticStep(model, pool, max_pos=MAX_POS, moe_impl=DGI)
+        x6 = (torch.randn(6, D, generator=_g(23), device="cpu") * 2).to(torch.bfloat16).cuda()
+        with torch.inference_mode(), sti._active():
+            before = [sti.moes[0](x6[r:r + 1].clone()).clone() for r in range(6)]
+        stm = StaticStep(model, pool, max_pos=MAX_POS, moe_impl=MEGA)
+        with torch.inference_mode(), stm._active():
+            want6 = stm.moes[0](x6.clone()).clone()
+            want1 = [stm.moes[0](x6[r:r + 1].clone()).clone() for r in range(6)]
+        stm.detach()
+        del stm
+        sub = DM.MegaSubstitution(sti, [0])
+        assert isinstance(sti.moes[0], DM.DGMegaMoE) and not isinstance(sti.moes[1], DM.DGMegaMoE)
+        with torch.inference_mode(), sti._active():
+            got6 = sti.moes[0](x6.clone()).clone()
+            got1 = [sti.moes[0](x6[r:r + 1].clone()).clone() for r in range(6)]
+        print(f"  {kind}: substitution {sub.describe()['bufs'].get('plan')}")
+        assert torch.equal(got6.view(torch.int16), want6.view(torch.int16)), (kind, "R6 substituted vs dg-mega step")
+        assert all(torch.equal(a.view(torch.int16), b.view(torch.int16)) for a, b in zip(got1, want1)), (kind, "R1")
+        sub.restore()
+        with torch.inference_mode(), sti._active():
+            after = [sti.moes[0](x6[r:r + 1].clone()).clone() for r in range(6)]
+        assert all(torch.equal(a.view(torch.int16), b.view(torch.int16)) for a, b in zip(after, before)), \
+            (kind, "restore() vs before")
+        sti.detach()
+        print(f"  {kind}: MegaSubstitution(layer 0) == the dg-mega step bitwise (R 6 and 1); restore() bit-identical")
+
+
+def test_m3n1_substitution_mini():
+    _substitution_gate("mini")
+
+
+def test_m3n1_substitution_mini4():
+    _substitution_gate("mini4")
+
+
+# ------------------------------------------------------------------------------------------------ M3-N1 (CPU)
+def _num():
+    import dg_mega_numerics as N
+
+    return N
+
+
+def test_cpu_quantizers_match_the_emulations():
+    """scale_mega == the definition (smallest power of two with amax / s <= 448, floor 2^-22); quant32(scale_mega)
+    == test_dg_mega_cpu._quant_fp32 (the fake MegaMoE's requant) bitwise; quant32(scale_ref) == the emulated
+    reference act_quant except at fp32 product boundaries (counted: < 0.1 %)."""
+    from test_dg_mega_cpu import _quant_fp32
+    from test_static_emulated_cpu import act_quant as emu_act_quant
+
+    N = _num()
+    g = _g(5)
+    z = torch.randn(64, 2048, generator=g, device="cpu") * torch.exp2(torch.randint(-12, 12, (64, 1), generator=g,
+                                                                                  device="cpu").float())
+    amax = z.view(64, -1, 32).abs().amax(-1)
+    s = N.scale_mega(amax)
+    assert bool((amax / s <= 448).all()) and bool(((amax / (s / 2) > 448) | (s <= 2.0 ** -22)).all())
+    q, sc = N.quant32(z, N.scale_mega)
+    assert torch.allclose(N.dequant(q, sc).float(), _quant_fp32(z), rtol=0, atol=0)
+    qr, sr = N.quant32(z.to(torch.bfloat16).float(), N.scale_ref)
+    qe, se = emu_act_quant(z.to(torch.bfloat16), 32, "ue8m0")
+    assert float((sr != se).float().mean()) < 1e-3 and float((qr.view(torch.uint8) != qe.view(torch.uint8))
+                                                               .float().mean()) < 1e-3
+    # the exact boundary: amax = 448 * 2^k is a power-of-two scale 2^k for MegaMoE
+    b = torch.tensor([448.0, 448.0 * 2 ** -5, 448.0 * 2 ** 7], device="cpu")
+    assert torch.equal(N.scale_mega(b), torch.tensor([1.0, 2 ** -5, 2.0 ** 7], device="cpu"))
+
+
+def test_cpu_swiglu_formulas():
+    """swiglu_mega == the fake MegaMoE's formula (test_dg_mega_cpu._mega_expert); the reference formula's bitwise
+    agreement with it is reported, not asserted (F.silu's CPU and GPU kernels differ; the box measures it)."""
+    N = _num()
+    g = _g(9)
+    gt = (torch.randn(4, 512, generator=g, device="cpu") * 6).to(torch.bfloat16)
+    up = (torch.randn(4, 512, generator=g, device="cpu") * 6).to(torch.bfloat16)
+    w = torch.rand(4, 1, generator=g, device="cpu")
+    gate = torch.clamp(gt.float(), max=10.0)
+    upc = torch.clamp(up.float(), min=-10.0, max=10.0)
+    want = gate / (1.0 + torch.exp(-gate)) * upc * w
+    assert torch.equal(N.swiglu_mega(gt, up, w, 10.0), want)
+    eq = float((N.swiglu_ref(gt, up, w, 10.0) == want).float().mean())
+    print(f"  swiglu ref vs mega formula on the CPU: {eq * 100:.2f} % bitwise equal")
+
+
+def _synthetic_window(N, D=512, I=256, n_exp=10, seed=3):
+    g = _g(seed)
+    x = N.synth_x(6, D, g)
+    layer = N.synth_layer(n_exp, D, I, g, x)
+    rng = random.Random(seed)
+    ids = torch.tensor([sorted(rng.sample(range(n_exp), 6)) for _ in range(6)], dtype=torch.long, device="cpu")
+    w = torch.rand(6, 6, generator=g, device="cpu") + 0.05
+    w = w / w.sum(-1, keepdim=True) * 1.5
+
+    def deq(e):
+        return tuple(N.deq_fp4(*layer["experts"][e][p]) for p in ("w1", "w3", "w2"))
+
+    sw = tuple(N.deq_fp4(*layer["shared"][p]) for p in ("w1", "w3", "w2"))
+    a64 = N.dequant(*N.quant32(x.float(), N.scale_ref))
+    shared = torch.stack([N.oracle_stages(a64[r], sw[0], sw[1], sw[2], 1.0, 10.0, "bf16")["o"] for r in range(6)])
+    return x, ids, w, deq, shared, layer
+
+
+def test_cpu_decomposition_on_a_synthetic_layer():
+    """tm_fix (bf16 before quant) == ours bitwise at every stage (same GEMMs; the SwiGLU formulas agree on these
+    values or the bf16 rounding absorbs the difference -- asserted on the L2-input bytes); tm's L2-input bytes differ
+    from ours on a few % and its routed distance to the oracle is several times ours; a fake kernel that returns
+    tm's output and tm's L2 bytes (rows shuffled, padding rows of zeros) is matched row by row."""
+    N = _num()
+    x, ids, w, deq, shared, layer = _synthetic_window(N)
+    gemm = N.emu_gemm_factory(layer, torch.device("cpu"))
+    holder = {}
+
+    def fake_mega():
+        r = holder["res"]
+        q = r["raw"]["q2"]["tm"][0].view(torch.uint8)
+        perm = torch.randperm(q.size(0), generator=_g(1), device="cpu")
+        snap = torch.cat([q[perm], torch.zeros(5, q.size(1), dtype=torch.uint8, device="cpu")])
+        return r["raw"]["y"]["tm"][0].clone(), snap
+
+    holder["res"] = N.analyze_window(x, ids, w, deq, shared, gemm, want_raw=True)
+    res = N.analyze_window(x, ids, w, deq, shared, gemm, mega=fake_mega, want_raw=True)
+    s = N.finalize(res["stats"])
+    raw = res["raw"]
+    assert torch.equal(raw["q2"]["tm_fix"][0].view(torch.uint8), raw["q2"]["ours"][0].view(torch.uint8))
+    assert torch.equal(raw["y"]["tm_fix_1r"][1].view(torch.int16), raw["y"]["ours"][1].view(torch.int16))
+    assert 0.005 < s["l2_input_pairwise"]["tm_vs_ours"]["mismatch_frac"] < 0.2
+    assert s["routed"]["tm"]["rel_l2"] > 2 * s["routed"]["ours"]["rel_l2"]
+    assert s["pairwise_routed"]["mega_vs_tm"]["mismatch_frac"] == 0.0
+    m = res["l2_match"]
+    assert m["rows_written"] == m["rows_matched"] == m["pairs"] == m["pairs_covered"] == 36, m
+    assert m["frac_bytes_eq_tm"] == 1.0 and m["frac_bytes_eq_ours"] < 1.0, m
+    summ = N.summarize_stats(s)
+    assert summ["final"]["mega"] is not None and len(N.summary_lines(summ, "t")) == 7
+    merged = N.finalize(N.merge(N.merge(None, res["stats"]), res["stats"]))
+    assert abs(merged["routed"]["tm"]["rel_l2"] - s["routed"]["tm"]["rel_l2"]) < 1e-12
+
+
+def test_cpu_kernel_patch_on_the_vendored_source(tmp_path):
+    """The bf16-before-quant patch applies exactly once to the vendored sm100_fp8_fp4_mega_moe.cuh, refuses a second
+    time, and patch-dg copies a package with the patched header + a manifest (here from the vendored tree)."""
+    N = _num()
+    src_pkg = os.path.join(REPO, "reference", "vllm-0.31.0", "deep_gemm")
+    txt = open(os.path.join(src_pkg, N.CUH)).read()
+    new = N.patch_bf16_before_quant(txt)
+    assert new.count(N.PATCH_TAG) == 1 and len(new) == len(txt) + len(N.PATCH_LINES)
+    assert "__float22bfloat162_rn(activation_values[i][k])" in new
+    try:
+        N.patch_bf16_before_quant(new)
+        raise AssertionError("double patch accepted")
+    except ValueError:
+        pass
+    out = tmp_path / "dgp"
+    assert N.main(["patch-dg", "--src", src_pkg, "--out", str(out)]) == 0
+    man = __import__("json").load(open(out / "patch-manifest.json"))
+    assert man["sha256_before"] != man["sha256_after"]
+    assert N.PATCH_TAG in open(out / "deep_gemm" / N.CUH).read()
+    assert N.PATCH_TAG not in open(os.path.join(src_pkg, N.CUH)).read()       # the vendored tree is untouched
+
+
+def test_cpu_groups_and_tf_metrics():
+    N = _num()
+    assert N.parse_groups("auto", [0, 10, 20, 39]) == [[0, 10, 20, 39]]
+    assert N.parse_groups("0,10|20|39", [0]) == [[0, 10], [20], [39]]
+    assert N.split_group([0, 10, 20, 39]) == [[0, 10], [20, 39]] and N.split_group([7]) == []
+    rows = [{"tag": "a", "logprobs": [{"logprob": -0.1, "top_logprobs": [{"logprob": -0.1}, {"logprob": -2.1}]},
+                                      {"logprob": -0.5, "top_logprobs": [{"logprob": -0.5}, {"logprob": -0.6}]}]}]
+    targets = {"a": [5, 7]}
+    base = {"a": {"n": 2, "argmax": [5, 7], "lp_target": [-0.1, -0.5], "top_lp": [[-0.1, -2.1], [-0.5, -0.6]]}}
+    cand = {"a": {"n": 2, "argmax": [5, 8], "lp_target": [-0.1, -0.7], "top_lp": [[-0.1, -2.1], [-0.4, -0.7]]}}
+    m = N.tf_compare(cand, rows, targets, base)
+    t = m["total"]
+    assert t["positions"] == 2 and t["flips_pg61"] == 1 and abs(t["flips_w_pg61"] - 0.1) < 1e-9
+    assert t["flips_base"] == 1 and abs(t["flips_w_base"] - 0.1) < 1e-9 and abs(t["max_abs_dlp_base"] - 0.2) < 1e-9
+
+
+def test_cpu_layerbox_run_layer_with_fakes():
+    """The box `layers` path (LayerBox + run_layer: checkpoint load, cold placement into spare groups for R = 6 and
+    each row alone, today's contiguous GEMM, the MegaMoE call, the timer) at small dims on the CPU: the contiguous
+    fake of tests/test_dg_inplace_cpu.py + the contract-checking MegaMoE fake of tests/test_dg_mega_cpu.py and a
+    synthetic checkpoint. Shapes, routing and bookkeeping only -- the numbers are the box's."""
+    from test_dg_inplace_cpu import _fake_dg_contig
+    from test_dg_mega_cpu import _fake_mega
+
+    N = _num()
+    D, I, E, k, H, S = 256, 256, 16, 6, 12, 4
+    g = _g(31)
+    x = N.synth_x(12, D, g)
+    lay = N.synth_layer(E, D, I, g, x)
+
+    class Ck:
+        def expert(self, L, e, p):
+            return lay["experts"][e][p]
+
+        def get(self, name):
+            p = name.split(".")[-2]
+            n_, k_ = (I, D) if p in ("w1", "w3") else (D, I)
+            if name.endswith("weight"):
+                return (torch.randn(n_, k_, generator=_g(len(name)), device="cpu") * 0.05).to(torch.float8_e4m3fn)
+            return torch.full((n_ // 32, k_ // 32), 120, dtype=torch.uint8, device="cpu")
+
+    dg = _fake_dg_contig()
+    fm = _fake_mega()
+    dg.SymmBuffer, dg.fp8_fp4_mega_moe = fm.SymmBuffer, fm.fp8_fp4_mega_moe
+    rng = random.Random(2)
+    ids = torch.tensor([sorted(rng.sample(range(E), k)) for _ in range(12)], dtype=torch.long, device="cpu")
+    w = torch.rand(12, k, generator=g, device="cpu") + 0.05
+    acts = {"rows": {t: {0: {"pos": list(range(1, 7)), "x": x[o:o + 6], "ids": ids[o:o + 6], "w": w[o:o + 6]}}
+                     for t, o in (("a", 0), ("b", 6))}}
+    wins = N.load_windows(acts, 0, 8, 1)
+    assert [v["tag"] for v in wins] == ["a", "b"] and N.load_windows(acts, 0, 8, 2) == []
+    box = N.LayerBox(dg, Ck(), 0, list(range(H)), S, "cpu", dims=(D, I, E, k))
+    rec = N.run_layer(box, wins, timer=lambda fn, iters: {"us": 0.0, "how": "fake"}, iters=1, log=lambda *a, **kw: None)
+    assert rec["G"] == H + S and len(rec["windows"]) == 2 and rec["row_invariant_all"] is True
+    assert set(rec["speed"]) == {"mega_R1_hot_us", "mega_R6_hot_us"}
+    assert any(v >= H for v in box.placed) and set(box.placed.values()) <= set(range(H, E))
+    s6 = rec["R6"]
+    assert s6["l2_input_pairwise"]["tm_fix_vs_ours"]["mismatch_frac"] == 0.0
+    assert all(math.isfinite(s6["final"][a_]["rel_l2"]) for a_ in N.ARMS)
+    assert math.isfinite(rec["R1"]["final"]["mega"]["rel_l2"]) and rec["summary_R6"]["final"]["mega"] is not None
+    assert "l2_match" not in rec                                     # the fake SymmBuffer has no l2_acts view
+    lines = N.report_lines([{"layers": {"0": rec}}], [], None, None)
+    assert any(l.startswith("| 0 | 6 |") for l in lines) and any(l.startswith("| 0 | 0 | 0 |") for l in lines)
+
+
+def test_cpu_mega_substitution_on_the_emulated_step(mega_emu, monkeypatch):
+    """MegaSubstitution on layer 0 of an emulated `ref` StaticStep (pool grown to k spares first, as the dg impls
+    do): the substituted layer == the MegaMoE-numerics oracle bitwise (R 6 and 1, cold experts staged); decode runs
+    and calls the fake once per step; restore() -> logits bit-identical to before the substitution."""
+    from test_dg_mega_cpu import _oracle
+    from test_static_emulated_cpu import _static_run
+
+    from runtime import dg_mega as DM
+    from runtime.static_step import StaticStep
+
+    model, pool, fk, fake, R_mod = mega_emu("mini4")
+    pool.add_spare_slots(6, model)                       # storage moves: re-register the fake gather's sources
+    reg = next(c.cell_contents for c in fk.gather_rows.__closure__ if isinstance(c.cell_contents, dict))
+    for l in range(pool.n_layers):
+        for p in ("w1", "w2", "w3"):
+            w, s = pool.hbm[l][p]
+            for t in list(w) + list(s):
+                reg[t.data_ptr()] = t.reshape(-1).view(torch.uint8)
+    st = StaticStep(model, pool, max_pos=127, _allow_cpu=True)
+    ids = list(range(5, 21))
+    before = _static_run(model, st, ids, 4)
+    sub = DM.MegaSubstitution(st, [0])
+    n0 = len(fake.calls)
+    assert isinstance(st.moes[0], DM.DGMegaMoE) and not isinstance(st.moes[1], DM.DGMegaMoE) and n0 == 1
+    lim = float(model.layers[0].ffn.shared_experts.swiglu_limit)
+    D = model.layers[0].ffn.dim
+    x6 = (torch.randn(6, D, generator=_g(4), device="cpu") * 2).to(torch.get_default_dtype())
+    with torch.inference_mode(), st._active():
+        y6 = st.moes[0](x6.clone())
+        want = _oracle(st.moes[0].moe, x6, R_mod, lim, "gemv")
+        assert torch.equal(y6.view(torch.int16), want.view(torch.int16))
+        for r in range(6):
+            assert torch.equal(st.moes[0](x6[r:r + 1].clone()).view(torch.int16), y6[r:r + 1].view(torch.int16))
+    during = _static_run(model, st, ids, 4)
+    assert all(bool(torch.isfinite(l).all()) for l in during[0])
+    assert len(fake.calls) - n0 == 7 + 4, len(fake.calls)                   # 7 direct calls + 4 decode steps
+    sub.restore()
+    assert not any(isinstance(m, DM.DGMegaMoE) for m in st.moes) and sub.bufs is None
+    after = _static_run(model, st, ids, 4)
+    assert all(torch.equal(a, b) for a, b in zip(after[0], before[0])) and after[1] == before[1]
+    st.detach()
+
+
+if __name__ != "__main__":  # pytest: the CPU tests' fixtures (resolved by name in this module); the box script skips
+    try:
+        from test_dg_mega_cpu import mega_emu  # noqa: E402,F401
+        from test_static_emulated_cpu import emu  # noqa: E402,F401
+    except Exception:  # pragma: no cover
+        pass
+
 TESTS = [test_route_kernel_on_device_equals_mirror, test_stage_kernel_on_device_equals_contract,
          test_layouts_equal_library_transform, test_mini_moe_level_gates_mini, test_mini_moe_level_gates_mini4,
-         test_mini_end_to_end_mini, test_mini_end_to_end_mini4]
+         test_mini_end_to_end_mini, test_mini_end_to_end_mini4, test_m3n1_substitution_mini,
+         test_m3n1_substitution_mini4]
 
 if __name__ == "__main__":
     import traceback
