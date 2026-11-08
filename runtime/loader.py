@@ -58,7 +58,7 @@ from torch import nn
 from torch.overrides import TorchFunctionMode
 
 from runtime.ckpt import ShardIndex
-from runtime.expert_pool import PROJS, TIER_HBM, ExpertPool
+from runtime.expert_pool import PROJS, TIER_HBM, ExpertPool, pool_sf_layout
 from runtime.host_tier import GiB, HostBuffer, check_mem_available, register_all
 from runtime.placement import (EXPERT_RE, ENGRAM_TABLE_RE, HotMap, PlacementConfig, Tier, default_config_path,
                                make_plan, placed_dtype, role)
@@ -398,6 +398,12 @@ def build_and_load(model_dir: str, map=None, device: Union[str, torch.device] = 
     # cold pool size is known only once the pool lays itself out; compute it the same way first
     n_cold = sum(len(hot_map.cold_ids(l)) for l in range(pcfg.n_layers))
     host_need += n_cold * pcfg.expert_bytes
+    sf_beside = pool_sf_layout() == "beside"   # M3-S3: the hot experts' e8m0 scales go to Grace too
+    if sf_beside:
+        n_hot = sum(len(hot_map.hot_ids(l)) for l in range(pcfg.n_layers))
+        host_need += n_hot * sum(n * (k // 32) for n, k in ((pcfg.moe_inter_dim, pcfg.dim),
+                                                            (pcfg.moe_inter_dim, pcfg.dim),
+                                                            (pcfg.dim, pcfg.moe_inter_dim)))
     mem_log.append(check_mem_available(host_need, int(reserve_host_gib * GiB), "before-host-alloc"))
 
     t0 = time.time()
@@ -407,6 +413,8 @@ def build_and_load(model_dir: str, map=None, device: Union[str, torch.device] = 
         host_buffers[n] = HostBuffer(index[n].nbytes, n)
     if pool.host is not None:
         host_buffers["cold_experts"] = pool.host
+    if pool.hot_sf_host is not None:   # M3-S3 beside: registered with the host tier, UVA views after bind
+        host_buffers["hot_scales"] = pool.hot_sf_host
     timings["alloc"] = time.time() - t0
 
     # ---- host tier: read straight into the host buffers (parallel positional reads)
@@ -422,7 +430,9 @@ def build_and_load(model_dir: str, map=None, device: Union[str, torch.device] = 
     for n in expert_names:
         m = EXPERT_RE.match(n)
         l, e, p, kind = int(m.group(1)), int(m.group(2)), m.group(3), m.group(4)
-        if pool.tier(l, e) == TIER_HBM:
+        if pool.tier(l, e) == TIER_HBM and pool.sf_beside and kind == "scale":
+            jobs.append((n, 0, index[n].nbytes, pool.hot_scale_memoryview(l, e, p)))   # M3-S3: to Grace
+        elif pool.tier(l, e) == TIER_HBM:
             hot_expert_names.append((n, l, e, p, kind))
         else:
             jobs.append((n, 0, index[n].nbytes, pool.host_memoryview(l, e, p, kind)))
@@ -489,6 +499,10 @@ def build_and_load(model_dir: str, map=None, device: Union[str, torch.device] = 
         view = hb.cuda_view(dt, shape, 0, device) if register_host else hb.host_view(dt, shape, 0)
         _set_param(model, n, view)
     pool.bind(model, cuda_views=register_host)
+    if pool.sf_beside:   # M3-S3: the packed SF of every hot slot, from the host copy just read (no value change)
+        t1 = time.time()
+        pool.pack_hot_sf()
+        timings["pack_hot_sf"] = time.time() - t1
     n_scale = 0
     for mod in model.modules():
         if isinstance(mod, ref.Linear) and mod.scale is not None:
@@ -506,6 +520,7 @@ def build_and_load(model_dir: str, map=None, device: Union[str, torch.device] = 
                         dequantized=sorted(dequantized), widened=sorted(widened), head_dtype=head_dtype)
     result.bytes = {"read_HBM": by_tier["HBM"], "read_HOST": by_tier["HOST"],
                     "pool_HBM": pool.hbm_bytes(), "pool_HOST": pool.cold_bytes,
+                    "pool_HOST_hot_scales": pool.hot_sf_bytes,
                     "engram_HOST": sum(host_buffers[n].nbytes for n in engram_names),
                     "hbm_params": sum(t.numel() * t.element_size() for t in hbm_params.values())}
     model.runtime_load = result
@@ -595,6 +610,14 @@ def verify_placement(model: nn.Module, result: LoadResult, threads: int = 8) -> 
             if p.data_ptr() != pool.host.ptr + off:
                 return n, False, "cold expert param does not alias the cold pool"
             placed = tensor_sha256(pool.host.host_view(dt, shape, off))
+            ref_h = index.file_sha256(n)
+        elif m and pool.sf_beside and m.group(4) == "scale":   # M3-S3: a hot expert's scales live on the host
+            l_, e_, p_ = int(m.group(1)), int(m.group(2)), m.group(3)
+            off = pool.hot_scale_offset(l_, e_, p_)
+            assert pool.hot_sf_host is not None
+            if p.data_ptr() != pool.hot_sf_host.ptr + off:
+                return n, False, "hot expert scale param does not alias the hot-scale host buffer"
+            placed = tensor_sha256(pool.hot_scale_host(l_, pool.slot[(l_, e_)][1], p_))
             ref_h = index.file_sha256(n)
         elif n.endswith(".attn.wo_a.weight"):
             placed = tensor_sha256(p)

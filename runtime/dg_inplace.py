@@ -32,6 +32,10 @@ expert -- the same methods, fused or not). What changes, per layer:
                      others "step" (sf_layer: per-layer store; the dedup lists hot slots in the work list only for
                      step layers). Same scale bytes reach the GEMM either way: bit-identical by construction.
           fp32 resident scales would be 49.6 GiB (4 B/scale) and do not fit (hbm_plan()).
+          M3-S3 ($DSV41_POOL_SF=beside, runtime/expert_pool.py): the POOL owns every slot's packed SF (pool.sfp,
+          [H+S] groups, the same group index as the weight pool) and the K-major hot e8m0 lives on Grace; the build
+          then uses that copy as its "pool" store for EVERY layer (whatever store was requested; no HBM check: the
+          bytes are the pool's), so no hot SF is ever re-packed and the stage writes cold weights + cold SF only.
   stage   ONE launch per layer (runtime/static_kernels.py t9a2_stage_inplace; contract = stage_inplace_emulated below):
           group[j] = loc slot of ids[j] if hot else H + j; cold experts' weight rows (HBM or UVA host address, the same
           pointer tables as dg-masked) are copied into pool slot H + j; scales are packed into the SF tensor (all k in
@@ -613,6 +617,8 @@ def pool_packed_sf(pool, layer: int, N: Dict[str, int], C: Dict[str, int], devic
     by every dg-inplace build on it (the 1-row and the R-row steps alike), built per layer on first use; the spare
     groups start zero (code 0 = 2^-127, finite) and are written by the staging launches. Keyed by pool_sf_key: a
     storage move (add_spare_slots) or a different hot set rebuilds it (the old copy goes with the stale builds)."""
+    if getattr(pool, "sf_beside", False):              # M3-S3: the pool's own slot-parallel packed SF
+        return pool.packed_sf(layer)
     key = pool_sf_key(pool)
     cache = getattr(pool, "_dg_packed_sf", None)
     if cache is None or cache["key"] != key:
@@ -696,6 +702,8 @@ class DGInplaceBuffers(DGBuffers):
         self.sf_store = sf_store or os.environ.get(SF_STORE_ENV, "step")
         if self.sf_store not in SF_STORES:
             raise ValueError(f"sf_store {self.sf_store!r} not in {SF_STORES} (${SF_STORE_ENV})")
+        self.sf_beside = bool(getattr(pool, "sf_beside", False))   # M3-S3: the pool owns every slot's packed SF
+        self.sf_store_req = self.sf_store
         self.spare_limit = pairs if spare_slots is None else int(spare_slots)
         if not 1 <= self.spare_limit <= pairs:
             raise ValueError(f"spare_slots {self.spare_limit} outside [1, {pairs}] (A blocks per layer)")
@@ -734,7 +742,15 @@ class DGInplaceBuffers(DGBuffers):
         self.sf_store_why: Optional[str] = None
         self.sf_pool_plan: Optional[dict] = None   # M3-S2: sf_pool_plan()'s record (pool store only)
         self.sf_pool_layers: Optional[Tuple[int, ...]] = None   # M3-S2: pooled layers when partial (None = all)
-        if self.sf_store in ("pool", "resident"):
+        if self.sf_beside:
+            if self.sf_store != "pool":
+                self.sf_store_why = (f"pool SF layout 'beside': the pool owns every slot's packed SF; "
+                                     f"requested sf_store {self.sf_store!r} -> pool")
+            self.sf_store = "pool"
+            print(f"[dg-inplace] sf_store pool: pool SF layout beside ({pool.n_layers}/{pool.n_layers} layers, "
+                  f"{sum(len(pool.hot[l]) + pool.spare for l in range(pool.n_layers))} groups owned by the pool; "
+                  f"no hot SF re-packed)", file=sys.stderr, flush=True)
+        elif self.sf_store in ("pool", "resident"):
             self._check_sf_hbm()
         # M3-S2: the store per layer ("pool" / "resident" / "step"); partial pool = some layers "step"
         self.sf_layer: Dict[int, str] = {
@@ -1001,12 +1017,7 @@ class DGInplaceBuffers(DGBuffers):
         g = torch.Generator(device="cpu").manual_seed(seed)
         groups = sorted(torch.randperm(H0, generator=g, device="cpu")[:U].tolist())
         counts = torch.randint(1, R_ + 1, (U,), generator=g, device="cpu").tolist()
-        sfp = {}
-        with torch.inference_mode(False), torch.no_grad():
-            for p in W:
-                t_ = packed_sf_zeros(G0, self.N[p], self.C[p], d)
-                t_[:H0].copy_(pack_words(pool.hbm[0][p][1]))
-                sfp[p] = t_
+        sfp = self._layer0_sf(W, G0, H0)
         tt = {"w": W, "sf": sfp, "G": G0}
         res = {"layout": self.layout, "align": self.align, "groups": U, "rows": sum(counts), "projs": {}}
         try:
@@ -1119,11 +1130,7 @@ class DGInplaceBuffers(DGBuffers):
         sfp = {}
         prev_pack = self.sf_pack
         try:
-            with torch.inference_mode(False), torch.no_grad():
-                for p in W:
-                    t_ = packed_sf_zeros(G0, self.N[p], self.C[p], d)
-                    t_[:H0].copy_(pack_words(pool.hbm[0][p][1]))
-                    sfp[p] = t_
+            sfp = self._layer0_sf(W, G0, H0)
             tt = {"w": W, "sf": sfp, "G": G0}
             all_eq = True
             for p, which in (("w1", 1), ("w2", 2)):
@@ -1177,6 +1184,20 @@ class DGInplaceBuffers(DGBuffers):
             del sfp
         return res
 
+    def _layer0_sf(self, W: Dict[str, torch.Tensor], G0: int, H0: int) -> Dict[str, torch.Tensor]:
+        """The build checks' packed SF of layer 0: a temporary copy packed from the pool's K-major hot scales, or
+        (M3-S3 beside) the pool's own packed SF -- the same values in its hot groups, read only."""
+        if self.sf_beside:
+            own = self.pool.packed_sf(0)
+            return {p: own[p] for p in W}
+        sfp = {}
+        with torch.inference_mode(False), torch.no_grad():
+            for p in W:
+                t_ = packed_sf_zeros(G0, self.N[p], self.C[p], self.dev)
+                t_[:H0].copy_(pack_words(self.pool.hbm[0][p][1]))
+                sfp[p] = t_
+        return sfp
+
     def describe(self) -> dict:
         r = super().describe()
         free = None
@@ -1186,6 +1207,8 @@ class DGInplaceBuffers(DGBuffers):
                     "allocated_GiB": round(torch.cuda.memory_allocated(self.dev) / GiB, 3)}
         if self.sf_store == "step":
             sf_b = sum(t.untyped_storage().nbytes() for t in self.sf_shared.values())
+        elif self.sf_store == "pool" and self.sf_beside:   # M3-S3: the pool's own (allocated with the pool)
+            sf_b = sum(t.untyped_storage().nbytes() for sf in self.pool.sfp.values() for t in sf.values())
         elif self.sf_store == "pool":
             c = getattr(self.pool, "_dg_packed_sf", None) or {"layers": {}}
             sf_b = sum(t.untyped_storage().nbytes() for sf in c["layers"].values() for t in sf.values())
@@ -1202,6 +1225,7 @@ class DGInplaceBuffers(DGBuffers):
                   "gemm_blocks": self.gemm_blocks, "gemm_m": self.gemm_blocks * self.block_rows,
                   "rowmatch": self.rowmatch,
                   "sf_store": self.sf_store, "sf_store_why": self.sf_store_why, "stage_n_work": self.stage_n_work(),
+                  "pool_sf_layout": getattr(self.pool, "sf_layout", "separate"),
                   "sf_layers": {s: sum(1 for v in self.sf_layer.values() if v == s)
                                 for s in sorted(set(self.sf_layer.values()))},
                   "sf_pool_layers": None if self.sf_pool_layers is None else list(self.sf_pool_layers),

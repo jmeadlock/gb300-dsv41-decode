@@ -1494,7 +1494,8 @@ class StaticStep:
                 "rows_moe_gemm": getattr(getattr(self, "dg", None), "rows_gemm", None),
                 "dedup_impl": _dedup_describe() if self.rows > 1 else None, "fp32_impl": _fp32_impl(),
                 "mixes": self.mix_fork.describe(),
-                "stage": None if self.stage_ov is None else self.stage_ov.describe()}
+                "stage": None if self.stage_ov is None else self.stage_ov.describe(),
+                "pool_sf": (self.pool.describe_sf() if hasattr(self.pool, "describe_sf") else None)}   # M3-S3
 
     def marker_count(self) -> int:
         return int(self.marker_ctr.item())
