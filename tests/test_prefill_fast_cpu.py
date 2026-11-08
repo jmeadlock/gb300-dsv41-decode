@@ -130,7 +130,7 @@ def test_switches_defaults_env_and_refusals(monkeypatch):
 
     for k in (PF.PREFILL_ENV, PF.FILLS_ENV, PF.STREAMS_ENV):
         monkeypatch.delenv(k, raising=False)
-    assert PF.prefill_mode() == "reference"            # default until the box gate
+    assert PF.prefill_mode() == "grouped"              # default since the 11/08 box gate (bit-equal 8/8, TTFT 3.9 s -> <1 s)
     assert PF.prefill_fills() is False                 # fills off by default (box: bit-equal, -0.55 s)
     assert PF.prefill_streams() == PF.DEFAULT_STREAMS
     monkeypatch.setenv(PF.PREFILL_ENV, "Grouped")

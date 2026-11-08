@@ -1,0 +1,16 @@
+  mini4 L=29: 4 layers x streams [1, 4]: grouped MoE == reference (torch.equal, 8 comparisons)
+  mini3 L=61: 2 layers x streams [1, 4]: grouped MoE == reference (torch.equal, 4 comparisons)
+PASS test_moe_layers_grouped_equal (19.8s)
+  mini4 L=37: prefill grouped (fills off, streams 4) == reference (fills on): first, logits 5a720784668f, main_hidden, 12 layer buffers; replay equal; 32 expert calls (16 cold) -> 96 GEMM launches (reference: 32 Expert calls)
+  mini3 L=130: prefill grouped (fills off, streams 1) == reference (fills on): first, logits fc0373b50585, main_hidden, 8 layer buffers; replay equal; 16 expert calls (8 cold) -> 48 GEMM launches (reference: 16 Expert calls)
+PASS test_prefill_grouped_equal_caches_and_replay (0.6s)
+  mini3 L=17 mode=static: loop after grouped prefill == after reference prefill (48 tokens, accepts [0, 0, 0, 0, 0, 0]..., 48 logits rows); prefill ms ref 153.2 grouped 66.2 (mini: not a speed gate)
+  mini3 L=18 mode=static: loop after grouped prefill == after reference prefill (48 tokens, accepts [0, 1, 0, 0, 0, 0]..., 48 logits rows); prefill ms ref 76.4 grouped 65.0 (mini: not a speed gate)
+PASS test_loop_stream_after_grouped_prefill_static (22.4s)
+  mini3 L=17 mode=graph/2g: loop after grouped prefill == after reference prefill (48 tokens, accepts [0, 0, 0, 0, 0, 0]..., 48 logits rows); prefill ms ref 38.9 grouped 28.7 (mini: not a speed gate)
+PASS test_loop_stream_after_grouped_prefill_graph (1.6s)
+  note: mini3 L=17 mode=static: tokens sha 696fb0b17d3c equal under both prefills
+  note: mini3 L=18 mode=static: tokens sha 491f1c0bf6c5 equal under both prefills
+  note: mini3 L=17 mode=graph/2g: tokens sha 696fb0b17d3c equal under both prefills
+comparisons executed: {'gates': 7, 'layers_equal': 12, 'buffers_equal': 20, 'tokens': 144, 'logit_rows': 144}
+4/4 not failed; 0 failed

@@ -1,7 +1,7 @@
 """M4-P2: the fast prefill, bit-identical -- layer-major, the routed experts' GEMMs issued as one batch per projection
 per layer (docs/HANDOFF-M4-P2-FAST-PREFILL.md; design docs/M4-PREFILL-DESIGN.md 4-7).
 
-    $DSV41_PREFILL=reference|grouped   (default reference until the box gate; runtime/draft_step.py prefill_hidden)
+    $DSV41_PREFILL=reference|grouped   (default grouped since 11/08 box gate; runtime/draft_step.py prefill_hidden)
     $DSV41_PREFILL_FILLS=off|on        (default off: torch's fill_uninitialized_memory scoped OFF around the prefill;
                                         box 2026-11-08: -0.55 s, logits + main_hidden bit-equal 8/8, off==on True)
     $DSV41_PREFILL_STREAMS=N           (grouped: CUDA streams the per-expert GEMM launches are spread over; default 4;
@@ -77,7 +77,7 @@ PREFILL_ENV = "DSV41_PREFILL"
 FILLS_ENV = "DSV41_PREFILL_FILLS"
 STREAMS_ENV = "DSV41_PREFILL_STREAMS"
 MODES = ("reference", "grouped")
-DEFAULT_MODE = "reference"     # until the box gate (handoff): flip to "grouped" only on the box receipts
+DEFAULT_MODE = "grouped"       # 11/08 box: TTFT 3.9 s -> 0.79-0.95 s, all 8 prompts bit-equal (first, logits, main_hidden, caches, replay), stream sha 8/8 (docs/prefill-bench-m4p2-20261108.json)
 DEFAULT_FILLS = "off"          # box 2026-11-08: fills off == on, 8/8 prompts, -0.55 s
 DEFAULT_STREAMS = 4
 BLOCK_M = 32                   # kernel.py fp4_gemm_kernel / act_quant_kernel block_M (rows per tile)
