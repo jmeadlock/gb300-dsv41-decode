@@ -26,8 +26,40 @@ the prefill's token), `done`. Invariant: P0 = L + n_out - 1.
            P0' = A' + 1.
   done     steps issued after `done` are predicated no-ops: no emission, A' := P0 - 1 (the commit then restores the
            compressor state, P0 stays, the draft writes no ring row with ctx_count 0, `tok` is not overwritten).
-The host replays K steps back to back, then one non-blocking D2H of (n_out, done, n_steps) into pinned memory; it waits
-on the event of the PREVIOUS batch (lookahead 1), so the queue never drains: at most (lookahead+1)*K - 1 no-op steps.
+The host replays steps back to back and, after a step, issues one non-blocking D2H of (n_out, done, n_steps) into pinned
+memory + an event (a "poll"); it waits on the event of the poll `lookahead` polls back, so the queue never drains.
+LOOP-OVERRUN (docs/HANDOFF-LOOP-OVERRUN.md): the loop used to poll every 8 steps with lookahead 1, i.e. it learned of
+`done` (EOS / max_new) up to (lookahead+1)*8 - 1 = 15 steps late and issued 9-15 no-op graph replays (~18 ms each) after
+every sequence (97 steps = 1.8 s over the 8 fixture prompts). Now (`PollPlan`, defaults poll_every=1, lookahead=1,
+tail_sync=True):
+  * a poll after EVERY step (`poll_every` 1) with `lookahead` polls in flight: the host learns of `done` after issuing
+    `lookahead` more steps -> overrun == lookahead (1) for an EOS ending; the pipeline never drains because the host
+    waits for the poll of step k only after step k+1 is queued behind it.
+  * tail sync (max_new endings): every step emits <= 6 tokens, so from the last observed n_out the host knows the
+    earliest step that could set `done` by length. Before issuing a step it cannot rule that out for, it drains (waits
+    for the poll of the newest issued step): one short GPU bubble per tail step instead of one no-op step (~18 ms).
+    Length endings -> overrun 0; the cost is a few drains only in the last ~2-4 steps.
+  * poll_every > 1 / lookahead > 1 / tail_sync False reproduce the old behaviour (A/B on the box).
+Arithmetic is untouched: the host only chooses WHEN to stop issuing; every step after `done` is a predicated no-op (see
+`done` above), so the emitted stream is the same whatever the poll schedule (tests/test_dspark_loop_cpu.py runs the real
+`LoopBuffers.accept` under every schedule and compares the streams).
+
+Device-side early stop (feasibility only, NOT implemented): the same overrun could be made ~free by skipping the graph body
+once `done` is set -- CUDA conditional graph nodes (IF: CUDA 12.4; SWITCH: 12.8; the box has CUDA 13 / torch 2.13) with
+the condition handle written by a one-thread kernel (`cudaGraphSetConditional(h, 1 - done)`) at the top of the graph;
+the body (verify|accept|commit|draft) would become the IF node's body graph, a skipped replay costing ~5-10 us instead of
+18 ms. Since a post-`done` step leaves every cache and counter unchanged by design (the T12 no-op), skipping is
+byte-identical for the stream, and the host could keep polling in 8-step batches again. Obstacles, in order of size:
+(1) torch.cuda.CUDAGraph exposes no conditional-node API that we know of (unchecked on torch 2.13): the capture would need the driver API through
+cuda-python (cuGraphConditionalHandleCreate, cuGraphAddNode with CU_GRAPH_NODE_TYPE_CONDITIONAL, cuStreamBeginCaptureToGraph
+into the body graph) and our own graph-pool / external-memory handling -- the current captures share torch's private pool;
+(2) everything captured today (DeepGEMM / FlashMLA / TileLang / Triton launches, ~thousands of nodes, PDL-attributed
+launches if M2-L5 lands) must be legal inside a conditional body graph; the driver documents restrictions on what a
+conditional body may contain, and we have not tried any of our kernels there -- UNVERIFIED, needs a box probe;
+(3) the residency hook's per-step host work (between replays) is unaffected, but nsys / step-anatomy tooling would see a
+nested graph; (4) the benefit is bounded by what the host poll already recovers (the
+remaining overrun is `lookahead` steps = 18 ms per request), so this is worth doing only if lookahead must grow to
+absorb host jitter. Recommendation: not now; revisit if the box shows host stalls forcing lookahead >= 2.
 
 Prefill -> first draft (design 2.3, risk 7): the reference prefill with main_hidden (`draft_step.prefill_hidden`) and
 the reference draft-ring seeding (forward_spec at start_pos 0, `seed_draft_rings`), then the draft step with
@@ -263,6 +295,44 @@ def host_accept(tok: Sequence[int], t: Sequence[int]) -> int:
     return n
 
 
+class PollPlan:
+    """The host's poll schedule (pure Python, no torch: tests/test_dspark_loop_cpu.py drives it against the real
+    LoopBuffers). It decides (a) after which issued steps to record a poll (`poll_now`) and (b) when the host must stop
+    and wait for the newest poll before issuing another step (`must_drain`, the tail sync); `observe` feeds it what a
+    completed poll read. A step emits at most ROWS = 6 tokens, so n_out after `s` issued steps is at most
+    n_obs + ROWS * (s - s_obs) for the last observation (n_obs after s_obs steps; initially 1 after 0): when that
+    bound is below max_new the sequence cannot have ended by LENGTH yet. EOS endings are not predictable and are
+    caught by the polls themselves (overrun = lookahead steps)."""
+
+    def __init__(self, max_new: int, poll_every: int = 1, lookahead: int = 1, tail_sync: bool = True):
+        self.max_new = int(max_new)
+        self.poll_every = max(1, int(poll_every))
+        self.lookahead = max(0, int(lookahead))
+        self.tail_sync = bool(tail_sync)
+        self.obs_step, self.obs_n_out, self.done = 0, 1, False
+
+    def observe(self, step: int, n_out: int, done: bool) -> None:
+        """A completed poll: the device status right after `step` issued steps. Older observations are ignored."""
+        if step >= self.obs_step:
+            self.obs_step, self.obs_n_out = int(step), int(n_out)
+        self.done = self.done or bool(done)
+
+    def n_out_bound(self, issued: int) -> int:
+        return self.obs_n_out + ROWS * (int(issued) - self.obs_step)
+
+    def length_end_possible(self, issued: int) -> bool:
+        """Could the sequence already be done by max_new after `issued` steps?"""
+        return self.n_out_bound(issued) >= self.max_new
+
+    def poll_now(self, issued: int) -> bool:
+        """Record a poll right after step number `issued` (1-based)?"""
+        return issued % self.poll_every == 0 or (self.tail_sync and self.length_end_possible(issued))
+
+    def must_drain(self, issued: int) -> bool:
+        """Wait for the newest poll before issuing step `issued + 1`? (the tail sync)"""
+        return self.tail_sync and issued > 0 and self.length_end_possible(issued)
+
+
 # ------------------------------------------------------------------------------------------------ the verify step
 class VerifyStep(StaticStep):
     """StaticStep (rows = 6) whose ratio-2 compressor-state commit is deferred to the loop (`defer_ratio2_commit`):
@@ -321,12 +391,13 @@ class DSparkLoop:
     """The DSpark k=5 loop over a Generator's model (module docstring). Builds the 6-row VerifyStep through the
     Generator (`gen.static_cls`, `gen.hidden_layers` = the mtp target layers, `gen.set_rows(6)`) and a DraftStep that
     aliases its main_hidden / t_out. gen.mode "graph" -> `capture()` then replays; "static" -> the same ops eagerly.
-    max_new: buffer capacity (the per-call bound is a device tensor). poll_every: steps per async status poll.
+    max_new: buffer capacity (the per-call bound is a device tensor). poll_every / lookahead / tail_sync: the async poll
+    schedule (module docstring, `PollPlan`; defaults 1 / 1 / True = overrun <= 1 step; 8 / 1 / False = the old 9-15).
     draft_impls: None = the verify's impls mapped by draft_step.draft_impls_for; "ref" = the reference draft; or a
     dict of DraftStep impl kwargs."""
 
-    def __init__(self, gen, max_new: int = 256, *, eos_ids: Optional[Sequence[int]] = None, poll_every: int = 8,
-                 lookahead: int = 1, draft_impls=None, _allow_cpu: bool = False):
+    def __init__(self, gen, max_new: int = 256, *, eos_ids: Optional[Sequence[int]] = None, poll_every: int = 1,
+                 lookahead: int = 1, tail_sync: bool = True, draft_impls=None, _allow_cpu: bool = False):
         from runtime.draft_step import DraftStep, draft_impls_for
 
         model = gen.model
@@ -368,6 +439,7 @@ class DSparkLoop:
             self.force_tok = torch.zeros(BLOCK, dtype=torch.long, device=self.dev)
         self.poll_every = max(1, int(poll_every))
         self.lookahead = max(0, int(lookahead))
+        self.tail_sync = bool(tail_sync)
         self.graphs: Dict[str, torch.cuda.CUDAGraph] = {}
         self.n_graphs = 0
         self.capture_info: Optional[dict] = None
@@ -623,6 +695,7 @@ class DSparkLoop:
         cap_steps = max(0, max_new - 1) + (self.lookahead + 1) * self.poll_every
         evs: List[tuple] = []
         issued = 0
+        poll = {"polls": 0, "drains": 0, "enqueue_us": 0.0, "wait_ms": 0.0}
         t1 = time.perf_counter()
         prof = profile is not None and cuda
         if not (max_new <= 1 or first in eos):
@@ -647,32 +720,7 @@ class DSparkLoop:
                     if int(b.done):
                         break
             else:
-                nb = self.lookahead + 1
-                pins = [torch.zeros(3, dtype=torch.long, device="cpu", pin_memory=True) for _ in range(nb)]
-                pending = collections.deque()
-                batch = 0
-                stop = False
-                while issued < cap_steps and not stop:
-                    for _ in range(min(self.poll_every, cap_steps - issued)):
-                        e = mk() if mk else None
-                        self._prof(prof, profile, issued, True)
-                        self.step_once(e)
-                        self._prof(prof, profile, issued, False)
-                        issued += 1
-                        if e is not None:
-                            evs.append(e)
-                    buf = pins[batch % nb]
-                    buf.copy_(b.status, non_blocking=True)
-                    ev = torch.cuda.Event()
-                    ev.record()
-                    pending.append((ev, buf))
-                    batch += 1
-                    while len(pending) > self.lookahead:
-                        e0, b0 = pending.popleft()
-                        e0.synchronize()
-                        if int(b0[1]):
-                            stop = True
-                            break
+                issued, poll = self._decode_async(max_new, cap_steps, mk, prof, profile, evs)
         if cuda:
             torch.cuda.synchronize(self.dev)
         if prof and getattr(self, "_prof_on", False):
@@ -689,6 +737,13 @@ class DSparkLoop:
                "tokens_per_step": (sum(1 + n for n in accepts) / live) if live else None,
                "prefill_ms": prefill_ms, "wall_ms": wall_ms, "decode_wall_ms": decode_wall_ms,
                "n_graphs": self.n_graphs, "prompt_tokens": len(ids)}
+        # LOOP-OVERRUN: steps issued after the sequence was done (predicated no-ops, a full graph replay each), their
+        # GPU time (their own start/end events), and what the polls cost the host. Additive keys.
+        res["overrun_steps"] = max(0, issued - live)
+        res["poll"] = dict(poll, poll_every=self.poll_every, lookahead=self.lookahead, tail_sync=self.tail_sync)
+        if evs:
+            res["overrun_ms"] = [s.elapsed_time(e2) for s, _m, e2 in evs[live:]]
+            res["decode_wall_ms_excl_overrun"] = decode_wall_ms - sum(res["overrun_ms"])
         if evs:
             ms = [(s.elapsed_time(e2), s.elapsed_time(m) if self.n_graphs != 1 else None,
                    m.elapsed_time(e2) if self.n_graphs != 1 else None) for s, m, e2 in evs[:live]]
@@ -711,6 +766,71 @@ class DSparkLoop:
             res["logits_sha256"] = h.hexdigest()
         return res
 
+    # ---------------------------------------------------------------- the async decode (LOOP-OVERRUN)
+    def _poll_buffers(self, n: int) -> list:
+        return [torch.zeros(3, dtype=torch.long, device="cpu", pin_memory=True) for _ in range(n)]
+
+    def _poll_record(self, buf: torch.Tensor):
+        """Enqueue the status D2H into `buf` and an event behind it (stream order: it sees the steps issued so far)."""
+        buf.copy_(self.b.status, non_blocking=True)
+        ev = torch.cuda.Event()
+        ev.record()
+        return ev
+
+    def _poll_wait(self, token) -> None:
+        token.synchronize()
+
+    def _decode_async(self, max_new: int, cap_steps: int, mk, prof, profile, evs: list) -> tuple:
+        """Issue steps with no host sync except the poll waits (`PollPlan`: a poll after every `poll_every` steps and in
+        the max_new tail, `lookahead` polls in flight, a drain before a step the tail cannot rule out). Returns
+        (steps issued, poll stats). The poll primitives are methods so the schedule is testable without CUDA."""
+        plan = PollPlan(max_new, self.poll_every, self.lookahead, self.tail_sync)
+        nb = self.lookahead + 1
+        pins = self._poll_buffers(nb)
+        pending: collections.deque = collections.deque()      # (token, buf, steps issued when recorded)
+        stats = {"polls": 0, "drains": 0, "enqueue_us": 0.0, "wait_ms": 0.0}
+        pc = time.perf_counter
+        issued = 0
+
+        def record() -> None:
+            t = pc()
+            buf = pins[stats["polls"] % nb]
+            pending.append((self._poll_record(buf), buf, issued))
+            stats["polls"] += 1
+            stats["enqueue_us"] += (pc() - t) * 1e6
+
+        def wait_oldest() -> bool:
+            tok, buf, step = pending.popleft()
+            t = pc()
+            self._poll_wait(tok)
+            stats["wait_ms"] += (pc() - t) * 1e3
+            n_out, done = int(buf[0]), bool(int(buf[1]))
+            plan.observe(step, n_out, done)
+            return done
+
+        stop = False
+        while issued < cap_steps and not stop:
+            if plan.must_drain(issued):                       # the next step might be a no-op: wait for the exact state
+                if not pending or pending[-1][2] != issued:
+                    record()
+                stats["drains"] += 1
+                while pending and not stop:
+                    stop = wait_oldest()
+                if stop:
+                    break
+            e = mk() if mk else None
+            self._prof(prof, profile, issued, True)
+            self.step_once(e)
+            self._prof(prof, profile, issued, False)
+            issued += 1
+            if e is not None:
+                evs.append(e)
+            if plan.poll_now(issued):
+                record()
+            while len(pending) > self.lookahead and not stop:
+                stop = wait_oldest()
+        return issued, stats
+
     def _prof(self, on: bool, profile, i: int, before: bool) -> None:
         if not on:
             return
@@ -728,6 +848,7 @@ class DSparkLoop:
     def describe(self) -> dict:
         return {"rows": ROWS, "block": BLOCK, "hidden_layers": list(self.hidden), "max_pos": self.max_pos,
                 "max_new_cap": self.b.cap, "poll_every": self.poll_every, "lookahead": self.lookahead,
+                "tail_sync": self.tail_sync,
                 "n_graphs": self.n_graphs, "ratio2_compressors": len(self.st._r2), "eos_ids": self.eos_ids,
                 "draft_impls": dict(self.draft_impls), "verify": self.st.describe(), "draft": self.ds.describe()}
 

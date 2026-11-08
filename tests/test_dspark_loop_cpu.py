@@ -714,6 +714,9 @@ def test_one_graph_and_two_graphs_modes_make_the_same_accept_plan(emu, monkeypat
             for parity in (True, False):
                 r = loop.generate(ids, n, stop_on_eos=False, parity=parity)
                 assert hook.calls == r["steps_issued"], (mode, parity, hook.calls, r["steps_issued"])
+                assert r["overrun_steps"] == r["steps_issued"] - r["steps"] == 0          # LOOP-OVERRUN: per-step sync path
+                assert r["poll"] == {"polls": 0, "drains": 0, "enqueue_us": 0.0, "wait_ms": 0.0, "poll_every": 1,
+                                     "lookahead": 1, "tail_sync": True}
                 hook.calls = 0
                 runs[(mode, parity)] = r
             if mode == 2:
@@ -868,3 +871,292 @@ def test_probe_check_token_ids_names_a_mini_sized_map():
         P.check_token_ids(types.SimpleNamespace(embed=model.embed, engram_hash=None), [129280])
     P.check_token_ids(types.SimpleNamespace(embed=model.embed, engram_hash=None), [129279])
     P.check_token_ids(model, [])
+
+
+# ------------------------------------------------------------------------------------------------ LOOP-OVERRUN
+# The async poll schedule (runtime/dspark_loop.py PollPlan + DSparkLoop._decode_async) on CPU: the real
+# LoopBuffers.accept under a simulated device (snapshot-at-record polls, pinned-ring reuse checked), every schedule vs the
+# host truth (_Sim): same stream, same final state, overrun bounds, and the 11/08 fixture's measured overrun reproduced.
+def _scripted_steps(ns, eos_step=None, n_steps=400, seed=0):
+    """[(tok, t)] with the accept lengths `ns` (cycled); the step `eos_step` (1-based live step) emits EOS 99 at row n."""
+    out = []
+    for i in range(n_steps):
+        n = ns[i % len(ns)]
+        tok, t = _case(n, 1000 * seed + i)
+        if eos_step is not None and i + 1 == eos_step:
+            t = t.clone()
+            t[n] = 99
+        out.append((tok, t))
+    return out
+
+
+def _async_sim_cls():
+    from runtime.dspark_loop import DSparkLoop, LoopBuffers
+
+    class SimLoop(DSparkLoop):
+        """DSparkLoop minus the model: step_once = LoopBuffers.accept on scripted (tok, t); polls snapshot the status at
+        record time (a real poll's D2H lands after the steps issued before it and before the ones after it)."""
+
+        def __init__(self, steps, max_new, poll_every, lookahead, tail_sync, first=7, L=20, eos=(99,)):
+            self.b = LoopBuffers(max_new, eos, "cpu")
+            self.b.reset(torch.tensor([first]), L, max_new)
+            self.steps, self.k = steps, 0
+            self.poll_every, self.lookahead, self.tail_sync = poll_every, lookahead, tail_sync
+            self.records = self.waits = 0
+
+        def step_once(self, events=None):
+            tok, t = self.steps[self.k % len(self.steps)]
+            self.k += 1
+            self.b.accept(tok, t)
+            self.b.p0.copy_(self.b.a_new + 1)
+
+        def _poll_buffers(self, n):
+            return [torch.zeros(3, dtype=torch.long) for _ in range(n)]
+
+        def _poll_record(self, buf):
+            buf.copy_(self.b.status)
+            self.records += 1
+            return (buf, buf.tolist())
+
+        def _poll_wait(self, token):
+            buf, snap = token
+            assert buf.tolist() == snap, "a pinned poll buffer was overwritten before its poll was read"
+            self.waits += 1
+
+    return SimLoop
+
+
+def _truth(steps, max_new, first=7, L=20):
+    sim = _Sim(first, L, max_new, (99,))
+    for tok, t in steps:
+        if sim.done:
+            break
+        sim.step(tok[0].tolist(), t.tolist())
+    assert sim.done
+    return sim
+
+
+def _run_async(steps, max_new, poll_every, lookahead, tail_sync):
+    SimLoop = _async_sim_cls()
+    loop = SimLoop(steps, max_new, poll_every, lookahead, tail_sync)
+    cap = max(0, max_new - 1) + (lookahead + 1) * poll_every
+    issued, stats = loop._decode_async(max_new, cap, None, False, None, [])
+    return loop, issued, stats, cap
+
+
+def _state(loop):
+    """Everything that reaches the emitted stream or the next step's inputs. `ctx` / `n_last` are excluded: a no-op step
+    rewrites them to 0 / -1 by design (the draft then writes no ring row); the next sequence's reset() clears them."""
+    b = loop.b
+    return (b.out_ids.tolist(), b.acc_log.tolist(), b.status.tolist(), int(b.p0), int(b.a_new))
+
+
+def test_poll_plan_bounds_and_schedule():
+    from runtime.dspark_loop import PollPlan
+
+    p = PollPlan(max_new=20, poll_every=4, lookahead=1, tail_sync=True)
+    # with no observation bound(s) = 1 + 6 s: 19 < 20 at s = 3, 25 >= 20 at s = 4
+    assert [s for s in range(1, 9) if p.poll_now(s)] == [4, 5, 6, 7, 8]
+    assert not p.length_end_possible(3) and p.length_end_possible(4)
+    assert p.poll_now(4) and not p.poll_now(1) and not p.poll_now(2) and not p.poll_now(3)
+    p.observe(2, 9, False)                                    # 9 tokens after 2 steps: bound(s) = 9 + 6 (s - 2)
+    assert p.n_out_bound(2) == 9 and p.n_out_bound(4) == 21 and p.length_end_possible(4) and not p.length_end_possible(3)
+    p.observe(1, 100, True)                                   # an older observation never rewinds the bound ...
+    assert p.obs_step == 2 and p.obs_n_out == 9 and p.done   # ... but done is sticky
+    off = PollPlan(max_new=20, poll_every=8, lookahead=1, tail_sync=False)
+    assert [s for s in range(1, 25) if off.poll_now(s)] == [8, 16, 24] and not off.must_drain(10)
+    assert not PollPlan(20).must_drain(0)                      # nothing issued: nothing to wait for
+    assert PollPlan(20, 1, 1, True).must_drain(4) and not PollPlan(20, 1, 1, True).must_drain(3)
+
+
+def test_poll_plan_python_cost_is_microseconds():
+    """The host-side policy (no CUDA) costs well under a microsecond-scale budget per step: the poll's real cost is the
+    event + pinned copy, measured on the box by `bench/headline.py --poll-probe` / res['poll']['enqueue_us']."""
+    import time
+
+    from runtime.dspark_loop import PollPlan
+
+    p = PollPlan(256, 1, 1, True)
+    t0 = time.perf_counter()
+    n = 20000
+    for s in range(1, n + 1):
+        p.poll_now(s % 300)
+        p.must_drain(s % 300)
+    us = (time.perf_counter() - t0) / n * 1e6
+    print(f"PollPlan: {us:.2f} us per step (poll_now + must_drain, CPU)")
+    assert us < 50
+
+
+@pytest.mark.parametrize("policy", [(1, 1, True), (1, 1, False), (1, 0, True), (1, 0, False), (1, 2, True),
+                                    (4, 1, True), (8, 1, False), (8, 1, True), (3, 2, False)])
+def test_async_poll_streams_identical_and_overrun_bounds(policy):
+    P, LA, TAIL = policy
+    n_cases = n_eos = n_len = 0
+    for max_new in (2, 5, 16, 33, 64, 200):
+        for pattern_seed, ns in enumerate(([3, 0, 5, 2], [0], [5], [1, 4, 2, 0, 3], [2, 2, 5, 0, 1, 1])):
+            for eos_step in (None, 1, 2, 3, 4, 5, 8, 9, 17, 40):
+                steps = _scripted_steps(ns, eos_step, n_steps=max_new + 40, seed=pattern_seed)
+                truth = _truth(steps, max_new)
+                j = len(truth.acc)
+                by_eos = any(x == 99 for x in truth.out[1:])
+                loop, issued, stats, cap = _run_async(steps, max_new, P, LA, TAIL)
+                n_cases += 1
+                n_eos += by_eos
+                n_len += not by_eos
+                r = loop.b.read()
+                # (1) the stream and the accounting are the host truth's, whatever the schedule
+                assert r["done"] and r["ids"] == truth.out and r["accepts"] == truth.acc, (policy, max_new, ns, eos_step)
+                # (2) no-op steps change nothing: the final device state equals the state after exactly j live steps
+                ref = _async_sim_cls()(steps, max_new, 1, 0, False)
+                for _ in range(j):
+                    ref.step_once()
+                assert _state(loop) == _state(ref), (policy, max_new, ns, eos_step)
+                # (3) overrun bounds
+                over = issued - j
+                assert over >= 0 and issued <= cap
+                if not TAIL:
+                    assert over == min(P * (-(-j // P) + LA) - j, cap - j), (policy, max_new, j, over)
+                else:
+                    assert over <= P * (-(-j // P) + LA) - j, (policy, max_new, j, over)
+                    if P == 1:
+                        assert over <= LA, (policy, max_new, ns, eos_step, j, over)
+                        if not by_eos:
+                            assert over == 0, (policy, max_new, ns, eos_step, j, over)
+                # (4) the poll bookkeeping
+                assert stats["polls"] == loop.records and loop.waits <= loop.records
+    assert n_eos > 100 and n_len > 100, (n_eos, n_len)
+
+
+def test_default_schedule_overrun_is_one_step_and_zero_for_length_endings():
+    steps = _scripted_steps([3, 1, 4], None, n_steps=300)
+    for max_new in (16, 64, 128):
+        loop, issued, stats, _ = _run_async(steps, max_new, 1, 1, True)
+        j = len(_truth(steps, max_new).acc)
+        assert issued == j and stats["drains"] >= 1                      # length ending: no step after done
+    steps = _scripted_steps([3, 1, 4], eos_step=11, n_steps=300)
+    loop, issued, stats, _ = _run_async(steps, 256, 1, 1, True)
+    assert issued == 11 + 1                                              # EOS ending: exactly `lookahead` steps late
+    assert stats["polls"] == issued                                      # one poll per step ...
+    assert stats["drains"] == 0                                          # ... and never a drain far from max_new
+    old, issued_old, _, _ = _run_async(steps, 256, 8, 1, False)
+    assert issued_old == 8 * (-(-11 // 8) + 1) == 24                     # the pre-fix schedule: 13 no-op steps
+
+
+def test_async_drain_edge_cases():
+    """done already at the first poll; max_new = 2 (one step reaches it); a sequence that ends at the cap's edge."""
+    steps = _scripted_steps([5], None, n_steps=50)
+    for max_new in (2, 3, 7):
+        for pol in ((1, 1, True), (1, 0, True), (8, 1, True), (8, 1, False)):
+            loop, issued, _, cap = _run_async(steps, max_new, *pol)
+            truth = _truth(steps, max_new)
+            assert loop.b.read()["ids"] == truth.out and issued <= cap
+    steps = _scripted_steps([0], None, n_steps=400)                      # 1 token/step: the longest sequences
+    for pol in ((1, 1, True), (8, 1, False)):
+        loop, issued, _, cap = _run_async(steps, 64, *pol)
+        assert loop.b.read()["done"] and issued <= cap and loop.b.read()["n_out"] == 64
+
+
+FIXTURE_20261108 = os.path.join(REPO, "docs", "headline-20261108-main-ss.json")
+
+
+@pytest.mark.skipif(not os.path.exists(FIXTURE_20261108), reason="needs docs/headline-20261108-main-ss.json")
+def test_fixture_overrun_reproduced_and_fixed():
+    """The 11/08 headline's per-prompt accept plans replayed through the real LoopBuffers + the old schedule (poll 8,
+    lookahead 1) reproduce its measured steps_issued exactly (97 overrun steps over the 8 prompts) -- the simulation
+    is the measured behaviour; the new default then overruns <= 1 step per prompt (0 for max_new endings)."""
+    import json
+
+    d = json.load(open(FIXTURE_20261108))
+    max_new = d["max_new"]
+    old_total = new_total = 0
+    rows = []
+    for tag, p in d["prompts"].items():
+        acc = p["accepts"]
+        steps = []
+        for i, n in enumerate(acc):
+            tok, t = _case(n, 77 + i, V=60)
+            if i == len(acc) - 1 and p["finish_reason"] == "stop":
+                t = t.clone()
+                t[n] = 99
+            steps.append((tok, t))
+        steps += [_case(0, 9000 + i, V=60) for i in range(40)]            # never reached
+        assert len(_truth(steps, max_new).acc) == len(acc), tag           # the plan ends where the real run ended
+        _, issued_old, _, _ = _run_async(steps, max_new, 8, 1, False)
+        assert issued_old == p["steps_issued"][0], (tag, issued_old, p["steps_issued"])
+        loop, issued_new, stats, _ = _run_async(steps, max_new, 1, 1, True)
+        assert issued_new - len(acc) <= 1
+        if p["finish_reason"] == "length":
+            assert issued_new == len(acc), tag
+        old_total += issued_old - len(acc)
+        new_total += issued_new - len(acc)
+        rows.append((tag, len(acc), p["finish_reason"], issued_old - len(acc), issued_new - len(acc), stats["drains"]))
+    assert old_total == 97
+    assert new_total == sum(1 for _, _, f, *_ in rows if f == "stop")
+    print("LOOP-OVERRUN fixture replay (prompt, live steps, ended by, overrun old, overrun new, drains):")
+    for row in rows:
+        print("  ", row)
+    print(f"  total overrun: old {old_total} steps, new {new_total} steps")
+
+
+# ---- bench/headline.py: the decode-wall block
+def _wall_run(ids_n, live, issued, step_ms, wall, overrun_ms, prefill=3800.0, poll=None):
+    r = {"token_ids": list(range(ids_n)), "accepts": [2] * live, "steps": live, "steps_issued": issued,
+         "overrun_steps": issued - live, "step_ms": [step_ms] * live, "overrun_ms": [step_ms] * (issued - live),
+         "decode_wall_ms": wall, "decode_wall_ms_excl_overrun": wall - overrun_ms, "prefill_ms": prefill}
+    if poll is not None:
+        r["poll"] = poll
+    return r
+
+
+def test_decode_wall_block():
+    B = _headline()
+    pl = {"polls": 10, "drains": 1, "enqueue_us": 80.0, "wait_ms": 5.0, "poll_every": 1, "lookahead": 1, "tail_sync": True}
+    a = _wall_run(21, 10, 11, 18.0, 10 * 18.0 + 18.0 + 1.0, 18.0, poll=pl)       # 20 decoded tokens, 1 overrun step
+    b = _wall_run(11, 5, 6, 20.0, 5 * 20.0 + 20.0 + 0.5, 20.0, poll=pl)         # 10 decoded tokens
+    w = B.decode_wall([a, b])
+    assert w["decode_tokens"] == 30 and w["overrun_steps"] == [1, 1] and w["overrun_steps_total"] == 2
+    assert w["overrun_steps_max"] == 1 and w["overrun_ms_total"] == 38.0
+    wall_excl = (199.0 - 18.0) + (120.5 - 20.0)
+    assert abs(w["ms_per_token_wall_excl_overrun"] - wall_excl / 30) < 1e-12
+    assert abs(w["ms_per_token_wall_incl_overrun"] - (199.0 + 120.5) / 30) < 1e-12
+    assert abs(w["ms_per_token_gpu"] - (180.0 + 100.0) / 30) < 1e-12
+    assert abs(w["host_gap_ms_per_token"] - (wall_excl - 280.0) / 30) < 1e-12 and w["host_gap_ms_per_token"] < 0.1
+    assert abs(w["overrun_ms_per_token"] - 38.0 / 30) < 1e-12
+    assert w["ttft_ms"]["mean"] == 3800.0 and w["poll"]["polls"] == 20 and w["poll"]["lookahead"] == 1
+    assert w["poll_enqueue_us_per_poll"] == 8.0
+    assert w["gate"]["overrun_max_le_2"] is True and w["gate"]["host_gap_le_0.1_ms_per_token"] is True
+    bad = B.decode_wall([_wall_run(21, 10, 13, 18.0, 10 * 18.0 + 3 * 18.0 + 9.0, 54.0)])
+    assert bad["gate"]["overrun_max_le_2"] is False and bad["gate"]["host_gap_le_0.1_ms_per_token"] is False
+    # runs from before LOOP-OVERRUN (no overrun_steps / wall keys): overrun falls back to issued - steps, the rest is None
+    old = B.decode_wall([{"token_ids": [1, 2, 3], "accepts": [1], "steps": 1, "steps_issued": 9, "prefill_ms": 1.0}])
+    assert old["overrun_steps"] == [8] and old["ms_per_token_wall_excl_overrun"] is None and old["host_gap_ms_per_token"] is None
+    assert B.decode_wall([])["overrun_steps_max"] is None
+
+
+def test_decode_wall_lines_and_summary():
+    B = _headline()
+    pl = {"polls": 10, "drains": 1, "enqueue_us": 80.0, "wait_ms": 5.0, "poll_every": 1, "lookahead": 1, "tail_sync": True}
+    w = B.decode_wall([_wall_run(21, 10, 11, 18.0, 199.0, 18.0, poll=pl)])
+    line = B.decode_wall_line("two_graphs", w)
+    assert "excl overrun" in line and "incl overrun" in line and "overrun steps 1 total, max 1" in line
+    assert "TTFT 3800.0 ms" in line and "poll every 1 lookahead 1 tail_sync True" in line
+    assert "gate overrun<=2 ok, host gap<=0.1 ok" in line
+    assert B.decode_wall_line("x", None) is None
+
+
+def test_headline_parser_poll_flags_and_probe_report():
+    B = _headline()
+    ap = B.build_parser()
+    a = ap.parse_args(["--model-dir", "/m"])
+    assert (a.poll_every, a.lookahead, a.tail_sync, a.poll_probe) == (1, 1, True, False)
+    a = ap.parse_args(["--model-dir", "/m", "--poll-every", "8", "--no-tail-sync", "--lookahead", "2"])
+    assert (a.poll_every, a.lookahead, a.tail_sync) == (8, 2, False)
+    assert ap.parse_args(["--poll-probe"]).model_dir is None
+    rep = B.poll_probe_report([5.0, 7.0, 6.0], [20.0, 30.0, 25.0], 18.0,
+                              {"none": [18.0, 18.0, 18.0], "la0": [18.06, 18.07, 18.05], "la1": [18.0, 18.0, 18.001],
+                               "batch8": [18.0, 18.0, 18.0]})
+    assert abs(rep["lookahead0_bubble_us_per_step"] - 60.0) < 1e-6
+    assert abs(rep["breakeven_steps_lookahead0_vs_one_overrun_step"] - 300.0) < 1e-3
+    assert rep["patterns"]["la1"]["bubble_us_per_step_vs_none"] < 1.0 and rep["idle_enqueue_us"]["p50"] == 6.0
+    if not torch.cuda.is_available():
+        assert B.poll_probe(ap.parse_args(["--poll-probe"])) == 3            # clean refusal without CUDA

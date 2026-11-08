@@ -12,7 +12,7 @@ What it does (docs/HANDOFF-M1-T12-LOOP.md 3):
   1. truth: the 1-row greedy per fixture prompt in this process (Generator.greedy, --mode, the given impls): token ids
      + per-position fp32-logits sha256. --r1-ref: the fresh 1-row token strings also compared with a stored record.
   2. the loop (runtime/dspark_loop.py DSparkLoop: verify 6 rows -> accept by exact match -> commit -> draft, on the
-     device; async EOS poll every --poll-every steps), built once (the dg-inplace pool pre-grown first), captured as
+     device; async EOS poll after every --poll-every steps (default 1, --lookahead 1, tail sync near max_new; LOOP-OVERRUN)), built once (the dg-inplace pool pre-grown first), captured as
      TWO graphs (A = verify|accept|commit, B = draft|next input) so the ms is attributed. Per prompt:
        fast x --reps   (no host sync in the decode; CUDA events per step: start | after A | after B)
        parity x --parity-reps (sync per step: the emitted rows' fp32 logits -> per-position sha256 + a parity record)
@@ -50,6 +50,12 @@ exact vs the 1-row truth, self-replay, the `policy_steps_before` it was warmed b
 and every key under it are unchanged. Extra box time is one more pass of the cell (about 3-4 min).
 The C1 instrument proper (nsys cudaProfilerApi range) is M1-T13; --profile TAG:FIRST:N opens that range around N steps
 of one prompt's first fast run, for `nsys profile --capture-range=cudaProfilerApi`.
+LOOP-OVERRUN (docs/HANDOFF-LOOP-OVERRUN.md, docs/HEADLINE-COLUMNS.md "Decode wall"): per prompt and pooled per cell
+(`decode_wall`; `headline.decode_wall` = the headline cell's) the report carries decode wall ms per token EXCLUDING and
+INCLUDING the steps the loop issued after the sequence was done, GPU ms per token, the host gap (gate <= 0.1), overrun steps
+(gate <= 2), TTFT (= prefill_ms) and the poll cost. `--poll-every/--lookahead/--no-tail-sync` pick the poll schedule
+(old behaviour: `--poll-every 8 --no-tail-sync`); `--poll-probe` (no model, CUDA only) times a poll and the per-step bubble of
+each schedule on a sleep graph.
 
 Box line (orchestrator; the fast path of M1-T10/T11; --spare-slots 16 because M1-T10 measured 123/1018 overflowing
 steps at 8 -- an overflowed layer's outputs are wrong for that step, which would show up as stream divergences; the
@@ -93,6 +99,10 @@ MS_PER_TOKEN_DEF = ("total GPU ms / total emitted tokens: sum of the CUDA-event 
 STEADY_STATE_DEF = ("steady_state = the headline cell run a SECOND time on the same 8 prompts with the residency "
                     "policy state carried over (no reset): every headline cell has run before it, so the policy has "
                     "seen `policy_steps_before` manager steps. Same instrument, same window, same ms/token definition")
+DECODE_WALL_DEF = ("per decoded token (tokens after the prefill's first), pooled total/total over the fast reps: wall = host "
+                   "perf_counter from the first step issue to the final device sync; excl_overrun subtracts the GPU time "
+                   "(own CUDA events) of the steps issued after the sequence was done; gpu = sum of live step event ms; "
+                   "host_gap = excl - gpu; overrun steps = steps_issued - live steps")
 
 
 # ------------------------------------------------------------------------------------------------ pure helpers
@@ -146,6 +156,68 @@ def window(runs: Sequence[dict], stats_from: int) -> dict:
            "all_ms_per_token": (sum(all_step) / sum(all_tok)) if all_tok else None,
            "all_total_gpu_ms": sum(all_step) if all_step else None,
            "all_total_emitted_tokens": sum(all_tok) if all_tok else None}
+    return out
+
+
+def decode_wall(runs: Sequence[dict]) -> dict:
+    """LOOP-OVERRUN: the host-side wall of the decode, with and without the steps the loop issued after the sequence was
+    done (predicated no-ops, a full graph replay each), pooled over `runs` (fast reps; total / total, not a mean of
+    ratios). Per decoded token = tokens after the prefill's first (len(token_ids) - 1):
+      ms_per_token_wall_incl_overrun  = sum(decode_wall_ms) / tokens          (what a client waits for)
+      ms_per_token_wall_excl_overrun  = sum(decode_wall_ms - overrun GPU ms) / tokens
+      ms_per_token_gpu                = sum(live step ms, CUDA events) / tokens
+      host_gap_ms_per_token           = excl - gpu                            (gate: <= 0.1)
+    plus overrun steps (issued - live; per run, total, max), the overrun's GPU ms, TTFT (= prefill_ms: reference prefill,
+    ring seeding, first draft; synced) and the poll cost the host paid. Keys that need CUDA events (gpu, excl) are None
+    when the runs carry none. JSON keys are additive; `gate` restates the LOOP-OVERRUN bars."""
+    over, issued, live, ttft = [], [], [], []
+    tok = wall = excl = gpu = ovms = 0.0
+    n_wall = n_excl = n_gpu = 0
+    pl = {"polls": 0, "drains": 0, "enqueue_us": 0.0, "wait_ms": 0.0}
+    cfg = None
+    for r in runs:
+        s, i = len(r.get("accepts") or []), r.get("steps_issued")
+        live.append(r.get("steps", s))
+        issued.append(i)
+        over.append(r["overrun_steps"] if r.get("overrun_steps") is not None else
+                    (max(0, i - live[-1]) if i is not None else None))
+        if r.get("prefill_ms") is not None:
+            ttft.append(r["prefill_ms"])
+        nt = max(0, len(r.get("token_ids") or []) - 1)
+        if r.get("decode_wall_ms") is not None:
+            wall += r["decode_wall_ms"]
+            n_wall += nt
+        if r.get("decode_wall_ms_excl_overrun") is not None:
+            excl += r["decode_wall_ms_excl_overrun"]
+            n_excl += nt
+            ovms += sum(r.get("overrun_ms") or [])
+        if r.get("step_ms"):
+            gpu += sum(r["step_ms"])
+            n_gpu += nt
+        p = r.get("poll")
+        if p:
+            cfg = {k: p.get(k) for k in ("poll_every", "lookahead", "tail_sync")}
+            for k in pl:
+                pl[k] += p.get(k, 0) or 0
+        tok += nt
+    ov = [x for x in over if x is not None]
+    both = n_excl and n_gpu and n_excl == n_gpu
+    out = {"runs": len(runs), "decode_tokens": int(tok), "steps": live, "steps_issued": issued, "overrun_steps": over,
+           "overrun_steps_total": sum(ov) if ov else None, "overrun_steps_max": max(ov) if ov else None,
+           "overrun_ms_total": ovms if n_excl else None,
+           "ms_per_token_wall_incl_overrun": (wall / n_wall) if n_wall else None,
+           "ms_per_token_wall_excl_overrun": (excl / n_excl) if n_excl else None,
+           "ms_per_token_gpu": (gpu / n_gpu) if n_gpu else None,
+           "host_gap_ms_per_token": ((excl / n_excl) - (gpu / n_gpu)) if both else None,
+           "overrun_ms_per_token": ((wall / n_wall) - (excl / n_excl)) if (n_wall and n_wall == n_excl) else None,
+           "total_decode_wall_ms": wall if n_wall else None,
+           "ttft_ms": _stats(ttft) if ttft else None, "poll": dict(pl, **(cfg or {})) if cfg else None}
+    if cfg and pl["polls"]:
+        out["poll_enqueue_us_per_poll"] = pl["enqueue_us"] / pl["polls"]
+    out["gate"] = {"overrun_max_le_2": (out["overrun_steps_max"] <= 2) if ov else None,
+                   "host_gap_le_0.1_ms_per_token": (out["host_gap_ms_per_token"] <= 0.1)
+                   if out["host_gap_ms_per_token"] is not None else None,
+                   "definition": DECODE_WALL_DEF}
     return out
 
 
@@ -502,7 +574,9 @@ def steady_state_block(run: dict, prompts: Dict[str, dict], rep: dict, ng: int, 
                     "tokens_per_step": base["tokens_per_step"], "accepts": base["accepts"], "stream": s,
                     "replay_ok": replay, "equal_headline_cell": same,
                     "cold_share_by_rep": [x.get("cold_share") for x in fast], "window": window(fast, stats_from),
-                    "prefill_ms": [x["prefill_ms"] for x in fast], "wall_ms_fast": [x["wall_ms"] for x in fast]}
+                    "prefill_ms": [x["prefill_ms"] for x in fast], "wall_ms_fast": [x["wall_ms"] for x in fast],
+                    "overrun_steps": [x.get("overrun_steps", x["steps_issued"] - x["steps"]) for x in fast],
+                    "decode_wall": decode_wall(fast)}
     fastruns = [x for v in res.values() for x in v["fast"]]
     w = window(fastruns, stats_from)
     cold = cold_pooled(fastruns)
@@ -530,6 +604,7 @@ def steady_state_block(run: dict, prompts: Dict[str, dict], rep: dict, ng: int, 
             "ms_per_token": w.get("ms_per_token"), "total_gpu_ms": w.get("total_gpu_ms"),
             "total_emitted_tokens": w.get("total_emitted_tokens"), "ms_per_token_definition": MS_PER_TOKEN_DEF,
             "ms_per_step_incl_manager": w.get("ms_per_step_incl_manager"), "cold_share": cold,
+            "decode_wall": decode_wall(fastruns),
             "window": w, "swaps": sw, "policy_steps_before": (sw or {}).get("policy_steps_before"),
             "streams": {"exact": n_exact, "prompts": len(per)}, "replay_ok": n_replay,
             "overflow": run.get("overflow"), "vs_headline": vs, "prompts": per,
@@ -568,7 +643,30 @@ def steady_state_lines(ss: Optional[dict]) -> List[str]:
     lines.append(f"  steady_state streams exact vs 1-row: {st.get('exact')}/{st.get('prompts')}; self-replay ok: "
                  f"{ss.get('replay_ok')}/{ss.get('n_prompts')}; overflow {(ss.get('overflow') or {}).get('steps', '-')}; "
                  f"pass {f(ss.get('wall_s'), 0)} s" + (f"; FAILED: {str(ss['error'])[-120:]}" if ss.get("error") else ""))
+    dwl = decode_wall_line("steady", ss.get("decode_wall"))
+    if dwl:
+        lines.append(dwl)
     return lines
+
+
+def decode_wall_line(label: str, dw: Optional[dict], ttft_ms: Optional[float] = None) -> Optional[str]:
+    """One printed line: decode wall ms/token excluding and including the overrun, GPU ms/token, the host gap, overrun
+    steps, TTFT and the poll cost (LOOP-OVERRUN)."""
+    if not dw:
+        return None
+    f = lambda x, d=3: "-" if x is None else f"{x:.{d}f}"  # noqa: E731
+    pl = dw.get("poll") or {}
+    tt = (dw.get("ttft_ms") or {}).get("mean", ttft_ms)
+    g = dw.get("gate") or {}
+    gate = ("" if not g else " | gate overrun<=2 " + {True: "ok", False: "FAIL", None: "-"}[g.get("overrun_max_le_2")]
+            + ", host gap<=0.1 " + {True: "ok", False: "FAIL", None: "-"}[g.get("host_gap_le_0.1_ms_per_token")])
+    return (f"  {label:10s}  decode wall ms/token: excl overrun {f(dw.get('ms_per_token_wall_excl_overrun'))} | incl overrun "
+            f"{f(dw.get('ms_per_token_wall_incl_overrun'))} | GPU {f(dw.get('ms_per_token_gpu'))} | host gap "
+            f"{f(dw.get('host_gap_ms_per_token'))} | overrun steps {dw.get('overrun_steps_total')} total, max "
+            f"{dw.get('overrun_steps_max')} ({f(dw.get('overrun_ms_total'), 1)} ms) | TTFT {f(tt, 1)} ms | poll "
+            f"every {pl.get('poll_every')} lookahead {pl.get('lookahead')} tail_sync {pl.get('tail_sync')}: "
+            f"{pl.get('polls')} polls, {f(dw.get('poll_enqueue_us_per_poll'), 1)} us enqueue each, {pl.get('drains')} "
+            f"drains{gate}")
 
 
 def summary_lines(rep: dict) -> List[str]:
@@ -602,22 +700,28 @@ def summary_lines(rep: dict) -> List[str]:
         if tg is not None and tt:
             lines.append(f"  {key:10s}  ms/token = total GPU ms / total emitted tokens = {f(tg, 1)} ms / {tt} tokens = "
                          f"{f(tg / tt, 3)}  [measured: CUDA events; window steps >= {w.get('stats_from_step')}, {w.get('steps')} steps]")
+        dwl = decode_wall_line(key, w.get("decode_wall"), h.get("ttft_ms_mean"))
+        if dwl:
+            lines.append(dwl)
     mgl = mode_gap_line(rep.get("mode_gap"))
     if mgl:
         lines.append(mgl)
     lines.extend(steady_state_lines(rep.get("steady_state")))
     lines.append(f"  vs Pg61 {PG61_MS_PER_STEP} ms/step (bar {CHARTER_BAR_MS}); prefill {f(h.get('prefill_ms_mean'), 1)} ms "
-                 f"mean; HBM after build {rep.get('hbm_after_build_GiB')}")
+                 f"mean (= TTFT); HBM after build {rep.get('hbm_after_build_GiB')}")
     lines.append(f"  {'prompt':6s} {'tok':>4s} {'steps':>5s} {'tok/st':>6s} {'ms/step':>8s} {'ms/tok':>7s} "
-                 f"{'stream vs 1-row':28s} {'replay':6s}")
+                 f"{'stream vs 1-row':28s} {'replay':6s} {'ovr':>3s} {'ms/tok wall':>11s}")
     for tag, p in (rep.get("prompts") or {}).items():
         s = p.get("stream") or {}
         st = "exact" if s.get("exact") else (f"diverge @{s.get('first_divergence')} (r1 margin "
                                              f"{f(s.get('r1_margin_at_divergence'), 3)})" if s else "-")
         w = p.get("window") or {}
+        dw = p.get("decode_wall") or {}
+        ovr = dw.get("overrun_steps_max")
         lines.append(f"  {tag:6s} {p.get('tokens', 0):4d} {p.get('steps', 0):5d} {f(p.get('tokens_per_step'), 3):>6s} "
                      f"{f((w.get('all_ms_per_step') or {}).get('mean')):>8s} {f(w.get('all_ms_per_token')):>7s} "
-                     f"{st:28s} {'ok' if p.get('replay_ok') else 'DIFF':6s}")
+                     f"{st:28s} {'ok' if p.get('replay_ok') else 'DIFF':6s} {'-' if ovr is None else ovr:>3} "
+                     f"{f(dw.get('ms_per_token_wall_incl_overrun')):>11s}")
     sm = rep.get("streams") or {}
     lines.append(f"  streams exact vs 1-row: {sm.get('exact')}/{sm.get('prompts')}; self-replay ok: "
                  f"{rep.get('replay_ok')}/{rep.get('n_prompts')}; overflow {rep.get('overflow')}; errors "
@@ -628,7 +732,7 @@ def summary_lines(rep: dict) -> List[str]:
 # ------------------------------------------------------------------------------------------------ main
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--model-dir", required=True)
+    ap.add_argument("--model-dir", default=None, help="required unless --poll-probe")
     ap.add_argument("--map", default=os.path.join(REPO, "docs", "maps", "hot-v26ar-seed-301.json"))   # 11/08 box: 301 = 18.62 vs 295 18.74, bit-identical, 3.9 GiB free (304: 18.56 but 1.7 GiB free -> opt-in)
     ap.add_argument("--hot-per-layer", type=int, default=None)
     ap.add_argument("--config", default=None)
@@ -660,7 +764,20 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--no-gemv-pin", action="store_true", help="do not set DSV41_GEMV_PIN_M1=1")
     ap.add_argument("--reps", type=int, default=2, help="fast (async) runs per prompt at 2 graphs")
     ap.add_argument("--parity-reps", type=int, default=2, help="parity (per-step sync) runs per prompt")
-    ap.add_argument("--poll-every", type=int, default=8)
+    ap.add_argument("--poll-every", type=int, default=1,
+                    help="LOOP-OVERRUN: record an async status poll after every N issued steps (default 1; the old default 8 "
+                         "left 9-15 no-op steps per sequence)")
+    ap.add_argument("--lookahead", type=int, default=1,
+                    help="polls in flight before the host waits for the oldest; overrun == lookahead steps for an EOS ending")
+    ap.add_argument("--no-tail-sync", dest="tail_sync", action="store_false", default=True,
+                    help="LOOP-OVERRUN: no drain near max_new (the default drains when the last poll cannot rule out a length "
+                         "ending, costing a short GPU bubble per tail step instead of one no-op step). Old behaviour: "
+                         "--poll-every 8 --no-tail-sync")
+    ap.add_argument("--poll-probe", action="store_true",
+                    help="LOOP-OVERRUN: no model. Time the host cost of a poll (event record + pinned D2H + sync) and the "
+                         "per-step GPU bubble of lookahead 0 / 1 / batched polls on a captured sleep graph; needs CUDA only")
+    ap.add_argument("--probe-step-ms", type=float, default=18.0, help="--poll-probe: graph step length (ms)")
+    ap.add_argument("--probe-steps", type=int, default=200, help="--poll-probe: steps per pattern and trial")
     ap.add_argument("--stats-from", type=int, default=32)
     ap.add_argument("--no-stop-on-eos", action="store_true")
     ap.add_argument("--r1-ref", default=None, help="stored 1-row JSONL to compare token strings with (optional)")
@@ -815,6 +932,8 @@ def aggregate(rep: dict, prompts: Dict[str, dict], results: Dict[int, Dict[str, 
                     "window_one_graph": window(one["fast"], stats_from) if one else None,
                     "cold_share_by_rep_one_graph": [x.get("cold_share") for x in one["fast"]] if one else None,
                     "steps_issued": [x["steps_issued"] for x in fast],
+                    "overrun_steps": [x.get("overrun_steps", x["steps_issued"] - x["steps"]) for x in fast],
+                    "decode_wall": decode_wall(fast),
                     "wall_ms_fast": [x["wall_ms"] for x in fast]}
     rep["prompts"] = per
     rep["n_prompts"] = len(per)
@@ -827,7 +946,9 @@ def aggregate(rep: dict, prompts: Dict[str, dict], results: Dict[int, Dict[str, 
         if rr:
             head[key] = window([x for v in rr.values() for x in v["fast"]], stats_from)
             head[key]["cold_share"] = cold_pooled([x for v in rr.values() for x in v["fast"]])
+            head[key]["decode_wall"] = decode_wall([x for v in rr.values() for x in v["fast"]])   # LOOP-OVERRUN
     w2 = head.get("two_graphs") or head.get("one_graph") or head.get("eager") or {}
+    head["decode_wall"] = w2.get("decode_wall")             # LOOP-OVERRUN: the headline cell's wall / overrun / TTFT block
     head["ms_per_6row_step_dspark_k5"] = (w2.get("ms_per_step") or {}).get("mean")
     head["ms_verify_graph"] = (w2.get("ms_verify_graph") or {}).get("mean") if w2.get("ms_verify_graph") else None
     head["ms_draft_graph"] = (w2.get("ms_draft_graph") or {}).get("mean") if w2.get("ms_draft_graph") else None
@@ -840,6 +961,7 @@ def aggregate(rep: dict, prompts: Dict[str, dict], results: Dict[int, Dict[str, 
         head["ms_per_6row_step_one_graph"] = (head["one_graph"].get("ms_per_step") or {}).get("mean")
     pf = [x for v in per.values() for x in v["prefill_ms"]]
     head["prefill_ms_mean"] = sum(pf) / len(pf) if pf else None
+    head["ttft_ms_mean"] = head["prefill_ms_mean"]          # LOOP-OVERRUN: TTFT == prefill_ms (synced prefill + first draft)
     rep["headline"] = head
     return rep
 
@@ -965,8 +1087,144 @@ def _begin_receipt(a, impls: dict, map_path: Optional[str], argv) -> dict:
                           residency=res, map_path=map_path, config_path=a.config, steady_state=ss)
 
 
+# ------------------------------------------------------------------------------------------------ poll probe
+def poll_probe_report(idle_enq_us: Sequence[float], idle_sync_us: Sequence[float], step_ms_gpu: float,
+                      walls_ms_per_step: Dict[str, Sequence[float]]) -> dict:
+    """Pure part of --poll-probe. idle_*: per-poll host us (record+copy enqueue; event sync right after, idle GPU);
+    walls_ms_per_step[pattern]: host wall per step of each trial for the patterns none / la0 / la1 / batch8. bubble =
+    (median wall of the pattern - median wall of `none`) per step = the GPU time lost per step to the poll schedule (the
+    graph is back-to-back in `none`). breakeven = the number of steps after which lookahead-0's cumulative bubble equals
+    ONE overrun step (step_ms_gpu): fewer steps than that and polling synchronously beats issuing one no-op step."""
+    med = lambda xs: _stats(list(xs)).get("p50")  # noqa: E731
+    base = med(walls_ms_per_step["none"])
+    pats = {}
+    for k, v in walls_ms_per_step.items():
+        m = med(v)
+        pats[k] = {"wall_ms_per_step": list(v), "median_ms_per_step": m,
+                   "bubble_us_per_step_vs_none": (m - base) * 1e3 if (m is not None and base is not None) else None}
+    la0 = (pats.get("la0") or {}).get("bubble_us_per_step_vs_none")
+    return {"idle_enqueue_us": _stats(list(idle_enq_us)), "idle_sync_after_enqueue_us": _stats(list(idle_sync_us)),
+            "step_ms_gpu": step_ms_gpu, "patterns": pats,
+            "lookahead0_bubble_us_per_step": la0,
+            "breakeven_steps_lookahead0_vs_one_overrun_step": (step_ms_gpu * 1e3 / la0) if la0 and la0 > 0 else None,
+            "definition": "bubble = pattern median wall per step minus the no-poll median (graph replays back to back); "
+                          "la0 = wait for the poll right after each step (overrun 0, GPU idles while the host wakes and "
+                          "launches); la1 = wait for the previous step's poll after issuing this one (overrun 1, no "
+                          "bubble if the host wake + launch < one step); batch8 = the pre-LOOP-OVERRUN schedule"}
+
+
+def poll_probe(a) -> int:
+    """--poll-probe (box, CUDA only, no model): (1) idle host cost of one poll = record the 24-byte pinned D2H + event
+    (enqueue) and the sync right after; (2) per-step bubble of the poll schedules on a captured graph of `--probe-step-ms`
+    (torch.cuda._sleep) -- the numbers that size the lookahead-0 / lookahead-1 / batched trade. Writes --json (default
+    scratch/poll-probe.json) and prints a summary."""
+    import torch
+
+    if not torch.cuda.is_available():
+        print("poll-probe: no CUDA device here; run it on the box (bench/headline.py --poll-probe)", file=sys.stderr)
+        return 3
+    pc = time.perf_counter
+    dev = torch.device("cuda")
+    status = torch.zeros(3, dtype=torch.long, device=dev)
+    pins = [torch.zeros(3, dtype=torch.long, device="cpu", pin_memory=True) for _ in range(2)]
+    enq, snc = [], []
+    for i in range(2050):
+        t0 = pc()
+        pins[i % 2].copy_(status, non_blocking=True)
+        ev = torch.cuda.Event()
+        ev.record()
+        t1 = pc()
+        ev.synchronize()
+        t2 = pc()
+        if i >= 50:
+            enq.append((t1 - t0) * 1e6)
+            snc.append((t2 - t1) * 1e6)
+
+    def sleep_ms(c: int) -> float:
+        e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        e0.record()
+        torch.cuda._sleep(c)
+        e1.record()
+        e1.synchronize()
+        return e0.elapsed_time(e1)
+
+    c0 = int(1e7)
+    sleep_ms(c0)
+    ms = _stats([sleep_ms(c0) for _ in range(5)])["p50"]
+    cycles = max(1, int(c0 * a.probe_step_ms / ms))
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        torch.cuda._sleep(cycles)
+        status.add_(0)
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        torch.cuda._sleep(cycles)
+        status.add_(0)
+    steps = []
+    for _ in range(20):
+        e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        e0.record()
+        g.replay()
+        e1.record()
+        e1.synchronize()
+        steps.append(e0.elapsed_time(e1))
+    step_ms = _stats(steps)["p50"]
+
+    def run(name: str, n: int) -> float:
+        import collections
+
+        la = {"none": 0, "la0": 0, "la1": 1, "batch8": 1}[name]
+        pend: collections.deque = collections.deque()
+        k = 0
+        torch.cuda.synchronize()
+        t0 = pc()
+        for i in range(n):
+            g.replay()
+            if name == "none" or (name == "batch8" and (i + 1) % 8):
+                continue
+            pins[k % 2].copy_(status, non_blocking=True)
+            ev = torch.cuda.Event()
+            ev.record()
+            pend.append(ev)
+            k += 1
+            while len(pend) > la:
+                pend.popleft().synchronize()
+        torch.cuda.synchronize()
+        return (pc() - t0) * 1e3 / n
+
+    names = ("none", "la0", "la1", "batch8")
+    walls: Dict[str, list] = {k: [] for k in names}
+    for _ in range(3):
+        for k in names:
+            walls[k].append(run(k, int(a.probe_steps)))
+    rep = poll_probe_report(enq, snc, step_ms, walls)
+    rep.update({"date": time.strftime("%Y-%m-%d %H:%M:%S %Z"), "device": torch.cuda.get_device_name(0),
+                "torch": torch.__version__, "probe_step_ms_requested": a.probe_step_ms, "steps_per_trial": a.probe_steps})
+    path = a.json or os.path.join(REPO, "scratch", "poll-probe.json")
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w") as fh:
+        json.dump(rep, fh, indent=1)
+    f = lambda x, d=1: "-" if x is None else f"{x:.{d}f}"  # noqa: E731
+    print(f"POLL-PROBE {rep['device']} | graph step {f(step_ms, 3)} ms | poll enqueue (record + 24 B pinned D2H) p50 "
+          f"{f(rep['idle_enqueue_us'].get('p50'))} us p90 {f(rep['idle_enqueue_us'].get('p90'))} us | sync right after "
+          f"p50 {f(rep['idle_sync_after_enqueue_us'].get('p50'))} us")
+    for k, v in rep["patterns"].items():
+        print(f"  {k:7s} wall {f(v['median_ms_per_step'], 4)} ms/step | bubble vs no-poll "
+              f"{f(v['bubble_us_per_step_vs_none'])} us/step")
+    print(f"  lookahead-0 breakeven vs one overrun step ({f(step_ms, 2)} ms): "
+          f"{f(rep['breakeven_steps_lookahead0_vs_one_overrun_step'], 0)} steps | {path}")
+    return 0
+
+
 def main(argv=None) -> int:
     a = build_parser().parse_args(argv)
+    if a.poll_probe:
+        return poll_probe(a)
+    if not a.model_dir:
+        build_parser().error("--model-dir is required (except with --poll-probe)")
     if not a.no_gemv_pin:
         os.environ["DSV41_GEMV_PIN_M1"] = "1"     # before any GEMV get_config (builds, warm-ups, captures)
     os.environ["DSV41_FP32_IMPL"] = a.fp32_impl   # T9b-5 (= runtime.fused_glue_r2.FP32_IMPL_ENV), before any build
@@ -1068,7 +1326,8 @@ def main(argv=None) -> int:
         # the verify step's tables exist -- DSparkLoop resets the static step first), then attaches to the verify step.
         gen.set_residency(res_cfg)
     rep["residency_config"] = res_cfg
-    loop = DSparkLoop(gen, a.max_new, poll_every=a.poll_every, draft_impls=None if a.draft_impls == "same" else "ref")
+    loop = DSparkLoop(gen, a.max_new, poll_every=a.poll_every, lookahead=a.lookahead, tail_sync=a.tail_sync,
+                      draft_impls=None if a.draft_impls == "same" else "ref")
     rep["loop"] = loop.describe()
     orders_compare(rep["rowmatch"], loop.st)
     print(f"[rowmatch] {rowmatch_line(rep['rowmatch'])}", flush=True)
