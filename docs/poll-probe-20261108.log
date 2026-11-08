@@ -1,0 +1,6 @@
+POLL-PROBE NVIDIA GB300 | graph step 17.977 ms | poll enqueue (record + 24 B pinned D2H) p50 13.2 us p90 16.2 us | sync right after p50 2.4 us
+  none    wall 17.9738 ms/step | bubble vs no-poll 0.0 us/step
+  la0     wall 17.9869 ms/step | bubble vs no-poll 13.1 us/step
+  la1     wall 17.9833 ms/step | bubble vs no-poll 9.5 us/step
+  batch8  wall 17.9743 ms/step | bubble vs no-poll 0.5 us/step
+  lookahead-0 breakeven vs one overrun step (17.98 ms): 1375 steps | scratch/headline-main-ov.json
