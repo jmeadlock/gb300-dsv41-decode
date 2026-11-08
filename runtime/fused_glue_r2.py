@@ -56,6 +56,9 @@ the R-row kernels reduce each row alone in that order; at R > 1 the self-checks 
 evaluated one row at a time (`per_row_reductions`: torch's sum / mean of each [1, 1, ...] row slice, the 1-row step's
 call). Invariant: 1-row output byte-identical to the pre-T9b-7 1-row step; R-row output equal per row to the 1-row
 output. `rows` = the pre-T9b-7 behaviour (orders calibrated at the R-row reference shapes), kept for A/B.
+M2-L1 (docs/HANDOFF-M2-L1-MIXES-FORK.md; section "M2-L1: mixes fork" below): $DSV41_MIXES=fork runs the mixes' tail
+(mm, *rsqrt, sinkhorn) on a second stream forked after hc_norm and joined before hc_post (runtime/static_step.MixesFork);
+same kernels, bit-identical; `fused` adds the T9b-5 one-launch mm+*rsqrt; default off.
 CPU (the Mac tests, the census): the wrappers run torch mirrors; with no device to calibrate on, the statistics run
 torch's own op (order "native"), so the CPU step is bit-identical by construction; the explicit-order mirrors and the
 Triton bodies (under tests/triton_shim.py) are tested against each other and against the family's definition.
@@ -610,6 +613,74 @@ def head_fixed_w(W: torch.Tensor, x: torch.Tensor, full_logits: bool = False) ->
 def head_fixed(model, x: torch.Tensor, full_logits: bool = False) -> torch.Tensor:
     """head_fixed_w on the backbone's head (model.head.weight, fp32- or bf16-stored)."""
     return head_fixed_w(model.head.weight, x, full_logits)
+
+
+# ------------------------------------------------------------------------------------------------ M2-L1: mixes fork
+# docs/HANDOFF-M2-L1-MIXES-FORK.md, docs/M2-FUSED-CHAIN-DESIGN.md 2.2 L1. Block.forward (model.py:983-996) consumes a
+# sublayer's mixes only in that sublayer's hc_post (post, comb) and in the NEXT sublayer's hc_pre (pre), so the mixes'
+# tail -- the mm, `* rsqrt` (one launch under the T9b-5 order) and the TileLang sinkhorn -- has a whole sublayer of
+# slack. $DSV41_MIXES (read once per StaticStep build, kept on its `mix_fork`, runtime/static_step.MixesFork):
+#   auto  (default, SMALL-WINS) fork at 1 row, off at R > 1 (below);
+#   off   the mixes on the step's stream, exactly as before;
+#   fork  the SAME kernels on a second stream: fork after the hc_norm launch (its statistic and the stream copy are the
+#         branch's inputs), join before the sublayer's hc_post; the main stream keeps hc_norm only. Kernels, inputs
+#         and launch configs are unchanged, so every output is bit-identical to `off` (scheduling only);
+#   fused fork + the mm and `* rsqrt` in ONE launch, t9b5_mix_fp32 (the T9b-5 fixed fp32 order: row-invariant, A3 vs
+#         cuBLAS), whatever $DSV41_FP32_IMPL says for the head / compressor. Under `--fp32-impl fixed` (today's
+#         headline) the mixes already run that kernel, so `fused` == `fork` there, byte for byte. The sinkhorn stays
+#         the reference TileLang kernel in every mode. The oracle side (the glue self-check, static_step's
+#         reference-op path) adopts the fixed order under `fused` exactly as under T9b-5 (policy W4 4d A).
+MIXES_ENV = "DSV41_MIXES"
+MIXES_IMPLS = ("off", "fork", "fused")             # what a step runs (MixesFork.impl)
+MIXES_CHOICES = MIXES_IMPLS + ("auto",)            # what $DSV41_MIXES may say
+MIXES_DEFAULT = "auto"
+# SMALL-WINS (docs/HANDOFF-SMALL-WINS.md; measured docs/headline-mixes-fork-20261107.json): `auto` = fork at ONE row
+# (10.11 -> 9.73 ms/step, byte-identical), off at R > 1 (the 6-row loop measured +0.35 ms with the fork). An explicit
+# off / fork / fused wins at every row count. rows None (unknown) resolves like R > 1: the conservative `off`.
+MIXES_AUTO = {"one_row": "fork", "rows": "off"}
+
+
+def mixes_choice(rows: Optional[int] = None) -> Tuple[str, str]:
+    """(resolved impl, source): source "env" (an explicit $DSV41_MIXES) or "auto" (the row-conditional default)."""
+    v = (os.environ.get(MIXES_ENV, "") or MIXES_DEFAULT).strip() or MIXES_DEFAULT
+    if v not in MIXES_CHOICES:
+        raise ValueError(f"{MIXES_ENV}={v!r} not in {MIXES_CHOICES}")
+    if v != "auto":
+        return v, "env"
+    return MIXES_AUTO["one_row" if rows is not None and int(rows) == 1 else "rows"], "auto"
+
+
+def mixes_impl(rows: Optional[int] = None) -> str:
+    """The mixes impl for a step that builds for `rows` rows (see MIXES_AUTO; an explicit env value wins)."""
+    return mixes_choice(rows)[0]
+
+
+def mix_fixed(impl: Optional[str] = None) -> bool:
+    """The mixes' mm in the T9b-5 fixed order: $DSV41_FP32_IMPL=fixed, or the step's mixes impl is `fused`
+    (impl None: $DSV41_MIXES now)."""
+    return fp32_fixed() or (mixes_impl() if impl is None else impl) == "fused"
+
+
+def resolved_choices(rows=(1,)) -> dict:
+    """SMALL-WINS: what the row-conditional defaults resolve to now, per row count the run builds for:
+    {"rows": {R: {"mixes": impl, "mixes_src": env|auto, "qkv_tail": mode, "qkv_tail_src": env|auto}}} (a step's own
+    build can still demote `fused` to `split` when its self-check fails: describe_r2()["qkv_tail"] has that)."""
+    out = {}
+    for r in rows:
+        m, ms = mixes_choice(r)
+        q, qs = qkv_tail_choice(r)
+        out[int(r)] = {"mixes": m, "mixes_src": ms, "qkv_tail": q, "qkv_tail_src": qs}
+    return {"rows": out, "env": {MIXES_ENV: os.environ.get(MIXES_ENV), QKV_TAIL_ENV: os.environ.get(QKV_TAIL_ENV)}}
+
+
+def resolved_line(rows=(1,), gemv: Optional[str] = None) -> str:
+    """One report line for bench/first_light.py / bench/headline.py: [small-wins] R=1 mixes=fork(auto) qkv_tail=fused(auto) ..."""
+    rc = resolved_choices(rows)["rows"]
+    parts = [f"R={r} mixes={c['mixes']}({c['mixes_src']}) qkv_tail={c['qkv_tail']}({c['qkv_tail_src']})"
+             for r, c in rc.items()]
+    if gemv is not None:
+        parts.append(f"gemv={gemv}")
+    return "[small-wins] " + "; ".join(parts)
 
 
 # ------------------------------------------------------------------------------------------------ T9b-8: compressor
@@ -1540,6 +1611,90 @@ def launch_topk_post(idx, clen, out, offset: int):
     out.copy_(indexer_post_torch(idx, clen.reshape(R_, 1) if rows else clen, offset).view(out.shape))
 
 
+# ------------------------------------------------------------------------------------------------ M2-L10: q/kv tail
+# docs/HANDOFF-M2-L10-QKV-TAIL.md; docs/M2-FUSED-CHAIN-DESIGN.md section 2.2 row L10. $DSV41_QKV_TAIL (read once per
+# build; `--qkv-tail` of bench/qkv_tail_bench.py sets it):
+#   auto (default, SMALL-WINS): fused at 1 row, split at R > 1 (QKV_TAIL_AUTO).
+#   split: today's S2/S3 -- the wq_a || wkv pair GEMV (T9b-4), then q_norm + act_quant
+#          (t9b2r2_norm_row) in q_path and kv_norm + RoPE + QDQ + ring write (t9b2r2_norm_row) in kv_path: 3 launches.
+#   fused: ONE launch in q_path (runtime/gemv_mxfp8.l10_qkv_tail: the same pair GEMV, then per-output tickets -- the
+#          last CTA of each half runs that half's norm_row body in the R2 order, bit-identical by construction) that
+#          also writes this layer's kv ring rows; kv_path then has nothing left to launch. The step's freqs / ring slot
+#          / ring are the static step's own (StaticStep._c, _ring_of) -- the exact objects kv_path receives, which it
+#          asserts. Applies where the split path would pair (gemv_pair on, both halves on the GEMV); self-checked at
+#          build (fused == split bitwise on qr / q / s / the ring, twice: the ticket left at 0), else split with the
+#          reason (describe_r2()["qkv_tail"]).
+QKV_TAIL_ENV = "DSV41_QKV_TAIL"
+QKV_TAILS = ("split", "fused")                     # what a step runs
+QKV_TAIL_CHOICES = QKV_TAILS + ("auto",)           # what $DSV41_QKV_TAIL may say
+QKV_TAIL_DEFAULT = "auto"
+# SMALL-WINS (docs/HANDOFF-SMALL-WINS.md; measured docs/qkv-tail-bench-20261107.json): `auto` = fused when the step
+# builds for ONE row (17.4 -> 16.2 us per layer-call, bit-identical), split at R > 1 (+0.15 ms at 6 rows). An explicit
+# split / fused wins at every row count. rows None (unknown) resolves like R > 1: `split`.
+QKV_TAIL_AUTO = {"one_row": "fused", "rows": "split"}
+QKV_TICKETS = 256          # gemv_mxfp8.L10_TICKET_WORDS (restated: this module never imports it at load; tests check)
+# M2-L10-FIX: the fused launch's form is gemv_mxfp8.qkv_tail_form() ($DSV41_QKV_TAIL_FORM: stage (default) | fold, the
+# round-1 kernel that was 1.5 ms/step slower at 6 rows); read at every launch, so the build-time self-check below
+# checks the form the step runs.
+GEMV_MODULE = None         # tests: the shim-loaded gemv_mxfp8 for launch_qkv_tail's kernel path (default: the real one)
+
+
+def qkv_tail_choice(rows: Optional[int] = None) -> Tuple[str, str]:
+    """(resolved mode, source): source "env" (an explicit $DSV41_QKV_TAIL) or "auto" (the row-conditional default)."""
+    v = (os.environ.get(QKV_TAIL_ENV) or QKV_TAIL_DEFAULT).strip()
+    if v not in QKV_TAIL_CHOICES:
+        raise ValueError(f"${QKV_TAIL_ENV}={v!r}: expected one of {QKV_TAIL_CHOICES}")
+    if v != "auto":
+        return v, "env"
+    return QKV_TAIL_AUTO["one_row" if rows is not None and int(rows) == 1 else "rows"], "auto"
+
+
+def qkv_tail_mode(rows: Optional[int] = None) -> str:
+    """The q/kv tail mode for a step that builds for `rows` rows (see QKV_TAIL_AUTO; an explicit env value wins)."""
+    return qkv_tail_choice(rows)[0]
+
+
+def _gm():
+    if GEMV_MODULE is not None:
+        return GEMV_MODULE
+    from runtime import gemv_mxfp8
+
+    return gemv_mxfp8
+
+
+def launch_qkv_tail(xq, wa, wb, *, q_nw, q_eps: float, q_ord: dict, qr, q, s, kv_nw, kv_eps: float, kv_ord: dict,
+                    ring, slot, rope, code_tab, ticket, tags=("wq_a", "wkv")):
+    """M2-L10: the q path and the kv path of one layer after the pair GEMV, R rows (R = xq's rows).
+    xq = act_quant(x) (q fp8 [.., R, K], s e8m0 [.., R, K/32]); wa / wb = attn.wq_a / attn.wkv (fp8 Linears with
+    .weight.scale); qr / q / s [1, R, QL] bf16 / fp8 / [1, R, QL/32] e8m0 out; ring (bf16 rows of HD) + slot [R] int64:
+    row t's kv goes to ring row slot[t]; rope = (freqs fp32 [rd/2, 2] or [R, rd/2, 2], rd, (re, im) modes) or None;
+    ticket int32 [QKV_TICKETS] (zero; left zero). One launch on CUDA (gemv_mxfp8.qkv_pair_tail) -> (result_a, result_b) of the
+    GEMV (bf16 or SplitK), or None when the pair cannot form there (the caller runs the split path). CPU: the split
+    path's own functions in order (gemv_pair, launch_norm_row x 2) -- the mirror, identical by definition."""
+    GM = _gm()
+    K = xq[0].size(-1)
+    x8, xs8 = xq[0].reshape(-1, K), xq[1].reshape(-1, K // BLOCK)
+    R_ = x8.size(0)
+    QL, HD = q_nw.numel(), kv_nw.numel()
+    if _kern(x8):
+        fr, rd, modes = rope if rope is not None else (None, 0, (0, 0))
+        fs = int(fr.stride(0)) if fr is not None and fr.dim() == 3 else 0
+        return GM.qkv_pair_tail(
+            x8, xs8, wa.weight, wa.weight.scale, wb.weight, wb.weight.scale, ticket=ticket, tab=code_tab, tags=tags,
+            q_tail=dict(nw=q_nw, qr=qr.view(R_, QL), q=q.view(R_, QL), s=s.view(R_, QL // BLOCK), eps=float(q_eps),
+                        fac=fac_of(QL), wf=float(QL), order=order_args(q_ord)),
+            kv_tail=dict(nw=kv_nw, ring=ring, slot=slot.reshape(-1), freqs=fr, FS=fs, rd=int(rd), modes=tuple(modes),
+                         eps=float(kv_eps), fac=fac_of(HD), wf=float(HD), order=order_args(kv_ord)))
+    ra, rb = GM.gemv_pair(x8, xs8, wa.weight, wa.weight.scale, wb.weight, wb.weight.scale, tags=tags)
+    one = R_ == 1
+    launch_norm_row(ra if hasattr(ra, "nsplit") else (ra.reshape(-1) if one else ra.reshape(R_, QL)), q_nw,
+                    qr.view(-1) if one else qr.view(R_, QL), eps=q_eps, ordd=q_ord, code_tab=code_tab,
+                    q=q.view(-1) if one else q.view(R_, QL), s=s.view(-1) if one else s.view(R_, QL // BLOCK))
+    launch_norm_row(rb if hasattr(rb, "nsplit") else (rb.reshape(-1) if one else rb.reshape(R_, HD)), kv_nw, ring,
+                    eps=kv_eps, ordd=kv_ord, code_tab=code_tab, slot=slot.reshape(-1), qdq=True, rope=rope)
+    return ra, rb
+
+
 # ------------------------------------------------------------------------------------------------ the R2 glue
 def _bits(t: torch.Tensor) -> torch.Tensor:
     t = t.contiguous()
@@ -1596,6 +1751,7 @@ class R2Glue:
         self.r2_bytes = {"gate_fp32": sum(t.numel() * 4 for t in self.gate_w.values()
                                           if t.data_ptr() not in {sm.moe.gate.weight.data_ptr() for sm in o.moes}),
                          "engram_wprod": sum(t.numel() * 4 for t in self.engram_wp.values())}
+        self._qkv_init()                       # M2-L10: $DSV41_QKV_TAIL (split | fused), fixed for this build
 
     def _r2_default_orders(self) -> None:
         """calibrate=False (the census): torch's own op on CPU, the predicted configuration on a device."""
@@ -1873,7 +2029,7 @@ class R2Glue:
                 fn, sc, bs = self._mix_params(layer, side)
                 norm = layer.attn_norm if side == "attn" else layer.ffn_norm
                 with self._oracle():   # T9b-7: at R > 1 (shape policy) the 1-row reference, row by row
-                    if fp32_fixed():   # T9b-5: the oracle adopts the fixed-order mixes (policy W4 4d A)
+                    if self._mix_fixed():   # T9b-5 / M2-L1 fused: the oracle adopts the fixed-order mixes (W4 4d A)
                         pr, po, cb = hc_mixes_fixed(R, layer, x, fn, sc, bs)
                     else:
                         pr, po, cb = layer.hc_mixes(x, fn, sc, bs)
@@ -2072,12 +2228,35 @@ class R2Glue:
             return layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base
         return layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base
 
+    def _mixes_impl(self) -> str:
+        """M2-L1: the owner step's mixes impl (fixed at its build; `off` for an owner without a MixesFork)."""
+        fk = getattr(self.o, "mix_fork", None)
+        return fk.impl if fk is not None else "off"
+
+    def _mix_fixed(self) -> bool:
+        return mix_fixed(self._mixes_impl())
+
+    def _mixes_fork(self):
+        """M2-L1: the owner's MixesFork when it forks right now (impl fork/fused AND inside the step's _active()
+        scope: eager static steps, warm-ups, capture), else None (the build-time self-checks never fork)."""
+        fk = getattr(self.o, "mix_fork", None)
+        return fk if fk is not None and fk.engaged(self.o) else None
+
+    def _mix_branch(self, layer, xf, mrs, side: str, x=None):
+        """The forked work, in the order of the unforked path: the reference statistic when mix_stat is off (it
+        only feeds the mixes), then mix_tail."""
+        if mrs is None:
+            with self._oracle():
+                mrs = torch.rsqrt(xf.square().mean(-1, keepdim=True) + layer.norm_eps)
+        return self.mix_tail(layer, xf, mrs, side, x=x)
+
     def mix_tail(self, layer, xf, mrs, side: str, x=None):
         """hc_mixes after its statistic (model.py:956-957): F.linear(x, hc_fn) * rsqrt, then the sinkhorn kernel.
-        T9b-5 ($DSV41_FP32_IMPL=fixed): the mm and the * rsqrt in ONE launch (t9b5_mix_fp32, fixed order); it reads
-        the bf16 stream x [1, T, HC, D] when given (the same values as xf = x.float(): half the bytes)."""
+        T9b-5 ($DSV41_FP32_IMPL=fixed) / M2-L1 `fused`: the mm and the * rsqrt in ONE launch (t9b5_mix_fp32, fixed
+        order); it reads the bf16 stream x [1, T, HC, D] when given (the same values as xf = x.float(): half the
+        bytes)."""
         fn, sc, bs = self._mix_params(layer, side)
-        if fp32_fixed():
+        if self._mix_fixed():
             T_ = xf.numel() // xf.size(-1)
             mixes = torch.empty(1, T_, fn.size(0), dtype=torch.float32, device=xf.device)
             src = x.reshape(T_, xf.size(-1)) if x is not None else xf.reshape(T_, xf.size(-1))
@@ -2119,10 +2298,16 @@ class R2Glue:
                        mrs=mrs.view(-1) if mrs is not None else None, mix_ord=self.orders.get("mix"),
                        mix_eps=layer.norm_eps, q=q.view(-1) if one else q.view(T_, D),
                        s=s.view(-1) if one else s.view(T_, D // BLOCK), dq=dq, ds=ds, split=self.on("hc_split"))
-        if mrs is None:   # mix_stat off: the reference statistic, on the same fp32 values (one launch fewer: .float())
-            with self._oracle():   # T9b-7: at R > 1 (shape policy) each row's statistic as the 1-row step's
-                mrs = torch.rsqrt(xf.square().mean(-1, keepdim=True) + layer.norm_eps)
-        pre, post, comb = self.mix_tail(layer, xf, mrs, side, x=x if x.dtype == torch.bfloat16 else None)
+        xb = x if x.dtype == torch.bfloat16 else None
+        fk = self._mixes_fork()
+        if fk is not None:   # M2-L1: statistic (mix_stat off) + mm + *rsqrt + sinkhorn on the side stream; the step
+            #                  joins it before this sublayer's hc_post (StaticStep._hc_post)
+            pre, post, comb = fk.run(lambda: self._mix_branch(layer, xf, mrs, side, xb), (x, xf, mrs))
+        else:
+            if mrs is None:   # mix_stat off: the reference statistic, on the same fp32 values (one launch fewer)
+                with self._oracle():   # T9b-7: at R > 1 (shape policy) each row's statistic as the 1-row step's
+                    mrs = torch.rsqrt(xf.square().mean(-1, keepdim=True) + layer.norm_eps)
+            pre, post, comb = self.mix_tail(layer, xf, mrs, side, x=xb)
         if side == "ffn":
             self._ffn_ctx = {"ptr": y.data_ptr(), "xf": yf, "q": q, "s": s, "dg": dg}
             return pre, post, comb, y, None
@@ -2236,8 +2421,164 @@ class R2Glue:
         return self.linear_pre(xq, attn.wq_a, x)
 
     def q_path(self, attn, x, xq):
-        """qr = q_norm(wq_a(x)) (model.py:771) and act_quant(qr) for wq_b (model.py:772, 197) in one launch."""
+        """qr = q_norm(wq_a(x)) (model.py:771) and act_quant(qr) for wq_b (model.py:772, 197) in one launch.
+        M2-L10 (qkv_tail fused, inside a static step): the pair GEMV + this + the layer's kv path in ONE launch."""
+        if self._qkv_fused_ok(attn, xq):
+            ctx = self._step_kv(attn)
+            if ctx is not None:
+                r = self._qkv_launch(attn, xq, *ctx)
+                if r is not None:
+                    self._kv_pend = (id(attn), "tail") + tuple(ctx) + (r[2][1],)
+                    self.qkv_calls["fused"] += 1
+                    return r[0], r[1]
+            self.qkv_calls["split"] += 1
         return self._q_norm_quant(attn, self._q_input(attn, x, xq))
+
+    # M2-L10 ---------------------------------------------------------------------------------------------------------
+    def _qkv_init(self) -> None:
+        self.qkv_tail, self.qkv_tail_source = qkv_tail_choice(int(getattr(self.o, "rows", 1) or 1))
+        self.qkv_tail_why = (None if self.qkv_tail == "fused" else
+                             f"${QKV_TAIL_ENV} = split (rows {int(getattr(self.o, 'rows', 1) or 1)}, "
+                             f"{'auto' if self.qkv_tail_source == 'auto' else 'explicit'})")
+        self.qkv_calls = {"fused": 0, "split": 0}      # q_path calls in fused mode: one launch / fell back to split
+        self._qkv_ticket = (torch.zeros(QKV_TICKETS, dtype=torch.int32, device=self.dev)
+                            if self.qkv_tail == "fused" else None)   # allocated here: never inside a capture
+
+    def _qkv_fused_ok(self, attn, xq) -> bool:
+        """Mode fused, and the split path here would be the pair (+ the two fused norm rows)."""
+        return (getattr(self, "qkv_tail", "split") == "fused" and xq is not None and self.on("q_path")
+                and self.on("kv_path") and self.on("gemv_pair") and self._gemv_ok(xq, attn.wq_a, attn.wkv))
+
+    def _step_kv(self, attn):
+        """(freqs_cis, slot, ring) this layer's kv_path will be called with by the static step (StaticStep._attn:
+        c.freqs(attn.freqs_cis), c.p_win(), _ring_of[id(attn)] -- cached per step, the same objects), or None outside
+        a step (self-checks, other owners)."""
+        c = getattr(self.o, "_c", None)
+        rings = getattr(self.o, "_ring_of", None)
+        if c is None or not rings or id(attn) not in rings:
+            return None
+        return c.freqs(attn.freqs_cis), c.p_win(), rings[id(attn)]
+
+    def _qkv_launch(self, attn, xq, freqs_cis, slot, ring):
+        """launch_qkv_tail for this layer -> (qr, (q, s), (result_a, result_b)) or None (pair refused)."""
+        from runtime import patches
+
+        QL, rd = attn.q_lora_rank, attn.rope_head_dim
+        T_ = self._rows(xq)
+        dev = xq[0].device
+        qr = torch.empty(1, T_, QL, dtype=torch.bfloat16, device=dev)
+        q = torch.empty(1, T_, QL, dtype=FP8, device=dev)
+        s = torch.empty(1, T_, QL // BLOCK, dtype=E8, device=dev)
+        rope = None
+        if rd:                                 # as _kv_norm_write
+            fr = torch.view_as_real(freqs_cis)
+            fr = fr.reshape(-1, 2) if T_ == 1 else fr.reshape(T_, -1, 2).contiguous()
+            rope = (fr, rd, self.rope_fwd)
+        res = launch_qkv_tail(xq, attn.wq_a, attn.wkv, q_nw=attn.q_norm.weight, q_eps=attn.q_norm.eps,
+                              q_ord=self.orders["q"], qr=qr, q=q, s=s, kv_nw=attn.kv_norm.weight,
+                              kv_eps=attn.kv_norm.eps, kv_ord=self.orders["kv"], ring=ring, slot=slot, rope=rope,
+                              code_tab=self.code_tab, ticket=self._qkv_ticket)
+        if res is None:
+            return None
+        patches.count_gemv_routed(attn.wq_a.weight, xq[0])
+        patches.count_gemv_routed(attn.wkv.weight, xq[0])
+        return qr, (q, s), res
+
+    def _check_qkv_tail(self, cal: dict, g) -> None:
+        """Build-time gate of qkv_tail fused (after the T9b-4 parts' checks): needs q_path, kv_path and gemv_pair on,
+        then fused == split bitwise (_verify_qkv_tail); else split, with the reason."""
+        if self.qkv_tail != "fused":
+            cal["qkv_tail"] = self.qkv_tail_why
+            return
+        why = next((f"{c} is {self.status.get(c)}" for c in ("q_path", "kv_path", "gemv_pair") if not self.on(c)),
+                   None)
+        if why is None:
+            try:
+                why = self._verify_qkv_tail(g)
+            except Exception as e:  # a kernel that does not compile/run here: split, with the reason
+                why = f"self-check raised {type(e).__name__}: {str(e)[:300]}"
+        if why:
+            self.qkv_tail = "split"
+            self.qkv_tail_why = f"off: {why}"
+            self.log(f"[fused-glue] qkv_tail fused OFF: {why}")
+        if self.qkv_tail_why:
+            cal["qkv_tail"] = self.qkv_tail_why
+        else:
+            try:
+                form = _gm().qkv_tail_form()
+            except Exception as e:  # pragma: no cover - a bad $DSV41_QKV_TAIL_FORM is caught by the check above
+                form = f"? ({e})"
+            cal["qkv_tail"] = f"fused: equal to split (form {form}; qr, q, s, ring; ticket reset)"
+
+    def _verify_qkv_tail(self, g) -> Optional[str]:
+        """fused (launch_qkv_tail) vs split (the pair + _q_norm_quant + _kv_norm_write in force), at this step's
+        rows, bitwise on qr / q / s / the whole ring, each fused call made twice (the second after the first left the
+        ticket at 0). None = equal."""
+        o, R = self.o, self.R
+        attn = o.model.layers[0].attn
+        D, HD = o.model.layers[0].attn_norm.dim, attn.head_dim
+        Rr = self.rows
+        nslot = max(int(attn.window_size), 2 * Rr + 8)
+        prev = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(torch.bfloat16)
+            with o._active():
+                for t in range(3):
+                    x = self._cat_rows(lambda: self._stream(g, 1, D, -4, 6).view(1, 1, D)).to(self.dev)
+                    xq = R.act_quant(x, R.fp8_block_size, R.scale_fmt, R.scale_dtype)
+                    if not self._gemv_ok(xq, attn.wq_a, attn.wkv):
+                        return "wq_a / wkv do not take the GEMV in this step's scope"
+                    pos = 1 + 7 * t
+                    f = attn.freqs_cis[pos:pos + Rr]
+                    slot = torch.remainder(torch.arange(pos, pos + Rr, dtype=torch.long, device="cpu"),
+                                           nslot).to(self.dev)
+                    self._kv_pend = None
+                    qr0, (q0, s0) = self._q_norm_quant(attn, self._q_input(attn, x, xq))
+                    pend, self._kv_pend = self._kv_pend, None
+                    if pend is not None:
+                        kvr = pend[1]
+                    elif self.on("reduce_fold"):
+                        kvr = self._gemv_fold(xq, attn.wkv, "wkv")
+                    else:
+                        kvr = self.linear_pre(xq, attn.wkv, x)
+                    ring0 = torch.zeros(1, nslot, HD, dtype=torch.bfloat16, device=self.dev)
+                    self._kv_norm_write(attn, kvr, f, ring0, slot)
+                    for rep in range(2):
+                        ring1 = torch.zeros(1, nslot, HD, dtype=torch.bfloat16, device=self.dev)
+                        r = self._qkv_launch(attn, xq, f, slot, ring1)
+                        if r is None:
+                            return "the pair cannot form here (pair_plan: the halves' MMA forms differ)"
+                        qr1, (q1, s1), _ = r
+                        bad = [n for n, a, b in (("qr", qr1, qr0), ("q", q1, q0), ("s", s1, s0), ("ring", ring1, ring0))
+                               if not _same(a, b)]
+                        if bad:
+                            return f"{bad} differ from the split path (rows {Rr}, draw {t}, call {rep})"
+                        if self._qkv_ticket is not None and int(self._qkv_ticket.abs().sum()) != 0:
+                            return f"ticket not reset to 0 after the launch ({self._qkv_ticket.tolist()})"
+        finally:
+            torch.set_default_dtype(prev)
+            from runtime import patches
+
+            patches.fp8_gemv_stats(reset=True)
+        return None
+
+    def describe_qkv_tail(self) -> dict:
+        gm = {}
+        try:
+            gm = dict(_gm().L10_STATS)
+        except Exception:  # pragma: no cover - module without the M2-L10 kernel
+            pass
+        form = comp = None
+        try:
+            form = _gm().qkv_tail_form()
+            comp = {"/".join(str(x) for x in k): v for k, v in _gm().L10_COMPILED.items()}
+        except Exception:  # pragma: no cover - module without the M2-L10-FIX kernel / a bad $DSV41_QKV_TAIL_FORM
+            pass
+        return {"mode": getattr(self, "qkv_tail", None), "env": QKV_TAIL_ENV, "form": form, "compiled": comp,
+                "source": getattr(self, "qkv_tail_source", None), "rows": int(getattr(self.o, "rows", 1) or 1),
+                "why": getattr(self, "qkv_tail_why", None),
+                "calls": dict(getattr(self, "qkv_calls", {})), "kernel_calls": gm,
+                "launches_per_layer": {"split": 3, "fused": 1}}
 
     def _kv_norm_write(self, attn, kvr, freqs_cis, ring, slot):
         """kv_norm + RoPE + QDQ + the ring write of T rows (slot [T]; M1-T10-PORT: freqs_cis [T, rd/2], row t at its
@@ -2256,6 +2597,12 @@ class R2Glue:
         the ring write in one launch. ring: the static step's own 256-slot ring (M1-T10 #20; default the reference
         window cache)."""
         pend, self._kv_pend = getattr(self, "_kv_pend", None), None
+        if pend is not None and pend[0] == id(attn) and isinstance(pend[1], str):   # M2-L10: the q path's launch
+            want_ring = attn.window_kv_cache if ring is None else ring           # wrote this layer's kv rows
+            if pend[2] is freqs_cis and pend[3] is slot and pend[4] is want_ring:
+                return
+            raise RuntimeError("kv_path: the fused q/kv tail (M2-L10) already wrote this layer's kv rows with the "
+                               "static step's freqs / ring slot / ring, but kv_path was called with other ones")
         if pend is not None and pend[0] == id(attn):                 # T9b-4: made by this layer's q path (pair)
             kvr = pend[1]
         elif xq is not None and self.on("reduce_fold") and self._gemv_ok(xq, attn.wkv):
@@ -2387,6 +2734,7 @@ class R2Glue:
             b.sf_pack_why = None if b.sf_pack else self.status.get("dg_sf_pack")
         if not self.on("dg_sf_pack") and b is not None and hasattr(b, "sf_pack"):
             b.sf_pack = False
+        self._check_qkv_tail(cal, g)            # M2-L10: after gemv_pair's own check
 
     def _r4_check(self, cal: dict, name: str, fn, g) -> None:
         r4 = cal.setdefault("r4", {})
@@ -2622,7 +2970,8 @@ class R2Glue:
                                  "cal_rows": getattr(self, "cal_rows", None), "step_rows": getattr(self, "rows", 1)},
                 "bytes": dict(getattr(self, "r2_bytes", {})), "indexer_score": INDEXER_SCORE_WHY,
                 "outcome": {c: self.numerics.get(c, {}).get("outcome") for c in R2_CLUSTERS if self.on(c)},
-                "fp32": describe_fp32(), "router_impl": self._describe_router_impl()}
+                "fp32": describe_fp32(), "router_impl": self._describe_router_impl(),
+                "qkv_tail": self.describe_qkv_tail()}
 
     def _describe_router_impl(self) -> dict:
         rp = getattr(self, "rplan", None)

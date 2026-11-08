@@ -31,6 +31,15 @@ Per shape, per M in --ms:
 Also: the per-step GEMM time at M=1 (sum over roles of calls x µs) for both impls, and the tuned configs (written to
 --tune-cache, which runtime/gemv_mxfp8 reads via $DSV41_GEMV_CACHE).
 
+T9b-6 (`--impl gemv3|both`, default both; docs/HANDOFF-T9B6-GEMV-BYTES.md): per shape and M the gemv3 kernel too, on
+the same operands -- its (N, K) config (tuned once per shape by autotune3 at M = 1 and 8, written to --tune-cache3),
+drift vs the reference on every real layer, fp64-oracle mean |err| vs gemv's, bit-identity with gemv's MMA=1 form at
+the same split plan, every row alone == its row in the M-row call, a graph replayed twice == eager, µs / GB/s and the
+config's bytes per thread per iteration and in flight per program. GATES3: per-step M=1 total <= 2.0 ms; every shape
+>= 3 TB/s or <= 4 µs (every measured M); rows / replay / same-plan bit-identity; oracle <= gemv's within 0.5 %. Per-step
+totals at every M for both impls. Exit code: GATES3 (gemv's T9b-1 gates with --impl gemv). Box line: the one below
+plus `--impl both --json scratch/gemv-bench-t9b6.json` (receipts go to scratch/, never docs/).
+
 Box command (same image and mounts as the T9a-1 runs; checkpoint read-only at /ref):
 
   W=$HOME/hermes/gb300-dsv41-decode
@@ -74,6 +83,14 @@ GATE_SMALL_US = 8.0
 GATE_STEP_SAVING_MS = 12.0
 GATE_MISMATCH = 5e-3
 INVARIANCE_SAMPLE = 12
+# T9b-6 gemv3 gates (docs/HANDOFF-T9B6-GEMV-BYTES.md): per-step M=1 total <= 2.0 ms (gemv: 3.43 ms in
+# docs/gemv-bench-r2-20261106.json); every shape class >= 3 TB/s or <= 4 us (checked at every measured M); rows
+# bit-identical to the row alone; graph replay == eager; fp64-oracle mean |err| <= gemv's within ORACLE3_TOL
+GATE3_STEP_MS_M1 = 2.0
+GATE3_GBPS = 3000.0
+GATE3_US = 4.0
+ORACLE3_TOL = 5e-3   # relative slack on the MEAN |err|: two valid fixed fp32 orders flip a bf16 rounding on <= 0.5 %
+#                      of outputs (the 1-ulp class), moving the mean by about that fraction either way
 
 
 # ------------------------------------------------------------------------------------------------ enumeration
@@ -121,8 +138,9 @@ def pick_layers(layers: List[int], n: int) -> List[int]:
 # ------------------------------------------------------------------------------------------------ helpers
 def activations(M: int, K: int, seed: int, K_mod):
     g = torch.Generator(device="cpu").manual_seed(seed)
-    x = (torch.randn(M, K // 32, 32, generator=g) * torch.exp2(torch.randint(-6, 7, (M, K // 32, 1), generator=g)
-                                                                .float())).view(M, K).to(torch.bfloat16).cuda()
+    x = (torch.randn(M, K // 32, 32, generator=g, device="cpu")
+         * torch.exp2(torch.randint(-6, 7, (M, K // 32, 1), generator=g, device="cpu").float())
+         ).view(M, K).to(torch.bfloat16).cuda()
     return K_mod.act_quant(x, 32, "ue8m0", E8)
 
 
@@ -199,6 +217,127 @@ def tune_summary(log: Optional[dict]) -> dict:
             "errors_sample": list(log.get("errors", {}).items())[:2]}
 
 
+# ------------------------------------------------------------------------------------------------ T9b-6 gates
+def shape_gates3(N: int, K: int, per_m3: Dict[int, dict]) -> dict:
+    """Per-shape gemv3 gates from the per-M records ({M: {"us", "GBps", "mismatch", "row_invariant",
+    "replay_identical", "err_ratio_vs_gemv", "bitident_same_plan"}}); a check a record lacks is None (not run)."""
+    def every(pred, key):
+        vals = [pred(r) for r in per_m3.values() if r.get(key) is not None]
+        return all(vals) if vals else None
+
+    return {
+        "fast_ge_3TBps_or_le_4us": every(lambda r: r["GBps"] >= GATE3_GBPS or r["us"] <= GATE3_US, "us"),
+        "row_invariant": every(lambda r: r["row_invariant"], "row_invariant"),
+        "replay_identical": every(lambda r: r["replay_identical"], "replay_identical"),
+        "oracle_le_gemv": every(lambda r: r["err_ratio_vs_gemv"] <= 1.0 + ORACLE3_TOL, "err_ratio_vs_gemv"),
+        "bitident_gemv_same_plan": every(lambda r: r["bitident_same_plan"], "bitident_same_plan"),
+        "mismatch_le_0p5pct": every(lambda r: r["mismatch"] <= GATE_MISMATCH, "mismatch"),
+    }
+
+
+GATES3 = ("fast_ge_3TBps_or_le_4us", "row_invariant", "replay_identical", "oracle_le_gemv", "bitident_gemv_same_plan",
+          "mismatch_le_0p5pct")
+
+
+def overall_gates3(shape_recs: List[dict], step3: dict) -> dict:
+    """Every shape's gemv3 gates + the per-step M=1 total <= GATE3_STEP_MS_M1; all_pass if none is False and the
+    step total and the speed gate were measured."""
+    gs = [r["gates3"] for r in shape_recs if r.get("gates3")]
+    out = {}
+    for name in GATES3:
+        vals = [g[name] for g in gs if g.get(name) is not None]
+        out[name] = all(vals) if vals else None
+    out["step_le_2ms_m1"] = (step3["ms_gemv3_m1"] <= GATE3_STEP_MS_M1) if step3.get("ms_gemv3_m1") is not None \
+        else None
+    out["failing"] = {name: [r["shape"] for r in shape_recs if r.get("gates3", {}).get(name) is False]
+                      for name in GATES3 if any(r.get("gates3", {}).get(name) is False for r in shape_recs)}
+    out["all_pass"] = all(out[k] is not False for k in GATES3 + ("step_le_2ms_m1",)) \
+        and out["step_le_2ms_m1"] is not None and out["fast_ge_3TBps_or_le_4us"] is not None
+    return out
+
+
+def step_totals3(shape_recs: List[dict], Ms: List[int]) -> dict:
+    """Per-step GEMV time (sum over shapes of calls x µs) for gemv3 and, where measured, gemv, at every M."""
+    st = {}
+    for M in Ms:
+        for impl, key, src in (("gemv3", "us", "per_m3"), ("gemv", "us_gemv", "per_m")):
+            recs = [r for r in shape_recs if M in r.get(src, {})]
+            if recs and len(recs) == len(shape_recs):
+                st[f"ms_{impl}_m{M}"] = round(sum(r["calls_per_step"] * r[src][M][key] for r in recs) / 1e3, 3)
+        if f"ms_gemv_m{M}" in st and f"ms_gemv3_m{M}" in st:
+            st[f"saved_ms_m{M}"] = round(st[f"ms_gemv_m{M}"] - st[f"ms_gemv3_m{M}"], 3)
+    st["target_ms_gemv3_m1"] = GATE3_STEP_MS_M1
+    return st
+
+
+def measure_gemv3(G, K_mod, reals, copies, xq, xs, M: int, N: int, K: int, a, err_gemv: Optional[float],
+                  dev) -> dict:
+    """One shape at one M on gemv3 (the (N, K) config, tuned on first use): drift vs the reference on every real
+    layer; on the first layer: fp64-oracle mean |err| (vs gemv's), bit-identity with gemv's MMA=1 form at the same
+    split plan, each row alone == its row in this call, a graph of the calls replayed twice == eager; timing under a
+    CUDA graph over the weight copies (one launch per call: no reduce)."""
+    cfg = G.get_config3(N, K, dev)
+    out = torch.empty(M, N, dtype=torch.bfloat16, device=dev)
+    mism = tot = gt1 = 0
+    max_ulp = 0
+    for name, w, s in reals:
+        ref = K_mod.fp8_gemm(xq, xs, w, s, E8, block_size=32)
+        got = G.mxfp8_gemv3(xq, xs, w, s, out, config=cfg).clone()
+        u = ulp_distance(got, ref)
+        mism += int((got != ref).sum())
+        tot += got.numel()
+        gt1 += int((u > 1).sum())
+        max_ulp = max(max_ulp, int(u.max()))
+        if not bool(torch.isfinite(got.float()).all()):
+            raise FloatingPointError(f"{name} M={M}: non-finite gemv3 output")
+    _, w0, s0 = reals[0]
+    base = G.mxfp8_gemv3(xq, xs, w0, s0, out, config=cfg).clone()
+    err3 = ratio = None
+    if N * K <= (64 << 20):
+        ex = exact_f64(xq, xs, w0, s0)
+        err3 = float((base.double() - ex).abs().mean())
+        ratio = err3 / err_gemv if err_gemv else None
+    same = G.mxfp8_gemv(xq, xs, w0, s0, torch.empty(M, N, dtype=torch.bfloat16, device=dev),
+                        config=G.GemvConfig(32, 2, 4, 3, cfg.split_k, 1))
+    rows_ok = all(torch.equal(G.mxfp8_gemv3(xq[m:m + 1].contiguous(), xs[m:m + 1].contiguous(), w0, s0,
+                                            torch.empty(1, N, dtype=torch.bfloat16, device=dev), config=cfg),
+                              base[m:m + 1]) for m in range(M)) if M > 1 else None
+    # replay identity: a small graph of the same call (warmed on the capture stream, as time_graph does), replayed
+    # twice into a NaN-filled output
+    rep_out = torch.empty(M, N, dtype=torch.bfloat16, device=dev)
+    g = torch.cuda.CUDAGraph()
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        G.mxfp8_gemv3(xq, xs, w0, s0, rep_out, config=cfg)
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    with torch.cuda.graph(g):
+        G.mxfp8_gemv3(xq, xs, w0, s0, rep_out, config=cfg)
+    replay_ok = True
+    for _ in range(2):
+        rep_out.fill_(float("nan"))
+        g.replay()
+        torch.cuda.synchronize()
+        replay_ok = replay_ok and torch.equal(rep_out, base)
+    del g
+    n_copies = len(copies)
+    ncalls = max(a.calls, n_copies)
+    us = G.time_graph([lambda i=i: G.mxfp8_gemv3(xq, xs, copies[i % n_copies][0], copies[i % n_copies][1], out,
+                                                 config=cfg) for i in range(ncalls)], a.reps)
+    plan = G.launch_plan3(cfg, M, N, K)
+    log = G._TUNE_LOG3.get((N, K))
+    return {"config": cfg.as_dict(), "numerics_key": list(G.numerics_key3(cfg, N, K)), "grid": list(plan["grid"]),
+            "EVEN": plan["EVEN"], "tile_bytes": plan["tile_bytes"], "bytes_per_thread": plan["bytes_per_thread"],
+            "inflight_bytes": plan["inflight_bytes"], "us": round(us, 3),
+            "GBps": round(bytes_moved(M, N, K) / us / 1e3, 1), "mismatch": mism / tot, "max_ulp": max_ulp,
+            "n_gt1ulp": gt1, "mean_abs_err_vs_f64": err3, "err_gemv_vs_f64": err_gemv, "err_ratio_vs_gemv": ratio,
+            "bitident_same_plan": bool(torch.equal(base, same)), "row_invariant": rows_ok,
+            "replay_identical": replay_ok,
+            "tune": {"source": "tuned", "best_us": log.get("best_us"), "n_timed": log.get("n_timed"),
+                     "n_failed": log.get("n_failed"), "worst_us": log.get("worst_us")} if log else {"source": "cache"}}
+
+
 # ------------------------------------------------------------------------------------------------ main
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
@@ -214,8 +353,15 @@ def main(argv=None) -> int:
     ap.add_argument("--tune-space", choices=("full", "quick"), default="full",
                     help="full = the handoff's grid (~100-200 candidates per shape and M bucket; first run compiles "
                          "them all, the Triton cache mount keeps them); quick = KU 4 / 4 warps / 2 stages only")
+    ap.add_argument("--impl", choices=("gemv", "gemv3", "both"), default="both",
+                    help="T9b-6: gemv (T9b-1 kernel + its gates), gemv3 (the bytes-in-flight kernel + GATES3; "
+                         "gemv's fp64 error from its cached / default config), both (default; exit code = GATES3)")
+    ap.add_argument("--tune-cache3", default=os.path.join(REPO, "scratch", "gemv-tune.gemv3.json"),
+                    help="gemv3's own versioned config cache ($DSV41_GEMV3_CACHE); the default is the path gemv3 "
+                         "derives from $DSV41_GEMV_CACHE=scratch/gemv-tune.json, so a later run finds it unprompted")
     a = ap.parse_args(argv)
     os.environ["DSV41_GEMV_CACHE"] = a.tune_cache
+    os.environ["DSV41_GEMV3_CACHE"] = a.tune_cache3
     os.environ.setdefault("DSV41_GEMV_TUNE", "1")
     os.environ["DSV41_GEMV_TUNE_SPACE"] = a.tune_space
 
@@ -264,10 +410,16 @@ def main(argv=None) -> int:
                   for i in range(n_copies)]
         rec = {"shape": [N, K], "roles": rs, "calls_per_step": sum(len(roles[r]["layers"]) for r in rs),
                "weight_MiB": round(wbytes / 2**20, 2), "real_layers": [n for n, _, _ in reals],
-               "timing_copies": n_copies, "timing_stream_MiB": round(n_copies * wbytes / 2**20, 1), "per_m": {}}
+               "timing_copies": n_copies, "timing_stream_MiB": round(n_copies * wbytes / 2**20, 1), "per_m": {},
+               "per_m3": {}}
         for M in Ms:
             xq, xs = activations(M, K, 1000 * M + N % 997 + K, K_mod)
             out = torch.empty(M, N, dtype=torch.bfloat16, device=dev)
+            if a.impl == "gemv3":   # T9b-6 only: gemv's fp64 error from its cached / default config, no gemv timing
+                rec["per_m3"][M] = r3 = measure_gemv3(G, K_mod, reals, copies, xq, xs, M, N, K, a,
+                                                      gemv_err_vs_f64(G, xq, xs, reals[0][1], reals[0][2], dev), dev)
+                print_gemv3(N, K, rs, M, r3, len(reals))
+                continue
             cfg = G.get_config(N, K, M, dev)   # tunes (synthetic rotating weights) unless cached
             # correctness on every real layer
             mism = tot = gt1 = 0
@@ -333,7 +485,12 @@ def main(argv=None) -> int:
                       f"{ts['runner_up'][1] if ts['runner_up'] else '-'} us, worst {ts['worst'][1]} us "
                       f"(spread {ts['spread']}x)" + (f"; e.g. error {ts['errors_sample'][0]}"
                                                     if ts["errors_sample"] else ""), flush=True)
-        rec["gates"] = shape_gates(N, K, rec["per_m"])
+            if a.impl == "both":
+                rec["per_m3"][M] = r3 = measure_gemv3(G, K_mod, reals, copies, xq, xs, M, N, K, a,
+                                                      err["gemv"] if err else None, dev)
+                print_gemv3(N, K, rs, M, r3, len(reals))
+        rec["gates"] = shape_gates(N, K, rec["per_m"]) if rec["per_m"] else {}
+        rec["gates3"] = shape_gates3(N, K, rec["per_m3"]) if rec["per_m3"] else {}
         rec["wall_s"] = round(time.time() - t0, 1)
         report["shapes"].append(rec)
         del reals, copies
@@ -354,18 +511,54 @@ def main(argv=None) -> int:
               for r in report["shapes"] for M, v in r["per_m"].items()}
     report["distinct_configs"] = {"n_distinct": len(set(picked.values())), "n_keys": len(picked), "picked": picked}
     report["tuned"] = G.describe()
-    report["tune_cache"] = G.save_cache(a.tune_cache)
+    report["tune_cache"] = G.save_cache(a.tune_cache) if a.impl != "gemv3" else None
+    st3: dict = {}
+    if a.impl != "gemv":
+        st3 = step_totals3(report["shapes"], Ms)
+        report["per_step3"] = st3
+        report["gates3"] = overall_gates3(report["shapes"], st3)
+        report["tune_cache3"] = G.save_cache3(a.tune_cache3)
     report["wall_s"] = round(time.time() - t_start, 1)
     os.makedirs(os.path.dirname(os.path.abspath(a.json)), exist_ok=True)
     with open(a.json, "w") as f:
         json.dump(report, f, indent=1, default=str)
-    print(f"per step at M=1 (GEMMs only): ref {st['ms_ref']:.2f} ms -> gemv {st['ms_gemv']:.2f} ms "
-          f"(saves {st['saved_ms']:.2f} ms over {calls_per_step} calls; target >= {GATE_STEP_SAVING_MS:.0f} ms)")
-    print(f"tuned configs: {report['distinct_configs']['n_distinct']} distinct over "
-          f"{report['distinct_configs']['n_keys']} (shape, M) keys")
-    print(f"GATES: {json.dumps(report['gates'])}")
-    print(f"report {a.json}; tuned configs {report['tune_cache']}")
-    return 0 if report["gates"]["all_pass"] else 1
+    if a.impl != "gemv3":
+        print(f"per step at M=1 (GEMMs only): ref {st['ms_ref']:.2f} ms -> gemv {st['ms_gemv']:.2f} ms "
+              f"(saves {st['saved_ms']:.2f} ms over {calls_per_step} calls; target >= {GATE_STEP_SAVING_MS:.0f} ms)")
+        print(f"tuned configs: {report['distinct_configs']['n_distinct']} distinct over "
+              f"{report['distinct_configs']['n_keys']} (shape, M) keys")
+        print(f"GATES: {json.dumps(report['gates'])}")
+    if a.impl != "gemv":
+        print("per step, GEMV only (sum of calls x us): " + ", ".join(f"{k} {v}" for k, v in st3.items()))
+        print(f"GATES3: {json.dumps(report['gates3'])}")
+    print(f"report {a.json}; tuned configs {report['tune_cache']} / {report.get('tune_cache3')}")
+    gates = report["gates3"] if a.impl != "gemv" else report["gates"]
+    return 0 if gates["all_pass"] else 1
+
+
+def gemv_err_vs_f64(G, xq, xs, w0, s0, dev) -> Optional[float]:
+    """gemv's mean |err| vs the float64 product (the T9b-6 oracle gate's baseline) with gemv's cached config for this
+    (N, K, M) -- else its default, never a fresh tune -- for `--impl gemv3`."""
+    M, K = xq.shape
+    N = w0.size(0)
+    if N * K > (64 << 20):
+        return None
+    if G.cache_path():
+        G.load_cache()
+    cfg = G._CONFIGS.get(G.config_key(N, K, M)) or G.default_config(N, K, M, G.num_sms(dev))
+    got = G.mxfp8_gemv(xq, xs, w0, s0, torch.empty(M, N, dtype=torch.bfloat16, device=dev), config=cfg)
+    return float((got.double() - exact_f64(xq, xs, w0, s0)).abs().mean())
+
+
+def print_gemv3(N, K, rs, M, r3: dict, n_layers: int) -> None:
+    ratio = r3["err_ratio_vs_gemv"]
+    ratio = None if ratio is None else round(ratio, 5)
+    print(f"[{N}x{K}] {'/'.join(rs)} M={M}: gemv3 {r3['us']:.2f} us ({r3['GBps']:.0f} GB/s) | mismatch vs ref "
+          f"{r3['mismatch'] * 100:.3f} % over {n_layers} layers, max ulp {r3['max_ulp']} | rows "
+          f"{r3['row_invariant']} replay {r3['replay_identical']} same-plan==gemv {r3['bitident_same_plan']} "
+          f"f64 ratio {ratio} | config {r3['config']} grid {tuple(r3['grid'])} EVEN {r3['EVEN']}, "
+          f"{r3['bytes_per_thread']} B/thread/iter, {r3['inflight_bytes']} B in flight/program | tune {r3['tune']}",
+          flush=True)
 
 
 if __name__ == "__main__":

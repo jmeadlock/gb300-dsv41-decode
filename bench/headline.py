@@ -377,6 +377,12 @@ def summary_lines(rep: dict) -> List[str]:
     f = lambda x, d=2: "-" if x is None else f"{x:.{d}f}"  # noqa: E731
     lines = [f"HEADLINE {rep.get('date')} | {METRIC} | mode {rep.get('mode')} | impls {rep.get('impls')} | "
              f"gemv pin M1 {rep.get('gemv_pin_m1')} | max_new {rep.get('max_new')} | prompts {rep.get('n_prompts')}"]
+    sw = rep.get("small_wins")
+    if sw:   # SMALL-WINS: what the row-conditional defaults resolved to (runtime.fused_glue_r2.resolved_line's content)
+        lines.append("  small-wins: " + "; ".join(
+            f"R={r} mixes={c['mixes']}({c['mixes_src']}) qkv_tail={c['qkv_tail']}({c['qkv_tail_src']})"
+            for r, c in (sw.get("rows") or {}).items()) + f"; fp8 {sw.get('fp8_impl_arg')}"
+            + (f" (kernel {sw.get('gemv_kernel')})" if sw.get("gemv_kernel") else ""))
     rm = rep.get("rowmatch")
     if rm:
         lines.append(f"  rowmatch: {rowmatch_line(rm)}")
@@ -434,7 +440,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--mode", choices=["static", "graph"], default="graph")
     ap.add_argument("--graphs", default="2,1", help="loop graph counts to run, in order (2 first: attributed ms)")
     ap.add_argument("--moe-impl", choices=["ref", "dg-masked", "dg-inplace"], default="ref")
-    ap.add_argument("--fp8-impl", choices=["ref", "gemv"], default="ref")
+    ap.add_argument("--fp8-impl", choices=["ref", "gemv", "gemv3"], default="ref",
+                    help="ref | gemv | gemv3 (= gemv + the T9b-6 v3 kernel path, $DSV41_GEMV_IMPL=gemv3; A3 class)")
     ap.add_argument("--glue-impl", choices=["ref", "fused"], default="ref")
     ap.add_argument("--attn-impl", choices=["ref", "bounded", "flashmla"], default="ref")
     ap.add_argument("--fp32-impl", choices=["cublas", "fixed"], default="cublas",
@@ -740,6 +747,10 @@ def main(argv=None) -> int:
     if not a.no_gemv_pin:
         os.environ["DSV41_GEMV_PIN_M1"] = "1"     # before any GEMV get_config (builds, warm-ups, captures)
     os.environ["DSV41_FP32_IMPL"] = a.fp32_impl   # T9b-5 (= runtime.fused_glue_r2.FP32_IMPL_ENV), before any build
+    from runtime.gemv_mxfp8 import apply_fp8_impl_arg
+
+    fp8_arg = a.fp8_impl                          # SMALL-WINS: "gemv3" = gemv + $DSV41_GEMV_IMPL=gemv3, before any build
+    a.fp8_impl = apply_fp8_impl_arg(fp8_arg)
     os.environ["DSV41_MOE_ROWMATCH"] = a.moe_rowmatch   # T9a-3 (= runtime.dg_inplace.ROWMATCH_ENV), before any build
     import torch
 
@@ -751,7 +762,7 @@ def main(argv=None) -> int:
     date = time.strftime("%Y%m%d")
     json_path = a.json or os.path.join(REPO, "docs", f"headline-{date}.json")
     graphs = [int(x) for x in a.graphs.split(",") if x.strip()]
-    impls = {"moe": a.moe_impl, "fp8": a.fp8_impl, "glue": a.glue_impl, "attn": a.attn_impl, "fp32": a.fp32_impl,
+    impls = {"moe": a.moe_impl, "fp8": fp8_arg, "glue": a.glue_impl, "attn": a.attn_impl, "fp32": a.fp32_impl,
              "moe_rowmatch": a.moe_rowmatch}
     rep: Dict = {"date": time.strftime("%Y-%m-%d %H:%M:%S %Z"), "argv": sys.argv[1:] if argv is None else argv,
                  "metric": METRIC, "mode": a.mode, "impls": impls, "max_new": a.max_new,
@@ -838,6 +849,13 @@ def main(argv=None) -> int:
     rep["loop"] = loop.describe()
     orders_compare(rep["rowmatch"], loop.st)
     print(f"[rowmatch] {rowmatch_line(rep['rowmatch'])}", flush=True)
+    _sw_rows = sorted({1, int(getattr(loop.st, "rows", 6) or 6)})   # SMALL-WINS: the 1-row truth and the loop's verify step
+    _gk = None if a.fp8_impl != "gemv" else __import__("runtime.gemv_mxfp8", fromlist=["gemv_impl"]).gemv_impl()
+    from runtime.fused_glue_r2 import resolved_choices, resolved_line
+
+    rep["small_wins"] = dict(resolved_choices(_sw_rows), fp8_impl_arg=fp8_arg, gemv_kernel=_gk,
+                             mixes_step=(loop.st.mix_fork.describe() if hasattr(loop.st, "mix_fork") else None))
+    print(resolved_line(_sw_rows, _gk), flush=True)
     run_graphs = graphs if a.mode == "graph" else [0]
     results = run_cells(loop, prompts, a.max_new, run_graphs, reps=a.reps, parity_reps=a.parity_reps,
                         stop_on_eos=stop, profile=profile, rep=rep)

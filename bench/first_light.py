@@ -1019,9 +1019,11 @@ def build_parser() -> argparse.ArgumentParser:
                          "dg-masked = 3 DeepGEMM masked grouped GEMMs per layer (T9a-1, runtime/dg_moe.py) / "
                          "dg-inplace = 3 DeepGEMM contiguous grouped GEMMs over the hot pool, cold experts staged "
                          "into spare slots (T9a-2, runtime/dg_inplace.py; adds a drift row vs dg-masked)")
-    ap.add_argument("--fp8-impl", choices=["ref", "gemv"], default="ref",
+    ap.add_argument("--fp8-impl", choices=["ref", "gemv", "gemv3"], default="ref",
                     help="static/graph fp8 Linear layers: ref = reference fp8_gemm (bit-identical, T8) / gemv = "
-                         "Triton MXFP8 GEMV at <= 8 rows (T9b-1, runtime/gemv_mxfp8.py)")
+                         "Triton MXFP8 GEMV at <= 8 rows (T9b-1, runtime/gemv_mxfp8.py) / gemv3 = gemv with the T9b-6 "
+                         "v3 kernel path (pins $DSV41_GEMV_IMPL=gemv3; row-invariant, a different reduction order: "
+                         "A3 class, not byte-identical to gemv)")
     ap.add_argument("--glue-impl", choices=["ref", "fused"], default="ref",
                     help="static/graph glue: ref = today's torch glue ops / fused = the zero/low-risk glue clusters "
                          "as fused kernels, bit-identical to ref (T9b-2, runtime/fused_glue.py)")
@@ -1238,12 +1240,21 @@ def main(argv=None) -> int:
     from runtime.fused_glue_r2 import FP32_IMPL_ENV, describe_fp32
 
     os.environ[FP32_IMPL_ENV] = a.fp32_impl      # T9b-5: before any StaticStep / glue build
+    from runtime.gemv_mxfp8 import apply_fp8_impl_arg
+
+    fp8_arg = a.fp8_impl                         # SMALL-WINS: "gemv3" = gemv + $DSV41_GEMV_IMPL=gemv3, before any build
+    a.fp8_impl = apply_fp8_impl_arg(fp8_arg)
     report["fp32"] = describe_fp32()
     report["receipt"] = _receipt.begin(      # LOOSE-ENDS-2: what produced this receipt (never raises)
         argv=report["argv"], model_dir=a.model_dir, fixture=a.fixture, residency=residency_config(a), map_path=a.map,
         config_path=a.config,
         impls={"moe": a.moe_impl, "fp8": a.fp8_impl, "glue": a.glue_impl, "attn": a.attn_impl, "fp32": a.fp32_impl,
                "mode": a.mode, "rows": a.rows, "teacher_forced": a.teacher_forced, "kv_numerics": a.kv_numerics})
+    from runtime.fused_glue_r2 import resolved_choices, resolved_line
+
+    _gk = None if a.fp8_impl != "gemv" else __import__("runtime.gemv_mxfp8", fromlist=["gemv_impl"]).gemv_impl()
+    report["small_wins"] = dict(resolved_choices((1, a.rows)), fp8_impl_arg=fp8_arg, gemv_kernel=_gk)
+    print(resolved_line(sorted({1, a.rows}), _gk), flush=True)   # SMALL-WINS: what auto resolved to, per row count
     from runtime.loader import build_and_load
 
     t0 = time.time()
@@ -1431,6 +1442,8 @@ def summary_lines(r: dict, json_path: str) -> List[str]:
     pl = (r.get("parity_levels") or {}).get("verdict")
     moe = g.get("moe_impl", "ref")
     fp8 = g.get("fp8_impl", "ref")
+    if fp8 == "gemv" and (r.get("small_wins") or {}).get("gemv_kernel") == "gemv3":
+        fp8 = "gemv3"                               # SMALL-WINS: the v3 kernel path under --fp8-impl gemv3
     glue = g.get("glue_impl", "ref")
     if glue != "ref" and g.get("glue_approx"):
         glue += "+approx"
@@ -1442,7 +1455,10 @@ def summary_lines(r: dict, json_path: str) -> List[str]:
              f"{'' if attn == 'ref' else f' attn {attn}'}"
              f"{'' if pl is None else f' levels {pl}'} | "
              f"map {b.get('map')} | boot {f(b.get('wall_s'), 0)} s | "
-             f"HBM {f(b.get('cuda_allocated_GiB'))} GiB | {r['env'].get('device')}"]
+             f"HBM {f(b.get('cuda_allocated_GiB'))} GiB | {r['env'].get('device')}"
+             + (" | small-wins " + ", ".join(
+                 f"R{k} mixes={c['mixes']} qkv={c['qkv_tail']}"
+                 for k, c in (r["small_wins"].get("rows") or {}).items()) if r.get("small_wins") else "")]
     reps = r.get("reps", {})
     p1 = reps.get(1, {}).get("prompts", [])
     m = [x.get("prompt_tokens_match") for x in p1]

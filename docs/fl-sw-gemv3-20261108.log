@@ -1,0 +1,57 @@
+[small-wins] R=1 mixes=fork(auto) qkv_tail=fused(auto); gemv=gemv3
+[transformers] You are using a model of type `deepseek_v41` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+[load] 96085 tensors in 48 shards, map /work/docs/maps/hot-v26ar-seed-295.json, config /ref/inference/config.json
+[load] linears with scale: 46370; wo_a dequantized: 40; widened: ['layers.14.attn.compressor.wgate.weight', 'layers.14.attn.compressor.wkv.weight', 'layers.2.attn.compressor.wgate.weight', 'layers.2.attn.compressor.wkv.weight', 'layers.8.attn.compressor.wgate.weight', 'layers.8.attn.compressor.wkv.weight', 'head.weight']; head fp32
+[rep1] prose  prompt 42 (pg61 42) -> 256 tok length, prefill 3442 ms, decode 20.4 ms/tok, cold 0.010
+[rep1] code   prompt 47 (pg61 47) -> 239 tok stop, prefill 3344 ms, decode 22.1 ms/tok, cold 0.131
+[rep1] math   prompt 54 (pg61 54) -> 256 tok length, prefill 3468 ms, decode 21.8 ms/tok, cold 0.102
+[rep1] json   prompt 38 (pg61 38) -> 18 tok stop, prefill 3150 ms, decode 22.6 ms/tok, cold 0.111
+[rep1] shell  prompt 34 (pg61 34) -> 256 tok length, prefill 2875 ms, decode 21.3 ms/tok, cold 0.071
+[rep1] tool   prompt 49 (pg61 49) -> 21 tok stop, prefill 3557 ms, decode 22.1 ms/tok, cold 0.075
+[rep1] long   prompt 46 (pg61 46) -> 256 tok length, prefill 3300 ms, decode 20.7 ms/tok, cold 0.035
+[rep1] story  prompt 31 (pg61 31) -> 180 tok stop, prefill 2834 ms, decode 20.7 ms/tok, cold 0.030
+[rep2] prose  prompt 42 (pg61 42) -> 256 tok length, prefill 3539 ms, decode 20.4 ms/tok, cold 0.010
+[rep2] code   prompt 47 (pg61 47) -> 239 tok stop, prefill 3463 ms, decode 22.1 ms/tok, cold 0.131
+[rep2] math   prompt 54 (pg61 54) -> 256 tok length, prefill 3511 ms, decode 21.7 ms/tok, cold 0.102
+[rep2] json   prompt 38 (pg61 38) -> 18 tok stop, prefill 3231 ms, decode 22.5 ms/tok, cold 0.111
+[rep2] shell  prompt 34 (pg61 34) -> 256 tok length, prefill 2965 ms, decode 21.3 ms/tok, cold 0.071
+[rep2] tool   prompt 49 (pg61 49) -> 21 tok stop, prefill 3663 ms, decode 22.0 ms/tok, cold 0.075
+[rep2] long   prompt 46 (pg61 46) -> 256 tok length, prefill 3419 ms, decode 20.7 ms/tok, cold 0.035
+[rep2] story  prompt 31 (pg61 31) -> 180 tok stop, prefill 2837 ms, decode 20.7 ms/tok, cold 0.030
+--- parity rep 1: scratch/fl-sw-gemv3.jsonl vs w0/results/phase1/parity-A.jsonl / w0/results/phase1/parity-A2.jsonl
+tag        A2 first/flips_w/maxd        cand first/flips_w/maxd      verdict
+prose      None    0.000  0.0000        31      0.000  0.1853        FAIL
+code       121     0.000  0.1206        86      0.000  0.3187        FAIL
+math       None    0.000  0.0000        182     0.000  0.4335        FAIL
+json       None    0.000  0.0000        None    0.000  0.2473        FAIL
+shell      None    0.000  0.0000        66      0.000  0.3282        FAIL
+tool       None    0.000  0.0000        None    0.000  0.3214        FAIL
+long       None    0.000  0.0000        24      0.000  0.5673        FAIL
+story      None    0.000  0.0000        3       0.000  0.6951        FAIL
+identical 2/8; PARITY: FAIL
+--- parity rep 2: scratch/fl-sw-gemv3-replay.jsonl vs w0/results/phase1/parity-A.jsonl / w0/results/phase1/parity-A2.jsonl
+tag        A2 first/flips_w/maxd        cand first/flips_w/maxd      verdict
+prose      None    0.000  0.0000        31      0.000  0.1853        FAIL
+code       121     0.000  0.1206        86      0.000  0.3187        FAIL
+math       None    0.000  0.0000        182     0.000  0.4335        FAIL
+json       None    0.000  0.0000        None    0.000  0.2473        FAIL
+shell      None    0.000  0.0000        66      0.000  0.3282        FAIL
+tool       None    0.000  0.0000        None    0.000  0.3214        FAIL
+long       None    0.000  0.0000        24      0.000  0.5673        FAIL
+story      None    0.000  0.0000        3       0.000  0.6951        FAIL
+identical 2/8; PARITY: FAIL
+[self-replay rep1 vs rep2] 8/8 byte-identical, 8/8 logits digests equal, files equal True
+[glue] fused: on dg_act,swiglu_routed,swiglu_shared,moe_combine,hc_post,o_rope_qdq,q_rope_epilogue,hc_norm,mix_stat,kv_path,q_path,router,engram,indexer_post,hc_split,gemv_pair,reduce_fold,dg_sf_pack; approx -; off gather,concat_free,dedup; r2 numerics hc_norm (i), mix_stat (i), kv_path (i), q_path (i), router (i), engram (i), indexer_post (i); orders {'norm_D': 'vec_T512_V4_dec|mul', 'mix': 'vec_T512_V4_dec|mul', 'kv': 'vec_T128_V4_dec|mul', 'q': 'vec_T256_V4_dec|mul', 'router': 'vec_T4_V1_dec|mul', 'engram': 'vec_T128_V4_dec|mul', 'engram_sum': 'vec_T128_V4_dec|mul'}
+[moe-rowmatch] off -> off: align 128 gemm_blocks 6 (R-row contiguous16); build check equal=None today's call equal=None
+FIRST LIGHT 2026-11-08 03:09:18 UTC | mode graph moe dg-inplace fp8 gemv3 glue fused attn flashmla | map /work/docs/maps/hot-v26ar-seed-295.json | boot 60 s | HBM 218.61 GiB | NVIDIA GB300 | small-wins R1 mixes=fork qkv=fused
+fixture encode: 8/8 prompt-token counts == Pg61 usage.prompt_tokens
+rep1: 8/8 prompts ok, 1482 tokens, 80 s, decode mean 21.5 ms/tok (incl. logprob work)
+rep2: 8/8 prompts ok, 1482 tokens, 58 s, decode mean 21.4 ms/tok (incl. logprob work)
+parity rep1 vs Pg61-A: identical 2/8; PARITY: FAIL
+parity rep2 vs Pg61-A: identical 2/8; PARITY: FAIL
+self-replay rep1 vs rep2: 8/8 byte-identical, 8/8 fp32-logit digests equal; diverged: none
+step cell (cuda_events): steps 32..512 mean 10.13 / p50 10.05 / p90 10.47 ms per step
+step cell: 98.69 tok/s (1/mean), 97.91 tok/s wall; prefill 3622 ms; vs rep1 tokens {'compared': 256, 'first_divergence': None}
+cold share/step mean 0.0174 p50 0.0083 p90 0.0375; cold calls/step mean 4.18 (routed 240/step)
+cold calls per layer (step cell), top 5: L1=139, L0=110, L5=107, L2=88, L19=84
+errors: 0 | report /work/docs/first-light-20261108.json
