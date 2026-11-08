@@ -620,7 +620,8 @@ def head_fixed(model, x: torch.Tensor, full_logits: bool = False) -> torch.Tenso
 # sublayer's mixes only in that sublayer's hc_post (post, comb) and in the NEXT sublayer's hc_pre (pre), so the mixes'
 # tail -- the mm, `* rsqrt` (one launch under the T9b-5 order) and the TileLang sinkhorn -- has a whole sublayer of
 # slack. $DSV41_MIXES (read once per StaticStep build, kept on its `mix_fork`, runtime/static_step.MixesFork):
-#   off   (default until the box gate)  the mixes on the step's stream, exactly as before;
+#   auto  (default, SMALL-WINS) fork at 1 row, off at R > 1 (below);
+#   off   the mixes on the step's stream, exactly as before;
 #   fork  the SAME kernels on a second stream: fork after the hc_norm launch (its statistic and the stream copy are the
 #         branch's inputs), join before the sublayer's hc_post; the main stream keeps hc_norm only. Kernels, inputs
 #         and launch configs are unchanged, so every output is bit-identical to `off` (scheduling only);
@@ -630,21 +631,56 @@ def head_fixed(model, x: torch.Tensor, full_logits: bool = False) -> torch.Tenso
 #         the reference TileLang kernel in every mode. The oracle side (the glue self-check, static_step's
 #         reference-op path) adopts the fixed order under `fused` exactly as under T9b-5 (policy W4 4d A).
 MIXES_ENV = "DSV41_MIXES"
-MIXES_IMPLS = ("off", "fork", "fused")
-MIXES_DEFAULT = "off"
+MIXES_IMPLS = ("off", "fork", "fused")             # what a step runs (MixesFork.impl)
+MIXES_CHOICES = MIXES_IMPLS + ("auto",)            # what $DSV41_MIXES may say
+MIXES_DEFAULT = "auto"
+# SMALL-WINS (docs/HANDOFF-SMALL-WINS.md; measured docs/headline-mixes-fork-20261107.json): `auto` = fork at ONE row
+# (10.11 -> 9.73 ms/step, byte-identical), off at R > 1 (the 6-row loop measured +0.35 ms with the fork). An explicit
+# off / fork / fused wins at every row count. rows None (unknown) resolves like R > 1: the conservative `off`.
+MIXES_AUTO = {"one_row": "fork", "rows": "off"}
 
 
-def mixes_impl() -> str:
-    v = os.environ.get(MIXES_ENV, MIXES_DEFAULT) or MIXES_DEFAULT
-    if v not in MIXES_IMPLS:
-        raise ValueError(f"{MIXES_ENV}={v!r} not in {MIXES_IMPLS}")
-    return v
+def mixes_choice(rows: Optional[int] = None) -> Tuple[str, str]:
+    """(resolved impl, source): source "env" (an explicit $DSV41_MIXES) or "auto" (the row-conditional default)."""
+    v = (os.environ.get(MIXES_ENV, "") or MIXES_DEFAULT).strip() or MIXES_DEFAULT
+    if v not in MIXES_CHOICES:
+        raise ValueError(f"{MIXES_ENV}={v!r} not in {MIXES_CHOICES}")
+    if v != "auto":
+        return v, "env"
+    return MIXES_AUTO["one_row" if rows is not None and int(rows) == 1 else "rows"], "auto"
+
+
+def mixes_impl(rows: Optional[int] = None) -> str:
+    """The mixes impl for a step that builds for `rows` rows (see MIXES_AUTO; an explicit env value wins)."""
+    return mixes_choice(rows)[0]
 
 
 def mix_fixed(impl: Optional[str] = None) -> bool:
     """The mixes' mm in the T9b-5 fixed order: $DSV41_FP32_IMPL=fixed, or the step's mixes impl is `fused`
     (impl None: $DSV41_MIXES now)."""
     return fp32_fixed() or (mixes_impl() if impl is None else impl) == "fused"
+
+
+def resolved_choices(rows=(1,)) -> dict:
+    """SMALL-WINS: what the row-conditional defaults resolve to now, per row count the run builds for:
+    {"rows": {R: {"mixes": impl, "mixes_src": env|auto, "qkv_tail": mode, "qkv_tail_src": env|auto}}} (a step's own
+    build can still demote `fused` to `split` when its self-check fails: describe_r2()["qkv_tail"] has that)."""
+    out = {}
+    for r in rows:
+        m, ms = mixes_choice(r)
+        q, qs = qkv_tail_choice(r)
+        out[int(r)] = {"mixes": m, "mixes_src": ms, "qkv_tail": q, "qkv_tail_src": qs}
+    return {"rows": out, "env": {MIXES_ENV: os.environ.get(MIXES_ENV), QKV_TAIL_ENV: os.environ.get(QKV_TAIL_ENV)}}
+
+
+def resolved_line(rows=(1,), gemv: Optional[str] = None) -> str:
+    """One report line for bench/first_light.py / bench/headline.py: [small-wins] R=1 mixes=fork(auto) qkv_tail=fused(auto) ..."""
+    rc = resolved_choices(rows)["rows"]
+    parts = [f"R={r} mixes={c['mixes']}({c['mixes_src']}) qkv_tail={c['qkv_tail']}({c['qkv_tail_src']})"
+             for r, c in rc.items()]
+    if gemv is not None:
+        parts.append(f"gemv={gemv}")
+    return "[small-wins] " + "; ".join(parts)
 
 
 # ------------------------------------------------------------------------------------------------ T9b-8: compressor
@@ -1578,7 +1614,8 @@ def launch_topk_post(idx, clen, out, offset: int):
 # ------------------------------------------------------------------------------------------------ M2-L10: q/kv tail
 # docs/HANDOFF-M2-L10-QKV-TAIL.md; docs/M2-FUSED-CHAIN-DESIGN.md section 2.2 row L10. $DSV41_QKV_TAIL (read once per
 # build; `--qkv-tail` of bench/qkv_tail_bench.py sets it):
-#   split (default until the box gate): today's S2/S3 -- the wq_a || wkv pair GEMV (T9b-4), then q_norm + act_quant
+#   auto (default, SMALL-WINS): fused at 1 row, split at R > 1 (QKV_TAIL_AUTO).
+#   split: today's S2/S3 -- the wq_a || wkv pair GEMV (T9b-4), then q_norm + act_quant
 #          (t9b2r2_norm_row) in q_path and kv_norm + RoPE + QDQ + ring write (t9b2r2_norm_row) in kv_path: 3 launches.
 #   fused: ONE launch in q_path (runtime/gemv_mxfp8.l10_qkv_tail: the same pair GEMV, then per-output tickets -- the
 #          last CTA of each half runs that half's norm_row body in the R2 order, bit-identical by construction) that
@@ -1588,8 +1625,13 @@ def launch_topk_post(idx, clen, out, offset: int):
 #          build (fused == split bitwise on qr / q / s / the ring, twice: the ticket left at 0), else split with the
 #          reason (describe_r2()["qkv_tail"]).
 QKV_TAIL_ENV = "DSV41_QKV_TAIL"
-QKV_TAILS = ("split", "fused")
-QKV_TAIL_DEFAULT = "split"
+QKV_TAILS = ("split", "fused")                     # what a step runs
+QKV_TAIL_CHOICES = QKV_TAILS + ("auto",)           # what $DSV41_QKV_TAIL may say
+QKV_TAIL_DEFAULT = "auto"
+# SMALL-WINS (docs/HANDOFF-SMALL-WINS.md; measured docs/qkv-tail-bench-20261107.json): `auto` = fused when the step
+# builds for ONE row (17.4 -> 16.2 us per layer-call, bit-identical), split at R > 1 (+0.15 ms at 6 rows). An explicit
+# split / fused wins at every row count. rows None (unknown) resolves like R > 1: `split`.
+QKV_TAIL_AUTO = {"one_row": "fused", "rows": "split"}
 QKV_TICKETS = 256          # gemv_mxfp8.L10_TICKET_WORDS (restated: this module never imports it at load; tests check)
 # M2-L10-FIX: the fused launch's form is gemv_mxfp8.qkv_tail_form() ($DSV41_QKV_TAIL_FORM: stage (default) | fold, the
 # round-1 kernel that was 1.5 ms/step slower at 6 rows); read at every launch, so the build-time self-check below
@@ -1597,11 +1639,19 @@ QKV_TICKETS = 256          # gemv_mxfp8.L10_TICKET_WORDS (restated: this module 
 GEMV_MODULE = None         # tests: the shim-loaded gemv_mxfp8 for launch_qkv_tail's kernel path (default: the real one)
 
 
-def qkv_tail_mode() -> str:
+def qkv_tail_choice(rows: Optional[int] = None) -> Tuple[str, str]:
+    """(resolved mode, source): source "env" (an explicit $DSV41_QKV_TAIL) or "auto" (the row-conditional default)."""
     v = (os.environ.get(QKV_TAIL_ENV) or QKV_TAIL_DEFAULT).strip()
-    if v not in QKV_TAILS:
-        raise ValueError(f"${QKV_TAIL_ENV}={v!r}: expected one of {QKV_TAILS}")
-    return v
+    if v not in QKV_TAIL_CHOICES:
+        raise ValueError(f"${QKV_TAIL_ENV}={v!r}: expected one of {QKV_TAIL_CHOICES}")
+    if v != "auto":
+        return v, "env"
+    return QKV_TAIL_AUTO["one_row" if rows is not None and int(rows) == 1 else "rows"], "auto"
+
+
+def qkv_tail_mode(rows: Optional[int] = None) -> str:
+    """The q/kv tail mode for a step that builds for `rows` rows (see QKV_TAIL_AUTO; an explicit env value wins)."""
+    return qkv_tail_choice(rows)[0]
 
 
 def _gm():
@@ -2386,8 +2436,10 @@ class R2Glue:
 
     # M2-L10 ---------------------------------------------------------------------------------------------------------
     def _qkv_init(self) -> None:
-        self.qkv_tail = qkv_tail_mode()
-        self.qkv_tail_why = None if self.qkv_tail == "fused" else f"${QKV_TAIL_ENV} = split (the default)"
+        self.qkv_tail, self.qkv_tail_source = qkv_tail_choice(int(getattr(self.o, "rows", 1) or 1))
+        self.qkv_tail_why = (None if self.qkv_tail == "fused" else
+                             f"${QKV_TAIL_ENV} = split (rows {int(getattr(self.o, 'rows', 1) or 1)}, "
+                             f"{'auto' if self.qkv_tail_source == 'auto' else 'explicit'})")
         self.qkv_calls = {"fused": 0, "split": 0}      # q_path calls in fused mode: one launch / fell back to split
         self._qkv_ticket = (torch.zeros(QKV_TICKETS, dtype=torch.int32, device=self.dev)
                             if self.qkv_tail == "fused" else None)   # allocated here: never inside a capture
@@ -2523,6 +2575,7 @@ class R2Glue:
         except Exception:  # pragma: no cover - module without the M2-L10-FIX kernel / a bad $DSV41_QKV_TAIL_FORM
             pass
         return {"mode": getattr(self, "qkv_tail", None), "env": QKV_TAIL_ENV, "form": form, "compiled": comp,
+                "source": getattr(self, "qkv_tail_source", None), "rows": int(getattr(self.o, "rows", 1) or 1),
                 "why": getattr(self, "qkv_tail_why", None),
                 "calls": dict(getattr(self, "qkv_calls", {})), "kernel_calls": gm,
                 "launches_per_layer": {"split": 3, "fused": 1}}

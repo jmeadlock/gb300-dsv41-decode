@@ -134,9 +134,13 @@ def test_constants_and_switch(monkeypatch):
         GM.qkv_tail_form()
     monkeypatch.delenv(GM.L10_FORM_ENV)
     monkeypatch.delenv(R2.QKV_TAIL_ENV, raising=False)
-    assert R2.qkv_tail_mode() == "split" == R2.QKV_TAIL_DEFAULT
+    # SMALL-WINS: the default is the row-conditional `auto` (fused at 1 row, split otherwise); test_small_wins_cpu.py
+    assert R2.QKV_TAIL_DEFAULT == "auto" and R2.QKV_TAILS == ("split", "fused")
+    assert R2.qkv_tail_mode(1) == "fused" and R2.qkv_tail_mode(6) == "split" and R2.qkv_tail_mode() == "split"
     monkeypatch.setenv(R2.QKV_TAIL_ENV, "fused")
-    assert R2.qkv_tail_mode() == "fused"
+    assert R2.qkv_tail_mode() == "fused" == R2.qkv_tail_mode(6)
+    monkeypatch.setenv(R2.QKV_TAIL_ENV, "split")
+    assert R2.qkv_tail_mode() == "split" == R2.qkv_tail_mode(1)
     monkeypatch.setenv(R2.QKV_TAIL_ENV, "both")
     with pytest.raises(ValueError):
         R2.qkv_tail_mode()

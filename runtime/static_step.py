@@ -462,6 +462,7 @@ class MixesFork:
         if pr not in MIXES_PRIORITIES:
             raise ValueError(f"{MIXES_PRIORITY_ENV}={pr!r} not in {tuple(MIXES_PRIORITIES)}")
         self.impl = impl
+        self.source = "explicit"   # SMALL-WINS: "auto" when StaticStep resolved $DSV41_MIXES=auto by its rows
         self.on = impl != "off"
         self.dev = torch.device(dev)
         self.cuda = self.dev.type == "cuda"
@@ -548,7 +549,7 @@ class MixesFork:
 
     def describe(self) -> dict:
         return {"impl": self.impl, "stream": ("side" if self.cuda else "inline (CPU)") if self.on else "main",
-                "priority": self.priority, "forks": self.forks, "joins": self.joins}
+                "source": self.source, "priority": self.priority, "forks": self.forks, "joins": self.joins}
 
 
 class StaticStep:
@@ -684,10 +685,12 @@ class StaticStep:
         self.n_counted = 0
         self._c: Optional[_StepScalars] = None
         self.glue_note: Optional[str] = None
-        from runtime.fused_glue_r2 import mixes_impl
+        from runtime.fused_glue_r2 import mixes_choice
 
-        self.mix_fork = MixesFork(self.dev, mixes_impl())  # M2-L1 ($DSV41_MIXES, read once here; before the glue's
-        #                                                    self-check, whose oracle follows the impl)
+        _mix, _mix_src = mixes_choice(self.rows)  # SMALL-WINS: auto = fork at 1 row, off at R > 1; env value wins
+        self.mix_fork = MixesFork(self.dev, _mix)  # M2-L1 ($DSV41_MIXES, read once here; before the glue's
+        #                                            self-check, whose oracle follows the impl)
+        self.mix_fork.source = _mix_src
         if self.glue_impl == "fused":  # #17: tables + build-time self-check (eager; syncs; before any capture)
             from runtime.fused_glue import FusedGlue
 

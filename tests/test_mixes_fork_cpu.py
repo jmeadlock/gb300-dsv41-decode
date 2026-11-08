@@ -51,10 +51,12 @@ def _bits_equal(a, b):
 
 # ------------------------------------------------------------------------------------------------ the switch
 def test_mixes_switch_and_mix_fixed(monkeypatch):
-    assert R2.mixes_impl() == "off" and R2.MIXES_DEFAULT == "off"
-    for v in R2.MIXES_IMPLS:
+    # SMALL-WINS: the default is the row-conditional `auto` (fork at 1 row, off otherwise); see test_small_wins_cpu.py
+    assert R2.MIXES_DEFAULT == "auto" and R2.MIXES_IMPLS == ("off", "fork", "fused")
+    assert R2.mixes_impl(1) == "fork" and R2.mixes_impl(6) == "off" and R2.mixes_impl() == "off"
+    for v in R2.MIXES_IMPLS:                   # an explicit value wins at every row count
         monkeypatch.setenv(R2.MIXES_ENV, v)
-        assert R2.mixes_impl() == v
+        assert R2.mixes_impl() == v == R2.mixes_impl(1) == R2.mixes_impl(6)
     monkeypatch.setenv(R2.MIXES_ENV, "sideways")
     with pytest.raises(ValueError, match="DSV41_MIXES"):
         R2.mixes_impl()

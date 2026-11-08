@@ -1191,6 +1191,23 @@ def set_impl(impl: Optional[str]) -> None:
     _IMPL[0] = impl
 
 
+FP8_IMPL_ARGS = ("ref", "gemv", "gemv3")   # bench/first_light.py / bench/headline.py `--fp8-impl` (SMALL-WINS)
+
+
+def apply_fp8_impl_arg(name: str) -> str:
+    """The benches' `--fp8-impl gemv3`: the steps / Generator only know ref | gemv, so `gemv3` is `gemv` plus the kernel
+    path pinned to gemv3 ($DSV41_GEMV_IMPL, read at every call; set it BEFORE any build / warm-up / capture, a captured
+    graph keeps the path it was captured with). Returns the value to hand to Generator / StaticStep (ref | gemv).
+    `gemv` leaves the kernel path alone (an explicit $DSV41_GEMV_IMPL still applies); default stays gemv."""
+    if name not in FP8_IMPL_ARGS:
+        raise ValueError(f"--fp8-impl {name!r} not in {FP8_IMPL_ARGS}")
+    if name == "gemv3":
+        os.environ["DSV41_GEMV_IMPL"] = "gemv3"
+        _IMPL[0] = None
+        return "gemv"
+    return name
+
+
 @dataclass(frozen=True)
 class Gemv3Config:
     block_n: int        # weight rows per program (>= 16: tl.dot's N; a power of two)
