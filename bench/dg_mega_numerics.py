@@ -43,7 +43,8 @@ Subcommands (receipts under scratch/ by default):
               unpatched kernel is reused; the l2-acts match says whether the patch took).
   report      receipts -> the tables of docs/M2-L3-NUMERICS.md (markdown on stdout).
 
-Box order: downstream (writes the activations) -> layers -> patch-dg -> layers --dg-path -> report. deep_gemm is
+Box order: downstream (writes the activations) -> layers -> patch-dg -> layers --dg-path -> downstream --dg-path
+(mega_bf16q arms; the base arm is rerun for the flips-vs-ours columns, activations are not re-captured) -> report. deep_gemm is
 imported from vllm/third_party with vllm never imported (runtime.dg_moe.import_deep_gemm).
 """
 from __future__ import annotations
@@ -501,6 +502,30 @@ def import_dg(dg_path: Optional[str], jit_cache: Optional[str]) -> Tuple[object,
     if info["method"] == "copy" and not str(info["file"]).startswith(root):
         raise SystemExit(f"deep_gemm imported from {info['file']}, not the copy {root}")
     return dg, info
+
+
+MEGA_ARM, MEGA_BF16Q_ARM = "mega", "mega_bf16q"
+
+
+def mega_arm_name(dg_path: Optional[str]) -> str:
+    """The receipt's name for the substituted arms: 'mega' (stock kernel) or 'mega_bf16q' (the patched copy)."""
+    return MEGA_BF16Q_ARM if dg_path else MEGA_ARM
+
+
+def activate_dg(a) -> Optional[dict]:
+    """--dg-path / --jit-cache of `downstream`: exactly layers' mechanism (import_dg: DG_JIT_CACHE_DIR, then the
+    patched package imported from the copy). Must run before anything imports deep_gemm in this process (the
+    first_light / runtime imports, build_and_load, the Generator): import_deep_gemm returns an already-imported
+    deep_gemm as is, which would silently run the stock kernel under the 'mega_bf16q' name. Returns the receipt's
+    deep_gemm record, or None when neither option is given (stock, nothing touched)."""
+    if not (a.dg_path or a.jit_cache):
+        return None
+    if "deep_gemm" in sys.modules and a.dg_path:
+        raise SystemExit("--dg-path: deep_gemm is already imported in this process; the patched copy would not be used")
+    _, info = import_dg(a.dg_path, a.jit_cache)
+    if a.dg_path and not info.get("patched_source"):
+        raise SystemExit(f"--dg-path {a.dg_path}: the copy's {CUH} lacks the patch ({PATCH_TAG}); run patch-dg")
+    return info
 
 
 # ------------------------------------------------------------------------------------------------ model (synthetic)
@@ -1103,6 +1128,7 @@ def split_group(g: List[int]) -> List[List[int]]:
 
 
 def cmd_downstream(a) -> int:  # pragma: no cover - box only
+    dginfo = activate_dg(a)                       # before ANY import that could pull deep_gemm in
     from first_light import load_fixture, run_parity, run_rep
     from runtime import dg_mega as DM
     from runtime.fused_glue_r2 import FP32_IMPL_ENV
@@ -1118,7 +1144,9 @@ def cmd_downstream(a) -> int:  # pragma: no cover - box only
     out = {"date": time.strftime("%Y-%m-%d %H:%M:%S %Z"), "argv": sys.argv[1:], "errors": [], "arms": [],
            "config": {k_: getattr(a, k_) for k_ in ("model_dir", "map", "mode", "moe_impl", "fp8_impl", "glue_impl",
                                                     "attn_impl", "fp32_impl", "moe_rowmatch", "max_pos", "max_new",
-                                                    "shared", "groups")}}
+                                                    "shared", "groups", "dg_path", "jit_cache")}}
+    out["mega_arm"] = mega_arm_name(a.dg_path)
+    out["deep_gemm"] = dginfo
     path = a.out or stem + ".json"
 
     def save():
@@ -1177,7 +1205,7 @@ def cmd_downstream(a) -> int:  # pragma: no cover - box only
                     st.release_graphs()
                     gen.capture()
             cap = Capture(model, [int(v) for v in a.capture_layers.split(",")], a.capture_steps) \
-                if (sub_layers is None and a.mode == "static" and a.acts) else None
+                if (sub_layers is None and a.mode == "static" and a.acts and not a.dg_path) else None
             tf = tf_pass(gen, rows, targets, a.max_new, cap=cap)
             if cap is not None:
                 cap.close()
@@ -1214,7 +1242,8 @@ def cmd_downstream(a) -> int:  # pragma: no cover - box only
     queue = parse_groups(a.groups, layers)
     while queue:
         g = queue.pop(0)
-        rec = arm("mega-L" + "-".join(str(l) for l in g), g)
+        rec = arm(out["mega_arm"] + "-L" + "-".join(str(l) for l in g), g)
+        rec["arm"] = out["mega_arm"]
         out["arms"].append(rec)
         if rec.get("fit") is False and a.groups == "auto":
             queue = split_group(g) + queue
@@ -1228,7 +1257,7 @@ def cmd_downstream(a) -> int:  # pragma: no cover - box only
             if rec is not base and base.get("free_run") and rec.get("free_run"):
                 rec["free_vs_base"] = stream_vs_base(rec["free_run"]["path"], base["free_run"]["path"])
         rec.pop("tf", None) if not a.keep_tf else None
-    out["summary"] = [{"label": r["label"], "layers": r["layers"], "fit": r.get("fit"),
+    out["summary"] = [{"label": r["label"], "arm": r.get("arm", "base"), "layers": r["layers"], "fit": r.get("fit"),
                        "tf": (r.get("tf_metrics") or {}).get("total"),
                        "free_parity": (r.get("free_run") or {}).get("parity_verdict_line"),
                        "free_vs_base_identical": (r.get("free_vs_base") or {}).get("identical")}
@@ -1249,7 +1278,8 @@ def _f(v, d=4):
     return str(v)
 
 
-def report_lines(layers: List[dict], patched: List[dict], ds: Optional[dict], model: Optional[dict]) -> List[str]:
+def report_lines(layers: List[dict], patched: List[dict], ds: Optional[dict], model: Optional[dict],
+                 ds_patched: Optional[dict] = None) -> List[str]:
     L: List[str] = []
     rows = {}
     for rc in layers:
@@ -1286,14 +1316,20 @@ def report_lines(layers: List[dict], patched: List[dict], ds: Optional[dict], mo
         spp = (rows[l].get("patched") or {}).get("speed") or {}
         g = lambda d, R: (d.get(f"mega_R{R}_hot_us") or {}).get("us")  # noqa: E731
         L.append(f"| {l} | {_f(g(su, 1))} | {_f(g(su, 6))} | {_f(g(spp, 1))} | {_f(g(spp, 6))} |")
-    if ds:
+    if ds or ds_patched:
         L.append("")
         L.append("| arm | layers | fit | TF positions | flips vs Pg61 (weighted) | flips vs ours (weighted) | "
                  "max abs dlogprob vs ours | free-run parity | free-run == ours |")
         L.append("|---|---|---|---|---|---|---|---|---|")
-        for s in ds.get("summary") or []:
+        # stock then patched; the patched receipt's base arm duplicates the stock one, so it is shown once
+        summ = [(s, False) for s in (ds or {}).get("summary") or []]
+        summ += [(s, True) for s in (ds_patched or {}).get("summary") or []
+                 if not (ds and s.get("arm", "base") == "base")]
+        for s, pat in summ:
             t = s.get("tf") or {}
-            L.append(f"| {s['label']} | {s['layers']} | {s.get('fit')} | {_f(t.get('positions'))} | "
+            name = s["label"] if s.get("arm", "base") == "base" else \
+                s.get("arm") or (MEGA_BF16Q_ARM if pat else MEGA_ARM)
+            L.append(f"| {name}{'' if name == s['label'] else ' (' + s['label'] + ')'} | {s['layers']} | {s.get('fit')} | {_f(t.get('positions'))} | "
                      f"{_f(t.get('flips_pg61'))} ({_f(t.get('flips_w_pg61'))}) | {_f(t.get('flips_base'))} "
                      f"({_f(t.get('flips_w_base'))}) | {_f(t.get('max_abs_dlp_base'))} | {_f(s.get('free_parity'))} |"
                      f" {_f(s.get('free_vs_base_identical'))} |")
@@ -1307,8 +1343,9 @@ def cmd_report(a) -> int:
     ld = lambda ps: [json.load(open(p)) for p in (ps or []) if p and os.path.exists(p)]  # noqa: E731
     layers, patched = ld(a.layers), ld(a.patched)
     ds = (ld([a.downstream]) or [None])[0]
+    ds_patched = (ld([a.downstream_patched]) or [None])[0]
     model = (ld([a.model]) or [None])[0]
-    for line in report_lines(layers, patched, ds, model):
+    for line in report_lines(layers, patched, ds, model, ds_patched):
         print(line)
     return 0
 
@@ -1353,6 +1390,9 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--capture-only", action="store_true")
     d.add_argument("--free-run", action=argparse.BooleanOptionalAction, default=True)
     d.add_argument("--keep-tf", action="store_true", help="keep per-position TF records in the receipt")
+    d.add_argument("--dg-path", default=None,
+                   help="patch-dg's --out (the PATCHED kernel; arms are named mega_bf16q); needs --jit-cache")
+    d.add_argument("--jit-cache", default=None, help="fresh JIT cache dir for the patched kernel")
     d.add_argument("--stem", default=None)
     d.add_argument("--out", default=None)
     y = sp.add_parser("layers", help="box: per-layer stage decomposition on fixture activations + speed")
@@ -1374,6 +1414,8 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--layers", nargs="*", default=[])
     r.add_argument("--patched", nargs="*", default=[])
     r.add_argument("--downstream", default=None)
+    r.add_argument("--downstream-patched", default=None,
+                   help="downstream receipt of a run with --dg-path (mega_bf16q arms), shown beside --downstream")
     r.add_argument("--model", default=None)
     return ap
 

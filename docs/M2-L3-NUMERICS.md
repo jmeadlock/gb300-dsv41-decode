@@ -184,6 +184,7 @@ The only real-checkpoint numbers so far are the spike's, on layer 0 with **synth
 |---|---|---|---|---|---|---|---|---|
 | base (production 1-row) | none | — (free after build: not measured) | not measured | not measured | — | — | not measured | — |
 | mega | 0, 10, 20, 39 | not measured | not measured | not measured | not measured | not measured | not measured | not measured |
+| mega_bf16q (`downstream --dg-path`, patched kernel) | 0, 10, 20, 39 | not measured | not measured | not measured | not measured | not measured | not measured | not measured |
 
 ## 6. µs per layer, hot, graph-replayed (the launch alone)
 
@@ -200,13 +201,16 @@ Use the `dk` wrapper of `bench/box/m2-round1.sh` (`/ref`, `/work/scratch`, the D
 
 ```
 dk $W m3n1t -- tests/gpu/test_dg_mega_gpu.py                                  # gates incl. test_m3n1_substitution_*
+# ORDER: downstream FIRST (it writes scratch/m3n1-acts.pt, which layers reads), then layers, patch-dg, the patched runs.
 dk $W m3n1d -- bench/dg_mega_numerics.py downstream --out scratch/m3n1-ds.json   # writes scratch/m3n1-acts.pt
-dk $W m3n1l -- bench/dg_mega_numerics.py layers --out scratch/m3n1-layers.json
+dk $W m3n1l -- bench/dg_mega_numerics.py layers --out scratch/m3n1-layers.json   # needs the acts from downstream
 dk $W m3n1p -- bench/dg_mega_numerics.py patch-dg --out scratch/dg-bf16q
 dk $W m3n1q -- bench/dg_mega_numerics.py layers --dg-path scratch/dg-bf16q --jit-cache scratch/dg-bf16q-jit \
     --out scratch/m3n1-layers-bf16q.json
+dk $W m3n1s -- bench/dg_mega_numerics.py downstream --dg-path scratch/dg-bf16q --jit-cache scratch/dg-bf16q-jit \
+    --out scratch/m3n1-ds-bf16q.json                  # mega_bf16q arms; needs patch-dg first; does not rewrite the acts
 python3 bench/dg_mega_numerics.py report --layers scratch/m3n1-layers.json --patched scratch/m3n1-layers-bf16q.json \
-    --downstream scratch/m3n1-ds.json --model scratch/m3n1-model-20261107.json
+    --downstream scratch/m3n1-ds.json --downstream-patched scratch/m3n1-ds-bf16q.json --model scratch/m3n1-model-20261107.json
 ```
 
 Expected wall time [E]:

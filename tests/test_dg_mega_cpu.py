@@ -517,3 +517,87 @@ def test_hbm_plan_real_model_l1_copy_does_not_fit():
     p = DM.hbm_bytes(40, [295 + 16] * 40, 5120, 2304, "copy")
     assert p["l1_copy_GiB"] > 100 and 10 < p["sf_copy_GiB"] < 14
     assert DM.hbm_bytes(40, [311] * 40, 5120, 2304, "inplace")["l1_copy_B"] == 0
+
+
+# ------------------------------------------------------------------------------------------------ M3-N1b: downstream --dg-path
+def _numerics():
+    import importlib
+    bench = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bench")
+    if bench not in sys.path:
+        sys.path.insert(0, bench)
+    return importlib.import_module("dg_mega_numerics")
+
+
+def test_downstream_dg_path_args_and_arm_names():
+    N = _numerics()
+    ap = N.build_parser()
+    d0 = ap.parse_args(["downstream"])
+    assert d0.dg_path is None and d0.jit_cache is None and N.mega_arm_name(d0.dg_path) == "mega"
+    d1 = ap.parse_args(["downstream", "--dg-path", "scratch/dg-bf16q", "--jit-cache", "scratch/jit"])
+    assert (d1.dg_path, d1.jit_cache) == ("scratch/dg-bf16q", "scratch/jit")
+    assert N.mega_arm_name(d1.dg_path) == "mega_bf16q"
+    y = ap.parse_args(["layers", "--dg-path", "a", "--jit-cache", "b"])           # same options as layers
+    assert (y.dg_path, y.jit_cache) == ("a", "b")
+    r = ap.parse_args(["report", "--downstream", "s.json", "--downstream-patched", "p.json"])
+    assert (r.downstream, r.downstream_patched) == ("s.json", "p.json")
+    # stock run touches nothing
+    assert N.activate_dg(d0) is None
+
+
+def test_activate_dg_uses_layers_mechanism_before_any_import(tmp_path, monkeypatch):
+    N = _numerics()
+    for m in [m for m in sys.modules if m == "deep_gemm" or m.startswith("deep_gemm.")]:
+        monkeypatch.delitem(sys.modules, m)
+    monkeypatch.delenv("DG_JIT_CACHE_DIR", raising=False)
+    root = tmp_path / "dg"
+    (root / "deep_gemm" / os.path.dirname(N.CUH)).mkdir(parents=True)
+    (root / "deep_gemm" / "__init__.py").write_text("__version__ = 'fake-patched'\n")
+    cuh = root / "deep_gemm" / N.CUH
+    cuh.write_text("// unpatched\n")
+    a = N.build_parser().parse_args(["downstream", "--dg-path", str(root), "--jit-cache", str(tmp_path / "jit")])
+    with pytest.raises(SystemExit, match="lacks the patch"):                       # a copy without the patch is refused
+        N.activate_dg(a)
+    monkeypatch.delitem(sys.modules, "deep_gemm")
+    cuh.write_text(f"// {N.PATCH_TAG}\n")
+    info = N.activate_dg(a)
+    try:
+        assert info["method"] == "copy" and info["patched_source"] is True
+        assert sys.modules["deep_gemm"].__version__ == "fake-patched"
+        assert os.environ["DG_JIT_CACHE_DIR"] == str(tmp_path / "jit") and (tmp_path / "jit").is_dir()
+        with pytest.raises(SystemExit, match="already imported"):                  # too late: refuses, never silent
+            N.activate_dg(a)
+    finally:
+        sys.modules.pop("deep_gemm", None)
+    no_jit = N.build_parser().parse_args(["downstream", "--dg-path", str(root)])
+    with pytest.raises(SystemExit, match="--jit-cache"):
+        N.activate_dg(no_jit)
+
+
+def test_downstream_activates_dg_before_other_imports():
+    """cmd_downstream's first statement is activate_dg(a): nothing imports deep_gemm ahead of it."""
+    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bench",
+                            "dg_mega_numerics.py")).read()
+    fn = next(n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef) and n.name == "cmd_downstream")
+    first = fn.body[0] if not (isinstance(fn.body[0], ast.Expr) and isinstance(fn.body[0].value, ast.Constant)) \
+        else fn.body[1]
+    assert isinstance(first, ast.Assign) and isinstance(first.value, ast.Call) \
+        and first.value.func.id == "activate_dg"
+
+
+def test_report_shows_stock_and_patched_downstream_arms():
+    N = _numerics()
+    tf = {"positions": 1476, "flips_pg61": 3, "flips_w_pg61": 0.5, "flips_base": 2, "flips_w_base": 0.25,
+          "max_abs_dlp_base": 0.1}
+    base = {"label": "base", "arm": "base", "layers": None, "fit": None, "tf": None}
+    stock = {"summary": [base, {"label": "mega-L0-10", "arm": "mega", "layers": [0, 10], "fit": True, "tf": tf}]}
+    patched = {"summary": [base, {"label": "mega_bf16q-L0-10", "arm": "mega_bf16q", "layers": [0, 10], "fit": True,
+                                  "tf": dict(tf, flips_w_pg61=0.125)}]}
+    text = "\n".join(N.report_lines([], [], stock, None, patched))
+    assert text.count("| base ") == 1
+    i, j = text.index("| mega (mega-L0-10)"), text.index("| mega_bf16q (mega_bf16q-L0-10)")
+    assert i < j and "3 (0.5)" in text and "3 (0.125)" in text
+    # patched only (stock receipt missing) still lists its base arm and the bf16q arm
+    only = "\n".join(N.report_lines([], [], None, None, patched))
+    assert "| base " in only and "mega_bf16q" in only
+    # no downstream receipt at all: unchanged behaviour
+    assert "flips vs Pg61" not in "\n".join(N.report_lines([], [], None, None))
