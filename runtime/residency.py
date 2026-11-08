@@ -166,15 +166,20 @@ def residency_stage(cfg: Optional["ResidencyConfig"], moe_impl: str, rows: int, 
     return min(int(RES_STAGE_ROWS_DEFAULT if s is None else s), int(topk) * int(rows))
 
 
-def sf_store_for(moe_impl: str, rows: int) -> Optional[str]:
+def sf_store_for(moe_impl: str, rows: int, pool=None) -> Optional[str]:
     """Where the dg-inplace step keeps the packed scale factors of the HBM-resident experts (runtime/dg_inplace.py):
     "step" (the staging launch re-packs them every step from the pointer tables), or "pool" / "resident" (packed
     once; the manager must write a promoted expert's packed SF itself). None: not dg-inplace. This is the REQUESTED
-    store (env / defaults, as StaticStep reads them); `attach` re-reads the one the build ended up with."""
+    store (env / defaults, as StaticStep reads them); `attach` re-reads the one the build ended up with.
+    M3-S3: under the pool SF layout "beside" (`pool.sf_layout`, else $DSV41_POOL_SF) every build uses "pool"."""
     if moe_impl != "dg-inplace":
         return None
 
     from runtime import dg_inplace as DI
+    from runtime.expert_pool import pool_sf_layout
+
+    if (getattr(pool, "sf_layout", None) or pool_sf_layout()) == "beside":
+        return "pool"
 
     if int(rows) > 1:
         return os.environ.get(DI.ROWS_SF_STORE_ENV) or DI.ROWS_SF_STORE_DEFAULT
@@ -282,6 +287,7 @@ class ResidencyManager:
         if getattr(pool, "residency", None) is not None:
             raise RuntimeError("this ExpertPool already has a ResidencyManager (close() it first)")
         c = self.cfg
+        self.beside = bool(getattr(pool, "sf_beside", False))   # M3-S3: e8m0 scales on Grace, packed SF in the pool
         weight_bytes = sum(n * (k // 2) for n, k in pool.proj_nk.values())
         free = c.hbm_free_bytes
         if free is None and self.cuda:
@@ -298,9 +304,9 @@ class ResidencyManager:
         else:
             want_total = max(self.existing, int(c.spare_cap))
         want_new = max(0, want_total - self.existing)
-        sf_group = s_row if (sf_store in ("pool", "resident") and want_new) else 0
+        sf_group = s_row if ((self.beside or sf_store in ("pool", "resident")) and want_new) else 0
         step_extra = 0
-        if sf_group:
+        if sf_group and not self.beside:   # beside: the packed SF grows with the pool, no rebuilt copy, no headroom
             from runtime import dg_inplace as DI
 
             # growing the pool re-keys the step's packed-SF copy (runtime/dg_inplace.py pool_sf_key): it is rebuilt,
@@ -308,7 +314,8 @@ class ResidencyManager:
             groups = sum(self.H) + self.L * max(self.n_stage, int(pool.spare))
             head = float(os.environ.get(DI.SF_POOL_HEADROOM_ENV, DI.SF_POOL_HEADROOM_GIB)) * GiB
             step_extra = int(groups * s_row + head)
-        self.budget = spare_budget(free, self.L, pool.expert_bytes, weight_bytes,
+        slot_hbm = weight_bytes if self.beside else pool.expert_bytes   # beside: the slot's e8m0 is on the host
+        self.budget = spare_budget(free, self.L, slot_hbm, weight_bytes,
                                    n_stage_new=max(0, self.n_stage - int(pool.spare)), reserve_gib=c.reserve_gib,
                                    kv_rows=c.kv_rows, kv_ctx=c.kv_ctx, step_extra_bytes=step_extra,
                                    sf_group_bytes=sf_group)
@@ -329,14 +336,19 @@ class ResidencyManager:
         self.spare_added_B = pool.add_spare_slots(self.n_stage + self.n_spare, model)
         self.base = [self.H[l] + self.n_stage for l in range(self.L)]  # first residency slot per layer
         self.pool_gen = pool.generation
-        # scales of the spare slots
+        # scales of the spare slots (M3-S3 beside: in a registered host buffer, like the boot slots' e8m0)
         self.sspare: Dict[int, Dict[str, torch.Tensor]] = {}
-        with torch.inference_mode(False), torch.no_grad():
-            for l in range(self.L):
-                self.sspare[l] = {}
-                for p in PROJS:
-                    s = pool.hbm[l][p][1]
-                    self.sspare[l][p] = torch.zeros(self.n_spare, *s.shape[1:], dtype=s.dtype, device=self.dev)
+        self.sspare_host: Dict[int, Dict[str, torch.Tensor]] = {}
+        self.sspare_buf: Optional[HostBuffer] = None
+        if self.beside:
+            self._sspare_on_host()
+        else:
+            with torch.inference_mode(False), torch.no_grad():
+                for l in range(self.L):
+                    self.sspare[l] = {}
+                    for p in PROJS:
+                        s = pool.hbm[l][p][1]
+                        self.sspare[l][p] = torch.zeros(self.n_spare, *s.shape[1:], dtype=s.dtype, device=self.dev)
         # demotion pool (Grace)
         self.D = int(min(c.n_demote, max(self.H) if self.H else 0))
         self._demo_layout()
@@ -391,6 +403,31 @@ class ResidencyManager:
         self.log(self.describe_line())
 
     # ---------------------------------------------------------------- layout helpers
+    def _sspare_on_host(self) -> None:
+        """M3-S3 beside: the residency slots' K-major e8m0 scales in one HostBuffer (per layer, projection one
+        [n_spare, N, K/32] block, 256-B aligned), zeroed, cudaHostRegister'd in one chunk on CUDA; sspare = the UVA
+        views (CPU views off CUDA), sspare_host = the CPU views (digests read those: .cpu() of an alias fails)."""
+        nk = self.pool.proj_nk
+        offs, off = {}, 0
+        for l in range(self.L):
+            for p in PROJS:
+                n, k = nk[p]
+                offs[(l, p)] = off
+                off = _align(off + self.n_spare * n * (k // 32))
+        self.sspare_buf = HostBuffer(_align(off, mmap.PAGESIZE), "residency_scales")   # anonymous mmap: zeroed
+        if self.cuda:
+            self.sspare_buf.register(chunk=_align(self.sspare_buf.nbytes, mmap.PAGESIZE))
+        with torch.inference_mode(False):
+            for l in range(self.L):
+                self.sspare[l], self.sspare_host[l] = {}, {}
+                for p in PROJS:
+                    n, k = nk[p]
+                    shape = (self.n_spare, n, k // 32)
+                    h = self.sspare_buf.host_view(torch.float8_e8m0fnu, shape, offs[(l, p)])
+                    self.sspare_host[l][p] = h
+                    self.sspare[l][p] = (self.sspare_buf.cuda_view(torch.float8_e8m0fnu, shape, offs[(l, p)], self.dev)
+                                         if self.cuda else h)
+
     def _demo_layout(self) -> None:
         nk = self.pool.proj_nk
         self.demo_off: Dict[Tuple[str, str], Tuple[int, torch.dtype, Tuple[int, int]]] = {}
@@ -416,16 +453,18 @@ class ResidencyManager:
         return int(getattr(self.st, "rows", 1)) if self.st is not None else 1
 
     # ---------------------------------------------------------------- views (homes)
-    def slot_view(self, l: int, s: int, p: str, kind: str) -> torch.Tensor:
+    def slot_view(self, l: int, s: int, p: str, kind: str, host: bool = False) -> torch.Tensor:
+        """host (M3-S3 beside, scales only): the CPU view of the same bytes (they live in a host buffer)."""
         pool = self.pool
         if kind == "weight":
             return pool.hbm_full[l][p][s]
+        host = host and self.beside
         if s < self.H[l]:
-            return pool.hbm[l][p][1][s]
+            return pool.hot_scale_host(l, s, p) if host else pool.hbm[l][p][1][s]
         i = s - self.base[l]
         if not 0 <= i < self.n_spare:
             raise IndexError(f"L{l} slot {s} is not a boot or residency slot")
-        return self.sspare[l][p][i]
+        return (self.sspare_host if host else self.sspare)[l][p][i]
 
     def demo_view(self, l: int, d: int, p: str, kind: str, cuda: Optional[bool] = None) -> torch.Tensor:
         cuda = self.cuda if cuda is None else cuda
@@ -975,6 +1014,10 @@ class ResidencyManager:
         if self.demo is not None:
             self.demo.release()
             self.demo = None
+        if self.sspare_buf is not None:   # M3-S3 beside: the residency slots' host scales (params rebound above)
+            self.sspare, self.sspare_host = {}, {}
+            self.sspare_buf.release()
+            self.sspare_buf = None
         if getattr(self.pool, "residency", None) is self:
             self.pool.residency = None
 
@@ -986,7 +1029,7 @@ class ResidencyManager:
         s = self.slot_of[l].get(e) if where == "home" else None
         for p, kind in ORDER6:
             if s is not None:
-                t = self.slot_view(l, s, p, kind).detach()
+                t = self.slot_view(l, s, p, kind, host=True).detach()   # beside scales: the host view, no .cpu()
                 t = t.cpu() if t.device.type != "cpu" else t
             else:
                 t = self.grace_view(l, e, p, kind, cuda=False)
@@ -1051,10 +1094,15 @@ class ResidencyManager:
         w_row = sum(n * (k // 2) for n, k in self.pool.proj_nk.values())
         s_row = sum(n * (k // 32) for n, k in self.pool.proj_nk.values())
         spare_w = self.L * self.n_spare * w_row
-        spare_s = self.L * self.n_spare * s_row
-        return {"spare_weight_B": spare_w, "spare_scale_B": spare_s, "pool_grown_B": self.spare_added_B,
-                "spare_GiB": round((spare_w + spare_s) / GiB, 3),
-                "demotion_pool_GiB": round((self.demo.nbytes if self.demo else 0) / GiB, 3)}
+        spare_s = self.L * self.n_spare * s_row   # separate: e8m0 in HBM; beside: the slot's packed SF group in HBM
+        out = {"spare_weight_B": spare_w, "spare_scale_B": spare_s, "pool_grown_B": self.spare_added_B,
+               "spare_GiB": round((spare_w + spare_s) / GiB, 3),
+               "demotion_pool_GiB": round((self.demo.nbytes if self.demo else 0) / GiB, 3)}
+        if self.beside:
+            hb = self.sspare_buf.nbytes if self.sspare_buf else 0
+            out.update({"sf_layout": "beside", "spare_scale_is": "packed SF group (pool.sfp)",
+                        "spare_e8m0_host_B": hb, "spare_e8m0_host_GiB": round(hb / GiB, 3)})
+        return out
 
     def swaps_per_step(self) -> dict:
         n = self.host_steps
