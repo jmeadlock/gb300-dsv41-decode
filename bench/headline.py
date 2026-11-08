@@ -36,6 +36,11 @@ and, with `--residency-ref <the off run's JSON>`, per prompt emitted-token / acc
 residency on the two_graphs cell is measured first and the one_graph cell last, at a different swap-policy state (cold
 share), so the report carries the gap, its split (verify vs draft graph, mean/median/p90), each cell's cold share, and
 a weighted fit of step ms vs cold share (modeled, labeled) -- one printed `mode gap:` line. Defaults are unchanged.
+LOOSE-ENDS-2: `ms/token` is TOTAL GPU ms / TOTAL emitted tokens over the window (pooled over prompts, not a mean of
+ratios); the window stores `total_gpu_ms` and `total_emitted_tokens` and the summary prints "ms/token = total GPU ms /
+total emitted tokens = X ms / N tokens = Y". The report carries a `receipt` block (bench/receipt.py: git commit +
+dirty-tree sha256, DSV41_* switches, impls, checkpoint config hash, fixture hash, torch/triton/cuda, driver, GPU uuid,
+SM/mem clocks at start and end, residency condition, start/end wall time).
 The C1 instrument proper (nsys cudaProfilerApi range) is M1-T13; --profile TAG:FIRST:N opens that range around N steps
 of one prompt's first fast run, for `nsys profile --capture-range=cudaProfilerApi`.
 
@@ -70,9 +75,14 @@ for p in (REPO, HERE):
     if p not in sys.path:
         sys.path.insert(0, p)
 
+import receipt as _receipt  # noqa: E402  (bench/receipt.py: LOOSE-ENDS-2 receipt stamping)
+
 METRIC = "ms per 6-row step, DSpark k=5"           # PROJECT.md "The number" (C1, 6 rows, DSpark k=5)
 PG61_MS_PER_STEP = 7.36                              # PROJECT.md baseline (production, 2026-10-29)
 CHARTER_BAR_MS = 5.0                                 # PROJECT.md bar
+MS_PER_TOKEN_DEF = ("total GPU ms / total emitted tokens: sum of the CUDA-event step times (verify graph + draft graph) "
+                    "over the window's live steps, divided by the sum of tokens emitted in those steps "
+                    "(accepted drafts + 1 per step), pooled over all prompts and fast reps")
 
 
 # ------------------------------------------------------------------------------------------------ pure helpers
@@ -117,9 +127,15 @@ def window(runs: Sequence[dict], stats_from: int) -> dict:
            "ms_verify_graph": _stats(ver) if ver else None, "ms_draft_graph": _stats(dra) if dra else None,
            "tokens_per_step": (sum(tok) / len(tok)) if tok else None,
            "ms_per_token": (sum(step) / sum(tok)) if tok else None,
+           # LOOSE-ENDS-2 (Astra): ms/token is TOTAL GPU ms / TOTAL emitted tokens over the window (pooled over prompts),
+           # not a mean of per-prompt ratios; the two totals are stored so the quotient can be re-derived from the receipt.
+           "total_gpu_ms": sum(step) if step else None, "total_manager_ms": sum(mgr) if mgr else None, "total_emitted_tokens": sum(tok) if tok else None,
+           "ms_per_token_definition": MS_PER_TOKEN_DEF,
            "all_steps": len(all_step), "all_ms_per_step": _stats(all_step),
            "all_tokens_per_step": (sum(all_tok) / len(all_tok)) if all_tok else None,
-           "all_ms_per_token": (sum(all_step) / sum(all_tok)) if all_tok else None}
+           "all_ms_per_token": (sum(all_step) / sum(all_tok)) if all_tok else None,
+           "all_total_gpu_ms": sum(all_step) if all_step else None,
+           "all_total_emitted_tokens": sum(all_tok) if all_tok else None}
     return out
 
 
@@ -377,6 +393,10 @@ def summary_lines(rep: dict) -> List[str]:
                      f"tok/step | {f(w.get('ms_per_token'))} ms/token | window steps >= {w.get('stats_from_step')}: "
                      f"{w.get('steps')} (all {w.get('all_steps')} steps: {f((w.get('all_ms_per_step') or {}).get('mean'))}"
                      f" ms/step, {f(w.get('all_tokens_per_step'), 3)} tok/step)")
+        tg, tt = w.get("total_gpu_ms"), w.get("total_emitted_tokens")
+        if tg is not None and tt:
+            lines.append(f"  {key:10s}  ms/token = total GPU ms / total emitted tokens = {f(tg, 1)} ms / {tt} tokens = "
+                         f"{f(tg / tt, 3)}  [measured: CUDA events; window steps >= {w.get('stats_from_step')}, {w.get('steps')} steps]")
     mgl = mode_gap_line(rep.get("mode_gap"))
     if mgl:
         lines.append(mgl)
@@ -601,6 +621,9 @@ def aggregate(rep: dict, prompts: Dict[str, dict], results: Dict[int, Dict[str, 
     head["ms_draft_graph"] = (w2.get("ms_draft_graph") or {}).get("mean") if w2.get("ms_draft_graph") else None
     head["tokens_per_step"] = w2.get("tokens_per_step")
     head["ms_per_token"] = w2.get("ms_per_token")
+    head["total_gpu_ms"] = w2.get("total_gpu_ms")                  # LOOSE-ENDS-2: the two totals behind ms_per_token
+    head["total_emitted_tokens"] = w2.get("total_emitted_tokens")
+    head["ms_per_token_definition"] = MS_PER_TOKEN_DEF
     if head.get("one_graph"):
         head["ms_per_6row_step_one_graph"] = (head["one_graph"].get("ms_per_step") or {}).get("mean")
     pf = [x for v in per.values() for x in v["prefill_ms"]]
@@ -701,6 +724,17 @@ def residency_line(rr: dict) -> str:
             f"{f(vo.get('step_ms_delta_pct'), 2)}%")[:400]
 
 
+def _begin_receipt(a, impls: dict, map_path: Optional[str], argv) -> dict:
+    from runtime.residency import config_from_args
+
+    try:
+        res = config_from_args(a)
+    except Exception:  # noqa: BLE001
+        res = None
+    return _receipt.begin(argv=argv, impls=impls, model_dir=a.model_dir, fixture=a.fixture,
+                          residency=res, map_path=map_path, config_path=a.config)
+
+
 def main(argv=None) -> int:
     a = build_parser().parse_args(argv)
     if not a.no_gemv_pin:
@@ -725,6 +759,7 @@ def main(argv=None) -> int:
                  "pg61_ms_per_step": PG61_MS_PER_STEP, "bar_ms_per_step": CHARTER_BAR_MS}
     t0 = time.time()
     mp = a.map if a.map and os.path.exists(a.map) else None
+    rep["receipt"] = _begin_receipt(a, impls, mp, rep["argv"])      # LOOSE-ENDS-2: what produced this number (never raises)
     model = build_and_load(a.model_dir, mp, "cuda", hot_per_layer=a.hot_per_layer, config_path=a.config,
                            reserve_host_gib=a.reserve_host_gib, load_mtp=True)
     rep["boot"] = model.runtime_load.summary()
@@ -739,6 +774,8 @@ def main(argv=None) -> int:
         n = a.spare_slots or DEFAULT_SPARE_SLOTS_ROWS   # grow ONCE before any build (bench/draft_bench.py note)
         if a.pool_spare is not None:
             n = max(n, a.pool_spare)
+        elif config_from_args(a) is not None:
+            n = max(n, 24)   # residency default-on (11/07): 16 staging + 8 residency, the measured config
         if config_from_args(a) is not None:
             # A2-2 FIX: the staging keeps `stage` of the pool's slots (--residency-stage, else --spare-slots, else 8)
             # and residency promotes into the REST: the default pool (16) already holds 8 -- no new allocation. Only
@@ -827,11 +864,13 @@ def main(argv=None) -> int:
         rep["pg61"] = None
     rep["hbm_end_GiB"] = _hbm(torch)
     os.makedirs(os.path.dirname(os.path.abspath(json_path)), exist_ok=True)
+    _receipt.finish(rep.get("receipt"))
     slim = json.loads(json.dumps(rep, default=str))
     with open(json_path, "w") as f:
         json.dump(slim, f, indent=1)
     for line in summary_lines(rep):
         print(line)
+    print(_receipt.summary_line(rep.get("receipt")))
     if rep.get("residency", {}).get("on"):
         print(residency_line(rep["residency"]))
     loop.close()

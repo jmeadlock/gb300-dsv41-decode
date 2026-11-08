@@ -114,6 +114,9 @@ from runtime.generate import (Generator, dump_record, install_layer_nvtx, record
                               set_determinism)
 
 PARITY = os.path.join(REPO, "bench", "parity.py")
+if os.path.join(REPO, "bench") not in sys.path:
+    sys.path.insert(0, os.path.join(REPO, "bench"))
+import receipt as _receipt  # noqa: E402  (bench/receipt.py: LOOSE-ENDS-2 receipt stamping)
 ATTN_VARIANTS = ("flashmla",)  # attention impls that are not bit-identical (A3-class): drift row, L0 not gated
 
 
@@ -628,6 +631,7 @@ def measure_rows(gen: Generator, a, report: Dict, *, out: str, json_path: str, f
             report["errors"].append({"stage": "v0_census", "traceback": traceback.format_exc()})
 
     os.makedirs(os.path.dirname(os.path.abspath(json_path)), exist_ok=True)
+    _receipt.finish(report.get("receipt"))
     with open(json_path, "w") as f:
         json.dump(report, f, indent=1, default=str)
     for line in summary_rows_lines(report, json_path):
@@ -1235,6 +1239,11 @@ def main(argv=None) -> int:
 
     os.environ[FP32_IMPL_ENV] = a.fp32_impl      # T9b-5: before any StaticStep / glue build
     report["fp32"] = describe_fp32()
+    report["receipt"] = _receipt.begin(      # LOOSE-ENDS-2: what produced this receipt (never raises)
+        argv=report["argv"], model_dir=a.model_dir, fixture=a.fixture, residency=residency_config(a), map_path=a.map,
+        config_path=a.config,
+        impls={"moe": a.moe_impl, "fp8": a.fp8_impl, "glue": a.glue_impl, "attn": a.attn_impl, "fp32": a.fp32_impl,
+               "mode": a.mode, "rows": a.rows, "teacher_forced": a.teacher_forced, "kv_numerics": a.kv_numerics})
     from runtime.loader import build_and_load
 
     t0 = time.time()
@@ -1406,6 +1415,7 @@ def measure(gen: Generator, a, report: Dict, *, n_layers: int, out: str, json_pa
     if getattr(gen, "residency", None) is not None:
         report["residency"] = residency_report(gen, a, report)  # A2-2
         print(residency_line(report["residency"]), flush=True)
+    _receipt.finish(report.get("receipt"))
     with open(json_path, "w") as f:
         json.dump(report, f, indent=1, default=str)
     for line in summary_lines(report, json_path):

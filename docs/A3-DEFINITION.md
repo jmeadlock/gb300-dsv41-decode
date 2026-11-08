@@ -84,8 +84,8 @@ ref margin 0.0000, cand picked `'text'`).
 ## 3. What A3 would say if it were computed as approved (derived, not in any receipt)
 
 - mean |Δlogprob| over the shared prefix, per row (table above): ≤ 0.05 on 7 of 8; story 0.05129 (n = 1).
-- pooled over all 8 prefixes (sum of |Δ| ÷ total prefix positions) — compute with the snippet in the test; the number is
-  not quoted here because it would be a *ninth* statistic nobody has gated on. Choose pooled vs per-prompt-worst before the next run (§5).
+- pooled over all 8 prefixes: Σ|Δ| = 7.0855 over **333** positions (31+114+27+18+118+21+3+1) ⇒ **0.02128** (derived).
+  Per-prompt-worst would be story 0.05129. Choose pooled vs worst-prompt *before* the next run (§5, item 6).
 - top-1 clause: undefined until §5 exists.
 
 ## 4. Denominator and length caveats (as coded)

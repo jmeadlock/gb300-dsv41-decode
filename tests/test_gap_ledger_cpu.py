@@ -344,3 +344,168 @@ def test_box_parsers():
         G.main(["ours-tf", "--model-dir", "/ref", "--json", "x.json", "--profile", "4:8"])   # graph + nsys refused
     a = ap.parse_args(["pg61-drive", "--json", "y.json"])
     assert a.reps == 3 and a.max_new == 256
+
+
+# ------------------------------------------------------------------------------------------------ LOOSE-ENDS-2: census without a 2nd instantiate
+class _FakeGraph:
+    """torch.cuda.CUDAGraph's keep_graph contract (torch >= 2.13), CPU-only. keep_graph=False instantiates at capture
+    end and refuses a user instantiate(); keep_graph=True waits for ONE explicit instantiate() and refuses a second --
+    'instantiate() is intended to be called by the user only when keep_graph=true' is the message of both refusals.
+    `auto` = the variant whose capture_end also instantiates (what the --census-loop crash looked like)."""
+    auto = False
+
+    def __new__(cls, keep_graph=False):
+        self = object.__new__(cls)
+        self.keep, self.ended, self.exec, self.inst_calls = keep_graph, False, False, 0
+        return self
+
+    def capture_end(self):
+        self.ended = True
+        if not self.keep or self.auto:
+            self.exec = True
+
+    def instantiate(self):
+        self.inst_calls += 1
+        if not self.keep or self.exec:
+            raise RuntimeError("instantiate() is intended to be called by the user only when keep_graph=true")
+        self.exec = True
+
+    def raw_cuda_graph(self):
+        return 1
+
+
+class _AutoGraph(_FakeGraph):
+    auto = True
+
+
+def _patched_torch(monkeypatch, cls):
+    torch = pytest.importorskip("torch")
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", cls)
+    return torch
+
+
+def test_keep_graphs_instantiates_once_and_replays_without_a_second(monkeypatch):
+    torch = _patched_torch(monkeypatch, _FakeGraph)
+    undo = G.keep_graphs()
+    try:
+        g = torch.cuda.CUDAGraph()
+        assert g.keep is True                       # kept, so the census can read the cudaGraph_t
+        g.capture_end()
+        assert g.exec and g.inst_calls == 1         # exactly one instantiate, at capture end
+        g.instantiate()                             # a caller's (or the runtime's) own call: a no-op, not a crash
+        assert g.inst_calls == 1
+        assert torch.cuda.CUDAGraph(keep_graph=False).keep is True   # an explicit keep_graph=False is overridden
+    finally:
+        undo()
+    assert torch.cuda.CUDAGraph is _FakeGraph
+
+
+def test_keep_graphs_survives_torch_instantiating_at_capture_end(monkeypatch):
+    """The --census-loop crash: capture_end already instantiated (torch's own, or a graph the runtime built with
+    keep_graph=False) and our extra instantiate() raised 'intended to be called by the user only when keep_graph=true'."""
+    torch = _patched_torch(monkeypatch, _AutoGraph)
+    undo = G.keep_graphs()
+    try:
+        g = torch.cuda.CUDAGraph()
+        g.capture_end()                             # must not raise
+        assert g.exec and "intended to be called by the user" in g._census_note
+        g.instantiate()                             # still a no-op afterwards
+    finally:
+        undo()
+    # without the guard the same sequence raises (the regression this fixes)
+    bare = _AutoGraph(keep_graph=True)
+    bare.capture_end()
+    with pytest.raises(RuntimeError, match="intended to be called by the user"):
+        bare.instantiate()
+
+
+def test_keep_graphs_only_swallows_the_double_instantiate_error(monkeypatch):
+    class _Broken(_FakeGraph):
+        def instantiate(self):
+            raise RuntimeError("CUDA error: out of memory")
+
+    torch = _patched_torch(monkeypatch, _Broken)
+    undo = G.keep_graphs()
+    try:
+        g = torch.cuda.CUDAGraph()
+        with pytest.raises(RuntimeError, match="out of memory"):
+            g.capture_end()
+    finally:
+        undo()
+    assert G._is_double_instantiate(RuntimeError("instantiate() is intended to be called by the user only when keep_graph=true"))
+    assert not G._is_double_instantiate(RuntimeError("CUDA error: out of memory")) and not G._is_double_instantiate(ValueError("x"))
+
+
+@pytest.mark.parametrize("cls", [_FakeGraph, _AutoGraph])
+def test_run_census_loop_reads_graphs_without_instantiating_twice(monkeypatch, cls, capsys):
+    import types
+
+    torch = _patched_torch(monkeypatch, cls)
+    pytest.importorskip("runtime.dspark_loop")
+    import runtime.dspark_loop as DL
+
+    class _Loop:
+        made = []
+
+        def __init__(self, gen, max_new):
+            self.graphs, self.closed = {}, False
+            _Loop.made.append(self)
+
+        def capture(self, n_graphs):
+            self.graphs = {}
+            for name in (("A", "B") if n_graphs == 2 else ("AB", "B")):
+                g = torch.cuda.CUDAGraph()
+                g.capture_end()
+                self.graphs[name] = g
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(DL, "DSparkLoop", _Loop)
+    undo = G.keep_graphs()
+    try:
+        tf = torch.cuda.CUDAGraph()
+        tf.capture_end()
+        gen = types.SimpleNamespace(static=types.SimpleNamespace(graphs={6: tf}))
+        rep = {"errors": []}
+        cen = G.run_census(gen, types.SimpleNamespace(census_loop=True, max_new=8), rep)
+    finally:
+        undo()
+    assert rep["errors"] == [] and rep["census"] is cen
+    assert list(cen["tf_graphs"]) == ["6"] and list(cen["loop_graphs"]) == ["2g:A", "2g:B", "1g:AB", "1g:B"]
+    assert all(isinstance(c, dict) for d in cen.values() for c in d.values())    # (no libcudart here: {'error': ...})
+    assert _Loop.made[0].closed
+    assert tf.inst_calls == 1 and all(g.inst_calls == 1 for g in _Loop.made[0].graphs.values())   # census never instantiated
+    assert "[census] loop_graphs 2g:A" in capsys.readouterr().out
+
+
+def test_run_census_records_a_failing_loop_and_keeps_the_tf_census(monkeypatch):
+    import types
+
+    _patched_torch(monkeypatch, _FakeGraph)
+    pytest.importorskip("runtime.dspark_loop")
+    import runtime.dspark_loop as DL
+
+    class _Bad:
+        def __init__(self, gen, max_new):
+            self.graphs, self.closed = {}, False
+            _Bad.me = self
+
+        def capture(self, n_graphs):
+            raise RuntimeError("boom")
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(DL, "DSparkLoop", _Bad)
+    gen = types.SimpleNamespace(static=types.SimpleNamespace(graphs={6: object()}))
+    rep = {"errors": []}
+    cen = G.run_census(gen, types.SimpleNamespace(census_loop=True, max_new=8), rep)
+    assert list(cen["tf_graphs"]) == ["6"] and cen["loop_graphs"] == {} and _Bad.me.closed
+    assert rep["errors"][0]["stage"] == "census_loop" and "boom" in rep["errors"][0]["traceback"]
+
+
+def test_graph_census_never_calls_instantiate():
+    g = _FakeGraph(keep_graph=True)
+    out = G.graph_census(g)                       # no libcudart on the CPU box -> an error dict, never an instantiate
+    assert isinstance(out, dict) and g.inst_calls == 0

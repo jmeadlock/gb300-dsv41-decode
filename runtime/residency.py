@@ -183,8 +183,9 @@ def sf_store_for(moe_impl: str, rows: int) -> Optional[str]:
 
 def add_cli_args(ap) -> None:
     """The --residency* flags (bench/headline.py; bench/first_light.py declares the same names itself)."""
-    ap.add_argument("--residency", choices=["off", "on"], default="off",
-                    help="A2-2: host-side swap policy (m3 v26 core) on the static/graph step's pointer tables")
+    ap.add_argument("--residency", choices=["off", "on"], default="on",
+                    help="A2-2: host-side swap policy (m3 v26 core) on the static/graph step's pointer tables. "
+                         "Default ON since 2026-11-07 (box: 19.93 vs 20.30 ms/step, bit-equal; docs/headline-resid2-20261107.json)")
     ap.add_argument("--residency-drain", type=int, default=64, help="host steps between counter drains")
     ap.add_argument("--residency-swaps-per-drain", type=int, default=2)
     ap.add_argument("--residency-hyst", type=float, default=1.5)

@@ -715,6 +715,8 @@ def graph_census(g, names: bool = True) -> dict:
         rep = {"cudart_version": ver.value, "api": used, "nodes": n.value, "kernel_nodes": types.get(0, 0),
                "node_types": {NODE_TYPES.get(k, str(k)): v for k, v in sorted(types.items())},
                "edges": ne.value, "edge_kinds": tally_edges(edges)}
+        if getattr(g, "_census_note", None):
+            rep["instantiate_note"] = g._census_note     # keep_graphs(): torch had already instantiated it
         if names:
             kidx = [i for i, t in enumerate(ntype) if t == 0]
             nm_, err = _kernel_names(nodes, kidx)
@@ -743,17 +745,43 @@ def graph_census(g, names: bool = True) -> dict:
         return {"error": f"{type(e).__name__}: {e}"}
 
 
+def _is_double_instantiate(e: BaseException) -> bool:
+    """True for torch's complaint about instantiating a CUDAGraph that is not (or no longer) in the 'not yet
+    instantiated, keep_graph=True' state: 'instantiate() is intended to be called by the user only when
+    keep_graph=true' (and its 'already instantiated' sibling). Any other error is real and propagates."""
+    msg = str(e)
+    return "instantiate" in msg and any(w in msg for w in ("keep_graph", "already", "only once", "twice"))
+
+
 def keep_graphs():
-    """Make every torch.cuda.CUDAGraph() constructed from now on keep its cudaGraph_t (keep_graph=True) and
-    instantiate at capture end (the documented keep_graph flow), so the runtime's own captures (StaticStep,
-    DSparkLoop: `torch.cuda.CUDAGraph()` looked up at call time) can be walked afterwards. Returns an undo()."""
+    """Make every torch.cuda.CUDAGraph() constructed from now on keep its cudaGraph_t (keep_graph=True) so the
+    runtime's own captures (StaticStep, DSparkLoop: `torch.cuda.CUDAGraph()` looked up at call time) can be walked
+    afterwards by graph_census (which only READS raw_cuda_graph(); it never instantiates).
+
+    The kept graph is instantiated exactly once, at capture end, so replay() never pays the lazy-instantiate cost:
+    `instantiate` is idempotent here (a second call -- ours, the runtime's, or torch's own -- is a no-op), and a
+    torch complaint about instantiating twice at capture end (the LOOSE-ENDS-2 crash: `RuntimeError: instantiate()
+    is intended to be called by the user only when keep_graph=true`, seen with --census-loop, whose DSparkLoop
+    captures several graphs back to back) is recorded on the graph (`_census_note`) instead of raised. Any other
+    instantiate error still raises. Returns an undo(). Callers should run it in try/finally."""
     import torch
 
     orig = torch.cuda.CUDAGraph
 
     class _Kept(orig):
-        def __new__(cls, keep_graph=True):
+        def __new__(cls, keep_graph=True):          # a caller asking for keep_graph=False is overridden: the census needs the graph
             return super().__new__(cls, True)
+
+        def instantiate(self):
+            if self.__dict__.get("_census_inst"):
+                return
+            try:
+                super().instantiate()
+            except RuntimeError as e:
+                if not _is_double_instantiate(e):
+                    raise
+                self._census_note = str(e)[:200]    # already instantiated by torch / the runtime: fine, the exec exists
+            self._census_inst = True
 
         def capture_end(self):
             super().capture_end()
@@ -832,6 +860,41 @@ def _routed(gen) -> Optional[Tuple[int, int]]:
     return (sum(rc[0]), sum(rc[1])) if rc is not None else None
 
 
+def run_census(gen, a, rep: dict) -> dict:
+    """The graph census of --census / --census-loop: the StaticStep's graphs, and with --census-loop the DSpark
+    loop's (2-graph A/B, then 1-graph AB/B). READS the kept graphs only (graph_census never instantiates); the one
+    instantiate per graph happened at capture end under keep_graphs(). Stored in rep["census"], printed; a failure
+    in the loop stage is recorded in rep["errors"] and the tf_graphs census is kept."""
+    cen = {"tf_graphs": {}, "loop_graphs": {}}
+    st = getattr(gen, "static", None)
+    for k, g in (getattr(st, "graphs", None) or {}).items():
+        cen["tf_graphs"][str(k)] = graph_census(g)
+    if a.census_loop:
+        try:
+            from runtime.dspark_loop import DSparkLoop
+
+            loop = DSparkLoop(gen, a.max_new)
+            try:
+                loop.capture(n_graphs=2)
+                for k, g in loop.graphs.items():
+                    cen["loop_graphs"][f"2g:{k}"] = graph_census(g)
+                loop.capture(n_graphs=1)
+                for k, g in loop.graphs.items():
+                    cen["loop_graphs"][f"1g:{k}"] = graph_census(g)
+            finally:
+                loop.close()
+        except Exception:
+            import traceback
+
+            rep["errors"].append({"stage": "census_loop", "traceback": traceback.format_exc()})
+    rep["census"] = cen
+    for grp, d in cen.items():
+        for k, c in d.items():
+            print(f"[census] {grp} {k}: " + (c.get("error") or f"{c['nodes']} nodes ({c['kernel_nodes']} kernel), "
+                                             f"{c['edges']} edges {c['edge_kinds']}"), flush=True)
+    return cen
+
+
 def cmd_ours_tf(a) -> int:
     _env_like_headline(a)
     import torch
@@ -893,32 +956,10 @@ def cmd_ours_tf(a) -> int:
     ovf = getattr(gen.static, "overflow_counts", None) if getattr(gen, "static", None) is not None else None
     rep["overflow"] = ovf() if ovf else None
     if a.census:
-        cen = {"tf_graphs": {}, "loop_graphs": {}}
-        st = getattr(gen, "static", None)
-        for k, g in (getattr(st, "graphs", None) or {}).items():
-            cen["tf_graphs"][str(k)] = graph_census(g)
-        if a.census_loop:
-            try:
-                from runtime.dspark_loop import DSparkLoop
-
-                loop = DSparkLoop(gen, a.max_new)
-                loop.capture(n_graphs=2)
-                for k, g in loop.graphs.items():
-                    cen["loop_graphs"][f"2g:{k}"] = graph_census(g)
-                loop.capture(n_graphs=1)
-                for k, g in loop.graphs.items():
-                    cen["loop_graphs"][f"1g:{k}"] = graph_census(g)
-                loop.close()
-            except Exception:
-                import traceback
-
-                rep["errors"].append({"stage": "census_loop", "traceback": traceback.format_exc()})
-        rep["census"] = cen
-        for grp, d in cen.items():
-            for k, c in d.items():
-                print(f"[census] {grp} {k}: " + (c.get("error") or f"{c['nodes']} nodes ({c['kernel_nodes']} kernel), "
-                                                 f"{c['edges']} edges {c['edge_kinds']}"), flush=True)
-        undo()
+        try:
+            run_census(gen, a, rep)
+        finally:
+            undo()      # always restore torch.cuda.CUDAGraph, also when the census raises
     if torch.cuda.is_available():
         free, total = torch.cuda.mem_get_info()
         rep["hbm_end_GiB"] = {"free": round(free / 2**30, 3), "total": round(total / 2**30, 3)}
