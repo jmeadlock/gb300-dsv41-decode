@@ -1,0 +1,96 @@
+[residency] HBM free 248.799 GiB - KV 0.14 - new staging 0.0 - reserve 0.0 -> affordable 639063 spare slots/layer (0.0004 GiB each over 4 layers); n_spare 2 (+0.001 GiB HBM), n_stage 0, demotion pool 4/layer = 0.002 GiB Grace; drain_n 8 swaps/drain 2 cap/step 4 hyst 1.0 min_abs 1.0 halflife 100.0
+[residency] attached: 24 pointer tables over 4 layers (+ cold_tab, loc); freeze=0
+Traceback (most recent call last):
+  File "/work/tests/gpu/test_residency_gpu.py", line 449, in <module>
+    t()
+  File "/work/tests/gpu/test_residency_gpu.py", line 162, in test_residency_on_equals_off_ref
+    _combo("ref", "ref")
+  File "/work/tests/gpu/test_residency_gpu.py", line 147, in _combo
+    a = rm.audit(golden=golden_from_index(model.runtime_load.index))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/runtime/residency.py", line 1002, in audit
+    want = golden(l, e)
+           ^^^^^^^^^^^^
+  File "/work/runtime/residency.py", line 1069, in g
+    t = index.read_tensor(f"layers.{l}.ffn.experts.{e}.{p}.{kind}")
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/runtime/ckpt.py", line 269, in read_tensor
+    self.read_into(name, t)
+  File "/work/runtime/ckpt.py", line 245, in read_into
+    mv = writable_bytes(dst)
+         ^^^^^^^^^^^^^^^^^^^
+  File "/work/runtime/ckpt.py", line 137, in writable_bytes
+    raise ValueError(f"read target must be host memory, got {dst.device}")
+ValueError: read target must be host memory, got cuda:0
+FAIL test_residency_on_equals_off_ref (9.8s)
+[residency] HBM free 248.652 GiB - KV 0.14 - new staging 0.0 - reserve 0.0 -> affordable 638687 spare slots/layer (0.0004 GiB each over 4 layers); n_spare 2 (+0.001 GiB HBM), n_stage 0, demotion pool 4/layer = 0.002 GiB Grace; drain_n 8 swaps/drain 2 cap/step 4 hyst 1.0 min_abs 1.0 halflife 100.0
+[residency] attached: 28 pointer tables over 4 layers (+ cold_tab, loc); freeze=0
+Traceback (most recent call last):
+  File "/work/tests/gpu/test_residency_gpu.py", line 449, in <module>
+    t()
+  File "/work/tests/gpu/test_residency_gpu.py", line 166, in test_residency_on_equals_off_fused_glue
+    _combo("ref", "fused")
+  File "/work/tests/gpu/test_residency_gpu.py", line 147, in _combo
+    a = rm.audit(golden=golden_from_index(model.runtime_load.index))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/runtime/residency.py", line 1002, in audit
+    want = golden(l, e)
+           ^^^^^^^^^^^^
+  File "/work/runtime/residency.py", line 1069, in g
+    t = index.read_tensor(f"layers.{l}.ffn.experts.{e}.{p}.{kind}")
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/runtime/ckpt.py", line 269, in read_tensor
+    self.read_into(name, t)
+  File "/work/runtime/ckpt.py", line 245, in read_into
+    mv = writable_bytes(dst)
+         ^^^^^^^^^^^^^^^^^^^
+  File "/work/runtime/ckpt.py", line 137, in writable_bytes
+    raise ValueError(f"read target must be host memory, got {dst.device}")
+ValueError: read target must be host memory, got cuda:0
+FAIL test_residency_on_equals_off_fused_glue (3.2s)
+SKIP (deep_gemm unavailable: No module named 'deep_gemm') test_residency_on_equals_off_dg_inplace (0.0s)
+[residency] HBM free 248.52 GiB - KV 0.14 - new staging 0.0 - reserve 0.0 -> affordable 638345 spare slots/layer (0.0004 GiB each over 4 layers); n_spare 1 (+0.0 GiB HBM), n_stage 0, demotion pool 4/layer = 0.002 GiB Grace; drain_n 1048576 swaps/drain 2 cap/step 4 hyst 1.0 min_abs 1.0 halflife 100.0
+[residency] attached: 24 pointer tables over 4 layers (+ cold_tab, loc); freeze=1
+[residency] HBM free 248.236 GiB - KV 0.14 - new staging 0.0 - reserve 0.0 -> affordable 637619 spare slots/layer (0.0004 GiB each over 4 layers); n_spare 1 (+0.0 GiB HBM), n_stage 0, demotion pool 4/layer = 0.002 GiB Grace; drain_n 1048576 swaps/drain 2 cap/step 4 hyst 1.0 min_abs 1.0 halflife 100.0
+[residency] attached: 24 pointer tables over 4 layers (+ cold_tab, loc); freeze=1
+  event ordering: 112 swaps (n_spare 1, ~1 GiB dummy H2D ahead of each) racing queued replays -> bit-equal; 30 forced flushes; negative control diverged at 31/33 positions
+PASS test_residency_swaps_while_replays_queued_event_ordering (1.9s)
+[residency] HBM free 248.436 GiB - KV 0.14 - new staging 0.0 - reserve 0.0 -> affordable 638130 spare slots/layer (0.0004 GiB each over 4 layers); n_spare 2 (+0.001 GiB HBM), n_stage 0, demotion pool 4/layer = 0.002 GiB Grace; drain_n 64 swaps/drain 2 cap/step 4 hyst 1.0 min_abs 1.0 halflife 100.0
+[residency] attached: 24 pointer tables over 4 layers (+ cold_tab, loc); freeze=0
+/usr/local/lib/python3.12/dist-packages/torch/cuda/__init__.py:1333: UserWarning: Synchronization debug mode is a prototype feature and does not yet detect all synchronizing operations (Triggered internally at /__w/pytorch/pytorch/torch/csrc/cuda/Module.cpp:1028.)
+  torch._C._cuda_set_sync_debug_mode(debug_mode)
+PASS test_residency_after_step_has_no_host_sync (0.6s)
+[residency] HBM free 248.375 GiB - KV 0.14 - new staging 0.0 - reserve 0.0 -> affordable 637974 spare slots/layer (0.0004 GiB each over 4 layers); n_spare 2 (+0.001 GiB HBM), n_stage 0, demotion pool 4/layer = 0.002 GiB Grace; drain_n 8 swaps/drain 2 cap/step 4 hyst 1.0 min_abs 1.0 halflife 100.0
+[residency] attached: 24 pointer tables over 4 layers (+ cold_tab, loc); freeze=0
+  mini4 graph step p50: off 2.303 ms, on 2.342 ms (+1.7 %; mini-model numbers, not the real step)
+PASS test_residency_step_time_report (1.1s)
+[residency] HBM free 248.283 GiB - KV 0.838 - new staging 0.0 - reserve 0.0 -> affordable 635943 spare slots/layer (0.0004 GiB each over 4 layers); n_spare 2 (+0.001 GiB HBM), n_stage 0, demotion pool 4/layer = 0.002 GiB Grace; drain_n 8 swaps/drain 2 cap/step 4 hyst 1.0 min_abs 1.0 halflife 100.0
+[residency] attached: 24 pointer tables over 4 layers (+ cold_tab, loc); freeze=0
+Traceback (most recent call last):
+  File "/work/tests/gpu/test_residency_gpu.py", line 449, in <module>
+    t()
+  File "/work/tests/gpu/test_residency_gpu.py", line 366, in test_residency_rows6_on_equals_off_ref
+    _rows_combo("ref")
+  File "/work/tests/gpu/test_residency_gpu.py", line 345, in _rows_combo
+    a = rm.audit(golden=golden_from_index(model.runtime_load.index))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/runtime/residency.py", line 1002, in audit
+    want = golden(l, e)
+           ^^^^^^^^^^^^
+  File "/work/runtime/residency.py", line 1069, in g
+    t = index.read_tensor(f"layers.{l}.ffn.experts.{e}.{p}.{kind}")
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/runtime/ckpt.py", line 269, in read_tensor
+    self.read_into(name, t)
+  File "/work/runtime/ckpt.py", line 245, in read_into
+    mv = writable_bytes(dst)
+         ^^^^^^^^^^^^^^^^^^^
+  File "/work/runtime/ckpt.py", line 137, in writable_bytes
+    raise ValueError(f"read target must be host memory, got {dst.device}")
+ValueError: read target must be host memory, got cuda:0
+FAIL test_residency_rows6_on_equals_off_ref (1.5s)
+SKIP (deep_gemm unavailable: No module named 'deep_gemm') test_residency_rows6_on_equals_off_dg_inplace_pool_sf (0.0s)
+SKIP (deep_gemm unavailable: No module named 'deep_gemm') test_residency_rows6_on_equals_off_dg_inplace_step_sf (0.0s)
+SKIP (deep_gemm unavailable: No module named 'deep_gemm') test_residency_rows6_on_equals_off_dg_inplace_fused_glue (0.0s)
+SKIP (deep_gemm unavailable: No module named 'deep_gemm') test_residency_rows6_swaps_while_replays_queued_event_ordering (0.0s)
+8/11 not failed; 3 failed

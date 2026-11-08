@@ -50,7 +50,7 @@ class ExpertPool:
         self.hot: Dict[int, Tuple[int, ...]] = {l: hot_map.hot_ids(l) for l in range(n_layers)}
         self.cold: Dict[int, Tuple[int, ...]] = {l: hot_map.cold_ids(l) for l in range(n_layers)}
         self.slot: Dict[Tuple[int, int], Tuple[int, int]] = {}
-        loc = torch.empty(n_layers, n_experts, 2, dtype=torch.int32)
+        loc = torch.empty(n_layers, n_experts, 2, dtype=torch.int32, device="cpu")  # host mirror: explicit (cuda default device)
         for l in range(n_layers):
             for s, e in enumerate(self.hot[l]):
                 self.slot[(l, e)] = (TIER_HBM, s)
@@ -92,6 +92,7 @@ class ExpertPool:
         self.hbm_full: Dict[int, Dict[str, torch.Tensor]] = {l: {p: self.hbm[l][p][0] for p in self.proj_nk}
                                                               for l in range(n_layers)}
         self.generation = 0  # bumped whenever pool storage moves (pointer tables built before are stale)
+        self.residency = None  # A2-2: runtime/residency.py ResidencyManager, the single writer of the tables + loc
 
     # --------------------------------------------------------------- byte sizes
     @property
@@ -114,6 +115,9 @@ class ExpertPool:
         S = int(S)
         if S <= self.spare:
             return 0
+        rm = getattr(self, "residency", None)
+        if rm is not None and rm.moved():  # A2-2: experts live in slots this copy would not carry over
+            raise RuntimeError("add_spare_slots while runtime/residency.py has moved experts: restore_boot() first")
         added = 0
         with torch.inference_mode(False), torch.no_grad():
             for l in range(self.n_layers):

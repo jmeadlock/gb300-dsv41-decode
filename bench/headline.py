@@ -23,6 +23,19 @@ to the 1-row's; (b) ms per 6-row step (steps >= --stats-from of each sequence; v
 step (accepted drafts + 1), ms per token = sum(step ms) / sum(tokens) over the window, prefill ms (reference prefill +
 draft-ring seeding + first draft, synced); (c) self-replay: fast reps, parity reps (records byte-identical, logits
 digests equal), fast == parity, 1 graph == 2 graphs (tokens + accept-length sequences); (d) HBM after the build.
+A2-2 (docs/A2-2-BOX-PLAN.md): `--residency on --residency-drain 64 [--residency-spare N ...]` puts the host-side swap
+policy (runtime/residency.py) on the loop's 6-row verify step (the 1-row truth above runs on the static map). The pool
+is pre-grown once to 16 spare slots/layer; the step stages cold experts into `--residency-stage` of them (default 8,
+else --spare-slots) and residency promotes into the REST (8): no new HBM unless --residency-spare asks for more than the
+pool holds and free HBM - reserve allows. A cold-unique count above the staging slots overflows (wrong logits for that
+step): the `overflow` field and the residency line report it; give the off run the same `--spare-slots`/`--pool-spare`. The loop calls the manager after every step; the
+report key `residency` has swaps/step, the cold-share curve (per drain and per sequence), the headroom calc and HBM, the
+manager's GPU ms per step (`ms_manager_per_step`; `ms_per_step_incl_manager` is the number to compare with the off run)
+and, with `--residency-ref <the off run's JSON>`, per prompt emitted-token / accept-length equality (an error if not).
+`mode_gap` (LOOSE-1107): one_graph vs two_graphs. Without residency they agree within 0.03 ms in every run; with
+residency on the two_graphs cell is measured first and the one_graph cell last, at a different swap-policy state (cold
+share), so the report carries the gap, its split (verify vs draft graph, mean/median/p90), each cell's cold share, and
+a weighted fit of step ms vs cold share (modeled, labeled) -- one printed `mode gap:` line. Defaults are unchanged.
 The C1 instrument proper (nsys cudaProfilerApi range) is M1-T13; --profile TAG:FIRST:N opens that range around N steps
 of one prompt's first fast run, for `nsys profile --capture-range=cudaProfilerApi`.
 
@@ -45,6 +58,7 @@ import sys
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 import argparse  # noqa: E402
+import hashlib  # noqa: E402
 import json  # noqa: E402
 import time  # noqa: E402
 import traceback  # noqa: E402
@@ -79,11 +93,12 @@ def _stats(xs: List[float]) -> dict:
 def window(runs: Sequence[dict], stats_from: int) -> dict:
     """Pool the live steps with index >= stats_from of every run -> ms/step (total, verify, draft), tokens/step,
     ms/token over that window; plus the same over all live steps (`all_*`)."""
-    step, ver, dra, tok, all_step, all_tok = [], [], [], [], [], []
+    step, ver, dra, tok, all_step, all_tok, mgr = [], [], [], [], [], [], []
     for r in runs:
         ms = r.get("step_ms") or []
         acc = r.get("accepts") or []
         v, d = r.get("verify_ms"), r.get("draft_ms")
+        mg = r.get("mgr_ms") or []     # A2-2: the residency manager's GPU ms after each step (not in step_ms)
         for i, m in enumerate(ms):
             all_step.append(m)
             all_tok.append(acc[i] + 1)
@@ -94,7 +109,11 @@ def window(runs: Sequence[dict], stats_from: int) -> dict:
                     ver.append(v[i])
                 if d:
                     dra.append(d[i])
+                if i < len(mg):
+                    mgr.append(mg[i])
     out = {"stats_from_step": stats_from, "steps": len(step), "ms_per_step": _stats(step),
+           "ms_manager_per_step": _stats(mgr) if mgr else None,
+           "ms_per_step_incl_manager": ((sum(step) / len(step) + sum(mgr) / len(mgr)) if step and mgr else None),
            "ms_verify_graph": _stats(ver) if ver else None, "ms_draft_graph": _stats(dra) if dra else None,
            "tokens_per_step": (sum(tok) / len(tok)) if tok else None,
            "ms_per_token": (sum(step) / sum(tok)) if tok else None,
@@ -137,11 +156,214 @@ def compare_stream(loop_ids, r1_ids, loop_sha=None, r1_sha=None, loop_rec=None, 
     return out
 
 
+def glue_orders(st) -> Optional[dict]:
+    """T9a-3: the fused glue's reduction orders of a StaticStep ({key: order name}) or None (glue ref / no orders).
+    A key whose order differs between the 1-row truth step and the 6-row verify step reduces that statistic in a
+    different fp32 order at 1 and 6 rows: the two steps' rows cannot be bit-equal through it."""
+    o = getattr(getattr(st, "glue", None), "orders", None)
+    if not o:
+        return None
+    return {str(k): (v.get("name") or str(v.get("order"))) if isinstance(v, dict) else str(v) for k, v in o.items()}
+
+
+def glue_off(st) -> Optional[List[str]]:
+    g = getattr(st, "glue", None)
+    if g is None or not hasattr(g, "status"):
+        return None
+    return sorted(c for c in g.status if not g.on(c))
+
+
+def rowmatch_record(st1) -> dict:
+    """T9a-3: the 1-row (truth) step's DG call shape and its per-row build check, plus its glue orders / off list."""
+    dg = getattr(st1, "dg", None)
+    rm = getattr(dg, "rowmatch", None)
+    chk = (rm or {}).get("check") or {}
+    return {"dg": None if rm is None else {
+                "mode": rm.get("mode"), "on": rm.get("on"), "why": rm.get("why"), "align": getattr(dg, "align", None),
+                "gemm_blocks": getattr(dg, "gemm_blocks", None), "rows_gemm": rm.get("rows_gemm"),
+                "check_equal": chk.get("equal"), "today_equal": chk.get("today_equal"),
+                "check": {p: {k_: v.get(k_) for k_ in ("build_vs_rows", "today_vs_rows", "of")}
+                          for p, v in (chk.get("projs") or {}).items()}},
+            "glue_orders_one_row": glue_orders(st1), "glue_off_one_row": glue_off(st1)}
+
+
+def orders_compare(rec: dict, st6) -> dict:
+    """rec (rowmatch_record) + the verify step's glue orders / off list -> which orders differ."""
+    a, b = rec.get("glue_orders_one_row"), glue_orders(st6)
+    rec["glue_orders_verify"] = b
+    rec["glue_off_verify"] = glue_off(st6)
+    if a is None or b is None:
+        rec["glue_orders_differ"] = None
+    else:
+        rec["glue_orders_differ"] = sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k))
+    o1, o6 = rec.get("glue_off_one_row"), rec.get("glue_off_verify")
+    rec["glue_off_only_verify"] = None if o1 is None or o6 is None else sorted(set(o6) - set(o1))
+    return rec
+
+
+def rowmatch_line(rm: dict) -> str:
+    d = rm.get("dg") or {}
+    s = (f"DG 1-row call {'ON' if d.get('on') else 'off'} ({d.get('mode')}, align {d.get('align')} x "
+         f"{d.get('gemm_blocks')} blocks; per-row build check {d.get('check_equal')}, today's call "
+         f"{d.get('today_equal')})") if d else "DG n/a"
+    diff = rm.get("glue_orders_differ")
+    if diff is not None:
+        s += f" | glue orders 1-row vs verify differ at {diff or 'none'}"
+    only = rm.get("glue_off_only_verify")
+    if only:
+        s += f" | glue off only at 6 rows: {only}"
+    return s
+
+
+MODE_GAP_TOL_MS = 0.05      # every run without residency has one_graph and two_graphs within 0.03 ms (docs/headline-*.json)
+
+
+def cold_pooled(runs: Sequence[dict]) -> Optional[float]:
+    """Cold share of the routed expert calls over `runs` (call-weighted: sum cold / sum routed), or None when the
+    runs carry no counters (a static-map run without residency still has them; JSONs before LOOSE-1107 do not for
+    the one_graph cell)."""
+    cold = sum(x.get("cold_calls") or 0 for x in runs if x.get("routed_calls"))
+    tot = sum(x.get("routed_calls") or 0 for x in runs)
+    return (cold / tot) if tot else None
+
+
+def _wls(pts: Sequence[tuple]) -> Optional[dict]:
+    """Weighted least squares y = a + b x over (x, y, w) -> {n, intercept, slope, r} (None: < 3 points or no spread)."""
+    pts = [(float(x), float(y), float(w)) for x, y, w in pts if x is not None and y is not None and w]
+    if len(pts) < 3:
+        return None
+    sw = sum(w for _, _, w in pts)
+    mx = sum(w * x for x, _, w in pts) / sw
+    my = sum(w * y for _, y, w in pts) / sw
+    sxx = sum(w * (x - mx) ** 2 for x, _, w in pts)
+    syy = sum(w * (y - my) ** 2 for _, y, w in pts)
+    sxy = sum(w * (x - mx) * (y - my) for x, y, w in pts)
+    if sxx <= 0 or syy <= 0:
+        return None
+    b = sxy / sxx
+    return {"n": len(pts), "intercept": my - b * mx, "slope": b, "r": sxy / (sxx * syy) ** 0.5}
+
+
+def mode_gap(rep: dict) -> Optional[dict]:
+    """LOOSE-1107: why one_graph and two_graphs differ in a run (None when the run has only one of them).
+
+    Both cells replay the same kernels; the loop adds ~0 (every run without residency has them within 0.03 ms). What
+    can differ between the cells is the STATE the run is in when each is measured: `run_cells` measures the first
+    cell (two_graphs: fast x reps + parity x parity_reps per prompt) first and the one_graph cell LAST, one fast run
+    per prompt, and with residency on the manager swaps experts between replays for the whole run, so the cold
+    share -- cold experts are staged and cost verify time -- falls from cell to cell (docs/headline-20261107-
+    residency.json: code 12.9 % -> 10.0 % -> 7.5 % -> 6.2 % over its first four runs). The report therefore carries
+    the gap, where it sits (verify graph vs draft graph, mean vs median, per prompt), the residency state of each
+    cell (cold share when recorded), a weighted fit of the two_graphs cell's own per-prompt step ms against its cold
+    share, and -- when the one_graph cell's cold share is not recorded -- a MODELED one_graph ms from the fit and the
+    policy's drain log over the last drains (labeled modeled). `within_tolerance` False without residency would be
+    a real mode effect; with residency on the cells are not comparable and `cause` says so."""
+    h = rep.get("headline") or {}
+    w2, w1 = h.get("two_graphs"), h.get("one_graph")
+    if not w2 or not w1 or not (w2.get("ms_per_step") or {}).get("n") or not (w1.get("ms_per_step") or {}).get("n"):
+        return None
+    g = lambda w, k: (w.get(k) or {}).get("mean") if w.get(k) else None      # noqa: E731
+    q = lambda w, k: (w.get("ms_per_step") or {}).get(k)                        # noqa: E731
+    m2, m1 = g(w2, "ms_per_step"), g(w1, "ms_per_step")
+    res = rep.get("residency") or {}
+    res_on = bool(rep.get("residency_config")) or bool(res.get("on"))
+    out: dict = {"two_graphs_ms": m2, "one_graph_ms": m1, "gap_ms": m2 - m1, "gap_pct": (m2 - m1) / m1 * 100,
+                 "tolerance_ms": MODE_GAP_TOL_MS, "within_tolerance": abs(m2 - m1) <= MODE_GAP_TOL_MS,
+                 "gap_p50_ms": q(w2, "p50") - q(w1, "p50"), "gap_p90_ms": q(w2, "p90") - q(w1, "p90"),
+                 "steps": {"two_graphs": w2.get("steps"), "one_graph": w1.get("steps")},
+                 "draft_graph_ms_two_graphs": g(w2, "ms_draft_graph"), "verify_graph_ms_two_graphs": g(w2, "ms_verify_graph"),
+                 "residency_on": res_on, "cell_order": "two_graphs measured first, one_graph last",
+                 "sf_store": res.get("sf_store") if res_on else None}
+    if res_on:
+        mg2, mg1 = g(w2, "ms_manager_per_step"), g(w1, "ms_manager_per_step")
+        out["manager_ms_per_step"] = {"two_graphs": mg2, "one_graph": mg1}
+        out["gap_incl_manager_ms"] = (w2.get("ms_per_step_incl_manager") - w1.get("ms_per_step_incl_manager")
+                                      if w2.get("ms_per_step_incl_manager") and w1.get("ms_per_step_incl_manager")
+                                      else None)
+    c2, c1 = w2.get("cold_share"), w1.get("cold_share")
+    out["cold_share"] = {"two_graphs": c2, "one_graph": c1}
+    per, pts = {}, []
+    for tag, p in (rep.get("prompts") or {}).items():
+        a, b = p.get("window") or {}, p.get("window_one_graph") or {}
+        a_all, b_all = (a.get("all_ms_per_step") or {}).get("mean"), (b.get("all_ms_per_step") or {}).get("mean")
+        if a_all is None or b_all is None:
+            continue
+        reps_ = [x for x in (p.get("cold_share_by_rep") or []) if x is not None]
+        cold2 = (sum(reps_) / len(reps_)) if reps_ else None
+        per[tag] = {"steps": p.get("steps"), "two_graphs_ms": a_all, "one_graph_ms": b_all, "gap_ms": a_all - b_all,
+                    "cold_share_two_graphs_reps": p.get("cold_share_by_rep"),
+                    "cold_share_one_graph_reps": p.get("cold_share_by_rep_one_graph")}
+        pts.append((cold2, a_all, p.get("steps") or 0))
+    out["per_prompt"] = per
+    fit = _wls(pts) if res_on else None
+    if fit:
+        out["fit_two_graphs_ms_vs_cold_share"] = dict(
+            fit, ms_per_cold_pct_point=fit["slope"] / 100.0,
+            what="weighted LSQ over prompts: mean step ms of the two_graphs cell (all live steps) vs the mean cold "
+                 "share of its fast reps; MODELED relation, not a measurement of the one_graph cell")
+    if fit and res_on:
+        if c2 is not None and c1 is not None:
+            out["gap_predicted_from_cold_share_ms"] = fit["slope"] * (c2 - c1)      # modeled
+        else:   # one_graph cold share not recorded: take the policy's drain log over the last one_graph steps
+            dl = res.get("drain_log") or []
+            n1, host = int(w1.get("all_steps") or 0), int(res.get("host_steps") or 0)
+            tail = [r["cold_share"] for r in dl if r.get("cold_share") is not None and r.get("host_steps", 0) > host - n1]
+            if tail:
+                cs = sum(tail) / len(tail)
+                out["one_graph_ms_modeled"] = {"cold_share_drain_tail": cs, "drains": len(tail),
+                                               "ms": fit["intercept"] + fit["slope"] * cs,
+                                               "actual_ms": (w1.get("all_ms_per_step") or {}).get("mean") or m1,
+                                               "what": "MODELED: fit intercept + slope x the cold share of the drains "
+                                                       "covering the last one_graph steps (drain log granularity: 64 steps)"}
+    # the verdict
+    if out["within_tolerance"]:
+        out["cause"] = (f"none: the cells agree within {MODE_GAP_TOL_MS} ms (same kernels in the same order; the "
+                        f"residency hook runs after each step's end event in both)")
+        out["headline_mode"] = "either: the cells are the same measurement"
+    elif not res_on:
+        out["cause"] = (f"UNEXPLAINED mode effect: residency off, gap {out['gap_ms']:+.3f} ms; check draft vs verify "
+                        f"graph attribution and run order")
+        out["headline_mode"] = "unresolved"
+    else:
+        bits = [f"residency on: the cells are measured at different policy states (two_graphs first, one_graph last)"]
+        if c2 is not None and c1 is not None:
+            bits.append(f"cold share {c2 * 100:.2f}% (two_graphs) vs {c1 * 100:.2f}% (one_graph)")
+        if fit:
+            bits.append(f"two_graphs step ms rises {fit['slope'] / 100:.3f} ms per cold-share point across prompts "
+                        f"(r {fit['r']:.2f}, n {fit['n']})")
+        if "one_graph_ms_modeled" in out:
+            mm = out["one_graph_ms_modeled"]
+            bits.append(f"modeled one_graph {mm['ms']:.2f} ms at drain-tail cold share {mm['cold_share_drain_tail'] * 100:.2f}% "
+                        f"(actual {mm['actual_ms']:.2f})")
+        sf = out.get("sf_store") or {}
+        if sf.get("got") and sf.get("got") != sf.get("requested"):
+            bits.append(f"sf_store {sf.get('requested')}->{sf.get('got')} is a per-run setting, identical in both cells "
+                        f"(it cannot make one mode slower)")
+        out["cause"] = "; ".join(bits)
+        out["headline_mode"] = ("not decidable from this run: the cells differ in residency state, so the gap is "
+                                "not a property of the graph mode. Compare modes at a fixed state (--residency-frozen "
+                                "after a warm run, or both cells after the same number of passes). Defaults unchanged")
+    return out
+
+
+def mode_gap_line(mg: Optional[dict]) -> Optional[str]:
+    if not mg:
+        return None
+    f = lambda x, d=2: "-" if x is None else f"{x:.{d}f}"          # noqa: E731
+    s = (f"  mode gap: two_graphs {f(mg['two_graphs_ms'])} - one_graph {f(mg['one_graph_ms'])} = {mg['gap_ms']:+.3f} ms "
+         f"(median {mg['gap_p50_ms']:+.2f}, p90 {mg['gap_p90_ms']:+.2f}; draft graph {f(mg['draft_graph_ms_two_graphs'])}"
+         f" ms in the two_graphs cell) | {mg['cause']}")
+    return s
+
+
 def summary_lines(rep: dict) -> List[str]:
     h = rep.get("headline") or {}
     f = lambda x, d=2: "-" if x is None else f"{x:.{d}f}"  # noqa: E731
     lines = [f"HEADLINE {rep.get('date')} | {METRIC} | mode {rep.get('mode')} | impls {rep.get('impls')} | "
              f"gemv pin M1 {rep.get('gemv_pin_m1')} | max_new {rep.get('max_new')} | prompts {rep.get('n_prompts')}"]
+    rm = rep.get("rowmatch")
+    if rm:
+        lines.append(f"  rowmatch: {rowmatch_line(rm)}")
     for key in ("two_graphs", "one_graph", "eager"):
         w = h.get(key)
         if not w:
@@ -149,10 +371,15 @@ def summary_lines(rep: dict) -> List[str]:
         ms = (w.get("ms_per_step") or {}).get("mean")
         v = (w.get("ms_verify_graph") or {}).get("mean") if w.get("ms_verify_graph") else None
         d = (w.get("ms_draft_graph") or {}).get("mean") if w.get("ms_draft_graph") else None
-        lines.append(f"  {key:10s}: {f(ms)} ms/step (verify {f(v)} + draft {f(d)}) | {f(w.get('tokens_per_step'), 3)} "
+        mg = (w.get("ms_manager_per_step") or {}).get("mean") if w.get("ms_manager_per_step") else None
+        mgs = f" [+ residency manager {f(mg, 3)} ms/step = {f(w.get('ms_per_step_incl_manager'))}]" if mg is not None else ""
+        lines.append(f"  {key:10s}: {f(ms)} ms/step{mgs} (verify {f(v)} + draft {f(d)}) | {f(w.get('tokens_per_step'), 3)} "
                      f"tok/step | {f(w.get('ms_per_token'))} ms/token | window steps >= {w.get('stats_from_step')}: "
                      f"{w.get('steps')} (all {w.get('all_steps')} steps: {f((w.get('all_ms_per_step') or {}).get('mean'))}"
                      f" ms/step, {f(w.get('all_tokens_per_step'), 3)} tok/step)")
+    mgl = mode_gap_line(rep.get("mode_gap"))
+    if mgl:
+        lines.append(mgl)
     lines.append(f"  vs Pg61 {PG61_MS_PER_STEP} ms/step (bar {CHARTER_BAR_MS}); prefill {f(h.get('prefill_ms_mean'), 1)} ms "
                  f"mean; HBM after build {rep.get('hbm_after_build_GiB')}")
     lines.append(f"  {'prompt':6s} {'tok':>4s} {'steps':>5s} {'tok/st':>6s} {'ms/step':>8s} {'ms/tok':>7s} "
@@ -195,7 +422,14 @@ def build_parser() -> argparse.ArgumentParser:
                          "sets $DSV41_FP32_IMPL before any build, so the 1-row truth and the loop both use it)")
     ap.add_argument("--draft-impls", choices=["same", "ref"], default="same",
                     help="M1-T11-PORT: same = the draft on the verify's impls (draft_step.draft_impls_for); ref = T11")
-    ap.add_argument("--spare-slots", type=int, default=None, help="6-row dg-inplace spare slots/layer (default 8)")
+    ap.add_argument("--spare-slots", type=int, default=None, help="6-row dg-inplace spare slots/layer (default 16)")
+    ap.add_argument("--pool-spare", type=int, default=None,
+                    help="pre-grow the pool to at least this many spare slots/layer (default: --spare-slots or 16; with "
+                         "--residency on never below 16). Give the residency-off run the same value as the on run so "
+                         "both start from the same HBM")
+    ap.add_argument("--moe-rowmatch", choices=["on", "align", "off"], default="off",
+                    help="T9a-3: the 1-row (truth) dg-inplace routed GEMM in the 6-row step's call shape, checked per "
+                         "row at build (runtime/dg_inplace.build_one_row; sets $DSV41_MOE_ROWMATCH before any build)")
     ap.add_argument("--no-gemv-pin", action="store_true", help="do not set DSV41_GEMV_PIN_M1=1")
     ap.add_argument("--reps", type=int, default=2, help="fast (async) runs per prompt at 2 graphs")
     ap.add_argument("--parity-reps", type=int, default=2, help="parity (per-step sync) runs per prompt")
@@ -207,6 +441,14 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--pg61-step", default=os.path.join(REPO, "w0", "results", "phase1", "step-pg61.json"))
     ap.add_argument("--reserve-host-gib", type=float, default=16.0)
     ap.add_argument("--json", default=None, help="default docs/headline-<YYYYMMDD>.json")
+    # A2-2: adaptive residency (runtime/residency.py) on the 6-row verify step; the loop calls the manager every step
+    from runtime.residency import add_cli_args
+
+    add_cli_args(ap)
+    ap.add_argument("--residency-ref", default=None,
+                    help="the residency-off run's headline JSON: per prompt tokens/accepts equal, ms/step delta")
+    ap.add_argument("--residency-audit", action="store_true",
+                    help="end of run: sha256 of every moved expert (HBM and Grace copies) vs the checkpoint shards")
     return ap
 
 
@@ -217,6 +459,27 @@ def _hbm(torch) -> Optional[dict]:
     return {"free": round(free / 2**30, 3), "total": round(total / 2**30, 3),
             "allocated": round(torch.cuda.memory_allocated() / 2**30, 3),
             "max_allocated": round(torch.cuda.max_memory_allocated() / 2**30, 3)}
+
+
+def _routed(loop) -> Optional[tuple]:
+    """(hot calls, cold calls) summed over layers since capture (StaticStep.routed_counts; syncs -- called between
+    sequences, never inside one)."""
+    try:
+        rc = loop.st.routed_counts()
+    except Exception:
+        return None
+    return None if rc is None else (sum(rc[0]), sum(rc[1]))
+
+
+def _cold_delta(res: dict, c0: Optional[tuple], c1: Optional[tuple]) -> None:
+    """A2-2: routed expert calls of one sequence and their cold share (the device counters run inside the graph, so
+    they include the loop's few predicated no-op steps; the share is a ratio, the bias is a handful of steps)."""
+    if c0 is None or c1 is None:
+        return
+    hot, cold = c1[0] - c0[0], c1[1] - c0[1]
+    res["routed_calls"] = hot + cold
+    res["cold_calls"] = cold
+    res["cold_share"] = cold / (hot + cold) if hot + cold else None
 
 
 def run_prompts(loop, prompts: Dict[str, dict], max_new: int, *, reps: int, parity_reps: int, stop_on_eos: bool,
@@ -230,10 +493,14 @@ def run_prompts(loop, prompts: Dict[str, dict], max_new: int, *, reps: int, pari
                 prof = None
                 if profile and profile[0] == tag and i == 0:
                     prof = (profile[1], profile[2])
+                c0 = _routed(loop)
                 fast.append(loop.generate(p["ids"], max_new, stop_on_eos=stop_on_eos, parity=False, profile=prof))
+                _cold_delta(fast[-1], c0, _routed(loop))
             for _ in range(parity_reps):
+                c0 = _routed(loop)
                 par.append(loop.generate(p["ids"], max_new, stop_on_eos=stop_on_eos, parity=True, tag=tag,
                                          prompt=p.get("prompt")))
+                _cold_delta(par[-1], c0, _routed(loop))
             out[tag] = {"fast": fast, "parity": par}
             r = fast[0] if fast else par[0]
             ms = r.get("step_ms") or []
@@ -306,12 +573,15 @@ def aggregate(rep: dict, prompts: Dict[str, dict], results: Dict[int, Dict[str, 
         n_replay += bool(replay)
         acc = base["accepts"]
         per[tag] = {"prompt_tokens": len(p["ids"]), "tokens": len(ids_), "steps": base["steps"],
+                    "tokens_sha256": hashlib.sha256(json.dumps([int(t) for t in ids_]).encode()).hexdigest(),
+                    "cold_share_by_rep": [x.get("cold_share") for x in fast],
                     "tokens_per_step": base["tokens_per_step"], "accept_hist": [acc.count(i) for i in range(6)],
                     "accepts": acc, "stream": s, "replay_ok": replay, "one_graph_equal": one_equal,
                     "prefill_ms": [x["prefill_ms"] for x in fast], "r1_ms_per_token": p.get("r1_ms_per_token"),
                     "r1_vs_ref": p.get("r1_vs_ref"), "finish_reason": base["finish_reason"],
                     "window": window(fast, stats_from),
                     "window_one_graph": window(one["fast"], stats_from) if one else None,
+                    "cold_share_by_rep_one_graph": [x.get("cold_share") for x in one["fast"]] if one else None,
                     "steps_issued": [x["steps_issued"] for x in fast],
                     "wall_ms_fast": [x["wall_ms"] for x in fast]}
     rep["prompts"] = per
@@ -324,6 +594,7 @@ def aggregate(rep: dict, prompts: Dict[str, dict], results: Dict[int, Dict[str, 
         rr = results.get(ng)
         if rr:
             head[key] = window([x for v in rr.values() for x in v["fast"]], stats_from)
+            head[key]["cold_share"] = cold_pooled([x for v in rr.values() for x in v["fast"]])
     w2 = head.get("two_graphs") or head.get("one_graph") or head.get("eager") or {}
     head["ms_per_6row_step_dspark_k5"] = (w2.get("ms_per_step") or {}).get("mean")
     head["ms_verify_graph"] = (w2.get("ms_verify_graph") or {}).get("mean") if w2.get("ms_verify_graph") else None
@@ -338,21 +609,116 @@ def aggregate(rep: dict, prompts: Dict[str, dict], results: Dict[int, Dict[str, 
     return rep
 
 
+def _mean(xs) -> Optional[float]:
+    xs = [x for x in xs if x is not None]
+    return sum(xs) / len(xs) if xs else None
+
+
+def residency_report(gen, a, rep: dict, results: Dict[int, Dict[str, dict]], graphs: Sequence[int]) -> dict:
+    """A2-2 (docs/A2-2-BOX-PLAN.md): the manager's budget / HBM / stats / policy telemetry, swaps per step (mean, max
+    vs the cap), the cold-share curve over the whole run -- per drain (the policy's cold picks / routed picks since
+    the previous drain) and per sequence in run order (the step's cold-call counters, `cold_share_by_seq`) -- the
+    manager's GPU ms per step, and with --residency-ref <the off run's headline JSON> per prompt: emitted tokens
+    sha256 and accept lengths equal, plus the ms/step delta. Call before loop.close() (close restores the boot map)."""
+    from runtime.residency import config_from_args
+
+    rm = getattr(gen, "residency_mgr", None)
+    out: Dict = {"config": config_from_args(a), "on": rm is not None}
+    if rm is None:
+        return out
+    try:
+        rm.flush()
+        d = rm.describe()
+        out.update({k: v for k, v in d.items() if k != "drain_log"})
+        out["drain_log"] = d["drain_log"]
+        out["cold_share_curve"] = [[r["host_steps"], r["cold_share"]] for r in d["drain_log"]]
+        cs = [r["cold_share"] for r in d["drain_log"] if r["cold_share"] is not None]
+        out["cold_share_first_drain"] = cs[0] if cs else None
+        out["cold_share_last4_drains"] = _mean(cs[-4:])
+        seq = []
+        for tag, res in (results.get(graphs[0]) or {}).items():      # chronological: fast reps, then parity reps
+            for kind in ("fast", "parity"):
+                for i, x in enumerate(res.get(kind) or []):
+                    seq.append({"tag": tag, "kind": kind, "i": i, "steps": x.get("steps"),
+                                "cold_share": x.get("cold_share"), "routed_calls": x.get("routed_calls")})
+        out["cold_share_by_seq"] = seq
+        h = rep.get("headline") or {}
+        w = h.get("two_graphs") or h.get("one_graph") or h.get("eager") or {}
+        out["ms_manager_per_step"] = (w.get("ms_manager_per_step") or {}).get("mean")
+        out["ms_per_step_incl_manager"] = w.get("ms_per_step_incl_manager")
+        out["overflow"] = rep.get("overflow")
+        if a.residency_ref:
+            with open(a.residency_ref) as f:
+                ref = json.load(f)
+            vs: Dict = {"ref": a.residency_ref, "prompts": {}}
+            for tag, p in (rep.get("prompts") or {}).items():
+                rp = (ref.get("prompts") or {}).get(tag)
+                if not rp:
+                    continue
+                vs["prompts"][tag] = {"accepts_equal": rp.get("accepts") == p.get("accepts"),
+                                      "tokens_equal": (rp.get("tokens_sha256") == p.get("tokens_sha256")
+                                                       if rp.get("tokens_sha256") else None)}
+            vs["all_accepts_equal"] = all(v["accepts_equal"] for v in vs["prompts"].values()) and bool(vs["prompts"])
+            vs["all_tokens_equal"] = (all(v["tokens_equal"] for v in vs["prompts"].values())
+                                      if vs["prompts"] and all(v["tokens_equal"] is not None
+                                                               for v in vs["prompts"].values()) else None)
+            rh = ref.get("headline") or {}
+            rw = rh.get("two_graphs") or rh.get("one_graph") or rh.get("eager") or {}
+            m0, m1 = (rw.get("ms_per_step") or {}).get("mean"), (w.get("ms_per_step") or {}).get("mean")
+            if m0 and m1:
+                vs["step_ms_off"], vs["step_ms_on"] = m0, m1
+                vs["step_ms_delta_pct"] = (m1 - m0) / m0 * 100
+                if w.get("ms_per_step_incl_manager"):
+                    vs["step_ms_on_incl_manager"] = w["ms_per_step_incl_manager"]
+                    vs["step_ms_delta_incl_manager_pct"] = (w["ms_per_step_incl_manager"] - m0) / m0 * 100
+            out["vs_off"] = vs
+            if vs["all_accepts_equal"] is False or vs["all_tokens_equal"] is False:
+                rep["errors"].append({"stage": "residency_vs_off", "traceback": f"residency on != off: {vs['prompts']}"})
+        if a.residency_audit:
+            from runtime.residency import golden_from_index
+
+            out["audit"] = rm.audit(golden=golden_from_index(gen.model.runtime_load.index))
+            if not out["audit"]["ok"]:
+                rep["errors"].append({"stage": "residency_audit", "traceback": str(out["audit"]["errors"][:8])})
+    except Exception:
+        tb = traceback.format_exc()
+        print(f"[residency] report FAILED\n{tb}", file=sys.stderr, flush=True)
+        rep["errors"].append({"stage": "residency_report", "traceback": tb})
+    return out
+
+
+def residency_line(rr: dict) -> str:
+    f = lambda x, d=4: "-" if x is None else f"{x:.{d}f}"  # noqa: E731
+    sp = rr.get("swaps_per_step") or {}
+    vo = rr.get("vs_off") or {}
+    hb = rr.get("hbm") or {}
+    return (f"  residency: {sp.get('swaps', 0)} swaps ({f(sp.get('mean'), 3)}/step, max {sp.get('max')}, cap "
+            f"{sp.get('cap')}); cold share drain1 {f(rr.get('cold_share_first_drain'))} -> last4 "
+            f"{f(rr.get('cold_share_last4_drains'))}; manager {f(rr.get('ms_manager_per_step'), 3)} ms/step; "
+            f"+{hb.get('spare_GiB')} GiB HBM, n_spare {rr.get('n_spare')} (stage {rr.get('n_stage')}, overflow steps "
+            f"{(rr.get('overflow') or {}).get('steps', '-')}); vs off: accepts equal "
+            f"{vo.get('all_accepts_equal', '-')}, tokens equal {vo.get('all_tokens_equal', '-')}, ms/step "
+            f"{f(vo.get('step_ms_delta_pct'), 2)}%")[:400]
+
+
 def main(argv=None) -> int:
     a = build_parser().parse_args(argv)
     if not a.no_gemv_pin:
         os.environ["DSV41_GEMV_PIN_M1"] = "1"     # before any GEMV get_config (builds, warm-ups, captures)
     os.environ["DSV41_FP32_IMPL"] = a.fp32_impl   # T9b-5 (= runtime.fused_glue_r2.FP32_IMPL_ENV), before any build
+    os.environ["DSV41_MOE_ROWMATCH"] = a.moe_rowmatch   # T9a-3 (= runtime.dg_inplace.ROWMATCH_ENV), before any build
     import torch
 
     from runtime.dspark_loop import DSparkLoop
     from runtime.generate import Generator, set_determinism
     from runtime.loader import build_and_load
+    from runtime.residency import config_from_args
 
     date = time.strftime("%Y%m%d")
     json_path = a.json or os.path.join(REPO, "docs", f"headline-{date}.json")
     graphs = [int(x) for x in a.graphs.split(",") if x.strip()]
-    impls = {"moe": a.moe_impl, "fp8": a.fp8_impl, "glue": a.glue_impl, "attn": a.attn_impl, "fp32": a.fp32_impl}
+    impls = {"moe": a.moe_impl, "fp8": a.fp8_impl, "glue": a.glue_impl, "attn": a.attn_impl, "fp32": a.fp32_impl,
+             "moe_rowmatch": a.moe_rowmatch}
     rep: Dict = {"date": time.strftime("%Y-%m-%d %H:%M:%S %Z"), "argv": sys.argv[1:] if argv is None else argv,
                  "metric": METRIC, "mode": a.mode, "impls": impls, "max_new": a.max_new,
                  "gemv_pin_m1": os.environ.get("DSV41_GEMV_PIN_M1") == "1", "errors": [], "json": json_path,
@@ -371,6 +737,18 @@ def main(argv=None) -> int:
         from runtime.static_step import DEFAULT_SPARE_SLOTS_ROWS
 
         n = a.spare_slots or DEFAULT_SPARE_SLOTS_ROWS   # grow ONCE before any build (bench/draft_bench.py note)
+        if a.pool_spare is not None:
+            n = max(n, a.pool_spare)
+        if config_from_args(a) is not None:
+            # A2-2 FIX: the staging keeps `stage` of the pool's slots (--residency-stage, else --spare-slots, else 8)
+            # and residency promotes into the REST: the default pool (16) already holds 8 -- no new allocation. Only
+            # an explicit --residency-spare larger than that grows the pool (here, once, before any build: a
+            # re-growth moves every layer's weight block; FIX2's box OOM was one).
+            from runtime.residency import ResidencyConfig, residency_stage
+
+            topk = int(model.layers[0].ffn.n_activated_experts)
+            stage = residency_stage(ResidencyConfig(stage_keep=a.residency_stage), "dg-inplace", 6, topk, a.spare_slots)
+            n = max(n, DEFAULT_SPARE_SLOTS_ROWS, stage + (a.residency_spare or 0))
         b = gen.pool.add_spare_slots(n, model)
         print(f"[pool] pre-grown to {gen.pool.spare} spare slots/layer (+{b / 2**30:.2f} GiB)", flush=True)
     with open(a.fixture) as f:
@@ -407,12 +785,22 @@ def main(argv=None) -> int:
             print(f"[r1] {r['tag']}: FAILED\n{traceback.format_exc()}", file=sys.stderr, flush=True)
 
     # 2. the loop, 2 graphs (then 1)
+    rep["rowmatch"] = rowmatch_record(getattr(gen, "static", None))   # T9a-3: before the loop resets the 1-row step
     profile = None
     if a.profile:
         t_, f_, n_ = a.profile.split(":")
         profile = (t_, int(f_), int(n_))
+    res_cfg = config_from_args(a)
+    if res_cfg is not None:
+        # A2-2: residency covers the loop's 6-row verify step only; the 1-row truth above ran on the static map. The
+        # manager grows the pool by its spare slots on top of the pre-grown staging slots (one more growth, before
+        # the verify step's tables exist -- DSparkLoop resets the static step first), then attaches to the verify step.
+        gen.set_residency(res_cfg)
+    rep["residency_config"] = res_cfg
     loop = DSparkLoop(gen, a.max_new, poll_every=a.poll_every, draft_impls=None if a.draft_impls == "same" else "ref")
     rep["loop"] = loop.describe()
+    orders_compare(rep["rowmatch"], loop.st)
+    print(f"[rowmatch] {rowmatch_line(rep['rowmatch'])}", flush=True)
     run_graphs = graphs if a.mode == "graph" else [0]
     results = run_cells(loop, prompts, a.max_new, run_graphs, reps=a.reps, parity_reps=a.parity_reps,
                         stop_on_eos=stop, profile=profile, rep=rep)
@@ -428,6 +816,9 @@ def main(argv=None) -> int:
 
     # 3. compare + aggregate
     aggregate(rep, prompts, results, run_graphs, a.stats_from)
+    if res_cfg is not None:
+        rep["residency"] = residency_report(gen, a, rep, results, run_graphs)   # before loop.close() restores the map
+    rep["mode_gap"] = mode_gap(rep)             # LOOSE-1107: one_graph vs two_graphs, and why they differ if they do
     try:
         from draft_bench import pg61_tokens_per_chunk
 
@@ -441,6 +832,8 @@ def main(argv=None) -> int:
         json.dump(slim, f, indent=1)
     for line in summary_lines(rep):
         print(line)
+    if rep.get("residency", {}).get("on"):
+        print(residency_line(rep["residency"]))
     loop.close()
     return 0 if not rep["errors"] else 2
 

@@ -1,0 +1,157 @@
+  mini4 teacher-forced (router plan-gemv): plain: all equal; fix: all equal
+  ROW-DIVERGENCE PROBE | impls {'moe_impl': 'dg-inplace', 'fp8_impl': 'gemv', 'glue_impl': 'fused', 'attn_impl': 'flashmla'} | rowwise fp32 | row_invariant_mode False | plan [5, 5, 5, 5] | stream random | L 18
+    rows compared 24: all taps equal 24, logits bit-equal 24, argmax equal 24
+    first divergence: none (every accepted row bit-equal to the 1-row step, every tap)
+      step  0 row 0 pos   18 n 5: equal; logits =, argmax =, 1-row margin 5.8791
+      step  0 row 1 pos   19 n 5: equal; logits =, argmax =, 1-row margin 8.4611
+      step  0 row 2 pos   20 n 5: equal; logits =, argmax =, 1-row margin 5.1056
+      step  0 row 3 pos   21 n 5: equal; logits =, argmax =, 1-row margin 13.8145
+      step  0 row 4 pos   22 n 5: equal; logits =, argmax =, 1-row margin 0.4953
+      step  0 row 5 pos   23 n 5: equal; logits =, argmax =, 1-row margin 5.3839
+    router impl plan-gemv; glue on (6 rows) ['dg_act', 'swiglu_routed', 'swiglu_shared', 'moe_combine', 'hc_post', 'o_rope_qdq', 'q_rope_epilogue', 'hc_norm', 'mix_stat', 'kv_path', 'q_path', 'router', 'engram', 'indexer_post', 'hc_split', 'gemv_pair', 'reduce_fold', 'dg_sf_pack', 'dedup']; FlashMLA on {'1': True, '6': True}; env {'DSV41_FP32_IMPL': 'fixed', 'DSV41_MOE_ROWMATCH': 'on', 'DSV41_GEMV_PIN_M1': '1', 'DSV41_GLUE_ORDER': None, 'DSV41_ROUTER_IMPL': 'plan-gemv', 'DSV41_FLASHMLA_ROW_SPLIT': '1', 'DSV41_FLASHMLA_TOPK_LENGTH': None}
+  ROW-DIVERGENCE PROBE | impls {'moe_impl': 'dg-inplace', 'fp8_impl': 'gemv', 'glue_impl': 'fused', 'attn_impl': 'flashmla'} | rowwise off | row_invariant_mode False | plan [5, 5, 5, 5] | stream random | L 18
+    rows compared 24: all taps equal 24, logits bit-equal 24, argmax equal 24
+    first divergence: none (every accepted row bit-equal to the 1-row step, every tap)
+      step  0 row 0 pos   18 n 5: equal; logits =, argmax =, 1-row margin 5.8791
+      step  0 row 1 pos   19 n 5: equal; logits =, argmax =, 1-row margin 8.4611
+      step  0 row 2 pos   20 n 5: equal; logits =, argmax =, 1-row margin 5.1056
+      step  0 row 3 pos   21 n 5: equal; logits =, argmax =, 1-row margin 13.8145
+      step  0 row 4 pos   22 n 5: equal; logits =, argmax =, 1-row margin 0.4953
+      step  0 row 5 pos   23 n 5: equal; logits =, argmax =, 1-row margin 5.3839
+    router impl plan-gemv; glue on (6 rows) ['dg_act', 'swiglu_routed', 'swiglu_shared', 'moe_combine', 'hc_post', 'o_rope_qdq', 'q_rope_epilogue', 'hc_norm', 'mix_stat', 'kv_path', 'q_path', 'router', 'engram', 'indexer_post', 'hc_split', 'gemv_pair', 'reduce_fold', 'dg_sf_pack', 'dedup']; FlashMLA on {'1': True, '6': True}; env {'DSV41_FP32_IMPL': 'fixed', 'DSV41_MOE_ROWMATCH': 'on', 'DSV41_GEMV_PIN_M1': '1', 'DSV41_GLUE_ORDER': None, 'DSV41_ROUTER_IMPL': 'plan-gemv', 'DSV41_FLASHMLA_ROW_SPLIT': None, 'DSV41_FLASHMLA_TOPK_LENGTH': None}
+PASS test_rowdiv_mini4_teacher_forced (28.9s)
+  mini4 rejections [5, 0, 2, 5, 1, 3, 0, 4]: rows differing 0; accepted rows changed by the rejected tokens: none
+  ROW-DIVERGENCE PROBE | impls {'moe_impl': 'dg-inplace', 'fp8_impl': 'gemv', 'glue_impl': 'fused', 'attn_impl': 'flashmla'} | rowwise off | row_invariant_mode False | plan [5, 0, 2, 5, 1, 3, 0, 4] | stream random | L 18
+    rows compared 28: all taps equal 28, logits bit-equal 28, argmax equal 28
+    first divergence: none (every accepted row bit-equal to the 1-row step, every tap)
+      step  0 row 0 pos   18 n 5: equal; logits =, argmax =, 1-row margin 5.8791
+      step  0 row 1 pos   19 n 5: equal; logits =, argmax =, 1-row margin 8.4611
+      step  0 row 2 pos   20 n 5: equal; logits =, argmax =, 1-row margin 5.1056
+      step  0 row 3 pos   21 n 5: equal; logits =, argmax =, 1-row margin 13.8145
+      step  0 row 4 pos   22 n 5: equal; logits =, argmax =, 1-row margin 0.4953
+      step  0 row 5 pos   23 n 5: equal; logits =, argmax =, 1-row margin 5.3839
+    router impl plan-gemv; glue on (6 rows) ['dg_act', 'swiglu_routed', 'swiglu_shared', 'moe_combine', 'hc_post', 'o_rope_qdq', 'q_rope_epilogue', 'hc_norm', 'mix_stat', 'kv_path', 'q_path', 'router', 'engram', 'indexer_post', 'hc_split', 'gemv_pair', 'reduce_fold', 'dg_sf_pack', 'dedup']; FlashMLA on {'1': True, '6': True}; env {'DSV41_FP32_IMPL': 'fixed', 'DSV41_MOE_ROWMATCH': 'on', 'DSV41_GEMV_PIN_M1': '1', 'DSV41_GLUE_ORDER': None, 'DSV41_ROUTER_IMPL': 'plan-gemv', 'DSV41_FLASHMLA_ROW_SPLIT': None, 'DSV41_FLASHMLA_TOPK_LENGTH': None}
+  mini4 rejections: accepted rows all equal to the 1-row step; no rejected-row leak
+PASS test_rowdiv_mini4_rejections (4.7s)
+  injection (layer 1 ffn.out row 2, +1 ulp): reported as [1, 'ffn.out', 0] at step 0 row 2; rows 0-1 equal
+PASS test_rowdiv_injection_is_named (1.5s)
+  FlashMLA real widths: row-split == one call True; m=6 vs m=1 True (max ulp 0)
+PASS test_flashmla_row_split_real_widths (0.0s)
+  V0 ROW-INVARIANCE CENSUS (row r at 6 rows vs the same row alone; torch.equal / max ulp)
+  family                           op                               eq   max_ulp     mism%  note
+  cuBLAS fp32 F.linear             router gate x.float() @ W.floa   NO      7680    85.286  
+  cuBLAS fp32 F.linear             compressor wkv / wgate, ratio    NO     19456    84.277  
+  T9b-8 fixed fp32                 compressor wkv / wgate, ratio   yes         0     0.000  replay equal True
+  cuBLAS bf16 F.linear             compressor wkv, ratio 1 (layer  yes         0     0.000  
+  cuBLAS bf16 F.linear             indexer weights_proj            yes         0     0.000  
+  cuBLAS bf16 F.linear             indexer wk on 3 latent rows     yes         0     0.000  
+  cuBLAS bf16 F.linear             indexer wk on 6 latent rows     yes         0     0.000  
+  cuBLAS fp32 F.linear             mHC mixes (cuBLAS; --fp32-impl   NO       160    88.889  
+  einsum bf16 (cuBLAS bmm)         wo_a bsgd,grd->bsgr             yes         0     0.000  
+  einsum bf16 (cuBLAS bmm)         indexer bshd,btd->bsht W=2048   yes         0     0.000  
+  torch.topk                       indexer top-512 of W=2048 (tie  yes         0     0.000  k=512 of 2048, ties; values equal True
+  einsum bf16 (cuBLAS bmm)         indexer bshd,btd->bsht W=4096   yes         0     0.000  
+  torch.topk                       indexer top-512 of W=4096 (tie  yes         0     0.000  k=512 of 4096, ties; values equal True
+  sparse_attn FlashMLA             m=6 vs m=1, real widths (128 +  yes         0     0.000  
+  sparse_attn FlashMLA             row-split (DSV41_FLASHMLA_ROW_  yes         0     0.000  
+  row-invariant: T9b-8 fixed fp32, cuBLAS bf16 F.linear, einsum bf16 (cuBLAS bmm), sparse_attn FlashMLA, torch.topk
+  NOT row-invariant: cuBLAS fp32 F.linear
+PASS test_real_width_census_reported (2.2s)
+[transformers] You are using a model of type `deepseek_v41` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+/__w/pytorch/pytorch/aten/src/ATen/native/cuda/IndexKernel.cu:111: operator(): block: [0,0,0], thread: [1,0,0] Assertion `-sizes[i] <= index && index < sizes[i] && "index out of bounds"` failed.
+/__w/pytorch/pytorch/aten/src/ATen/native/cuda/IndexKernel.cu:111: operator(): block: [0,0,0], thread: [2,0,0] Assertion `-sizes[i] <= index && index < sizes[i] && "index out of bounds"` failed.
+/__w/pytorch/pytorch/aten/src/ATen/native/cuda/IndexKernel.cu:111: operator(): block: [0,0,0], thread: [4,0,0] Assertion `-sizes[i] <= index && index < sizes[i] && "index out of bounds"` failed.
+/__w/pytorch/pytorch/aten/src/ATen/native/cuda/IndexKernel.cu:111: operator(): block: [0,0,0], thread: [7,0,0] Assertion `-sizes[i] <= index && index < sizes[i] && "index out of bounds"` failed.
+/__w/pytorch/pytorch/aten/src/ATen/native/cuda/IndexKernel.cu:111: operator(): block: [0,0,0], thread: [9,0,0] Assertion `-sizes[i] <= index && index < sizes[i] && "index out of bounds"` failed.
+/__w/pytorch/pytorch/aten/src/ATen/native/cuda/IndexKernel.cu:111: operator(): block: [0,0,0], thread: [10,0,0] Assertion `-sizes[i] <= index && index < sizes[i] && "index out of bounds"` failed.
+/__w/pytorch/pytorch/aten/src/ATen/native/cuda/IndexKernel.cu:111: operator(): block: [0,0,0], thread: [12,0,0] Assertion `-sizes[i] <= index && index < sizes[i] && "index out of bounds"` failed.
+/__w/pytorch/pytorch/aten/src/ATen/native/cuda/IndexKernel.cu:111: operator(): block: [0,0,0], thread: [13,0,0] Assertion `-sizes[i] <= index && index < sizes[i] && "index out of bounds"` failed.
+Traceback (most recent call last):
+  File "/work/tests/gpu/test_row_divergence_gpu.py", line 227, in <module>
+    t()
+  File "/work/tests/gpu/test_row_divergence_gpu.py", line 210, in test_rowdiv_real_reported
+    reps[name] = rep = _run(model, pool, plan, fix=fix, reject_variant=var, **kw)
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/tests/gpu/test_row_divergence_gpu.py", line 80, in _run
+    return P.run_probe(model, pool, impls=IMPLS, plan=plan, rowwise=FIX["rowwise"] if fix else "off",
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/bench/row_divergence_probe.py", line 514, in run_probe
+    out = _prefill(model, ids, dev)                     # (output_ids, logits, main_hidden), model.py:1275
+          ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/bench/row_divergence_probe.py", line 411, in _prefill
+    out = reference_forward(model, torch.tensor([list(ids)], dtype=torch.long, device="cpu").to(dev), 0)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/runtime/refmodel.py", line 148, in reference_forward
+    return model(tokens, start_pos, **kw)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1884, in _call_impl
+    return inner()
+           ^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1832, in inner
+    result = forward_call(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/work/reference/deepseek-inference/model.py", line 1270, in forward
+    h, pre_mix = layer(h, start_pos, pre_mix, image_mask)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1789, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/reference/deepseek-inference/model.py", line 987, in forward
+    x = self.attn(x, start_pos, *attn_args)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1789, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/reference/deepseek-inference/model.py", line 771, in forward
+    qr = self.q_norm(self.wq_a(x))
+                     ^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/nn/modules/module.py", line 1789, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/reference/deepseek-inference/model.py", line 243, in forward
+    return linear(x, self.weight, self.bias)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/runtime/patches.py", line 191, in linear
+    return orig(x, weight, bias)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/work/reference/deepseek-inference/model.py", line 198, in linear
+    return fp8_gemm(
+           ^^^^^^^^^
+  File "/work/reference/deepseek-inference/kernel.py", line 306, in fp8_gemm
+    kernel(a.view(M, K), b, c.view(M, N), a_s.view(M, -1), b_s)
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py", line 202, in __call__
+    return self.torch_function(*args, **kwds)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/tilelang/jit/adapter/tvm_ffi.py", line 287, in func
+    executable(*tensor_list)
+  File "/usr/local/lib/python3.12/dist-packages/tvm_ffi/module.py", line 299, in __call__
+    return self.main(*args)
+           ^^^^^^^^^^^^^^^^
+  File "python/tvm_ffi/cython/function.pxi", line 968, in tvm_ffi.core.Function.__call__
+  File "<unknown>", line 0, in __tvm_ffi_main
+  File "<unknown>", line 0, in __tvm_ffi_fp8_gemm_kernel_
+  File "/project/3rdparty/tvm/src/runtime/cuda/cuda_module.cc", line 140, in CUfunc_st* tvm::runtime::CUDAModuleNode::GetFunc(int, const std::string&)
+RuntimeError: cuModuleLoadData(&(module_[device_id]), code_.data()) failed with error: CUDA_ERROR_ASSERT
+[load] 96085 tensors in 48 shards, map /work/docs/maps/hot-v26ar-seed-295.json, config /ref/inference/config.json
+[load] linears with scale: 46370; wo_a dequantized: 40; widened: ['layers.14.attn.compressor.wgate.weight', 'layers.14.attn.compressor.wkv.weight', 'layers.2.attn.compressor.wgate.weight', 'layers.2.attn.compressor.wkv.weight', 'layers.8.attn.compressor.wgate.weight', 'layers.8.attn.compressor.wkv.weight', 'head.weight']; head fp32
+FAIL test_rowdiv_real_reported (84.1s)
+  note: FlashMLA m=6 vs m=1 at real widths: equal True (max ulp 0)
+  note: real-width census NOT row-invariant: router gate x.float() @ W.float()  (40 layers) (7680 ulp), compressor wkv / wgate, ratio 2, cuBLAS (layers 2, 8, 14; --fp32-impl fixed replaces it) (19456 ulp), mHC mixes (cuBLAS; --fp32-impl fixed replaces it) (160 ulp)
+  note: real-width census: compressor wkv / wgate, ratio 2 (layers 2, 8, 14; --fp32-impl fixed): row-invariant yes (replay equal True)
+comparisons executed: {'rows': 76, 'taps': 4028, 'gates': 6}
+5/6 not failed; 1 failed

@@ -739,13 +739,14 @@ class StaticStep:
             self.dg = DGBuffers(self, shapes, sshapes, swiglu_limit=lim, deterministic=self.dg_deterministic)
             moe_cls = DGMaskedMoE
         elif self.moe_impl == "dg-inplace":  # T9a-2: contiguous grouped GEMM over the hot pool + spare slots
-            from runtime.dg_inplace import DGInplaceBuffers, DGInplaceMoE
+            from runtime.dg_inplace import DGInplaceMoE, build_one_row
 
             if pool is None:
                 raise ValueError("moe_impl dg-inplace needs the model's ExpertPool")
             added = pool.add_spare_slots(k, self.model)  # before the pointer tables below (storage moves)
-            self.dg = DGInplaceBuffers(self, shapes, sshapes, pool=pool, swiglu_limit=lim,
-                                       deterministic=self.dg_deterministic)
+            # T9a-3: in the R-row step's call shape ($DSV41_MOE_ROWMATCH, default on; checked per row at build)
+            self.dg = build_one_row(self, shapes, sshapes, pool=pool, swiglu_limit=lim,
+                                    deterministic=self.dg_deterministic)
             self.dg.spare_added_B = added
             moe_cls = DGInplaceMoE
         n_layers, n_exp = len(layers), moe0.n_routed_experts
@@ -803,7 +804,7 @@ class StaticStep:
         0's real pool bytes) or the build falls back to it (the record says why: describe()["layout_check"])."""
         from runtime import dg_inplace as DI
 
-        spec = self._rows_gemm_req or os.environ.get(DI.ROWS_GEMM_ENV) or "contiguous16"  # probe 2026-11-07: fastest bit-equal
+        spec = DI.rows_gemm_spec(self._rows_gemm_req)  # default contiguous16 (probe 2026-11-07: fastest bit-equal)
         layout, align = DI.parse_rows_gemm(spec)
         store = self._rows_sf_req or os.environ.get(DI.ROWS_SF_STORE_ENV) or DI.ROWS_SF_STORE_DEFAULT
         kw = dict(pool=self.pool, swiglu_limit=lim, deterministic=self.dg_deterministic, slots=ns,
@@ -875,7 +876,7 @@ class StaticStep:
         latent = None
         if attn.is_kv_source:
             if self.rows == 1:
-                latent = attn.compressor(x, representative_pos(parity))       # #12 (model.py:748)
+                latent = self._compressor_one(attn.compressor, x, representative_pos(parity))  # #12 (model.py:748)
             else:
                 latent = self._compressor_rows(attn.compressor, x)            # M1-T10: one graph for both parities
             sa.compress_kv = attn.compress_kv_cache
@@ -896,6 +897,24 @@ class StaticStep:
             attn.compress_kv_cache[:1].index_copy_(1, c.div(ratio), latent)  # #13
         return sa.compress_kv[:1, : self.W[ratio]], idxs                      # #8 stopgap: fixed length
 
+    def _compressor_proj(self, comp, xf):
+        """model.py:464-465 at ratio > 1: (wkv(xf), wgate(xf)) -- the reference's cuBLAS F.linear under `cublas`, the
+        T9b-5 order (fused_glue_r2.compressor_proj_fixed, T9b-8) under $DSV41_FP32_IMPL=fixed, the same at every R."""
+        from runtime.fused_glue_r2 import compressor_fixed, compressor_proj_fixed
+
+        if compressor_fixed(comp):
+            return compressor_proj_fixed(comp, xf)
+        return comp.wkv(xf), comp.wgate(xf)
+
+    def _compressor_one(self, comp, x, start_pos: int):
+        """The 1-row step's Compressor.forward: the reference call (model.py:458-485), or under `fixed` at ratio > 1
+        the same decode branch with _compressor_proj's projections (fused_glue_r2.compressor_decode_fixed, T9b-8)."""
+        from runtime.fused_glue_r2 import compressor_decode_fixed, compressor_fixed
+
+        if compressor_fixed(comp):
+            return compressor_decode_fixed(comp, x, start_pos)
+        return comp(x, start_pos)
+
     def _compressor_rows(self, comp, x):
         """Compressor.forward (model.py:458-485) for the R rows of one step at positions P0..P0+R-1 (R even): ratio 1
         is the reference call (461-462, any row count); ratio 2 projects all rows (464-465), pools the R/2 completed
@@ -906,7 +925,7 @@ class StaticStep:
         c = self._c
         dtype = x.dtype
         xf = x.float()
-        kv, score = comp.wkv(xf), comp.wgate(xf)                              # model.py:464-465, [1, R, d]
+        kv, score = self._compressor_proj(comp, xf)                           # model.py:464-465, [1, R, d] (T9b-8)
         pooled = pool_ratio2_rows(comp.kv_state[:1, :1], comp.score_state[:1, :1], kv, score, c.r2_seq())
         sidx = c.r2_state()                                                   # commit after the read of state0
         comp.kv_state[:1].copy_(kv.index_select(1, sidx))

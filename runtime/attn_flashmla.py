@@ -41,6 +41,17 @@ softmax_scale) -> o [b, m, h, d] bf16` (`sparse_attn_flashmla`):
 Graph capture: one kernel launch plus (only when padding is needed) pads/narrows; no host sync, no scheduler metadata;
 the outputs come from the graph's private pool. The probe measured replay == replay and graph == eager.
 
+T12-DIAG, row invariance and "num_splits": `sparse_prefill_fwd` takes NO num_splits / tile_scheduler_metadata. Those
+belong to the decode entry `flash_mla_with_kvcache` -> `sparse_decode_fwd` / `dense_decode_fwd`
+(flash_mla_interface.py:57-176: FlashMLASchedMeta.tile_scheduler_metadata / num_splits, split-KV whose partition
+depends on the batch -- the M-dependent schedule research/round2-20261107/W4 4e warns about). The prefill kernel has
+no split-KV combine: each query row's softmax / PV runs over that row's own index list in index order, so its
+reduction order cannot depend on s_q (measured: row_census "sparse_attn FlashMLA m=6 vs m=1" equal on the real
+checkpoint's h=64 d=512, first-light-rows6-*-20261107.json; self_check `rows_m_invariant` true). The closest thing to
+"forcing the 1-row schedule" is to issue one s_q = 1 call per query row, which `$DSV41_FLASHMLA_ROW_SPLIT=1` (or
+`row_split=True`) does: R launches instead of 1, outputs concatenated in row order -- a diagnostic switch
+(bench/row_divergence_probe.py --flashmla-row-split); read at call time, i.e. at capture for a graph.
+
 Routing: `StaticStep(attn_impl="flashmla")` calls `sparse_attn_flashmla` directly from its `_sparse_attn` (it owns the
 call site), for every layer (ratio 0 and compressed), only inside its static step; the prefill and the eager reference
 never reach it, so no monkeypatch on model.py is needed. A build-time `self_check` (eager, before any capture) runs it
@@ -71,15 +82,22 @@ HQ = (64, 128)              # h_q the SM100 kernels take (nvidia/flashmla.py:66-
 TOPK_ALIGN = 128            # nvidia/flashmla.py:292 round_up(top_k + window, 128)
 CHECK_MAX_RATIO = 2.0       # build-time gross-error gate: fp64-oracle error <= 2x the reference kernel's (probe gate)
 TOPK_LENGTH_ENV = "DSV41_FLASHMLA_TOPK_LENGTH"  # "0": pass no per-row length (the -1 slots are then masked instead)
+ROW_SPLIT_ENV = "DSV41_FLASHMLA_ROW_SPLIT"      # "1": one s_q = 1 kernel call per query row (T12-DIAG, docstring)
 
 _STATE: Dict[str, object] = {"ops": None, "so": None, "error": None}
-_STATS = {"calls": 0, "padded": 0}
+_STATS = {"calls": 0, "padded": 0, "row_split_calls": 0}
 
 
 def use_topk_length() -> bool:
     """Whether compressed-layer calls pass `topk_length` (default yes; `DSV41_FLASHMLA_TOPK_LENGTH=0` turns it off --
     a box knob in case the kernel mishandles lengths; the probe's arm C ran without them). Read at build/capture."""
     return os.environ.get(TOPK_LENGTH_ENV, "1") != "0"
+
+
+def use_row_split() -> bool:
+    """T12-DIAG: whether multi-row calls are issued one query row at a time ($DSV41_FLASHMLA_ROW_SPLIT=1; default
+    off). Read at call time (= at capture for a graph)."""
+    return os.environ.get(ROW_SPLIT_ENV, "0") == "1"
 
 
 # ------------------------------------------------------------------------------------------------ loading
@@ -212,11 +230,12 @@ def prepare(q: torch.Tensor, kv: torch.Tensor, attn_sink: torch.Tensor, topk_idx
 
 
 def sparse_attn_flashmla(q: torch.Tensor, kv: torch.Tensor, attn_sink: torch.Tensor, topk_idxs: torch.Tensor,
-                         softmax_scale: float, topk_length: Optional[torch.Tensor] = None, ops=None) -> torch.Tensor:
+                         softmax_scale: float, topk_length: Optional[torch.Tensor] = None, ops=None,
+                         row_split: Optional[bool] = None) -> torch.Tensor:
     """The reference `sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale)` (kernel.py:392-403) on FlashMLA's
     sparse_prefill_fwd: same argument shapes and dtypes, returns a contiguous bf16 [b, m, h, d]. `topk_length`
     (int32, b*m entries) limits each row to its leading indices (all later ones must be -1). `ops` defaults to
-    `load_ops()`."""
+    `load_ops()`. `row_split` (None = $DSV41_FLASHMLA_ROW_SPLIT): one s_q = 1 call per query row (T12-DIAG)."""
     why = reason(q, kv, topk_idxs, topk_length)
     if why is not None:
         raise ValueError(f"sparse_attn_flashmla: ineligible inputs ({why}): q {q.dtype} {tuple(q.shape)}, kv "
@@ -225,8 +244,15 @@ def sparse_attn_flashmla(q: torch.Tensor, kv: torch.Tensor, attn_sink: torch.Ten
     qf, kvf, idx, sink, tlen, (b, m, h, d), padded = prepare(q, kv, attn_sink, topk_idxs, topk_length)
     _STATS["calls"] += 1
     _STATS["padded"] += int(padded)
-    res = getattr(ops, OP)(qf, kvf, idx, float(softmax_scale), D_V, sink, tlen, None)
-    o = res[0]
+    fn = getattr(ops, OP)
+    split = use_row_split() if row_split is None else bool(row_split)
+    if split and qf.size(0) > 1:
+        # every slice is a contiguous leading-dim view; kv / sink are shared (the kernel only reads them)
+        _STATS["row_split_calls"] += qf.size(0)
+        o = torch.cat([fn(qf[i:i + 1], kvf, idx[i:i + 1], float(softmax_scale), D_V, sink,
+                          None if tlen is None else tlen[i:i + 1], None)[0] for i in range(qf.size(0))], 0)
+    else:
+        o = fn(qf, kvf, idx, float(softmax_scale), D_V, sink, tlen, None)[0]
     if o.size(1) != h or o.size(-1) != d:
         o = o[:, :h, :d]
     return o.reshape(b, m, h, d).contiguous()

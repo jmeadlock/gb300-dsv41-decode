@@ -293,13 +293,43 @@ def test_gather_tables_vs_six_gathers():
 
 
 # ------------------------------------------------------------------------------------------------ mini checkpoints
+def _check_cluster_plan(d: dict, want_on: set, what: str) -> None:
+    """The 1-row build's cluster plan (`st.glue.describe()`), checked for what it must say -- the numerics are the
+    caller's bit-equality runs (fused == ref glue, graph == static), which stay strict.
+
+    T12-DIAG (docs/glue-gpu-test-t9b7-20261107.log, 4 failures): the old one-line assertion allowed only round-2
+    clusters on beyond `want_on`, so T9b-4's sub-switches (hc_split, gemv_pair, reduce_fold: fused_glue.R4_PARTS) being
+    ON failed it, and its message printed the NOT-on clusters (all documented n/a), which read like n/a strictness.
+      * every wanted cluster is on (a wanted cluster n/a or off is a real failure);
+      * a cluster on beyond `want_on` belongs to a family whose status another check owns: round 2
+        (tests/gpu/test_fused_glue_r2_gpu.py), T9b-4 parts and M1 parts (each self-checked at build, run here);
+      * every cluster NOT on carries a reason: "n/a: ..." (not applicable to these impls / rows, or documented
+        deferred: fused_glue.ROWS_WHY / CONCAT_FREE_WHY) or "off: ..." (disabled by env or a failed self-check of a
+        cluster outside `want_on` -- reported); anything else is a malformed status and fails."""
+    from runtime.fused_glue import CLUSTERS, CONCAT_FREE_WHY, M1_PARTS, R2_CLUSTER_NAMES, R4_PARTS
+
+    st = d["clusters"]
+    on = set(d["on"])
+    missing = {c: st.get(c) for c in sorted(want_on - on)}
+    assert not missing, f"{what}: wanted clusters not on: {missing}"
+    owned = set(R2_CLUSTER_NAMES) | set(R4_PARTS) | set(M1_PARTS)
+    stray = sorted(on - want_on - owned)
+    assert not stray, f"{what}: clusters on outside any checked family: {stray} ({ {c: st.get(c) for c in stray} })"
+    not_on = {c: st.get(c) or "" for c in CLUSTERS if c not in on}
+    bad = {c: s for c, s in not_on.items() if not (s.startswith("n/a: ") or s.startswith("off: "))}
+    assert not bad, f"{what}: clusters not on without a documented reason: {bad}"
+    deferred = sorted(c for c, s in not_on.items() if CONCAT_FREE_WHY in s)
+    na = sorted(c for c, s in not_on.items() if s.startswith("n/a: ") and c not in deferred)
+    off = {c: s for c, s in not_on.items() if s.startswith("off: ")}
+    print(f"  {what}: plan ok -- on {sorted(on)}; n/a {na}; deferred {deferred}; off {off or '-'}")
+
+
 def _fused_vs_ref(kind, moe, fp8):
     _need_glue()
     if moe != "ref":
         from runtime.dg_moe import import_deep_gemm
 
         import_deep_gemm()
-    from runtime.fused_glue import CLUSTERS
 
     with _model(kind) as (model, tokdir):
         gen = _gen(model, tokdir, moe_impl=moe, fp8_impl=fp8, glue_impl="fused")
@@ -309,12 +339,7 @@ def _fused_vs_ref(kind, moe, fp8):
         want_on = {"gather", "swiglu_shared", "hc_post", "o_rope_qdq"} | (
             {"dg_act", "swiglu_routed", "moe_combine"} if moe != "ref" else set()) | (
             {"q_rope_epilogue"} if fp8 == "gemv" else set())
-        # round 2 (runtime/fused_glue_r2.py) clusters are on when their device calibration is outcome (i); their
-        # status is checked by tests/gpu/test_fused_glue_r2_gpu.py
-        from runtime.fused_glue import R2_CLUSTER_NAMES
-
-        assert want_on <= set(d["on"]) and set(d["on"]) - want_on <= set(R2_CLUSTER_NAMES), \
-            {c: d["clusters"][c] for c in CLUSTERS if c not in d["on"]}
+        _check_cluster_plan(d, want_on, f"{kind} {moe}/{fp8}")
         runs = {}
         for L, seed in ((16, 5), (17, 6)):                               # both prefill parities
             ids = _ids(L, seed)
@@ -380,10 +405,60 @@ def test_fused_step_cell_informative():
         print(f"  mini4 dg-masked/gemv graph step cell p50: glue ref {p50['ref']:.3f} ms, fused {p50['fused']:.3f} ms")
 
 
+def test_t9b7_real_width_orders():
+    """T9b-7 (docs/HANDOFF-T9B7-GLUE-ORDER.md) at DSV4.1's real widths (D 5120, hc*D 20480, q_lora 1280, head_dim 512,
+    topk 6; Engram over D at hc_mult 4 rows): the order picked at the 1-row reference shape reproduces torch's 1-row
+    value on every row of a 6-row batch evaluated one row at a time (fused_glue_r2.per_row_reductions, the R-row
+    oracle) -- gated, bit for bit; reported: how many rows torch's batched [1, 6, ...] reduce gets differently (the
+    R-dependence T9b-7 removes) and the order a `rows` build would pick. And launch_norm_row at 6 rows in the 1-row
+    order == the 1-row launch on each row (q 1280, kv 512, norm_D 5120)."""
+    _need_glue()
+    from runtime import fused_glue_r2 as R2
+
+    dev = torch.device("cuda")
+    R6 = 6
+    sites = [("norm_D", 5120, 1, "sqmean"), ("mix", 4 * 5120, 1, "sqmean"), ("q", 1280, 1, "sqmean"),
+             ("kv", 512, 1, "sqmean"), ("router", 6, 1, "sum"), ("engram", 5120, 4, "sqmean"),
+             ("engram_sum", 5120, 4, "sum")]
+    g = torch.Generator(device="cpu").manual_seed(77)
+    bad = []
+    for name, w, r1, kind in sites:
+        o1 = R2.pick_order(dev, w, r1, kind)
+        oR = R2.pick_order(dev, w, R6 * r1, kind)
+        x = R2._stat_rows(g, R6 * r1, w, kind).to(dev).float()
+        shape = (1, R6, w) if r1 == 1 else (1, R6, r1, w)
+        op = (lambda t: t.square().mean(-1)) if kind == "sqmean" else (lambda t: t.sum(-1))
+        batched = op(x.reshape(shape).clone()).reshape(-1)
+        with R2.per_row_reductions():
+            per_row = op(x.reshape(shape).clone()).reshape(-1)
+        vals = x * x if kind == "sqmean" else x
+        sim = R2.order_sum_torch(vals, o1["order"])
+        sim = R2.mean_finish(sim, w, o1["fin"]) if kind == "sqmean" else sim
+        ok = _eq(sim, per_row)
+        nb = int((batched.view(torch.int32) != per_row.view(torch.int32)).view(R6, r1).any(-1).sum())
+        print(f"  T9b-7 {name:10s} w {w:6d} x{r1}: 1-row order {o1['name']} (exact {o1['exact']}); "
+              f"6-row-shape order {oR['name']}; batched torch rows != per-row: {nb}/{R6}; 1-row order == "
+              f"per-row oracle: {ok}")
+        if not (o1["exact"] and ok):
+            bad.append(name)
+    assert not bad, f"1-row orders not reproducing the per-row oracle at real widths: {bad}"
+    for name, N in (("norm_D", 5120), ("q", 1280), ("kv", 512)):
+        ordd = R2.pick_order(dev, N, 1, "sqmean")
+        x = _act(g, R6, N, -4, 6)
+        nw = (torch.randn(N, generator=g, device="cpu") * 0.3 + 1.0).to(torch.bfloat16).cuda()
+        out = torch.empty(R6, N, dtype=torch.bfloat16, device=dev)
+        R2.launch_norm_row(x, nw, out, eps=1e-6, ordd=ordd)
+        for r in range(R6):
+            o1_ = torch.empty(N, dtype=torch.bfloat16, device=dev)
+            R2.launch_norm_row(x[r].contiguous(), nw, o1_, eps=1e-6, ordd=ordd)
+            assert _eq(out[r], o1_), (name, r)
+    torch.cuda.synchronize()
+
+
 TESTS = [test_act_quant_kernels_vs_reference_all_bf16, test_swiglu_kernels_vs_reference_real_shapes,
          test_combine_and_hc_post_kernels, test_rope_kernels_modes_on_device, test_gather_tables_vs_six_gathers,
          test_fused_vs_ref_mini_refref, test_fused_vs_ref_mini4_refref, test_fused_vs_ref_mini_dg_gemv,
-         test_fused_vs_ref_mini4_dg_gemv, test_fused_step_cell_informative]
+         test_fused_vs_ref_mini4_dg_gemv, test_t9b7_real_width_orders, test_fused_step_cell_informative]
 
 if __name__ == "__main__":
     import traceback

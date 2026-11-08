@@ -137,6 +137,7 @@ class _DT:
 int32, int64, float32, bfloat16 = _DT("int32", np.int32), _DT("int64", np.int64), _DT("float32", np.float32), \
     _DT("bfloat16", None)
 uint8, float8e4nv = _DT("uint8", np.uint8), _DT("float8e4nv", None)
+float64 = _DT("float64", np.float64)     # M2-T15 fix: the softplus modes' fp64 exp (casts round to nearest even)
 
 
 class constexpr:  # noqa: N801 - Triton's name; only used as an annotation
@@ -207,10 +208,10 @@ def maximum(a, b):
     return T(r) if isinstance(a, T) or isinstance(b, T) else r
 
 
-def sum(x, axis):  # noqa: A001 - Triton's name
+def sum(x, axis=None):  # noqa: A001 - Triton's name
     a = np.asarray(_v(x))
     # fp32 accumulation for floats (as before); M1-T10-MOE: integer / bool sums stay integer (Triton's int sum is an
-    # int: the warp dedup shifts and indexes with them)
+    # int: the warp dedup shifts and indexes with them); M2-T15 fix: axis None reduces every dimension (as Triton)
     return T(np.sum(a, axis=axis, dtype=np.float32 if a.dtype.kind == "f" else np.int64))
 
 
@@ -277,8 +278,13 @@ _ASM = {"mul.rn.f32": lambda a, b: a * b, "add.rn.f32": lambda a, b: a + b, "sub
 
 
 def inline_asm_elementwise(asm, constraints, args, dtype, is_pure, pack):
-    """Only the single-instruction fp32 forms runtime/fused_glue.py uses (`mul.rn.f32 $0, $1, $2;` etc.)."""
+    """Only the single-instruction fp32 forms runtime/fused_glue.py uses (`mul.rn.f32 $0, $1, $2;` etc.), and
+    M2-T15's fence (`fence.acq_rel.gpu; mov.b32 $0, $1;`, runtime/static_kernels._m2_fence): the identity here
+    (programs run one after another, every store is visible to the next)."""
     op = asm.split()[0]
+    if op == "fence.acq_rel.gpu;":
+        assert dtype is int32 and pack == 1 and len(args) == 1 and not is_pure, asm
+        return T(np.asarray(_v(args[0])).astype(np.int32))
     assert op in _ASM and dtype is float32 and pack == 1, asm
     a, b = (np.asarray(_v(t), dtype=np.float32) for t in args)
     return T(_ASM[op](a, b).astype(np.float32))
@@ -322,7 +328,24 @@ def _div_rn(a, b):
     return T((np.asarray(_v(a), dtype=np.float32) / np.asarray(_v(b), dtype=np.float32)).astype(np.float32))
 
 
-def load(ptr, mask=None, other=None):
+# M2-T15 (runtime/static_kernels._m2_softplus): libdevice exp / log1p as numpy float32 functions. NOT libdevice's
+# bits: the Mac tests compare the kernel body against a mirror built from these same two functions
+# (tests/test_router_plan_cpu.py), and the device's libdevice vs torch's F.softplus is the box probe's question.
+# M2-T15 fix (SOFTPLUS modes 2 / 3): exp of an fp64 block is numpy's float64 exp (libdevice __nv_exp on the device).
+def _exp(x):
+    a = np.asarray(_v(x))
+    with np.errstate(over="ignore", under="ignore"):
+        if a.dtype == np.float64:
+            return T(np.exp(a))
+        return T(np.exp(a.astype(np.float32)).astype(np.float32))
+
+
+def _log1p(x):
+    return T(np.log1p(np.asarray(_v(x), dtype=np.float32)).astype(np.float32))
+
+
+def load(ptr, mask=None, other=None, cache_modifier=None, volatile=False, eviction_policy=None):
+    # (M2-T15: cache_modifier=".cg" -- an L2 read -- is a caching hint; programs here share one memory)
     vals = ptr.buf[np.clip(ptr.off, 0, ptr.buf.size - 1)]
     if mask is None:
         assert ((ptr.off >= 0) & (ptr.off < ptr.buf.size)).all(), "unmasked out-of-bounds load"
@@ -347,9 +370,10 @@ STORES: list = []
 DIRTY: set = set()  # id() of the buffers a launch stored to (fp8 / uint8 / int64 ones are written back only then)
 
 
-def atomic_add(ptr, val, mask=None):
+def atomic_add(ptr, val, mask=None, sem=None, scope=None):
     """M1-T10-FIX2 (t9a2_stage_inplace's overflow counter): scalar or block add at the pointer(s); returns the old
-    value(s). Programs run one after another here, so the read-modify-write is trivially atomic."""
+    value(s). Programs run one after another here, so the read-modify-write is trivially atomic (M2-T15's ticket:
+    sem / scope accepted, program order already is their order)."""
     off = np.atleast_1d(ptr.off)
     m = np.ones(off.shape, bool) if mask is None else np.broadcast_to(_v(mask), off.shape)
     assert ((off[m] >= 0) & (off[m] < ptr.buf.size)).all(), "out-of-bounds atomic"
@@ -443,7 +467,8 @@ def cdiv(a, b):
 
 def _modules():
     tl = types.ModuleType("triton.language")
-    for name in ("T", "P", "int32", "int64", "float32", "bfloat16", "constexpr", "program_id", "arange", "zeros",
+    for name in ("T", "P", "int32", "int64", "float32", "float64", "bfloat16", "constexpr", "program_id", "arange",
+                 "zeros",
                  "where", "minimum", "maximum", "sum", "dot", "trans", "static_range", "load", "store",
                  "uint8", "float8e4nv", "max", "abs", "fma", "inline_asm_elementwise", "reshape", "split", "join",
                  "broadcast_to", "pointer_type", "multiple_of", "atomic_add", "sort", "cumsum", "debug_barrier"):
@@ -453,6 +478,7 @@ def _modules():
     ex = types.ModuleType("triton.language.extra")
     ld = types.ModuleType("triton.language.extra.libdevice")
     ld.rsqrt, ld.sqrt_rn, ld.div_rn = _rsqrt, _sqrt_rn, _div_rn
+    ld.exp, ld.log1p = _exp, _log1p                                  # M2-T15 softplus
     ex.libdevice = ld
     tl.extra = ex
     tr.next_power_of_2 = lambda n: 1 if int(n) <= 1 else 1 << (int(n) - 1).bit_length()  # (this module shadows max)

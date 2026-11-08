@@ -294,7 +294,7 @@ class VerifyStep(StaticStep):
         c = self._c
         dtype = x.dtype
         xf = x.float()
-        kv, score = comp.wkv(xf), comp.wgate(xf)                              # model.py:464-465 (parent's ops)
+        kv, score = self._compressor_proj(comp, xf)                           # model.py:464-465 (parent's ops, T9b-8)
         pooled = pool_ratio2_rows(comp.kv_state[:1, :1], comp.score_state[:1, :1], kv, score, c.r2_seq())
         _, kvs, scs = self._r2[id(comp)]
         kvs[:, :2].copy_(comp.kv_state[:1])                                   # pre-step slots 0, 1
@@ -372,6 +372,7 @@ class DSparkLoop:
         self.n_graphs = 0
         self.capture_info: Optional[dict] = None
         self.n_replays = 0
+        self._hook_evs: List[tuple] = []   # A2-2: (start, end) CUDA events around the residency hook, one per timed step
 
     # ---------------------------------------------------------------- bodies
     def _verify_accept(self) -> None:
@@ -431,6 +432,26 @@ class DSparkLoop:
         if events is not None:
             events[2].record()
         self.n_replays += 1
+        rm = getattr(self.gen, "residency_mgr", None)
+        if rm is not None:
+            self._residency_hook(rm, events is not None)
+
+    def _residency_hook(self, rm, timed: bool) -> None:
+        """A2-2: the ResidencyManager's per-step call, between this step's replay and the next one, on the replay
+        stream (runtime/residency.py: count the routed ids this replay left in st.ids_step, publish finished swaps,
+        drain, one barrier; table writes are scalar fill_ kernels in stream order, so a graph enqueued later reads
+        the new contents and one enqueued earlier is finished before a demoted slot is overwritten). Steps the loop
+        issues after `done` are predicated no-ops: the device `live` flag keeps them out of the hit counters. The
+        hook runs AFTER the step's end event, so the step/verify/draft ms stay graph-only; `generate` reports the
+        manager's own GPU time per step as `mgr_ms` (a pair of events around the hook)."""
+        if timed:
+            h0 = torch.cuda.Event(enable_timing=True)
+            h1 = torch.cuda.Event(enable_timing=True)
+            h0.record()
+        rm.after_step(live=self.b.live)
+        if timed:
+            h1.record()
+            self._hook_evs.append((h0, h1))
 
     def set_force(self, drafts: Optional[Sequence[int]]) -> None:
         """Scripted drafts for the NEXT draft write (V1): d'1..d'5 := drafts; None = the draft step's own."""
@@ -593,6 +614,7 @@ class DSparkLoop:
         prefill_ms = (time.perf_counter() - t0) * 1e3
         entries: List[dict] = []
         digests: List[str] = []
+        self._hook_evs = []
         if parity:
             lc = logits0.detach().to("cpu", torch.float32)
             entries.append(logprob_entry(lc, first, top_k, gen.token_str))
@@ -673,6 +695,8 @@ class DSparkLoop:
             res["step_ms"] = [x[0] for x in ms]
             res["verify_ms"] = [x[1] for x in ms] if self.n_graphs != 1 else None
             res["draft_ms"] = [x[2] for x in ms] if self.n_graphs != 1 else None
+            if self._hook_evs:   # A2-2: the residency manager's own GPU time per live step (count + table writes)
+                res["mgr_ms"] = [h0.elapsed_time(h1) for h0, h1 in self._hook_evs[:live]]
         if parity:
             k = len(ids_out)
             entries, digests = entries[:k], digests[:k]

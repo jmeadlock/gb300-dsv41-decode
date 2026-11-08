@@ -695,8 +695,9 @@ def test_static6_dg_inplace_equals_dg_masked_emulated(rows_dg, kind, L):
     assert pool.spare == S == b.spare_limit == st.spare_slots and b.k == B
     assert all(isinstance(m, DGInplaceMoERows) for m in st.moes)
     assert b.mi.shape == (B * b.align,) and st.describe()["moe_impl"] == "dg-inplace"
+    n_c0 = len(fake.contig_calls)         # the build's own layout check (contiguous16 default) is not a step call
     a_lg, a_h, a_s = _static_run(model, st, ids, toks, n)
-    calls = list(fake.contig_calls)
+    calls = list(fake.contig_calls[n_c0:])
     rc = st.routed_counts()
     ov = st.overflow_counts()
     st.detach()

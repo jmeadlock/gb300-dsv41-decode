@@ -481,6 +481,13 @@ T9B5_RB_MAX = 8
 # override: DSV41_T9B5_CFG="head:8=16,2,8,1;mix:1=1,8,4,1".
 T9B5_CFG = {"head": {1: (32, 4, 4, 1), 2: (32, 2, 4, 1), 4: (16, 4, 4, 1), 8: (16, 4, 8, 1)},
             "mix": {1: (1, 20, 16, 1)}}   # mixes: 40 K tiles in 2 trips (latency: few programs at 1 row)
+# M2-T17 (docs/HANDOFF-M2-T17-BF16-HEAD.md): the head weight kept in its checkpoint dtype, bf16 in HBM -- the SAME kernel
+# (t9b5_head_fp32: the tile is loaded as bf16 and widened to fp32 in registers by `.to(tl.float32)`, which is exact, so
+# every product and every sum is the fp32-stored head's, bit for bit), half the bytes. A bf16 tile is half the bytes of an
+# fp32 tile, so U (K tiles per loop trip) is doubled to keep the bytes in flight per program the same as the fp32 config's.
+# UNTUNED starting point: bench/head_bench.py sweeps (BN, U, num_warps, num_stages) on the box and prints the best as a
+# DSV41_T9B5_CFG string (site key "head_bf16:<RB>"); every config is bit-identical (speed-only knobs).
+T9B5_CFG["head_bf16"] = {1: (32, 8, 4, 1), 2: (32, 4, 4, 1), 4: (16, 8, 4, 1), 8: (16, 8, 8, 1)}
 T9B5_CFG_ENV = "DSV41_T9B5_CFG"
 
 
@@ -589,14 +596,18 @@ def _t9b5_env_cfg() -> dict:
 
 def t9b5_rows_per_program(site: str, R: int) -> int:
     """RB: the mixes run one row per program (their 2 MB weight is L2-resident across the R programs that share
-    it); the head puts every row (<= 8) in one program so its 2.65 GB weight is read once per step."""
+    it); the head (fp32- or bf16-stored: site "head" / "head_bf16") puts every row (<= 8) in one program so its
+    weight is read once per step."""
     if site == "mix":
         return 1
     return min(T9B5_RB_MAX, triton.next_power_of_2(max(1, int(R))))
 
 
-def t9b5_config(site: str, R: int) -> tuple:
-    """(RB, BN, U, num_warps, num_stages) for a call of `site` at R rows."""
+def t9b5_config(site: str, R: int, wdtype: Optional[torch.dtype] = None) -> tuple:
+    """(RB, BN, U, num_warps, num_stages) for a call of `site` at R rows. A bf16-stored head weight (wdtype
+    torch.bfloat16 at site "head", or site "head_bf16" itself) takes the "head_bf16" table / env key."""
+    if site == "head" and wdtype == torch.bfloat16:
+        site = "head_bf16"
     rb = t9b5_rows_per_program(site, R)
     env = _t9b5_env_cfg()
     bn, u, nw, ns = env.get((site, rb)) or T9B5_CFG[site].get(rb) or T9B5_CFG[site][max(T9B5_CFG[site])]
@@ -607,7 +618,12 @@ def fixed_dot(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor, *, kb: int, s
               scale: Optional[torch.Tensor] = None, cfg: Optional[tuple] = None) -> None:
     """T9b-5: out [R, N] fp32 <- x [R, K] . w [N, K]^T (* scale [R]) in the fixed order of KB = kb lanes (the
     contract above; fused_glue_r2.fixed_dot_torch on CPU). site "head" / "mix" picks the named kernel and the
-    default launch config; cfg = (RB, BN, U, num_warps, num_stages) overrides it (speed only)."""
+    default launch config; cfg = (RB, BN, U, num_warps, num_stages) overrides it (speed only). w may be fp32 or
+    bf16 (M2-T17: widened in registers, exact; the head's bf16 weight takes the "head_bf16" launch table)."""
+    if site not in T9B5_KERNELS:
+        raise ValueError(f"fixed_dot: site {site!r} not in {tuple(T9B5_KERNELS)}")
+    if w.dtype not in (torch.float32, torch.bfloat16) or x.dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError(f"fixed_dot: x {x.dtype} / w {w.dtype} must be fp32 or bf16 (the kernel widens bf16 exactly)")
     if x.dim() != 2 or w.dim() != 2 or out.dim() != 2:
         raise ValueError(f"fixed_dot: x {tuple(x.shape)}, w {tuple(w.shape)}, out {tuple(out.shape)} must be 2-D")
     R, K = x.shape
@@ -622,9 +638,608 @@ def fixed_dot(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor, *, kb: int, s
         raise ValueError(f"fixed_dot: scale must be fp32 contiguous [R = {R}]")
     if R == 0:
         return
-    rb, bn, u, nw, ns = cfg if cfg is not None else t9b5_config(site, R)
+    rb, bn, u, nw, ns = cfg if cfg is not None else t9b5_config(site, R, w.dtype)
     nk = K // kb
     u = max(1, min(int(u), nk))
     T9B5_KERNELS[site][(triton.cdiv(N, bn), triton.cdiv(R, rb))](
         x, w, out, scale if scale is not None else out, R, N, x.stride(0), w.stride(0), out.stride(0),
         nk, kb, bn, rb, u, scale is not None, num_warps=nw, num_stages=ns, enable_fp_fusion=False)
+
+
+# ------------------------------------------------------------------------------------------------ T9b-8 (compressor)
+# docs/LEDGER.md 2026-11-07 15:05 (T12-DIAG, docs/rowdiv-shell-20261107.log): the ratio-2 attention compressor's wkv /
+# wgate (model.py:463-465: F.linear(x.float(), W), W declared fp32 at ratio > 1 by model.py:444-448 and widened from the
+# checkpoint's bf16 by runtime/loader.py, so every product is exact in fp32 and only the sum order is a choice) were the
+# last cuBLAS fp32 site of the 6-row step that is not row-invariant (85 % of elements differ 6 rows vs 1). Under
+# `--fp32-impl fixed` they run THE T9b-5 order (_t9b5_dot above; KB = fused_glue_r2.FIXED_KB["comp"]) under their own
+# launch name, site "comp" of fixed_dot. Real shapes: [R, 5120] x [512, 5120] fp32 (10.5 MB per weight, 3 ratio-2
+# layers x 2 weights per step). N is small, so BN is small (128-512 programs on one weight) and every row <= 8 shares a
+# program (RB = next_power_of_2(R): the weight is read once per launch at any R). (BN, U, num_warps, num_stages) are
+# speed-only (UNTUNED starting point; override "comp:<RB>=BN,U,nw,ns" in $DSV41_T9B5_CFG).
+@triton.jit
+def t9b8_comp_fp32(x, w, out, sc, R, N, sxr, swn, sor, NK: tl.constexpr, KB: tl.constexpr, BN: tl.constexpr,
+                   RB: tl.constexpr, U: tl.constexpr, HAS_SC: tl.constexpr):
+    """The ratio-2 compressor's wkv / wgate (model.py:464-465): [R, head_dim] = x [R, D] . W [head_dim, D]^T (named
+    launch for nsys)."""
+    _t9b5_dot(x, w, out, sc, R, N, sxr, swn, sor, NK, KB, BN, RB, U, HAS_SC)
+
+
+T9B5_KERNELS["comp"] = t9b8_comp_fp32
+# RB 1: 512 one-output programs (x is one 20 KB row); RB >= 2: 4 outputs per program so the R rows of x (L2 reads,
+# R x 20 KB per program) are shared by 4 weight rows, 128 programs, num_stages 2 to keep the next trip's loads in flight.
+T9B5_CFG["comp"] = {1: (1, 16, 4, 1), 2: (4, 8, 4, 2), 4: (4, 8, 4, 2), 8: (4, 8, 4, 2)}
+
+
+# ------------------------------------------------------------------------------------------------ M2-T15 (L2)
+# docs/HANDOFF-M2-T15-ROUTER-PLAN.md, docs/M2-FUSED-CHAIN-DESIGN.md section 2.2 row L2: the router (Gate.forward,
+# model.py:811-829) and, at R rows, the MoE plan (runtime/moe_rows.m1_dedup_warp's tensors) in ONE launch per layer,
+# `m2_router_plan`. Host side, CPU mirrors, the tie rule's derivation and the switch: runtime/router_plan.py.
+#
+#   GEMV (constexpr; `--router-impl plan-gemv`): program p computes the gate scores of experts [p*BN, (p+1)*BN) for
+#     all R rows with the T9b-5 order (_t9b5_dot: KB lanes, sequential fp32 FMA from +0.0, adjacent-pair tree; the
+#     bf16 weight is widened in registers, exactly) into `raw`; every thread fences (fence.acq_rel.gpu), the CTA
+#     syncs, one acq_rel atomic takes a ticket; the LAST program to arrive runs the tail and resets the ticket to 0
+#     (graph replays start from 0). Without GEMV (`--router-impl plan`): ONE program; `raw` holds the scores of the
+#     gate mm that stays a torch op (cuBLAS, exactly today's).
+#   tail (one CTA): SOFTPLUS (constexpr): F.softplus's CUDA formula `x > 20 ? x : log1p(exp(x))` with libdevice
+#     log1p / exp (beta = 1: x * 1 and / 1 are exact) -- else `raw` already holds torch's F.softplus output; sqrt_rn;
+#     + bias (model.py:819, 824); then torch.topk's CUDA result REPRODUCED (router_plan.py "the tie rule"):
+#       selection = gatherTopK: every element whose radix key (TopKTypeConfig<float>::convert) is above the k-th
+#         largest key, then the lowest-index elements equal to it (\"the first seen set\") -- here k rounds of a max
+#         over (radix key << 16 | 65535 - index), the exact same set;
+#       order = SmallBitonicSort (sortKeyValueInplace, sort size 32, GTOp<float, handleNaN=true>, bitonicSwap's
+#         `(comp(kA, kB) && validA) || !validB`) applied to gatherTopK's output layout (the above-k-th elements in
+#         index order, then the tied ones in index order): with no tie among the k selected values the network's
+#         output is the descending order (rank = #greater); with a tie the 32-lane network itself runs (15 stages,
+#         through the `net` scratch row: store, barrier, load the partner lane).
+#     then Gate.forward's tail in torch.topk's order = t9b2r2_router_post's arithmetic for all rows at once (the
+#     weight sum in the calibrated order -- the same adds, see _m2_finish_rows --, div_rn, * route_scale, ascending
+#     sort) -> ids_o [R, k] int64 ascending, w_o [R, k] fp32; PLAN (constexpr, R > 1): runtime/moe_rows.m1_dedup_warp called as a
+#     device function on (ids_o, w_o) -- the SAME code the separate dedup launch runs, so the plan tensors (uniq,
+#     counts, ..., m_indices tags / psum / masked_m, work list, overflow) are its tensors bit for bit.
+#
+# M2-T15 fix (docs/HANDOFF-M2-T15-FIX.md): the single-CTA tail above serializes R rows' scoring / top-k / weights and
+# the plan in one CTA (R=6: 42.6 us vs fused 39.5). The runtime now launches `m2_router_rows` instead (router_plan.py
+# RouterPlan; `m2_router_plan` stays for the bench's before/after and the legacy in-kernel GEMV):
+#   grid (R,): program r runs _m2_route on row r alone (RP = 1, r0 = r) -- the SAME per-row arithmetic as the 1-CTA
+#     tail (every reduction in _m2_route is along a row; the CTA-wide tie flag only picks between the rank formula and
+#     the network, which agree on a row without ties), so each row's ids / w / tk are bit-equal to it by construction;
+#   PLAN (constexpr): every program fences, syncs, takes an acq_rel ticket; the LAST to arrive fences again and runs
+#     m1_dedup_warp (the same device function, on the R rows' ids_o / w_o) and resets the ticket to 0. The other form
+#     (router_plan `split`) launches the rows kernel without PLAN and then moe_rows.dedup_fused (today's dedup launch).
+#   SOFTPLUS is a mode: 0 = `raw` already holds F.softplus; 1 = libdevice log1p(exp) (Triton links libdevice with
+#     FTZ: results below 2^-126 flush to +0 -- the box probe's 28k / 21M mismatches, docs/router-plan-bench-20261107);
+#     2 / 3 = mode 1 where exp(x) >= 2^-126, else exp in fp64 (libdevice __nv_exp: fp64 is never flushed) rounded to
+#     fp32 once (2) or first to 24 bits then into the subnormal range (3, a scale-then-round expf's double rounding),
+#     log1p(d) = d for those d. 2 / 3 are hypotheses about CUDA's non-FTZ expf: the build-time probe picks the first
+#     exact mode, else F.softplus stays a torch op.
+# `m2_gate_fp32` (plan-gemv's gate scores): T9b-5's _t9b5_dot (the tuned fixed-order fp32 GEMV of the head / mixes)
+# under its own launch name and config table (M2_GATE_CFG); order = KB lanes (router_plan.gate_kb), a function of
+# (KB) only -- never of R or of the launch config.
+# Every arm of a runtime `if` uses its own variable names (Triton unifies same-named variables across arms).
+try:
+    from triton.language.extra import libdevice as _m2_ld
+except ImportError:  # pragma: no cover - older Triton layouts
+    from triton.language.extra.cuda import libdevice as _m2_ld
+
+M2_NET = 32                        # torch SmallBitonicSort's sort_size (Sort.cu): k <= 32 -> one 32-lane network
+M2_SOFTPLUS_THRESHOLD = 20.0       # F.softplus's default threshold (beta 1)
+M2_WARPS = int(os.environ.get("DSV41_ROUTER_PLAN_WARPS", "4"))
+M2_GEMV_CFG = {"BN": 4, "U": 4, "num_warps": 4}   # speed only (the order is a function of KB alone)
+# M2-T15 fix: m2_router_rows' warps per row program (1: every 1-D op of the row and of m1_dedup_warp -- designed for
+# one warp -- is a register / shuffle op). Speed only: no float reduction in the tail depends on it (sums of one
+# value and exact zeros, integer max / sum).
+M2_ROWS_WARPS = int(os.environ.get("DSV41_ROUTER_ROWS_WARPS", "1"))
+M2_FLT_MIN = 1.1754943508222875e-38   # 2^-126: below it Triton's FTZ libdevice exp returns +0
+# plan-gemv's gate GEMV (m2_gate_fp32), keyed by next_power_of_2(R): (RB, BN, U, num_warps, num_stages). Speed only
+# (bench/router_plan_bench.py --gate-sweep times candidates; all are bit-identical: the order is KB's).
+# Override: DSV41_GATE_CFG="1=1,2,10,4,1;8=1,2,10,4,1".
+M2_GATE_CFG = {1: (1, 2, 10, 4, 1), 2: (1, 2, 10, 4, 1), 4: (1, 2, 10, 4, 1), 8: (1, 2, 10, 4, 1)}
+M2_GATE_CFG_ENV = "DSV41_GATE_CFG"
+_M2 = {"dedup": None}              # runtime/moe_rows.m1_dedup_warp, bound on first use (tests bind the shim's copy)
+
+
+def _m2_bind_dedup(fn=None) -> None:
+    """Bind the device function the PLAN tail calls (moe_rows.m1_dedup_warp unless `fn`, the tests' shim copy)."""
+    global m2_dedup_body
+    if fn is None:
+        from runtime.moe_rows import m1_dedup_warp as fn
+    m2_dedup_body = fn
+    _M2["dedup"] = fn
+
+
+# Bound at import on the real Triton, so the plan kernel's JIT cache key (computed at its first launch, from the
+# sources of everything it calls) always includes m1_dedup_warp's source: an edit to moe_rows.py recompiles it. Under
+# tests/triton_shim.py the tests bind the shim copy (_m2_bind_dedup) -- importing moe_rows here would load it with the
+# shim as its triton.
+m2_dedup_body = None
+if getattr(triton, "__version__", "") != "numpy-shim":
+    try:
+        from runtime.moe_rows import m1_dedup_warp as m2_dedup_body  # noqa: F811
+        _M2["dedup"] = m2_dedup_body
+    except ImportError:  # pragma: no cover - bound on first use instead
+        m2_dedup_body = None
+
+
+# --- the weight sum's reduction family (fused_glue_r2's module docstring: tile offsets (k*T + t)*V + v / unrolled
+# (k*V + v)*T + t, each accumulator sequential from +0, the V accumulators folded left, then the T tree -- halving above
+# 32, below it halving (DEC) or adjacent pairs), here for all R rows at once ([RP, ...] tiles, the same adds per row as
+# fused_glue_r2._r2_finish on one row). _r2_offs is a verbatim copy (tests/test_router_plan_cpu.py checks it); the
+# rows forms are tested against fused_glue_r2.order_sum_torch's definition for every family shape used.
+@triton.jit
+def _r2_offs(k, T: tl.constexpr, V: tl.constexpr, U: tl.constexpr):
+    """Element offsets [T, V] of tile k: (k*T + t)*V + v (vectorized) or (k*V + v)*T + t (U, unrolled)."""
+    t = tl.arange(0, T)[:, None]
+    v = tl.arange(0, V)[None, :]
+    if U:
+        o = v * T + t
+    else:
+        o = t * V + v
+    return k * (T * V) + o
+
+
+@triton.jit
+def _m2_halve_rows(s, RP: tl.constexpr, N: tl.constexpr):
+    """[RP, N] -> [RP, N/2]: s[:, i] + s[:, i + N/2] (each side a sum of one value and exact zeros: exact)."""
+    s2 = tl.reshape(s, [RP, 2, N // 2])
+    r = tl.arange(0, 2)[None, :, None]
+    return tl.sum(tl.where(r == 0, s2, 0.0), axis=1) + tl.sum(tl.where(r == 1, s2, 0.0), axis=1)
+
+
+@triton.jit
+def _m2_pairs_rows(s, RP: tl.constexpr, N: tl.constexpr):
+    """[RP, N] -> [RP, N/2]: s[:, 2i] + s[:, 2i + 1]."""
+    s2 = tl.reshape(s, [RP, N // 2, 2])
+    c = tl.arange(0, 2)[None, None, :]
+    return tl.sum(tl.where(c == 0, s2, 0.0), axis=2) + tl.sum(tl.where(c == 1, s2, 0.0), axis=2)
+
+
+@triton.jit
+def _m2_level_rows(s, RP: tl.constexpr, N: tl.constexpr, DEC: tl.constexpr):
+    if N > 32:
+        out = _m2_halve_rows(s, RP, N)
+    else:
+        if DEC:
+            out = _m2_halve_rows(s, RP, N)
+        else:
+            out = _m2_pairs_rows(s, RP, N)
+    return out
+
+
+@triton.jit
+def _m2_finish_rows(acc, RP: tl.constexpr, T: tl.constexpr, V: tl.constexpr, DEC: tl.constexpr):
+    """acc [RP, T, V] -> [RP]: fold the V accumulators left, then the tree over T (= _r2_finish per row)."""
+    vv = tl.arange(0, V)[None, None, :]
+    s = tl.sum(tl.where(vv == 0, acc, 0.0), axis=2)
+    for j in tl.static_range(V - 1):
+        s = s + tl.sum(tl.where(vv == j + 1, acc, 0.0), axis=2)
+    if T >= 512:
+        s = _m2_level_rows(s, RP, 512, DEC)
+    if T >= 256:
+        s = _m2_level_rows(s, RP, 256, DEC)
+    if T >= 128:
+        s = _m2_level_rows(s, RP, 128, DEC)
+    if T >= 64:
+        s = _m2_level_rows(s, RP, 64, DEC)
+    if T >= 32:
+        s = _m2_level_rows(s, RP, 32, DEC)
+    if T >= 16:
+        s = _m2_level_rows(s, RP, 16, DEC)
+    if T >= 8:
+        s = _m2_level_rows(s, RP, 8, DEC)
+    if T >= 4:
+        s = _m2_level_rows(s, RP, 4, DEC)
+    if T >= 2:
+        s = _m2_level_rows(s, RP, 2, DEC)
+    return tl.sum(s, axis=1)
+
+
+# --- M2-T15 helpers
+@triton.jit
+def _m2_fence(v):
+    """fence.acq_rel.gpu in every thread that holds an element of v (int32); returns v (the value keeps the asm)."""
+    return tl.inline_asm_elementwise("fence.acq_rel.gpu;\n\tmov.b32 $0, $1;", "=r,r", [v], dtype=tl.int32,
+                                     is_pure=False, pack=1)
+
+
+@triton.jit
+def _m2_softplus(v):
+    """F.softplus(v) (beta 1, threshold 20) as ATen's CUDA kernel computes it: (v * 1) > 20 ? v : log1p(exp(v)) / 1."""
+    return tl.where(v > 20.0, v, _m2_ld.log1p(_m2_ld.exp(v)))
+
+
+@triton.jit
+def _m2_softplus_sub(v, MODE: tl.constexpr):
+    """SOFTPLUS modes 2 / 3 (section comment): _m2_softplus where libdevice's (FTZ) exp(v) is >= 2^-126; below, the
+    subnormal-or-zero exp(v) from fp64 -- rounded to fp32 once (2) or to 24 bits and then to the subnormal grid (3)
+    -- and log1p(d) = d."""
+    e = _m2_ld.exp(v)
+    lp = _m2_ld.log1p(e)
+    ed = _m2_ld.exp(tl.minimum(v, -80.0).to(tl.float64))   # (only lanes with v < -87.3 use it; no overflow)
+    if MODE == 2:
+        es = ed.to(tl.float32)
+    else:
+        e24 = (ed * 18446744073709551616.0).to(tl.float32)                 # * 2^64 (exact): 24-bit rounding
+        es = (e24.to(tl.float64) * 5.421010862427522e-20).to(tl.float32)  # * 2^-64 (exact), then the subnormal one
+    return tl.where(v > 20.0, v, tl.where(e < 1.1754943508222875e-38, es, lp))
+
+
+@triton.jit
+def _m2_softplus_mode(v, MODE: tl.constexpr):
+    """SOFTPLUS mode 1 / 2 / 3 (section comment; mode 0 never calls this). Modes 2 / 3 run the fp64 form only when
+    some lane of the block needs it (exp(v) < 2^-126 below the threshold): GB300's fp64 rate is a small fraction of
+    fp32, so a block without such a lane pays one compare + one reduction only. (`spx` is meant to be unified across
+    the two arms: same type, the arm's result.)"""
+    sp1 = _m2_softplus(v)
+    if MODE == 1:
+        spx = sp1
+    else:
+        n_sub = tl.sum(((_m2_ld.exp(v) < 1.1754943508222875e-38) & (v <= 20.0)).to(tl.int32))
+        if n_sub > 0:
+            spx = _m2_softplus_sub(v, MODE)
+        else:
+            spx = sp1
+    return spx
+
+
+@triton.jit
+def _m2_radix_key(b):
+    """TopKTypeConfig<float>::convert (SortingRadixSelect.cuh) as int64 in [0, 2^32): bits ^ 0x80000000 for a clear
+    sign bit, ~bits for a set one, 0xffffffff for NaN. Orders like the floats, with -0 < +0 and every NaN on top."""
+    bits = b.to(tl.int32, bitcast=True)
+    s = bits.to(tl.int64)
+    u = tl.where(s < 0, s + 4294967296, s)                 # the uint32 bits (int64 literals only: no uint32 typing)
+    k = tl.where(s < 0, 4294967296 - u - 1, (u + 1073741824) + 1073741824)
+    return tl.where(b != b, k * 0 + 4294967296 - 1, k)
+
+
+@triton.jit
+def _m2_gt_key(b):
+    """An int32 key whose `>` is GTOp<float, handleNaN=true> (SortingCommon.cuh): NaN above everything (NaNs equal),
+    -0 == +0, otherwise the floats' order."""
+    bits = b.to(tl.int32, bitcast=True)
+    k = tl.where(bits < 0, 0 - (bits & 0x7FFFFFFF), bits)
+    return tl.where(b != b, 0x7FFFFFFF, k)
+
+
+@triton.jit
+def _m2_bitonic(net, tk, si, bv, gpos, mr, rr, kk, KC: tl.constexpr):
+    """torch's SmallBitonicSort network on [RP, 32] lanes per row (SortUtils.cuh bitonicSort / bitonicSwap): lane
+    gpos[r, i] starts with (key of bv, valid, si); lanes >= KC are invalid (key 0.0, value 0). Packed int64 lanes:
+    gt_key << 32 | valid << 20 | index. Writes the first KC lanes' indices to tk[r, :KC] (torch.topk's order)."""
+    L = tl.arange(0, 32)[None, :]
+    base = net + rr * 32
+    tl.store(base + L, tl.zeros([1, 32], dtype=tl.int64), mask=mr)
+    tl.debug_barrier()
+    pk0 = _m2_gt_key(bv).to(tl.int64) * 4294967296 + 1048576 + si
+    tl.store(base + gpos, pk0, mask=mr & (kk < KC))
+    tl.debug_barrier()
+    cur = tl.load(base + L, mask=mr, other=0)
+    for lg0 in tl.static_range(5):            # size = 2 << lg0: 2, 4, 8, 16 (flag = pos & size), then 32 (dir false)
+        for ls in tl.static_range(lg0 + 1):    # stride = size / 2 ... 1
+            STR = 1 << (lg0 - ls)
+            tl.debug_barrier()
+            tl.store(base + L, cur, mask=mr)
+            tl.debug_barrier()
+            par = tl.load(base + (L ^ STR), mask=mr, other=0)
+            lower = (L & STR) == 0
+            a = tl.where(lower, cur, par)
+            b = tl.where(lower, par, cur)
+            ka = a >> 32
+            kb = b >> 32
+            va = (a >> 20) & 1
+            vb = (b >> 20) & 1
+            sw = ((ka > kb) & (va == 1)) | (vb == 0)
+            dirv = (L & (2 << lg0)) != 0
+            do = sw == dirv
+            cur = tl.where(lower, tl.where(do, b, a), tl.where(do, a, b))
+    tl.store(tk + rr * KC + L, cur & 1048575, mask=mr & (L < KC))
+
+
+@triton.jit
+def _m2_route(raw, bias, sc, bsc, tk, net, ids_o, w_o, R, E, rs, eps, r0,
+              SOFTPLUS: tl.constexpr, RP: tl.constexpr, EP: tl.constexpr, KC: tl.constexpr, KP: tl.constexpr,
+              OT: tl.constexpr, OV: tl.constexpr, OU: tl.constexpr, ODEC: tl.constexpr):
+    """The tail's routing part for rows [r0, r0 + RP) (one CTA): scores, the top-k with torch.topk's CUDA result, the
+    weights. Every reduction is along a row, so a row's results do not depend on r0 / RP (the 1-CTA tail: r0 = 0,
+    RP = R's power of two; m2_router_rows: r0 = the program's row, RP = 1)."""
+    rr = r0 + tl.arange(0, RP)[:, None]
+    ee = tl.arange(0, EP)[None, :]
+    mr = rr < R
+    me = ee < E
+    m = mr & me
+    v = tl.load(raw + rr * E + ee, mask=m, other=0.0, cache_modifier=".cg")
+    if SOFTPLUS == 0:
+        sp = v
+    else:
+        sp = _m2_softplus_mode(v, SOFTPLUS)
+    s_ = _m2_ld.sqrt_rn(sp)
+    b_ = s_ + tl.load(bias + ee, mask=me, other=0.0)
+    tl.store(sc + rr * E + ee, s_, mask=m)
+    tl.store(bsc + rr * E + ee, b_, mask=m)
+    # selection (gatherTopK's set): k rounds of max over (radix key, lowest index)
+    pk = tl.where(m, _m2_radix_key(b_) * 65536 + (65535 - ee), -1)
+    kk = tl.arange(0, KP)[None, :]
+    si = tl.zeros([RP, KP], dtype=tl.int64)
+    sk = tl.zeros([RP, KP], dtype=tl.int64)
+    for j in tl.static_range(KC):
+        mx = tl.max(pk, axis=1)
+        si = tl.where(kk == j, (65535 - (mx & 65535))[:, None], si)
+        sk = tl.where(kk == j, (mx >> 16)[:, None], sk)
+        pk = tl.where(pk == mx[:, None], -1, pk)
+    tl.debug_barrier()                                      # sc / bsc visible to the whole CTA
+    vk = kk < KC
+    vrk = mr & vk
+    bv = tl.load(bsc + rr * E + si, mask=vrk, other=0.0)
+    scv = tl.load(sc + rr * E + si, mask=vrk, other=0.0)
+    # gatherTopK's output layout: above-k-th in index order, then the tied-at-k-th in index order
+    kth = tl.max(tl.where(kk == KC - 1, sk, -1), axis=1)
+    g32 = ((sk > kth[:, None]) & vk).to(tl.int32)
+    ki = tl.arange(0, KP)[None, :, None]
+    kj = tl.arange(0, KP)[None, None, :]
+    vj3 = (kj < KC).to(tl.int32)
+    bef = (si[:, None, :] < si[:, :, None]).to(tl.int32) * vj3
+    n_gt = tl.sum(g32, axis=1)
+    c_gt = tl.sum(bef * g32[:, None, :], axis=2)
+    c_eq = tl.sum(bef * (1 - g32[:, None, :]), axis=2)
+    gpos = tl.where(g32 == 1, c_gt, n_gt[:, None] + c_eq)
+    # SmallBitonicSort: descending by GTOp; ties -> the network itself
+    gk = _m2_gt_key(bv)
+    gji = (gk[:, None, :] > gk[:, :, None]).to(tl.int32)    # [r, i, j]: value j above value i
+    pos = tl.sum(gji * vj3, axis=2)
+    teq = (gk[:, None, :] == gk[:, :, None]).to(tl.int32) * (ki != kj).to(tl.int32) * vj3 \
+        * (ki < KC).to(tl.int32) * mr.to(tl.int32)[:, :, None]
+    n_tie = tl.sum(tl.sum(tl.sum(teq, axis=2), axis=1), axis=0)
+    if n_tie == 0:
+        tl.store(tk + rr * KC + pos, si, mask=vrk)
+    else:
+        _m2_bitonic(net, tk, si, bv, gpos, mr, rr, kk, KC)
+    tl.debug_barrier()
+    # Gate.forward's tail in torch.topk's order (t9b2r2_router_post's arithmetic, all rows at once): weights =
+    # scores[idx], their sum in the calibrated order, w = weights / (sum + eps) * route_scale, ascending by id
+    tkv = tl.load(tk + rr * KC + kk, mask=vrk, other=0)                                   # [RP, KP] topk order
+    hit = (si[:, None, :] == tkv[:, :, None]) & (kj < KC) & (ki < KC)                     # [r, p, i]
+    wv = tl.sum(tl.where(hit, scv[:, None, :], 0.0), axis=2)                              # sc[tk[r, p]] (exact)
+    acc = tl.zeros([RP, OT, OV], dtype=tl.float32)
+    pp = tl.arange(0, KP)[None, None, :]
+    for t2 in tl.static_range((KC + OT * OV - 1) // (OT * OV)):
+        e = tl.reshape(_r2_offs(t2, OT, OV, OU), [OT * OV])                               # tile t2's positions
+        val = tl.sum(tl.where(pp == e[None, :, None], wv[:, None, :], 0.0), axis=2)        # [RP, OT*OV]
+        acc = acc + tl.reshape(tl.where((e < KC)[None, :], val, 0.0), [RP, OT, OV])
+    den = _m2_finish_rows(acc, RP, OT, OV, ODEC) + eps
+    wj = _m2_ld.div_rn(wv, den[:, None]) * rs
+    rank = tl.sum(((tkv[:, None, :] < tkv[:, :, None]) & (kj < KC)).to(tl.int32), axis=2)  # distinct ids per row
+    tl.store(ids_o + rr * KC + rank, tkv, mask=vrk)
+    tl.store(w_o + rr * KC + rank, wj, mask=vrk)
+    tl.debug_barrier()
+
+
+@triton.jit
+def _m2_tail(raw, bias, sc, bsc, tk, net, ids_o, w_o, R, E, rs, eps,
+             uniq_o, counts_o, valid_o, slot_o, rank_o, prow_o, pw_o, arow_o, posmat_o,
+             mm_o, ids_s, uval_o, gtab, stage_o, sidx_o, tags_o, wl_o, gl_o, ovf, scr, dummy,
+             BR, H, S, TS, G, GSCR, SOFTPLUS: tl.constexpr, RP: tl.constexpr, EP: tl.constexpr, KC: tl.constexpr,
+             KP: tl.constexpr, OT: tl.constexpr, OV: tl.constexpr, OU: tl.constexpr, ODEC: tl.constexpr,
+             PLAN: tl.constexpr, DKP: tl.constexpr, NRP: tl.constexpr, HAS_MM: tl.constexpr, HAS_CTR: tl.constexpr,
+             INPL: tl.constexpr, HAS_DUMMY: tl.constexpr, LAYOUT: tl.constexpr, HAS_TAGS: tl.constexpr,
+             HAS_WL: tl.constexpr, STEP_SF: tl.constexpr, HAS_OVF: tl.constexpr):
+    """One CTA: the routing (_m2_route), then (PLAN) moe_rows.m1_dedup_warp on its outputs."""
+    _m2_route(raw, bias, sc, bsc, tk, net, ids_o, w_o, R, E, rs, eps, 0, SOFTPLUS, RP, EP, KC, KP, OT, OV, OU, ODEC)
+    if PLAN:
+        m2_dedup_body(ids_o, w_o, uniq_o, counts_o, valid_o, slot_o, rank_o, prow_o, pw_o, arow_o, posmat_o,
+                      mm_o, ids_s, uval_o, gtab, stage_o, sidx_o, tags_o, wl_o, gl_o, ovf, scr, dummy,
+                      R * KC, KC, R, BR, H, S, TS, G, GSCR,
+                      DKP, NRP, HAS_MM, HAS_CTR, INPL, HAS_DUMMY, LAYOUT, HAS_TAGS, HAS_WL, STEP_SF, HAS_OVF)
+
+
+@triton.jit
+def m2_router_plan(x, gw, raw, bias, sc, bsc, tk, net, ticket, ids_o, w_o,
+                   R, E, sxr, swn, rs, eps, NPROG,
+                   uniq_o, counts_o, valid_o, slot_o, rank_o, prow_o, pw_o, arow_o, posmat_o,
+                   mm_o, ids_s, uval_o, gtab, stage_o, sidx_o, tags_o, wl_o, gl_o, ovf, scr, dummy,
+                   BR, H, S, TS, G, GSCR,
+                   GEMV: tl.constexpr, NK: tl.constexpr, KB: tl.constexpr, BN: tl.constexpr, RB: tl.constexpr,
+                   U: tl.constexpr, FT: tl.constexpr, SOFTPLUS: tl.constexpr,
+                   RP: tl.constexpr, EP: tl.constexpr, KC: tl.constexpr, KP: tl.constexpr,
+                   OT: tl.constexpr, OV: tl.constexpr, OU: tl.constexpr, ODEC: tl.constexpr,
+                   PLAN: tl.constexpr, DKP: tl.constexpr, NRP: tl.constexpr, HAS_MM: tl.constexpr,
+                   HAS_CTR: tl.constexpr, INPL: tl.constexpr, HAS_DUMMY: tl.constexpr, LAYOUT: tl.constexpr,
+                   HAS_TAGS: tl.constexpr, HAS_WL: tl.constexpr, STEP_SF: tl.constexpr, HAS_OVF: tl.constexpr):
+    """M2-T15: the router (+ GEMV: the gate mm) (+ PLAN: the R-row MoE plan) in one launch (section comment)."""
+    if GEMV:
+        _t9b5_dot(x, gw, raw, raw, R, E, sxr, swn, E, NK, KB, BN, RB, U, False)
+        fz = _m2_fence(tl.zeros([FT], dtype=tl.int32))
+        tl.debug_barrier()
+        old = tl.atomic_add(ticket, 1 + tl.sum(fz, axis=0), sem="acq_rel", scope="gpu")
+        if old == NPROG - 1:                                  # the last program to arrive: every raw score is in
+            fz2 = _m2_fence(tl.zeros([FT], dtype=tl.int32))
+            tl.debug_barrier()
+            _m2_tail(raw + tl.sum(fz2, axis=0), bias, sc, bsc, tk, net, ids_o, w_o, R, E, rs, eps,
+                     uniq_o, counts_o, valid_o, slot_o, rank_o, prow_o, pw_o, arow_o, posmat_o,
+                     mm_o, ids_s, uval_o, gtab, stage_o, sidx_o, tags_o, wl_o, gl_o, ovf, scr, dummy,
+                     BR, H, S, TS, G, GSCR, SOFTPLUS, RP, EP, KC, KP, OT, OV, OU, ODEC,
+                     PLAN, DKP, NRP, HAS_MM, HAS_CTR, INPL, HAS_DUMMY, LAYOUT, HAS_TAGS, HAS_WL, STEP_SF, HAS_OVF)
+            tl.store(ticket, 0)
+    else:
+        _m2_tail(raw, bias, sc, bsc, tk, net, ids_o, w_o, R, E, rs, eps,
+                 uniq_o, counts_o, valid_o, slot_o, rank_o, prow_o, pw_o, arow_o, posmat_o,
+                 mm_o, ids_s, uval_o, gtab, stage_o, sidx_o, tags_o, wl_o, gl_o, ovf, scr, dummy,
+                 BR, H, S, TS, G, GSCR, SOFTPLUS, RP, EP, KC, KP, OT, OV, OU, ODEC,
+                 PLAN, DKP, NRP, HAS_MM, HAS_CTR, INPL, HAS_DUMMY, LAYOUT, HAS_TAGS, HAS_WL, STEP_SF, HAS_OVF)
+
+
+@triton.jit
+def m2_router_rows(raw, bias, sc, bsc, tk, net, ticket, ids_o, w_o, R, E, rs, eps,
+                   uniq_o, counts_o, valid_o, slot_o, rank_o, prow_o, pw_o, arow_o, posmat_o,
+                   mm_o, ids_s, uval_o, gtab, stage_o, sidx_o, tags_o, wl_o, gl_o, ovf, scr, dummy,
+                   BR, H, S, TS, G, GSCR,
+                   FT: tl.constexpr, SOFTPLUS: tl.constexpr, EP: tl.constexpr, KC: tl.constexpr,
+                   KP: tl.constexpr, OT: tl.constexpr, OV: tl.constexpr, OU: tl.constexpr, ODEC: tl.constexpr,
+                   PLAN: tl.constexpr, DKP: tl.constexpr, NRP: tl.constexpr, HAS_MM: tl.constexpr,
+                   HAS_CTR: tl.constexpr, INPL: tl.constexpr, HAS_DUMMY: tl.constexpr, LAYOUT: tl.constexpr,
+                   HAS_TAGS: tl.constexpr, HAS_WL: tl.constexpr, STEP_SF: tl.constexpr, HAS_OVF: tl.constexpr):
+    """M2-T15 fix (section comment): grid (R,), program r routes row r; PLAN: the last program to arrive runs
+    m1_dedup_warp on all R rows' ids_o / w_o and resets the ticket."""
+    r0 = tl.program_id(0)
+    _m2_route(raw, bias, sc, bsc, tk, net, ids_o, w_o, R, E, rs, eps, r0, SOFTPLUS, 1, EP, KC, KP, OT, OV, OU, ODEC)
+    if PLAN:
+        fz = _m2_fence(tl.zeros([FT], dtype=tl.int32))          # this row's ids_o / w_o stores before the ticket
+        tl.debug_barrier()
+        old = tl.atomic_add(ticket, 1 + tl.sum(fz, axis=0), sem="acq_rel", scope="gpu")
+        if old == R - 1:                                          # the last row in: every row's ids / w are written
+            fz2 = _m2_fence(tl.zeros([FT], dtype=tl.int32))
+            tl.debug_barrier()
+            z2 = tl.sum(fz2, axis=0)                              # (0: the loads below depend on the fence)
+            m2_dedup_body(ids_o + z2, w_o + z2, uniq_o, counts_o, valid_o, slot_o, rank_o, prow_o, pw_o, arow_o,
+                          posmat_o, mm_o, ids_s, uval_o, gtab, stage_o, sidx_o, tags_o, wl_o, gl_o, ovf, scr, dummy,
+                          R * KC, KC, R, BR, H, S, TS, G, GSCR,
+                          DKP, NRP, HAS_MM, HAS_CTR, INPL, HAS_DUMMY, LAYOUT, HAS_TAGS, HAS_WL, STEP_SF, HAS_OVF)
+            tl.store(ticket, 0)
+
+
+@triton.jit
+def m2_gate_fp32(x, w, out, R, N, sxr, swn, sor, NK: tl.constexpr, KB: tl.constexpr, BN: tl.constexpr,
+                 RB: tl.constexpr, U: tl.constexpr):
+    """plan-gemv's gate scores (model.py:819's x.float() @ W^T): T9b-5's fixed-order fp32 dot, its own launch name."""
+    _t9b5_dot(x, w, out, out, R, N, sxr, swn, sor, NK, KB, BN, RB, U, False)
+
+
+@triton.jit
+def m2_softplus_probe(x, out, n, BLOCK: tl.constexpr, MODE: tl.constexpr):
+    """The tail's softplus (SOFTPLUS mode MODE) on n values (the build-time / GPU-test probe vs F.softplus)."""
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = i < n
+    tl.store(out + i, _m2_softplus_mode(tl.load(x + i, mask=m, other=0.0), MODE), mask=m)
+
+
+def softplus_probe(x: torch.Tensor, mode: int = 1) -> torch.Tensor:
+    """m2_softplus_probe over x (fp32, contiguous): the tail's softplus values in SOFTPLUS mode `mode` (1, 2, 3)."""
+    if int(mode) not in (1, 2, 3):
+        raise ValueError(f"softplus_probe: mode {mode} not in (1, 2, 3)")
+    x = x.contiguous().view(-1)
+    out = torch.empty_like(x)
+    n = x.numel()
+    BLOCK = 1024
+    m2_softplus_probe[(triton.cdiv(n, BLOCK),)](x, out, n, BLOCK, int(mode), num_warps=4, enable_fp_fusion=False)
+    return out
+
+
+def _m2_gate_env_cfg() -> dict:
+    out = {}
+    for item in (os.environ.get(M2_GATE_CFG_ENV) or "").split(";"):
+        item = item.strip()
+        if item:
+            key, val = item.split("=")
+            out[int(key)] = tuple(int(v) for v in val.split(","))
+    return out
+
+
+def gate_config(R: int) -> tuple:
+    """(RB, BN, U, num_warps, num_stages) of m2_gate_fp32 at R rows (env override, else M2_GATE_CFG)."""
+    rp = min(8, triton.next_power_of_2(max(1, int(R))))
+    return _m2_gate_env_cfg().get(rp) or M2_GATE_CFG.get(rp) or M2_GATE_CFG[max(M2_GATE_CFG)]
+
+
+def gate_dot(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor, *, kb: int, cfg: Optional[tuple] = None) -> None:
+    """plan-gemv: out [R, E] fp32 <- x [R, D] . w [E, D]^T in the T9b-5 order of KB = kb lanes (fixed_dot's contract;
+    fused_glue_r2.fixed_dot_torch is the CPU definition). cfg = (RB, BN, U, num_warps, num_stages): speed only."""
+    if x.dim() != 2 or w.dim() != 2 or out.dim() != 2:
+        raise ValueError(f"gate_dot: x {tuple(x.shape)}, w {tuple(w.shape)}, out {tuple(out.shape)} must be 2-D")
+    R, K = x.shape
+    N = w.size(0)
+    if w.size(1) != K or tuple(out.shape) != (R, N) or out.dtype != torch.float32:
+        raise ValueError(f"gate_dot: x [{R}, {K}], w {tuple(w.shape)}, out {tuple(out.shape)} {out.dtype}")
+    if x.stride(1) != 1 or w.stride(1) != 1 or out.stride(1) != 1:
+        raise ValueError("gate_dot: x / w / out rows must be contiguous")
+    if kb < 1 or kb & (kb - 1) or kb > T9B5_KB_MAX or K % kb:
+        raise ValueError(f"gate_dot: kb {kb} must be a power of two <= {T9B5_KB_MAX} dividing K = {K}")
+    if R == 0:
+        return
+    rb, bn, u, nw, ns = cfg if cfg is not None else gate_config(R)
+    nk = K // kb
+    u = max(1, min(int(u), nk))
+    m2_gate_fp32[(triton.cdiv(N, bn), triton.cdiv(R, rb))](
+        x, w, out, R, N, x.stride(0), w.stride(0), out.stride(0), nk, kb, bn, rb, u,
+        num_warps=nw, num_stages=ns, enable_fp_fusion=False)
+
+
+def _plan_kw(plan: Optional[dict], ids: torch.Tensor):
+    if plan is not None:
+        return plan["ptrs"], plan["ints"], dict(plan["cx"], PLAN=True)
+    return ((ids,) * 21, (0,) * 6,
+            dict(PLAN=False, DKP=1, NRP=1, HAS_MM=False, HAS_CTR=False, INPL=False, HAS_DUMMY=False, LAYOUT=0,
+                 HAS_TAGS=False, HAS_WL=False, STEP_SF=False, HAS_OVF=False))
+
+
+def router_rows_launch(raw: torch.Tensor, bias: torch.Tensor, ws: dict, ids: torch.Tensor, w: torch.Tensor, *,
+                       R: int, E: int, K: int, order: dict, rs: float, eps: float, softplus: int,
+                       plan: Optional[dict] = None, num_warps: Optional[int] = None) -> None:
+    """Launch m2_router_rows, grid (R,) (M2-T15 fix; runtime/router_plan.py builds the arguments). raw [R, E] fp32
+    row-major: the gate scores (softplus = SOFTPLUS mode 1 / 2 / 3) or F.softplus of them (softplus = 0); ws: sc /
+    bsc [R, E] fp32, tk [R, K] int64, net [>= R, 32] int64, ticket int32 [1] (0 between launches); ids [R, K] int64 /
+    w [R, K] fp32 out (row-major); order = fused_glue_r2.order_args of the weight-sum order; plan = router_plan
+    .dedup_args (the last row program runs m1_dedup_warp on them) or None."""
+    EP = triton.next_power_of_2(int(E))
+    KP = triton.next_power_of_2(int(K))
+    if K > M2_NET or not 1 <= int(R) <= 8 or E >= 65536:
+        raise ValueError(f"router_rows: R {R}, E {E}, K {K} outside the kernel's range (1 <= R <= 8, E < 65536, "
+                         f"K <= 32)")
+    if int(softplus) not in (0, 1, 2, 3):
+        raise ValueError(f"router_rows: softplus mode {softplus} not in (0, 1, 2, 3)")
+    if raw.stride(-1) != 1 or (raw.dim() == 2 and raw.stride(0) != int(E)):
+        raise ValueError("router_rows: raw must be row-major [R, E]")
+    if plan is not None and _M2["dedup"] is None:
+        _m2_bind_dedup()
+    nw = int(num_warps or M2_ROWS_WARPS)
+    ptrs, ints, cx = _plan_kw(plan, ids)
+    m2_router_rows[(int(R),)](
+        raw, bias, ws["sc"], ws["bsc"], ws["tk"], ws["net"], ws["ticket"], ids, w, int(R), int(E), float(rs),
+        float(eps), *ptrs, *ints,
+        FT=32 * nw, SOFTPLUS=int(softplus), EP=EP, KC=int(K), KP=KP, OT=int(order["T"]), OV=int(order["V"]),
+        OU=bool(order["U"]), ODEC=bool(order["DEC"]), num_warps=nw, enable_fp_fusion=False, **cx)
+
+
+def router_plan_launch(raw: torch.Tensor, bias: torch.Tensor, ws: dict, ids: torch.Tensor, w: torch.Tensor, *,
+                       R: int, E: int, K: int, order: dict, rs: float, eps: float, softplus: int,
+                       x: Optional[torch.Tensor] = None, gw: Optional[torch.Tensor] = None, kb: int = 64,
+                       gemv_cfg: Optional[dict] = None, plan: Optional[dict] = None,
+                       num_warps: Optional[int] = None) -> None:
+    """Launch m2_router_plan -- the M2-T15 round-1 single-CTA form (kept for the bench's before / after and its
+    in-kernel GEMV; the runtime uses router_rows_launch). raw [R, E] fp32: the gate scores (plan) or
+    the GEMV's output scratch (x [R, D] + gw [E, D] given: plan-gemv); ws: sc / bsc [R, E] fp32, tk [R, K] int64, net
+    [RP, 32] int64, ticket int32 [1] (0 between launches); ids [R, K] int64 / w [R, K] fp32 out; order = the
+    calibrated weight-sum order's constexprs (fused_glue_r2.order_args: T, V, U, DEC); plan = the dedup's arguments
+    (router_plan.dedup_args: `ptrs` in m1_dedup_warp's order, `ints` (BR, H, S, TS, G, GSCR) and `cx` constexprs).
+    softplus: a SOFTPLUS mode (bool True = 1)."""
+    RP = triton.next_power_of_2(max(1, int(R)))
+    EP = triton.next_power_of_2(int(E))
+    KP = triton.next_power_of_2(int(K))
+    if K > M2_NET or RP > 8 or E >= 65536:
+        raise ValueError(f"router_plan: R {R}, E {E}, K {K} outside the kernel's range (R <= 8, E < 65536, K <= 32)")
+    gemv = x is not None
+    if plan is not None and _M2["dedup"] is None:
+        _m2_bind_dedup()
+    if gemv:
+        cfg = dict(M2_GEMV_CFG, **(gemv_cfg or {}))
+        D = x.size(-1)
+        if x.stride(-1) != 1 or gw.stride(-1) != 1 or D % kb:
+            raise ValueError("router_plan: x / gate weight rows must be contiguous and K a multiple of KB")
+        bn, u, nw = int(cfg["BN"]), max(1, min(int(cfg["U"]), D // kb)), int(cfg["num_warps"])
+        nprog = triton.cdiv(int(E), bn)
+        g = dict(GEMV=True, NK=D // kb, KB=int(kb), BN=bn, RB=RP, U=u, FT=32 * nw)
+        xs, ws_ = x.stride(0) if x.dim() == 2 else D, gw.stride(0)
+    else:
+        nw = int(num_warps or M2_WARPS)
+        nprog = 1
+        g = dict(GEMV=False, NK=1, KB=1, BN=1, RB=1, U=1, FT=32 * nw)
+        x = gw = raw
+        xs = ws_ = 0
+    if plan is not None:
+        ptrs, ints, cx = plan["ptrs"], plan["ints"], dict(plan["cx"], PLAN=True)
+    else:
+        ptrs, ints, cx = _plan_kw(None, ids)
+    m2_router_plan[(nprog,)](
+        x, gw, raw, bias, ws["sc"], ws["bsc"], ws["tk"], ws["net"], ws["ticket"], ids, w,
+        int(R), int(E), xs, ws_, float(rs), float(eps), nprog, *ptrs, *ints,
+        SOFTPLUS=int(softplus), RP=RP, EP=EP, KC=int(K), KP=KP, OT=int(order["T"]), OV=int(order["V"]),
+        OU=bool(order["U"]), ODEC=bool(order["DEC"]), num_warps=nw, enable_fp_fusion=False, **g, **cx)

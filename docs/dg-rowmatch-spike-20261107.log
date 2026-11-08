@@ -1,0 +1,70 @@
+[pool] layer 0: 295 hot + 14 cold in spare slots; 8 sets of 6x6
+OK   r1_c128 {"rows": 48}
+OK   r1_c128_pk {"rows": 48}
+OK   r1_c16 {"rows": 48}
+OK   r1_c16_pad {"rows": 48}
+OK   r1_c16_pad_pk {"rows": 48}
+OK   r1_c16_pad_g16 {"rows": 48}
+OK   r6_c16 {"rows": 48}
+OK   r6_c16_pk {"rows": 48}
+OK   r6_c128 {"rows": 48}
+OK   r1_masked {"rows": 48}
+OK   r6_masked {"rows": 48}
+  r1_c128|r1_c128_pk             rows bit-equal  48/48  max ulp 0
+  r1_c128|r1_c16                 rows bit-equal  48/48  max ulp 0
+  r1_c128|r1_c16_pad             rows bit-equal  48/48  max ulp 0
+  r1_c128|r1_c16_pad_pk          rows bit-equal  48/48  max ulp 0
+  r1_c128|r1_c16_pad_g16         rows bit-equal  48/48  max ulp 0
+  r1_c128|r6_c16                 rows bit-equal  48/48  max ulp 0
+  r1_c128|r6_c16_pk              rows bit-equal  48/48  max ulp 0
+  r1_c128|r6_c128                rows bit-equal  48/48  max ulp 0
+  r1_c128|r1_masked              rows bit-equal  48/48  max ulp 0
+  r1_c128|r6_masked              rows bit-equal  48/48  max ulp 0
+  r1_c128_pk|r1_c16              rows bit-equal  48/48  max ulp 0
+  r1_c128_pk|r1_c16_pad          rows bit-equal  48/48  max ulp 0
+  r1_c128_pk|r1_c16_pad_pk       rows bit-equal  48/48  max ulp 0
+  r1_c128_pk|r1_c16_pad_g16      rows bit-equal  48/48  max ulp 0
+  r1_c128_pk|r6_c16              rows bit-equal  48/48  max ulp 0
+  r1_c128_pk|r6_c16_pk           rows bit-equal  48/48  max ulp 0
+  r1_c128_pk|r6_c128             rows bit-equal  48/48  max ulp 0
+  r1_c128_pk|r1_masked           rows bit-equal  48/48  max ulp 0
+  r1_c128_pk|r6_masked           rows bit-equal  48/48  max ulp 0
+  r1_c16|r1_c16_pad              rows bit-equal  48/48  max ulp 0
+  r1_c16|r1_c16_pad_pk           rows bit-equal  48/48  max ulp 0
+  r1_c16|r1_c16_pad_g16          rows bit-equal  48/48  max ulp 0
+  r1_c16|r6_c16                  rows bit-equal  48/48  max ulp 0
+  r1_c16|r6_c16_pk               rows bit-equal  48/48  max ulp 0
+  r1_c16|r6_c128                 rows bit-equal  48/48  max ulp 0
+  r1_c16|r1_masked               rows bit-equal  48/48  max ulp 0
+  r1_c16|r6_masked               rows bit-equal  48/48  max ulp 0
+  r1_c16_pad|r1_c16_pad_pk       rows bit-equal  48/48  max ulp 0
+  r1_c16_pad|r1_c16_pad_g16      rows bit-equal  48/48  max ulp 0
+  r1_c16_pad|r6_c16              rows bit-equal  48/48  max ulp 0
+  r1_c16_pad|r6_c16_pk           rows bit-equal  48/48  max ulp 0
+  r1_c16_pad|r6_c128             rows bit-equal  48/48  max ulp 0
+  r1_c16_pad|r1_masked           rows bit-equal  48/48  max ulp 0
+  r1_c16_pad|r6_masked           rows bit-equal  48/48  max ulp 0
+  r1_c16_pad_pk|r1_c16_pad_g16   rows bit-equal  48/48  max ulp 0
+  r1_c16_pad_pk|r6_c16           rows bit-equal  48/48  max ulp 0
+  r1_c16_pad_pk|r6_c16_pk        rows bit-equal  48/48  max ulp 0
+  r1_c16_pad_pk|r6_c128          rows bit-equal  48/48  max ulp 0
+  r1_c16_pad_pk|r1_masked        rows bit-equal  48/48  max ulp 0
+  r1_c16_pad_pk|r6_masked        rows bit-equal  48/48  max ulp 0
+  r1_c16_pad_g16|r6_c16          rows bit-equal  48/48  max ulp 0
+  r1_c16_pad_g16|r6_c16_pk       rows bit-equal  48/48  max ulp 0
+  r1_c16_pad_g16|r6_c128         rows bit-equal  48/48  max ulp 0
+  r1_c16_pad_g16|r1_masked       rows bit-equal  48/48  max ulp 0
+  r1_c16_pad_g16|r6_masked       rows bit-equal  48/48  max ulp 0
+  r6_c16|r6_c16_pk               rows bit-equal  48/48  max ulp 0
+  r6_c16|r6_c128                 rows bit-equal  48/48  max ulp 0
+  r6_c16|r1_masked               rows bit-equal  48/48  max ulp 0
+  r6_c16|r6_masked               rows bit-equal  48/48  max ulp 0
+  r6_c16_pk|r6_c128              rows bit-equal  48/48  max ulp 0
+  r6_c16_pk|r1_masked            rows bit-equal  48/48  max ulp 0
+  r6_c16_pk|r6_masked            rows bit-equal  48/48  max ulp 0
+  r6_c128|r1_masked              rows bit-equal  48/48  max ulp 0
+  r6_c128|r6_masked              rows bit-equal  48/48  max ulp 0
+  r1_masked|r6_masked            rows bit-equal  48/48  max ulp 0
+OK   us_per_layer {"r1_c128": 53.15, "r1_c128_pk": 44.81, "r1_c16": 45.05, "r1_c16_pad": 100.01, "r1_c16_pad_pk": 90.2, "r6_c16": 110.3, "r6_c16_pk": 101.82, "delta_us_per_layer_on_vs_today": 45.39, "delta_us_per_layer_align_vs_today": -8.1, "projected_1row_ms_on": 12.336, "projected_1row_ms_align": 10.196, "note": "
+wrote /work/scratch/dg-rowmatch-spike-20261107.json
+VERDICT {"rows": 48, "rowmatch_on_equal_r6": true, "rowmatch_on_packed_equal_r6": true, "rowmatch_align_equal_r6": true, "today_equal_r6": true, "today_fp32_equal_r6": true, "r6_packed_equal_fp32": true, "r6_c128_equal_c16": true, "num_groups_invariant": true, "masked_1_equal_6": true, "masked_equal_contiguous": true, "all_equal": true, "not_equal_pairs": [], "projected_1row_ms_on": 12.336, "delta_us_per_layer_on": 45.39, "gate_1row_ms": 10.72, "failed": []}
