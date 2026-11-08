@@ -1,0 +1,58 @@
+[small-wins] R=1 mixes=fork(auto) qkv_tail=fused(auto); gemv=gemv
+[transformers] You are using a model of type `deepseek_v41` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+[dg-inplace] sf_store pool: pool SF layout beside (40/40 layers, 12040 groups owned by the pool; no hot SF re-packed)
+[load] 96085 tensors in 48 shards, map /work/docs/maps/hot-v26ar-seed-295.json, config /ref/inference/config.json
+[load] linears with scale: 46370; wo_a dequantized: 40; widened: ['layers.14.attn.compressor.wgate.weight', 'layers.14.attn.compressor.wkv.weight', 'layers.2.attn.compressor.wgate.weight', 'layers.2.attn.compressor.wkv.weight', 'layers.8.attn.compressor.wgate.weight', 'layers.8.attn.compressor.wkv.weight', 'head.weight']; head fp32
+[rep1] prose  prompt 42 (pg61 42) -> 256 tok length, prefill 3524 ms, decode 20.1 ms/tok, cold 0.010
+[rep1] code   prompt 47 (pg61 47) -> 218 tok stop, prefill 3580 ms, decode 22.0 ms/tok, cold 0.132
+[rep1] math   prompt 54 (pg61 54) -> 256 tok length, prefill 3663 ms, decode 21.5 ms/tok, cold 0.093
+[rep1] json   prompt 38 (pg61 38) -> 18 tok stop, prefill 3213 ms, decode 22.4 ms/tok, cold 0.112
+[rep1] shell  prompt 34 (pg61 34) -> 256 tok length, prefill 2915 ms, decode 21.0 ms/tok, cold 0.064
+[rep1] tool   prompt 49 (pg61 49) -> 21 tok stop, prefill 3653 ms, decode 21.9 ms/tok, cold 0.076
+[rep1] long   prompt 46 (pg61 46) -> 256 tok length, prefill 3372 ms, decode 20.6 ms/tok, cold 0.042
+[rep1] story  prompt 31 (pg61 31) -> 192 tok stop, prefill 2911 ms, decode 20.4 ms/tok, cold 0.024
+[rep2] prose  prompt 42 (pg61 42) -> 256 tok length, prefill 3488 ms, decode 20.2 ms/tok, cold 0.010
+[rep2] code   prompt 47 (pg61 47) -> 218 tok stop, prefill 3609 ms, decode 22.0 ms/tok, cold 0.132
+[rep2] math   prompt 54 (pg61 54) -> 256 tok length, prefill 3683 ms, decode 21.5 ms/tok, cold 0.093
+[rep2] json   prompt 38 (pg61 38) -> 18 tok stop, prefill 3341 ms, decode 22.4 ms/tok, cold 0.112
+[rep2] shell  prompt 34 (pg61 34) -> 256 tok length, prefill 3051 ms, decode 21.0 ms/tok, cold 0.064
+[rep2] tool   prompt 49 (pg61 49) -> 21 tok stop, prefill 3715 ms, decode 22.0 ms/tok, cold 0.076
+[rep2] long   prompt 46 (pg61 46) -> 256 tok length, prefill 3497 ms, decode 20.7 ms/tok, cold 0.042
+[rep2] story  prompt 31 (pg61 31) -> 192 tok stop, prefill 3052 ms, decode 20.4 ms/tok, cold 0.024
+--- parity rep 1: scratch/fl-s3-bes.jsonl vs w0/results/phase1/parity-A.jsonl / w0/results/phase1/parity-A2.jsonl
+tag        A2 first/flips_w/maxd        cand first/flips_w/maxd      verdict
+prose      None    0.000  0.0000        17      0.000  0.1768        FAIL
+code       121     0.000  0.1206        149     0.000  0.2747        FAIL
+math       None    0.000  0.0000        27      0.000  0.3072        FAIL
+json       None    0.000  0.0000        None    0.000  0.1031        FAIL
+shell      None    0.000  0.0000        40      0.000  0.1357        FAIL
+tool       None    0.000  0.0000        None    0.000  0.3445        FAIL
+long       None    0.000  0.0000        23      0.000  0.4011        FAIL
+story      None    0.000  0.0000        1       0.000  0.0513        FAIL
+identical 2/8; PARITY: FAIL
+--- parity rep 2: scratch/fl-s3-bes-replay.jsonl vs w0/results/phase1/parity-A.jsonl / w0/results/phase1/parity-A2.jsonl
+tag        A2 first/flips_w/maxd        cand first/flips_w/maxd      verdict
+prose      None    0.000  0.0000        17      0.000  0.1768        FAIL
+code       121     0.000  0.1206        149     0.000  0.2747        FAIL
+math       None    0.000  0.0000        27      0.000  0.3072        FAIL
+json       None    0.000  0.0000        None    0.000  0.1031        FAIL
+shell      None    0.000  0.0000        40      0.000  0.1357        FAIL
+tool       None    0.000  0.0000        None    0.000  0.3445        FAIL
+long       None    0.000  0.0000        23      0.000  0.4011        FAIL
+story      None    0.000  0.0000        1       0.000  0.0513        FAIL
+identical 2/8; PARITY: FAIL
+[self-replay rep1 vs rep2] 8/8 byte-identical, 8/8 logits digests equal, files equal True
+[glue] fused: on dg_act,swiglu_routed,swiglu_shared,moe_combine,hc_post,o_rope_qdq,q_rope_epilogue,hc_norm,mix_stat,kv_path,q_path,router,engram,indexer_post,hc_split,gemv_pair,reduce_fold,dg_sf_pack; approx -; off gather,concat_free,dedup; r2 numerics hc_norm (i), mix_stat (i), kv_path (i), q_path (i), router (i), engram (i), indexer_post (i); orders {'norm_D': 'vec_T512_V4_dec|mul', 'mix': 'vec_T512_V4_dec|mul', 'kv': 'vec_T128_V4_dec|mul', 'q': 'vec_T256_V4_dec|mul', 'router': 'vec_T4_V1_dec|mul', 'engram': 'vec_T128_V4_dec|mul', 'engram_sum': 'vec_T128_V4_dec|mul'}
+[moe-rowmatch] off -> off: align 128 gemm_blocks 6 (R-row contiguous16); build check equal=None today's call equal=None
+FIRST LIGHT 2026-11-08 08:23:52 UTC | mode graph moe dg-inplace fp8 gemv glue fused attn flashmla | map /work/docs/maps/hot-v26ar-seed-295.json | boot 64 s | HBM 218.61 GiB | NVIDIA GB300 | small-wins R1 mixes=fork qkv=fused
+fixture encode: 8/8 prompt-token counts == Pg61 usage.prompt_tokens
+rep1: 8/8 prompts ok, 1473 tokens, 76 s, decode mean 21.2 ms/tok (incl. logprob work)
+rep2: 8/8 prompts ok, 1473 tokens, 58 s, decode mean 21.3 ms/tok (incl. logprob work)
+parity rep1 vs Pg61-A: identical 2/8; PARITY: FAIL
+parity rep2 vs Pg61-A: identical 2/8; PARITY: FAIL
+self-replay rep1 vs rep2: 8/8 byte-identical, 8/8 fp32-logit digests equal; diverged: none
+step cell (cuda_events): steps 32..512 mean 9.76 / p50 9.75 / p90 10.00 ms per step
+step cell: 102.43 tok/s (1/mean), 101.53 tok/s wall; prefill 3647 ms; vs rep1 tokens {'compared': 256, 'first_divergence': None}
+cold share/step mean 0.0091 p50 0.0083 p90 0.0167; cold calls/step mean 2.20 (routed 240/step)
+cold calls per layer (step cell), top 5: L1=101, L2=66, L0=54, L38=50, L10=45
+errors: 0 | report /work/docs/first-light-20261108.json

@@ -68,6 +68,9 @@ def _hot_scale_addrs(pool) -> set:
 
 # ------------------------------------------------------------------------------------------------ the switch
 def test_layout_switch(monkeypatch):
+    monkeypatch.delenv(EP.POOL_SF_ENV, raising=False)
+    assert EP.pool_sf_layout() == "beside"   # default since 11/08 (box 18.74 vs 19.06, bit-identical)
+    monkeypatch.setenv(EP.POOL_SF_ENV, "separate")
     assert EP.pool_sf_layout() == "separate"
     monkeypatch.setenv(EP.POOL_SF_ENV, "beside")
     assert EP.pool_sf_layout() == "beside" and EP.pool_sf_layout("separate") == "separate"

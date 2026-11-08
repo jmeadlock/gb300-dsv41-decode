@@ -1,0 +1,103 @@
+{
+ "probe": {
+  "date": "2026-11-08 08:00:30 UTC",
+  "argv": [
+   "probe",
+   "--out",
+   "scratch/pool-layout-probe.json"
+  ],
+  "errors": [],
+  "label": {
+   "build": "[M] real-shape ExpertPool, random bytes, both layouts",
+   "gemm": "[M] DeepGEMM contiguous on beside's pool SF vs on a copy packed from separate's e8m0",
+   "stage": "[M] bench/staging_bytes_bench.py probe serial + overlap (step lists = with hot SF, pool lists = without)"
+  },
+  "build": {
+   "separate": {
+    "construct_s": 0.009,
+    "fill_s": 0.027,
+    "register_s": null,
+    "pack_s": 0.0,
+    "grow_s": 0.031,
+    "pool_hbm_GiB": 10.331,
+    "process_hbm_delta_GiB": 14.34,
+    "host_e8m0_GiB": 0.0,
+    "per_layer_hbm_GiB": 5.1653
+   },
+   "beside": {
+    "construct_s": 0.009,
+    "fill_s": 0.152,
+    "register_s": 0.0019283294677734375,
+    "pack_s": 0.023,
+    "grow_s": 0.021,
+    "pool_hbm_GiB": 10.372,
+    "process_hbm_delta_GiB": 10.383,
+    "host_e8m0_GiB": 0.608,
+    "per_layer_hbm_GiB": 5.1859
+   },
+   "separate_plus_pool_sf_per_layer_GiB": 5.4897
+  },
+  "gemm": {
+   "w1_packed_equal": true,
+   "w1": {
+    "equal": true,
+    "mismatch_frac": 0.0,
+    "max_ulp": 0,
+    "n_ulp_gt1": 0,
+    "max_abs": 0.0,
+    "n": 50688,
+    "nonfinite": 0
+   },
+   "w2_packed_equal": true,
+   "w2": {
+    "equal": true,
+    "mismatch_frac": 0.0,
+    "max_ulp": 0,
+    "n_ulp_gt1": 0,
+    "max_abs": 0.0,
+    "n": 112640,
+    "nonfinite": 0
+   },
+   "equal": true
+  },
+  "stage": {
+   "rc": 0,
+   "errors": [],
+   "serial_c0": {
+    "with_hot_sf_us": 29.74,
+    "without_us": 3.58,
+    "hot_sf_term_us": 26.15
+   },
+   "serial_c1": {
+    "with_hot_sf_us": 81.29,
+    "without_us": 74.54,
+    "hot_sf_term_us": 6.75
+   },
+   "serial_c2": {
+    "with_hot_sf_us": 116.86,
+    "without_us": 114.63,
+    "hot_sf_term_us": 2.23
+   },
+   "overlap_c0": {
+    "exposed_with_hot_sf_us": 18.7,
+    "exposed_without_us": 2.95,
+    "beside_layer_saves_us": 15.75
+   },
+   "overlap_c1": {
+    "exposed_with_hot_sf_us": 37.4,
+    "exposed_without_us": 26.69,
+    "beside_layer_saves_us": 10.71
+   },
+   "overlap_c2": {
+    "exposed_with_hot_sf_us": 61.85,
+    "exposed_without_us": 47.45,
+    "beside_layer_saves_us": 14.41
+   },
+   "checks": {
+    "slots": true,
+    "sf_all": true,
+    "d": true
+   }
+  }
+ }
+}

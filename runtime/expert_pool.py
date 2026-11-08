@@ -49,7 +49,7 @@ TIER_HBM, TIER_HOST = 0, 1
 ALIGN = 256  # bytes; every host block starts on a 256-B boundary
 POOL_SF_ENV = "DSV41_POOL_SF"
 POOL_SF_LAYOUTS = ("separate", "beside")
-POOL_SF_DEFAULT = "separate"
+POOL_SF_DEFAULT = "beside"   # default since 2026-11-08 (box: 18.74 vs 19.06 ms/step, bit-identical; docs/headline-s3-B-20261108.json)
 SF_PACK = 4  # e8m0 codes per int32 word (= runtime/dg_inplace.SF_PACK)
 
 
