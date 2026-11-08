@@ -28,9 +28,17 @@ from test_static_rows_cpu import _cpu_default_device, _prefill, _tf_tokens, emu,
 
 @pytest.fixture(autouse=True)
 def _mixes_env(monkeypatch):
+    # bench/mixes_fork_bench.py writes os.environ directly: `import` does setdefault(CUBLAS_WORKSPACE_CONFIG) and
+    # main() assigns DSV41_FP32_IMPL=fixed (a bench-side leak; not monkeypatch-tracked). Restore the whole
+    # environment after every test here, else later modules (test_residency_cpu) run with the fixed fp32 impl.
+    import os
+
+    saved = dict(os.environ)
     monkeypatch.delenv(R2.MIXES_ENV, raising=False)
     monkeypatch.delenv("DSV41_MIXES_PRIORITY", raising=False)
     yield
+    os.environ.clear()
+    os.environ.update(saved)
 
 
 def _run(model, st, ids, toks, n):

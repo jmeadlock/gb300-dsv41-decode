@@ -381,9 +381,12 @@ def rows_t10(rows_dg, monkeypatch):
 
 @pytest.mark.parametrize("gemm,store", [("contiguous", "pool"), ("contiguous", "step"), ("contiguous16", "pool"),
                                         ("psum", "pool"), ("psum", "step"), ("masked", "pool")])
-def test_static6_dg_inplace_call_shapes_equal_dg_masked(rows_t10, gemm, store):
+def test_static6_dg_inplace_call_shapes_equal_dg_masked(rows_t10, gemm, store, monkeypatch):
+    from runtime import expert_pool as EP
     from runtime.static_step import StaticStep
 
+    if store == "step":                               # the per-step re-pack store is the SEPARATE-layout path
+        monkeypatch.setenv(EP.POOL_SF_ENV, "separate")
     model, pool, fk, fake = rows_t10("mini4")
     hid = (len(model.layers) - 1,)
     n = 3
@@ -544,8 +547,11 @@ def test_glue_census_names_the_warp_dedup():
 
 
 def test_pool_sf_headroom_falls_back_to_step(monkeypatch, capsys):
-    """pool SF on the box: allocated only if >= $DSV41_SF_POOL_HEADROOM_GIB (default 6) of HBM stays free, else the
+    """pool SF on the box, the all-or-nothing rule ($DSV41_SF_POOL_LAYERS=all, pinned: the default is now auto):
+    allocated only if >= $DSV41_SF_POOL_HEADROOM_GIB (default 2.0 since 11/07, was 6) of HBM stays free, else the
     build uses "step" and says why (the real model's copy is ~12.8 GiB; the 6-row receipts had 17-23 GiB free)."""
+    assert DI.SF_POOL_HEADROOM_GIB == 2.0 and DI.SF_POOL_LAYERS_DEFAULT == "auto"     # NEW defaults
+    monkeypatch.setenv(DI.SF_POOL_LAYERS_ENV, "all")
     class Pool:
         n_layers, spare = 2, 2
         hot = {0: (1, 2), 1: (3,)}
@@ -560,14 +566,14 @@ def test_pool_sf_headroom_falls_back_to_step(monkeypatch, capsys):
     need = DI.pool_sf_bytes(Stub.pool, Stub.N, Stub.C)
     assert need == 2 * 4 * 3 * 1024 * 256 * 4
     monkeypatch.delenv(DI.SF_POOL_HEADROOM_ENV, raising=False)
-    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda dev=None: (need + 7 * DI.GiB, 250 * DI.GiB))
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda dev=None: (need + 3 * DI.GiB, 250 * DI.GiB))
     s = Stub()
     DI.DGInplaceBuffers._check_sf_hbm(s)
     assert s.sf_store == "pool" and s.sf_store_why is None
-    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda dev=None: (need + 5 * DI.GiB, 250 * DI.GiB))
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda dev=None: (need + 1 * DI.GiB, 250 * DI.GiB))
     s = Stub()
     DI.DGInplaceBuffers._check_sf_hbm(s)
-    assert s.sf_store == "step" and "6.0 GiB headroom" in s.sf_store_why and "[dg-inplace]" in capsys.readouterr().err
+    assert s.sf_store == "step" and "2.0 GiB headroom" in s.sf_store_why and "[dg-inplace]" in capsys.readouterr().err
 
 
 def test_alignment_global_left_as_found_for_other_builds(rows_t10):

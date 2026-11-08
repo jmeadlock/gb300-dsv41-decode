@@ -374,8 +374,13 @@ def di_emu(emu, monkeypatch):
     return build
 
 
-def test_add_spare_slots_preserves_rebinds_and_is_idempotent(di_emu):
+def test_add_spare_slots_preserves_rebinds_and_is_idempotent(di_emu, monkeypatch):
+    from runtime import expert_pool as EP
+
+    assert EP.POOL_SF_DEFAULT == "beside"                                  # NEW default; `added` then counts the SF too
+    monkeypatch.setenv(EP.POOL_SF_ENV, "separate")                         # the separate-layout accounting, pinned
     model, pool, _, _ = di_emu("mini4")
+    assert pool.sf_layout == "separate"
     ids = list(range(5, 17))
     want = _ref_run(model, ids, 4)
     old = {(l, p): pool.hbm[l][p][0].clone() for l in range(pool.n_layers) for p in pool.proj_nk}
@@ -405,12 +410,16 @@ def _dg_inplace_vs_reference(di_emu, kind, monkeypatch, sf_store, align, rowmatc
     from runtime.dg_inplace import DGInplaceMoE
     from runtime.static_step import StaticStep
 
+    from runtime import expert_pool as EP
+
+    monkeypatch.setenv(EP.POOL_SF_ENV, "separate")   # $DSV41_SF_STORE (step/resident) is the SEPARATE-layout path; beside = pool
     if sf_store is not None:
         monkeypatch.setenv(DI.SF_STORE_ENV, sf_store)
     if align is not None:
         monkeypatch.setenv(DI.ALIGN_ENV, str(align))
     monkeypatch.setenv(DI.ROWMATCH_ENV, rowmatch)   # T9a-3: "on" = the 6-row call shape (ALIGN 16, 6k blocks)
     model, pool, fk, fake = di_emu(kind)
+    assert pool.sf_layout == "separate"
     st = StaticStep(model, pool, max_pos=127, moe_impl="dg-inplace", _allow_cpu=True)
     b, k = st.dg, st.topk
     plan = DI.rowmatch_plan(k)
@@ -460,6 +469,21 @@ def _dg_inplace_vs_reference(di_emu, kind, monkeypatch, sf_store, align, rowmatc
 def test_dg_inplace_static_step_equals_reference_under_emulated_gemm(di_emu, kind, monkeypatch, sf_store, align,
                                                                     rowmatch):
     _, _, st, _ = _dg_inplace_vs_reference(di_emu, kind, monkeypatch, sf_store, align, rowmatch)
+    st.detach()
+
+
+def test_dg_inplace_default_sf_layout_is_beside_with_pool_store(di_emu, monkeypatch):
+    """NEW default (11/08): POOL_SF beside -> the 1-row step's SF store is \"pool\" whatever $DSV41_SF_STORE says."""
+    from runtime import expert_pool as EP
+    from runtime.static_step import StaticStep
+
+    monkeypatch.delenv(EP.POOL_SF_ENV, raising=False)
+    monkeypatch.delenv(DI.SF_STORE_ENV, raising=False)
+    assert EP.POOL_SF_DEFAULT == "beside"
+    model, pool, fk, fake = di_emu("mini4")
+    assert pool.sf_layout == "beside"
+    st = StaticStep(model, pool, max_pos=127, moe_impl="dg-inplace", _allow_cpu=True)
+    assert st.dg.sf_store == "pool"
     st.detach()
 
 

@@ -154,7 +154,9 @@ def test_fp8_impl_arg_gemv3(monkeypatch):
     assert "DSV41_GEMV_IMPL" not in os.environ and GM.gemv_impl() == "gemv"
     assert GM.apply_fp8_impl_arg("gemv3") == "gemv"    # what Generator / StaticStep get
     assert os.environ["DSV41_GEMV_IMPL"] == "gemv3" and GM.gemv_impl() == "gemv3"
-    monkeypatch.delenv("DSV41_GEMV_IMPL")
+    # runtime code (apply_fp8_impl_arg) wrote os.environ directly. monkeypatch.delenv here would RECORD "gemv3" as the
+    # value to restore and re-install it at teardown (leaking gemv3 into every later test); pop it for real.
+    os.environ.pop("DSV41_GEMV_IMPL")
     with pytest.raises(ValueError):
         GM.apply_fp8_impl_arg("gemv4")
 

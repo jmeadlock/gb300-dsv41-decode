@@ -18,3 +18,15 @@ def _cpu_tests_stage_kernel(request, monkeypatch):
     if "/gpu/" in str(request.node.fspath) or "DSV41_STAGE" in os.environ:
         return
     monkeypatch.setenv("DSV41_STAGE", "kernel")
+
+
+@pytest.fixture(autouse=True)
+def _restore_process_environ():
+    """Runtime/bench code writes os.environ directly (gemv_mxfp8.apply_fp8_impl_arg -> DSV41_GEMV_IMPL, bench imports ->
+    CUBLAS_WORKSPACE_CONFIG, bench mains -> DSV41_FP32_IMPL, dg activation -> DG_JIT_CACHE_DIR). Those writes are not
+    monkeypatch-tracked and leaked into later test modules (order-dependent failures). Put os.environ back after every test."""
+    saved = dict(os.environ)
+    yield
+    if dict(os.environ) != saved:
+        os.environ.clear()
+        os.environ.update(saved)

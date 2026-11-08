@@ -27,6 +27,7 @@ import pytest
 import torch
 
 from runtime import dg_inplace as DI
+from runtime import expert_pool as EP
 from runtime import moe_rows as MR
 from runtime import staging_overlap as SO
 from test_dg_inplace_cpu import _fill_registry, _static_kernels_under_shim, _synthetic_layer
@@ -765,7 +766,11 @@ def test_m3s2_sf_pool_plan_rules(monkeypatch):
         with pytest.raises(ValueError):
             DI.parse_sf_pool_layers(bad, 40)
     monkeypatch.delenv(DI.SF_POOL_LAYERS_ENV, raising=False)
-    assert DI.parse_sf_pool_layers(None, 40) == ("all", None)           # default = today's all-or-nothing rule
+    assert DI.SF_POOL_LAYERS_DEFAULT == "auto" and DI.SF_POOL_HEADROOM_GIB == 2.0   # NEW defaults (11/07 box)
+    assert EP.POOL_SF_DEFAULT == "beside"
+    assert DI.parse_sf_pool_layers(None, 40) == ("auto", None)          # default = the partial pool (auto)
+    monkeypatch.setenv(DI.SF_POOL_LAYERS_ENV, "all")                    # the old all-or-nothing rule, pinned
+    assert DI.parse_sf_pool_layers(None, 40) == ("all", None)
 
 
 def _m3s2_build(model, pool, monkeypatch, store, spec, **kw):
@@ -785,14 +790,16 @@ def test_m3s2_partial_pool_bit_identical(rows_dg, monkeypatch, mode):
     """sf_store pool with layers 0 and 2 pooled, 1 and 3 "step" == whole pool == whole step: torch.equal on every
     row's logits, main_hidden, caches and the spare-slot bytes; per-layer work lists (hot slots listed only in step
     layers); a step layer's SF is a StepSFView (not a dict), a pool layer's the pool copy."""
+    monkeypatch.setenv(EP.POOL_SF_ENV, "separate")                     # the partial pool is the SEPARATE-layout path
     model, pool, fk, fake = rows_dg("mini4")
+    assert pool.sf_layout == "separate"
     monkeypatch.setattr(SO, "CPU_RESOLVE", _registry(pool).__getitem__)
     monkeypatch.setenv(SO.STAGE_ENV, mode)
     hid = (len(model.layers) - 1,)
     n_layers = len(model.layers)
     ids, toks = _tf_tokens(18, 18, 77)
     outs, slots = {}, {}
-    for name, store, spec in (("step", "step", None), ("pool", "pool", None), ("partial", "pool", "0,2")):
+    for name, store, spec in (("step", "step", None), ("pool", "pool", "all"), ("partial", "pool", "0,2")):
         st = _m3s2_build(model, pool, monkeypatch, store, spec, hidden_layers=hid)
         b = st.dg
         if name == "partial":
@@ -841,7 +848,9 @@ def test_m3s2_partial_pool_with_residency_equals_off(emu, monkeypatch):
     from test_residency_rows_cpu import _run6
     from test_static_rows_cpu import _masked_rowwise
 
+    monkeypatch.setenv(EP.POOL_SF_ENV, "separate")                     # the partial pool is the SEPARATE-layout path
     model, pool, _ = emu("mini4")
+    assert pool.sf_layout == "separate"
     fake = _fake_dg_contig()
     fake.m_grouped_fp8_fp4_gemm_nt_masked = _masked_rowwise(fake)
     monkeypatch.setitem(sys.modules, "deep_gemm", fake)

@@ -47,9 +47,18 @@ def _cpu_default_device():
 # ================================================================================================ plan arithmetic
 def test_sf_store_for_follows_the_steps_defaults_and_env(monkeypatch):
     from runtime import dg_inplace as DI
+    from runtime import expert_pool as EP
 
     monkeypatch.delenv(DI.ROWS_SF_STORE_ENV, raising=False)
     monkeypatch.delenv(DI.SF_STORE_ENV, raising=False)
+    monkeypatch.delenv(EP.POOL_SF_ENV, raising=False)
+    # NEW default (11/08): pool SF layout "beside" -> every dg-inplace build uses the "pool" store, rows or 1-row
+    assert EP.POOL_SF_DEFAULT == "beside" and EP.pool_sf_layout() == "beside"
+    assert sf_store_for("dg-inplace", 6) == "pool" and sf_store_for("dg-inplace", 1) == "pool"
+    monkeypatch.setenv(DI.SF_STORE_ENV, "resident")                                 # beside ignores the step env
+    assert sf_store_for("dg-inplace", 1) == "pool"
+    monkeypatch.delenv(DI.SF_STORE_ENV)
+    monkeypatch.setenv(EP.POOL_SF_ENV, "separate")                                  # the old path, pinned
     assert sf_store_for("ref", 6) is None and sf_store_for("dg-masked", 1) is None
     assert sf_store_for("dg-inplace", 6) == "pool" == DI.ROWS_SF_STORE_DEFAULT      # rows default (M1-T10-MOE)
     assert sf_store_for("dg-inplace", 1) == "step"                                  # 1-row default
@@ -61,8 +70,12 @@ def test_sf_store_for_follows_the_steps_defaults_and_env(monkeypatch):
 
 def test_budget_charges_the_pool_sf_copy_and_its_headroom(emu, monkeypatch):   # noqa: F811
     from runtime import dg_inplace as DI
+    from runtime import expert_pool as EP
 
+    assert DI.SF_POOL_HEADROOM_GIB == 2.0                                           # NEW default (was 6.0)
+    monkeypatch.setenv(EP.POOL_SF_ENV, "separate")      # the separate-layout path: the pool SF copy is a budget line
     model, pool, _ = emu("mini4")
+    assert pool.sf_layout == "separate"
     L, H = pool.n_layers, [len(pool.hot[l]) for l in range(pool.n_layers)]
     s_row = sum(n * (k // 32) for n, k in pool.proj_nk.values())
     big = 1 << 40
@@ -143,8 +156,11 @@ def test_rows6_dg_inplace_on_equals_off_by_sf_store(emu, monkeypatch, store, S):
     policy swaps -> logits equal off; no promoted expert sits in a staging slot; overflow 0; the manager owns the
     packed SF iff the store is not re-packed per step; the audit passes."""
     from runtime import dg_inplace as DI
+    from runtime import expert_pool as EP
     from runtime.static_step import DEFAULT_SPARE_SLOTS_ROWS, StaticStep
 
+    if store == "step":                                 # the per-step re-pack store is the SEPARATE-layout path
+        monkeypatch.setenv(EP.POOL_SF_ENV, "separate")
     model, pool, _ = emu("mini4")
     _dg_fakes(monkeypatch)
     _install(monkeypatch, pool)

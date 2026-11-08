@@ -823,18 +823,21 @@ def test_fused_glue_rows_equals_ref_glue_emulated(rows_glue, monkeypatch, moe_im
 
 
 
-def test_first_light_rows_accepts_dg_inplace_and_fused_glue(rows_glue, tmp_path, capsys):
+def test_first_light_rows_accepts_dg_inplace_and_fused_glue(rows_glue, tmp_path, capsys, monkeypatch):
     """`first_light.py --rows 6 --teacher-forced --moe-impl dg-inplace --glue-impl fused` (M1-T10-FIX): the 6-row step
     runs dg-inplace (no dg-masked substitution) with the row-parallel fused clusters; self-replay, the cells, the
     [glue] line of the 6-row step and the 12-line summary."""
     import importlib.util
     import os
 
+    from runtime import expert_pool as EP
     from runtime import fused_glue as FG
     from runtime.generate import Generator
     from runtime.static_step import StaticStep
     from tiny_tok import make_wordlevel_tokenizer
 
+    assert EP.POOL_SF_DEFAULT == "beside"       # NEW default: spare_added_B would then count the slots' SF too
+    monkeypatch.setenv(EP.POOL_SF_ENV, "separate")   # the byte accounting below is the separate layout's
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     spec = importlib.util.spec_from_file_location("bench_first_light", os.path.join(repo, "bench", "first_light.py"))
     fl = importlib.util.module_from_spec(spec)
