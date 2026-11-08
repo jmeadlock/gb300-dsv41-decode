@@ -64,8 +64,35 @@ RECIPE = dict(recipe_a=(1, 32), recipe_b=(1, 32))
 FP8 = torch.float8_e4m3fn
 
 
+def _per_proj_cfg(cfg, pj):
+    """A --cfgs entry: (nprog, block_bytes) for all three projections, or ((n, b), (n, b), (n, b)) per projection."""
+    if cfg is None:
+        return None, None
+    return cfg[pj] if isinstance(cfg[0], tuple) else cfg
+
+
+def _cfg_tag(cfg) -> str:
+    if isinstance(cfg[0], tuple):
+        return "np" + "-".join(f"{n}b{b // 1024}k" for n, b in cfg)
+    return f"np{cfg[0]}b{cfg[1] // 1024}k"
+
+
+def parse_cfgs(spec: str):
+    """'48:8192,16:32768' -> [(48, 8192), (16, 32768)]; a '/'-joined triple 'n:b/n:b/n:b' is one per-projection cfg
+    (w1/w3/w2, the runtime's $DSV41_STAGE_OVERLAP_NPROG=48,16,16 / _BLOCK_BYTES=8192,32768,32768)."""
+    out = []
+    for v in str(spec).split(","):
+        if not v:
+            continue
+        parts = [tuple(int(x) for x in q.split(":")) for q in v.split("/")]
+        if any(len(q) != 2 for q in parts) or len(parts) not in (1, 3):
+            raise ValueError(f"--cfgs entry {v!r}: nprog:block_bytes or three of them joined by '/'")
+        out.append(parts[0] if len(parts) == 1 else tuple(parts))
+    return out
+
+
 def _key(v: str, cfg) -> str:
-    return v if cfg is None else f"{v}/np{cfg[0]}b{cfg[1] // 1024}k"
+    return v if cfg is None else f"{v}/{_cfg_tag(cfg)}"
 
 
 def _date() -> str:
@@ -285,7 +312,7 @@ class _Setup:
                       self.row_w, self.sf_dims, self.S)
 
     def stage_proj(self, rd, pj, cfg=None, weights=True):
-        nprog, bb = cfg or (None, None)
+        nprog, bb = _per_proj_cfg(cfg, pj)
         SO.stage_proj(self.ptab, rd["uniq"], self.gtab, self.dtab, self.dsts, rd["sidx"], rd["wl"], self.H,
                       self.row_w, self.sf_dims, self.S, pj, weights=weights, nprog=nprog, block_bytes=bb)
 
@@ -543,12 +570,14 @@ def main(argv=None) -> int:
     ap.add_argument("--hot", type=int, default=128)
     ap.add_argument("--rounds", type=int, default=16)
     ap.add_argument("--reps", type=int, default=50)
-    ap.add_argument("--cfgs", default="48:8192,16:32768,8:65536", help="kernel-overlap nprog:block_bytes pairs")
+    ap.add_argument("--cfgs", default="48:8192,16:32768,8:65536,48:8192/16:32768/16:32768,"
+                                      "144:8192/16:32768/16:32768",
+                    help="kernel-overlap nprog:block_bytes pairs; 'n:b/n:b/n:b' = one per projection (w1/w3/w2)")
     ap.add_argument("--host", choices=("hostbuffer", "pinned"), default="hostbuffer")
     ap.add_argument("--seed", type=int, default=20261108)
     a = ap.parse_args(argv)
     a.argv = list(sys.argv[1:] if argv is None else argv)
-    a.cfgs = [tuple(int(x) for x in v.split(":")) for v in str(a.cfgs).split(",") if v]
+    a.cfgs = parse_cfgs(a.cfgs)
     out = {}
     if a.cmd in ("probe", "all"):
         out["probe"] = cmd_probe(a)

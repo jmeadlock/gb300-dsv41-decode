@@ -11,6 +11,11 @@
     hoist the shared expert, and wait on projection p right before GEMM p (call order recorded); fused glue too;
   * a ce mode under graph capture raises StageCaptureError; mode validation; the [E] model's invariants; the bench's
     `model` subcommand runs on the Mac; vllm is never imported.
+  * M3-S1-FIX: round 1's box failure ('kernel-overlap', 'L1.ckv') reproduced in the GPU file's own sequence with
+    kernel vs kernel (replay-loop cache residue, not a race) and fixed by the GPU file's _checkpoint / _restore; the
+    stream-ordering model (torch dispatch over the kernel-overlap step: no main-stream byte access overlaps the
+    forked staging's between fork and join, ref + fused glue, two negative controls caught); the per-projection
+    launch knobs; the guarded none-diag timing diagnostic; the bench's per-projection --cfgs.
 """
 from __future__ import annotations
 
@@ -326,6 +331,325 @@ def test_one_row_and_other_impls_have_no_hook(rows_dg, monkeypatch):
     s2 = StaticStep(model, pool, max_pos=255, rows=6, moe_impl="dg-masked", _allow_cpu=True)
     assert s2.stage_ov is None
     s2.detach()
+
+
+def _gpu_module():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("so_gpu", os.path.join(REPO, "tests", "gpu",
+                                                                         "test_staging_overlap_gpu.py"))
+    G = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(G)
+    return G
+
+
+# ------------------------------------------------------------------------------------------------ M3-S1-FIX
+def test_round1_l1ckv_is_replay_residue_and_restore_fixes_it(rows_dg, monkeypatch):
+    """Round 1's box failure, AssertionError ('kernel-overlap', 'L1.ckv'), in the GPU file's own sequence on the
+    CPU: base = kernel n = 4 steps; then 2n steps (the GPU file's _replay_ms(toks + toks, 2n)); then an n-step run
+    is compared to the base. The SAME mode (kernel vs kernel, no fork, no stream) fails the same way: logits and
+    main_hidden equal, the caches differ exactly at the compressed entries only the 2n-step run wrote (L1 ratio 2:
+    entries 21..32 = positions 42..65). With the GPU file's _checkpoint / _restore before every run, kernel and
+    kernel-overlap are equal to the base on everything, run after run."""
+    from runtime.static_step import StaticStep
+
+    G = _gpu_module()
+    model, pool, fk, fake = rows_dg("mini4")
+    monkeypatch.setattr(SO, "CPU_RESOLVE", _registry(pool).__getitem__)
+    hid = (len(model.layers) - 1,)
+    n = 4
+    ids, toks = _tf_tokens(18, 6 * n, 2026)
+
+    def build(mode):
+        monkeypatch.setenv(SO.STAGE_ENV, mode)
+        return StaticStep(model, pool, max_pos=511, rows=6, hidden_layers=hid, moe_impl="dg-inplace", spare_slots=8,
+                          _allow_cpu=True)
+
+    st = build("kernel")
+    ck = G._checkpoint(model, pool, st)
+    base = _static_run(model, st, ids, toks, n)
+    base_snap = G._snap(st, pool)
+    _static_run(model, st, ids, toks + toks, 2 * n)                 # the replay timing loop's extra positions
+    dirty = _static_run(model, st, ids, toks, n)                    # round 1's next run, here in the SAME mode
+    _assert_rows_equal(dirty[0], base[0], "residue: logits stay equal")
+    assert all(torch.equal(x, y) for x, y in zip(dirty[1], base[1]))
+    diff = G._state_diff(dirty[2], base[2])
+    assert "L1.ckv" in diff, diff
+    last = (18 + 6 * n - 1) // 2                                    # L1 (ratio 2): last entry an n-step run writes
+    d = (dirty[2]["L1.ckv"].float() - base[2]["L1.ckv"].float()).abs()
+    rows_bad = d.reshape(d.size(0), d.size(1), -1).amax(-1)[0].nonzero().flatten().tolist()
+    assert rows_bad and min(rows_bad) > last and max(rows_bad) <= (18 + 12 * n - 1) // 2, rows_bad
+    st.detach()
+    for mode in ("kernel", "kernel-overlap"):
+        st = build(mode)
+        for it in range(3):
+            G._restore(model, pool, st, ck)
+            a = _static_run(model, st, ids, toks, n)
+            G._eq_all(a, base, G._snap(st, pool), base_snap, f"{mode} restored #{it}")
+        _static_run(model, st, ids, toks + toks, 2 * n)            # dirty it again: the next restore must cope
+        G._restore(model, pool, st, ck)
+        G._eq_all(_static_run(model, st, ids, toks, n), base, G._snap(st, pool), base_snap, f"{mode} after dirt")
+        st.detach()
+
+
+# ---- the stream-ordering model: every access of the forked staging vs every concurrent main-stream access
+def _span(t):
+    """[lo, hi) bytes a CPU tensor can touch (strided interior included: conservative)."""
+    if not isinstance(t, torch.Tensor) or t.device.type != "cpu" or t.numel() == 0:
+        return None
+    es = t.element_size()
+    lo = t.data_ptr()
+    return lo, lo + sum((s - 1) * st for s, st in zip(t.shape, t.stride()) if s > 0) * es + es
+
+
+def _flat(v):
+    if isinstance(v, torch.Tensor):
+        yield v
+    elif isinstance(v, (list, tuple)):
+        for x in v:
+            yield from _flat(x)
+
+
+class _StreamModel:
+    """Records the step as an event list on the CPU: ("fork", l), side ops (the s1_stage_proj contract run through
+    CPU_RESOLVE, plus its pointer / plan-table reads that .tolist() hides from dispatch), ("wait", l, pj), and every
+    main-stream aten op with its read / write byte spans (torch dispatch; view ops touch no bytes). On the GPU the
+    side op pj runs concurrently with every main op after the fork until the first wait(l, q >= pj) (the side
+    stream is serial); `races` lists every overlapping access pair in such a window with a write on either side."""
+
+    def __init__(self, monkeypatch):
+        from torch.utils._python_dispatch import TorchDispatchMode
+
+        self.ev = []
+        self.stream = "main"
+        model = self
+
+        class Mode(TorchDispatchMode):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                kwargs = kwargs or {}
+                out = func(*args, **kwargs)
+                sch = func._schema
+                ins = [t for a_ in list(args) + list(kwargs.values()) for t in _flat(a_)]
+                if any(r.alias_info is not None and not r.alias_info.is_write for r in sch.returns):
+                    # a view touches no bytes -- but `to` & co. may alias OR copy: a fresh output storage is a copy
+                    st_in = {t.untyped_storage().data_ptr() for t in ins}
+                    if all(o.untyped_storage().data_ptr() in st_in for o in _flat(out)):
+                        return out
+                rd, wr = [], []
+                for i, a in enumerate(sch.arguments):
+                    v = args[i] if i < len(args) else kwargs.get(a.name)
+                    w = a.alias_info is not None and a.alias_info.is_write
+                    for t in _flat(v):
+                        s = _span(t)
+                        if s:
+                            (wr if w else rd).append(s)
+                model.ev.append(("op", model.stream, str(func), rd, wr))
+                return out
+
+        self.mode = Mode
+        launch0, proj0, wait0 = SO.StageOverlap.launch, SO.StageOverlap._proj, SO.StageOverlap.wait
+
+        def launch(ov, sm, t, m):
+            if ov.mode != "kernel":
+                self.ev.append(("fork", sm.layer))
+            return launch0(ov, sm, t, m)
+
+        def proj(ov, t, m, pj, n_work, plan, layer):
+            prev, self.stream = self.stream, ("side", layer, pj)
+            tabs = [m["uniq"], m["sidx"], m["wl"], t["gtab"], t["ptab6"], t["dtab"]]
+            self.ev.append(("op", self.stream, "contract-reads", [s for s in map(_span, tabs) if s], []))
+            try:
+                return proj0(ov, t, m, pj, n_work, plan, layer)
+            finally:
+                self.stream = prev
+
+        def wait(ov, sm, pj):
+            self.ev.append(("wait", sm.layer, pj))
+            return wait0(ov, sm, pj)
+
+        monkeypatch.setattr(SO.StageOverlap, "launch", launch)
+        monkeypatch.setattr(SO.StageOverlap, "_proj", proj)
+        monkeypatch.setattr(SO.StageOverlap, "wait", wait)
+
+    @staticmethod
+    def races(ev):
+        def hit(xs, ys):
+            return any(a < d and c < b for a, b in xs for c, d in ys)
+
+        out, side, open_, layer, forks = [], {}, set(), None, 0
+        for e in ev:
+            if e[0] == "fork":
+                assert not open_, f"L{layer}: forked staging {sorted(open_)} never joined before the next fork"
+                layer, side, open_ = e[1], {pj: ([], []) for pj in range(3)}, {0, 1, 2}
+                forks += 1
+            elif e[0] == "wait":
+                assert e[1] == layer, (e, layer)
+                open_ -= {pj for pj in open_ if pj <= e[2]}
+            elif e[1] != "main":
+                _, l_, pj = e[1]
+                assert l_ == layer and pj in open_, (e[1], layer, open_)
+                side[pj][0].extend(e[3])
+                side[pj][1].extend(e[4])
+            else:
+                for pj in open_:
+                    s_rd, s_wr = side[pj]
+                    if hit(s_wr, e[3] + e[4]) or hit(s_rd, e[4]):
+                        out.append((layer, pj, e[2]))
+        assert not open_, f"L{layer}: forked staging {sorted(open_)} never joined at the end of the run"
+        return out, forks
+
+
+@pytest.mark.parametrize("glue", [False, True])
+def test_stream_order_model_no_race(request, monkeypatch, glue):
+    """M3-S1-FIX: the kernel-overlap step's op sequence (mini4, 6 rows, 2 steps; reference glue and fused glue)
+    under the stream model -- no main-stream op between the fork and the join of projection p touches a byte the
+    forked staging of p reads or writes with a write on either side (the dedup / plan tables, the spare slots, the
+    packed SF; the hoisted shared expert, the act quant and GEMMs w1 / w3 included). Negative control: the same log
+    with the w1 wait dropped (GEMM w1 then reads the w1 pool while its staging may still write it) IS a race."""
+    from runtime.static_step import StaticStep
+
+    model, pool, fk, fake = request.getfixturevalue("rows_glue" if glue else "rows_dg")("mini4")
+    monkeypatch.setattr(SO, "CPU_RESOLVE", _registry(pool).__getitem__)
+    monkeypatch.setenv(SO.STAGE_ENV, "kernel-overlap")
+    hid = (len(model.layers) - 1,)
+    ids, toks = _tf_tokens(18, 12, 77)
+    kw = {"glue_impl": "fused"} if glue else {}
+    st = StaticStep(model, pool, max_pos=255, rows=6, hidden_layers=hid, moe_impl="dg-inplace", _allow_cpu=True,
+                    **kw)
+    sm_ = _StreamModel(monkeypatch)
+    with sm_.mode():
+        _static_run(model, st, ids, toks, 2)
+    st.detach()
+    races, forks = _StreamModel.races(sm_.ev)
+    n_side = sum(1 for e in sm_.ev if e[0] == "op" and e[1] != "main")
+    n_main = sum(1 for e in sm_.ev if e[0] == "op" and e[1] == "main")
+    assert forks == 2 * len(model.layers) and n_side >= 3 * forks and n_main > 100, (forks, n_side, n_main)
+    assert not races, races[:10]
+    dropped = [e for e in sm_.ev if not (e[0] == "wait" and e[2] == 0)]
+    bad, _ = _StreamModel.races(dropped)
+    assert bad and all(pj == 0 for _, pj, _ in bad), bad[:5]
+    # negative control 2: a main-stream op under the fork that WRITES the plan table the side reads (the work list)
+    sm2 = _StreamModel(monkeypatch)
+    sh0 = MR._RowsMoEBase._shared
+
+    def shared_dirty(self, x):
+        self.last["wl"].add_(0)                                         # same bytes; still a write under the fork
+        return sh0(self, x)
+
+    monkeypatch.setattr(MR._RowsMoEBase, "_shared", shared_dirty)
+    st = StaticStep(model, pool, max_pos=255, rows=6, hidden_layers=hid, moe_impl="dg-inplace", _allow_cpu=True,
+                    **kw)
+    with sm2.mode():
+        _static_run(model, st, ids, toks, 1)
+    st.detach()
+    bad2, _ = _StreamModel.races(sm2.ev)
+    assert {pj for _, pj, _ in bad2} == {0, 1, 2} and all("add_" in f for _, _, f in bad2), bad2[:5]
+
+
+def test_per_projection_launch_knobs(monkeypatch):
+    """$DSV41_STAGE_OVERLAP_NPROG / _BLOCK_BYTES: one value (all three projections) or three (w1,w3,w2); bad specs
+    refuse at build. Bytes are the same for every setting (test_s1_stage_proj_body_equals_contract's grid sweep)."""
+    class Owner:
+        dev = torch.device("cpu")
+        dg = None
+
+    monkeypatch.delenv(SO.NPROG_ENV, raising=False)
+    monkeypatch.delenv(SO.BLOCK_ENV, raising=False)
+    d = SO.StageOverlap(Owner(), "kernel-overlap", 2).describe()
+    assert d["nprog"] == [SO.STAGE_NPROG] * 3 and d["block_bytes"] == [SO.VEC_BLOCK_BYTES] * 3
+    monkeypatch.setenv(SO.NPROG_ENV, "48,16,16")
+    monkeypatch.setenv(SO.BLOCK_ENV, "8192,32768,32768")
+    ov = SO.StageOverlap(Owner(), "kernel-overlap", 2)
+    assert ov.nprog == [48, 16, 16] and ov.block_bytes == [8192, 32768, 32768]
+    monkeypatch.setenv(SO.NPROG_ENV, "16")
+    assert SO.StageOverlap(Owner(), "kernel-overlap", 2).nprog == [16] * 3
+    for bad_n, bad_b in (("48,16", None), ("0", None), (None, "8192,3000,8192")):
+        for k, v in ((SO.NPROG_ENV, bad_n), (SO.BLOCK_ENV, bad_b)):
+            if v is None:
+                monkeypatch.delenv(k, raising=False)
+            else:
+                monkeypatch.setenv(k, v)
+        with pytest.raises(ValueError):
+            SO.StageOverlap(Owner(), "kernel-overlap", 2)
+
+
+@pytest.mark.parametrize("glue", [False, True])
+def test_per_projection_cfg_step_equal(request, monkeypatch, glue):
+    """kernel-overlap with NPROG=48,16,16 / BLOCK_BYTES=8192,32768,32768 == kernel on the 6-row step (mini4)."""
+    from runtime.static_step import StaticStep
+
+    model, pool, fk, fake = request.getfixturevalue("rows_glue" if glue else "rows_dg")("mini4")
+    monkeypatch.setattr(SO, "CPU_RESOLVE", _registry(pool).__getitem__)
+    hid = (len(model.layers) - 1,)
+    ids, toks = _tf_tokens(18, 12, 5)
+    kw = {"glue_impl": "fused"} if glue else {}
+    outs = {}
+    for mode, np_, bb in (("kernel", None, None), ("kernel-overlap", "48,16,16", "8192,32768,32768")):
+        monkeypatch.setenv(SO.STAGE_ENV, mode)
+        for k, v in ((SO.NPROG_ENV, np_), (SO.BLOCK_ENV, bb)):
+            if v is None:
+                monkeypatch.delenv(k, raising=False)
+            else:
+                monkeypatch.setenv(k, v)
+        st = StaticStep(model, pool, max_pos=255, rows=6, hidden_layers=hid, moe_impl="dg-inplace", _allow_cpu=True,
+                        **kw)
+        outs[mode] = _static_run(model, st, ids, toks, 2)
+        if mode != "kernel":
+            assert st.describe()["stage"]["nprog"] == [48, 16, 16]
+        st.detach()
+    a, b = outs["kernel-overlap"], outs["kernel"]
+    _assert_rows_equal(a[0], b[0], "per-projection cfg vs kernel")
+    assert all(torch.equal(x, y) for x, y in zip(a[1], b[1]))
+    for k_ in b[2]:
+        assert torch.equal(a[2][k_], b[2][k_]), k_
+
+
+def test_none_diag_is_guarded_and_really_skips_staging(rows_dg, monkeypatch):
+    """The timing diagnostic $DSV41_STAGE=none-diag (the ceiling measurement): refused without the ack; with it the
+    step never launches staging (the spare slots are not written) and -- mini4 routes cold experts -- the outputs
+    are NOT kernel's (so it can never pass for a bit-identical variant); describe() says outputs_valid False."""
+    from runtime.static_step import StaticStep
+
+    monkeypatch.delenv(SO.DIAG_ENV, raising=False)
+    monkeypatch.setenv(SO.STAGE_ENV, SO.DIAG_MODE)
+    with pytest.raises(ValueError, match="wrong outputs"):
+        SO.stage_mode()
+    model, pool, fk, fake = rows_dg("mini4")
+    monkeypatch.setattr(SO, "CPU_RESOLVE", _registry(pool).__getitem__)
+    hid = (len(model.layers) - 1,)
+    ids, toks = _tf_tokens(18, 12, 31)
+    outs = {}
+    for mode in ("kernel", SO.DIAG_MODE):
+        monkeypatch.setenv(SO.STAGE_ENV, mode)
+        monkeypatch.setenv(SO.DIAG_ENV, SO.DIAG_ACK)
+        st = StaticStep(model, pool, max_pos=255, rows=6, hidden_layers=hid, moe_impl="dg-inplace", _allow_cpu=True)
+        before = [pool.hbm_full[l][p][len(pool.hot[l]):].clone() for l in range(pool.n_layers) for p in DI.PROJS]
+        s0 = fk.calls.get("stage_rows", 0)
+        outs[mode] = _static_run(model, st, ids, toks, 2)
+        if mode == SO.DIAG_MODE:
+            d = st.describe()["stage"]
+            assert d["outputs_valid"] is False and d["stats"]["launches"] == 0
+            assert d["stats"]["diag_skipped"] == 2 * len(model.layers)
+            assert fk.calls.get("stage_rows", 0) == s0
+            after = [pool.hbm_full[l][p][len(pool.hot[l]):] for l in range(pool.n_layers) for p in DI.PROJS]
+            assert all(torch.equal(x, y) for x, y in zip(before, after)), "none-diag wrote a spare slot"
+        st.detach()
+    assert not all(torch.equal(x, y) for x, y in zip(outs[SO.DIAG_MODE][0], outs["kernel"][0])), \
+        "none-diag matched kernel: the mini map routed no cold expert, the diagnostic proved nothing"
+
+
+def test_bench_cfg_parsing():
+    sys.path.insert(0, os.path.join(REPO, "bench"))
+    import staging_overlap_bench as B
+
+    cf = B.parse_cfgs("48:8192,48:8192/16:32768/16:32768")
+    assert cf == [(48, 8192), ((48, 8192), (16, 32768), (16, 32768))]
+    assert B._key("kernel-overlap", cf[0]) == "kernel-overlap/np48b8k"
+    assert B._key("kernel-overlap", cf[1]) == "kernel-overlap/np48b8k-16b32k-16b32k"
+    assert [B._per_proj_cfg(cf[1], p) for p in range(3)] == [(48, 8192), (16, 32768), (16, 32768)]
+    assert B._per_proj_cfg(cf[0], 2) == (48, 8192) and B._per_proj_cfg(None, 0) == (None, None)
+    with pytest.raises(ValueError):
+        B.parse_cfgs("48:8192/16:32768")
 
 
 # ------------------------------------------------------------------------------------------------ model / bench

@@ -18,7 +18,11 @@ Modes ($DSV41_STAGE, read at StaticStep build; describe()["stage"]):
                   combine, as graph capture requires. No host sync anywhere; the DeepGEMM call shapes are untouched
                   (no hot/cold split), so --moe-rowmatch and the 6-row == 1-row invariance are unaffected.
                   Knobs: $DSV41_STAGE_OVERLAP_NPROG (programs per staged slot, default 48) and
-                  $DSV41_STAGE_OVERLAP_BLOCK_BYTES (bytes per program per trip, default 8 KiB). RISK (cf. M2-L1, the
+                  $DSV41_STAGE_OVERLAP_BLOCK_BYTES (bytes per program per trip, default 8 KiB), each one value or
+                  three comma-separated (w1,w3,w2; M3-S1-FIX: e.g. NPROG=48,16,16 BLOCK_BYTES=8192,32768,32768 --
+                  a fast w1 copy, which GEMM w1 waits on, and low-contention w3 / w2 copies, which hide under the
+                  GEMMs; probe B: 48 programs cost the GEMMs 21-35 us/layer at c >= 2, 16 x 32 KiB 3-17).
+                  RISK (cf. M2-L1, the
                   forked mixes that lost 0.35 ms at 6 rows): the copy's CTAs share SMs with the shared-expert GEMVs
                   and the persistent DeepGEMM kernel; stream priority is not reserved capacity. Fewer programs
                   with more bytes in flight each is the lever; bench/staging_overlap_bench.py measures both.
@@ -84,8 +88,26 @@ class StageCaptureError(RuntimeError):
     """A ce mode met graph capture: copy-engine sources would be fixed at capture, the cold set is not."""
 
 
+# M3-S1-FIX diagnostic (NOT a mode of the runtime): no cold staging at all -- the spare slots keep whatever they
+# held, so any step that routes a cold expert computes WRONG outputs. It exists for one box measurement: the
+# headline ms/step with staging removed is the ceiling of what hiding the staging can buy (kernel - none-diag), and
+# kernel-overlap - none-diag is the staging still exposed in the REAL graph (the probe's [E] only models it).
+# Measure it on the teacher-forced 6-row step cell (bench/first_light.py --rows 6 --teacher-forced): the input tokens
+# stay fixed; the stale slots hold real experts' weights, so hidden states stay in range, but deeper layers' routing
+# drifts -- compare the cell's cold share (expert_pool counters) with the kernel run's before trusting the delta.
+# A generation-loop (headline) number with it is meaningless (the stream diverges, so does the work).
+# Refused unless $DSV41_STAGE_DIAG=wrong-outputs-ok; never publish a stream / parity number taken with it.
+DIAG_MODE = "none-diag"
+DIAG_ENV, DIAG_ACK = "DSV41_STAGE_DIAG", "wrong-outputs-ok"
+
+
 def stage_mode(req: Optional[str] = None) -> str:
     v = req or os.environ.get(STAGE_ENV) or STAGE_DEFAULT
+    if v == DIAG_MODE:
+        if os.environ.get(DIAG_ENV) != DIAG_ACK:
+            raise ValueError(f"${STAGE_ENV}={DIAG_MODE} skips cold staging (wrong outputs): a timing diagnostic "
+                             f"only, needs ${DIAG_ENV}={DIAG_ACK}")
+        return v
     if v not in STAGE_MODES:
         raise ValueError(f"${STAGE_ENV}={v!r} not in {STAGE_MODES}")
     return v
@@ -96,6 +118,22 @@ def _block_bytes(block_bytes) -> int:
     if bb < VEC_ALIGN or bb & (bb - 1):
         raise ValueError(f"stage block {bb} B must be a power of two >= {VEC_ALIGN}")
     return bb
+
+
+def _per_proj(spec: Optional[str], conv, name: str) -> List[Optional[int]]:
+    """'' / None -> [None] * 3 (stage_proj's defaults); '48' -> [48] * 3; '48,16,16' -> one per projection (w1, w3,
+    w2). Launch shape only: every setting writes the same bytes (s1_stage_proj's contract)."""
+    if not spec:
+        return [None, None, None]
+    vals = [v.strip() for v in str(spec).split(",")]
+    if len(vals) == 1:
+        vals = vals * 3
+    if len(vals) != 3 or any(not v for v in vals):
+        raise ValueError(f"${name}={spec!r}: one value or three (w1,w3,w2)")
+    out = [conv(v) for v in vals]
+    if any(int(v) < 1 for v in out):
+        raise ValueError(f"${name}={spec!r}: values must be >= 1")
+    return out
 
 
 # ------------------------------------------------------------------------------------------------ the kernel
@@ -269,12 +307,13 @@ class StageOverlap:
         self.owner, self.mode, self.n_layers = owner, stage_mode(mode), int(n_layers)
         self.dev = torch.device(owner.dev)
         self.cuda = self.dev.type == "cuda"
-        self.overlap = OVERLAP[self.mode]
-        self.capturable = CAPTURABLE[self.mode]
-        env = os.environ.get(NPROG_ENV)
-        self.nprog = int(env) if env else None
-        env = os.environ.get(BLOCK_ENV)
-        self.block_bytes = _block_bytes(env) if env else None
+        self.overlap = OVERLAP.get(self.mode, False)
+        self.capturable = CAPTURABLE.get(self.mode, True)         # none-diag: nothing to capture but the GEMMs
+        # per projection (w1, w3, w2): "48" = all three, "48,16,16" = one each (M3-S1-FIX: w1 is the latency-
+        # critical copy -- GEMM w1 waits on it with only the shared expert as cover -- w3 / w2 hide under GEMMs, where
+        # fewer programs with more bytes in flight each contend less with the persistent DeepGEMM, probe B)
+        self.nprog = _per_proj(os.environ.get(NPROG_ENV), int, NPROG_ENV)
+        self.block_bytes = _per_proj(os.environ.get(BLOCK_ENV), _block_bytes, BLOCK_ENV)
         self.side = None
         self.ev_route: List = []
         self.ev: List[List] = []
@@ -301,11 +340,12 @@ class StageOverlap:
         b = self.owner.dg
         if plan is None:
             stage_proj(t["ptab6"], m["uniq"], t["gtab"], t["dtab"], t["dsts"], m["sidx"], m["wl"], t["H"], b.row_w,
-                       b.sf_dims, n_work, pj, nprog=self.nprog, block_bytes=self.block_bytes)
+                       b.sf_dims, n_work, pj, nprog=self.nprog[pj], block_bytes=self.block_bytes[pj])
         else:
             self.stats["ce_copies"] += ce_copy_proj(t, plan, pj, b.row_w)
             stage_proj(t["ptab6"], m["uniq"], t["gtab"], t["dtab"], t["dsts"], m["sidx"], m["wl"], t["H"], b.row_w,
-                       b.sf_dims, n_work, pj, weights=False, nprog=self.nprog, block_bytes=self.block_bytes)
+                       b.sf_dims, n_work, pj, weights=False, nprog=self.nprog[pj],
+                       block_bytes=self.block_bytes[pj])
         self.stats["proj_launches"] += 1
         self._note("stage", layer, pj)
 
@@ -315,6 +355,9 @@ class StageOverlap:
         b = self.owner.dg
         if self.mode == "kernel":
             b.stage_rows(t, m)
+            return False
+        if self.mode == DIAG_MODE:                       # diagnostic: no staging launch at all (wrong outputs)
+            self.stats["diag_skipped"] = self.stats.get("diag_skipped", 0) + 1
             return False
         if self._capturing() and not self.capturable:
             raise StageCaptureError(
@@ -363,8 +406,9 @@ class StageOverlap:
 
     def describe(self) -> dict:
         return {"mode": self.mode, "capturable": self.capturable, "overlap": self.overlap,
-                "side_stream": self.side is not None, "nprog": self.nprog or STAGE_NPROG,
-                "block_bytes": self.block_bytes or VEC_BLOCK_BYTES, "stats": dict(self.stats)}
+                "outputs_valid": self.mode != DIAG_MODE,
+                "side_stream": self.side is not None, "nprog": [v or STAGE_NPROG for v in self.nprog],
+                "block_bytes": [v or VEC_BLOCK_BYTES for v in self.block_bytes], "stats": dict(self.stats)}
 
 
 def build(owner, n_layers: int, mode: Optional[str] = None) -> StageOverlap:

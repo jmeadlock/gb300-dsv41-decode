@@ -9,7 +9,11 @@ Skipped without CUDA/tilelang (Mac); on the box a missing/broken deep_gemm FAILS
     == the default `kernel` mode, eager: torch.equal on logits, main_hidden, caches, spare slots, packed SF;
     kernel-overlap captured: graph == static-eager (fork/join inside the capture, no host sync); a ce mode under
     capture raises StageCaptureError; overflow 0; graph replay ms/step of kernel vs kernel-overlap on the mini
-    (tiny shapes: a smoke number, labeled);
+    (tiny shapes: a smoke number, labeled). M3-S1-FIX: every compared run starts from the pre-base checkpoint
+    (round 1's ('kernel-overlap', 'L1.ckv') was the replay timing loop's cache residue, see _checkpoint), kernel-
+    overlap is compared $DSV41_S1_GATE_ITERS (20) times eager + 20 times as a graph, the per-projection launch shape
+    (NPROG 48,16,16 / BLOCK_BYTES 8192,32768,32768) 5 + 5 times, and a residue control shows the round-1 mechanism
+    with kernel vs kernel (logits equal, L1.ckv differs);
   * the probe (bench/staging_overlap_bench.py probe, quick: 4 rounds, 10 reps) runs end to end and its byte / output
     checks pass; receipt scratch/staging-overlap-probe-quick-<date>.json.
 
@@ -168,6 +172,62 @@ def _snap(st, pool):
     return slots, sf
 
 
+def _live_state(model, pool, st=None):
+    """Every tensor a step writes that outlives the step: the model's buffers (window ring, compressor state,
+    compressed KV, index K, engram cache, ...) + the tensors _state() reads, the pool's spare slots and -- given a
+    step -- its packed-SF spare groups. Live tensors (not clones), deduplicated by address."""
+    from runtime import dg_inplace as DI
+
+    ts = [b for _, b in model.named_buffers()]
+    for i, l in enumerate(model.layers):
+        a = l.attn
+        if a.compressor is not None and a.compressor.compress_ratio > 1:
+            ts += [a.compressor.kv_state, a.compressor.score_state]
+        if a.is_kv_source:
+            ts.append(a.compress_kv_cache)
+        if a.indexer is not None and a.indexer.owns_k:
+            ts.append(a.indexer.k_cache)
+    if getattr(model, "engram_hash", None) is not None:
+        ts.append(model.engram_hash.cache)
+    ts += [pool.hbm_full[l][p][len(pool.hot[l]):] for l in range(pool.n_layers) for p in DI.PROJS]
+    if st is not None:
+        ts += [st.dg.layers[l]["sf"][p][st.dg.layers[l]["H"]:] for l in sorted(st.dg.layers) for p in DI.PROJS]
+    seen, out = set(), []
+    for t in ts:
+        k = (t.data_ptr(), t.numel(), t.dtype)
+        if t.numel() and k not in seen:
+            seen.add(k)
+            out.append(t)
+    return out
+
+
+def _checkpoint(model, pool, st=None):
+    """M3-S1-FIX: a copy of _live_state's values. Round 1's mini4 failure ('kernel-overlap', 'L1.ckv') was this
+    file's own residue: _replay_ms ran the kernel graph 2n = 8 steps (positions 18..65) AFTER the n = 4-step base
+    snapshot (18..41), so compressed-KV entries 21..32 of L1 (ratio 2) held replay values in every later run and
+    the whole-buffer torch.equal failed -- for ANY mode, `kernel` included (tests/test_staging_overlap_cpu.py
+    reproduces it with kernel vs kernel). Restoring the pre-base checkpoint before every compared run makes each
+    run start from the same bytes; nothing is masked (the comparison is still the whole buffer)."""
+    return [t.clone() for t in _live_state(model, pool, st)]
+
+
+def _restore(model, pool, st, ck):
+    """Copy a checkpoint's values back into this step's live tensors (same order: model buffers, the pool's spare
+    slots, then the step's packed-SF spare groups -- a step built later gets the base step's build-time SF)."""
+    live = _live_state(model, pool, st)
+    assert len(live) == len(ck) and all(a.shape == b.shape and a.dtype == b.dtype for a, b in zip(live, ck)), \
+        "checkpoint layout differs from this step's live state"
+    with torch.inference_mode():
+        for t, c in zip(live, ck):
+            t.copy_(c)
+    if any(t.is_cuda for t in live):
+        torch.cuda.synchronize()
+
+
+def _state_diff(a, b):
+    return sorted(k for k in b if not torch.equal(a[k], b[k]))
+
+
 def _replay_ms(st, model, ids, toks, n):
     from test_static_rows_gpu import _prefill
 
@@ -184,44 +244,86 @@ def _replay_ms(st, model, ids, toks, n):
     return e0.elapsed_time(e1) / max(1, n - 1)
 
 
+GATE_ITERS = int(os.environ.get("DSV41_S1_GATE_ITERS", "20"))   # M3-S1-FIX: kernel-overlap runs per path (>= 20)
+
+
+def _eq_all(a, b, sn, bsn, what):
+    """torch.equal on every row's logits, main_hidden, the whole caches, the spare slots and the packed SF."""
+    _assert_rows(a[0], b[0], what)
+    assert all(torch.equal(x, y) for x, y in zip(a[1], b[1])), (what, "main_hidden")
+    d = _state_diff(a[2], b[2])
+    assert not d, (what, "caches", d)
+    assert all(torch.equal(x, y) for x, y in zip(sn[0], bsn[0])), (what, "spare slots")
+    assert all(torch.equal(x, y) for x, y in zip(sn[1], bsn[1])), (what, "packed SF")
+    COUNTS["caches"] += len(b[2])
+
+
 def test_static6_modes_equal_kernel_mini4():
+    """Every mode == kernel on mini4 (6 rows, 4 of 8 experts cold per layer). M3-S1-FIX: each compared run starts
+    from the pre-base checkpoint (_checkpoint docstring: round 1's L1.ckv failure was the replay timing loop's
+    residue), kernel-overlap is compared GATE_ITERS times eager and GATE_ITERS times as a graph (a timing-dependent
+    race would show as a flaky iteration), and a residue control re-runs kernel WITHOUT the restore after the
+    replay to show the round-1 mechanism on this box (logits equal, L1.ckv differs)."""
     _need_dg()
     from runtime import staging_overlap as SO
 
     prev = os.environ.get(SO.STAGE_ENV)
-    rec = {}
+    iters = max(1, GATE_ITERS)
+    rec = {"iters": iters, "label": "[M] mini4 (tiny shapes): graph replay ms/step, a smoke number, not a "
+                                    "performance claim"}
+    RESULTS["mini4"] = rec                     # incremental: the receipt keeps what ran even if an assert fires
     try:
         with _model("mini4") as (model, pool):
             hid = (len(model.layers) - 1,)
+            n_layers = len(model.layers)
             n = 4
             ids, toks = _toks(18, ROWS * n, 2026)
             kw = dict(rows=ROWS, hidden_layers=hid, moe_impl="dg-inplace", spare_slots=8)
             os.environ[SO.STAGE_ENV] = "kernel"
             st = _need_step(model, pool, **kw)
             assert st.stage_ov.mode == "kernel"
+            ck = _checkpoint(model, pool, st)                     # before any step: the state every run starts from
+            rec["checkpoint_tensors"] = len(ck)
             base = _static(model, st, ids, toks, n)
             base_snap = _snap(st, pool)
             st.capture()
+            _restore(model, pool, st, ck)
             bg = _static(model, st, ids, toks, n, graph=True)
-            _assert_rows(bg[0], base[0], "kernel: graph vs eager")
+            _eq_all(bg, base, _snap(st, pool), base_snap, "kernel: graph vs eager")
             rec["kernel_graph_ms_per_step_mini"] = round(_replay_ms(st, model, ids, toks + toks, 2 * n), 4)
+            # residue control: the round-1 sequence (no restore after the 2n-step replay), same mode as the base
+            dirty = _static(model, st, ids, toks, n)
+            _assert_rows(dirty[0], base[0], "residue control: kernel after the replay, logits")
+            rec["residue_control_cache_diff"] = _state_diff(dirty[2], base[2])
+            assert "L1.ckv" in rec["residue_control_cache_diff"], (
+                "the round-1 residue did not reproduce with kernel vs kernel: the L1.ckv diagnosis is wrong here",
+                rec["residue_control_cache_diff"])
             st.detach()
-            for mode in ("kernel-overlap", "ce", "ce-overlap"):
+            # M3-S1-FIX: + the per-projection launch shape (fast w1 copy, low-contention w3 / w2), same bytes
+            runs = [("kernel-overlap", None, None, iters), ("kernel-overlap", "48,16,16", "8192,32768,32768",
+                                                            max(2, iters // 4)), ("ce", None, None, 2),
+                    ("ce-overlap", None, None, 2)]
+            for mode, np_, bb, n_it in runs:
                 os.environ[SO.STAGE_ENV] = mode
+                for k_, v_ in ((SO.NPROG_ENV, np_), (SO.BLOCK_ENV, bb)):
+                    if v_ is None:
+                        os.environ.pop(k_, None)
+                    else:
+                        os.environ[k_] = v_
+                tag = mode if np_ is None else f"{mode}/np{np_.replace(',', '-')}"
                 st = _need_step(model, pool, **kw)
                 assert st.stage_ov.mode == mode and st.describe()["stage"]["mode"] == mode
-                a = _static(model, st, ids, toks, n)
-                _assert_rows(a[0], base[0], f"{mode} vs kernel (eager)")
-                assert all(torch.equal(x, y) for x, y in zip(a[1], base[1])), mode
-                for k_ in base[2]:
-                    assert torch.equal(a[2][k_], base[2][k_]), (mode, k_)
-                sl, sf = _snap(st, pool)
-                assert all(torch.equal(x, y) for x, y in zip(sl, base_snap[0])), (mode, "spare slots")
-                assert all(torch.equal(x, y) for x, y in zip(sf, base_snap[1])), (mode, "packed SF")
-                stats = st.stage_ov.stats
-                assert stats["launches"] == len(model.layers) * n, stats
+                n_eager = n_it
+                stats0 = None
+                for it in range(n_eager):
+                    _restore(model, pool, st, ck)
+                    a = _static(model, st, ids, toks, n)
+                    _eq_all(a, base, _snap(st, pool), base_snap, f"{tag} vs kernel (eager #{it})")
+                    if stats0 is None:
+                        stats0 = dict(st.stage_ov.stats)
+                assert stats0["launches"] == n_layers * n, stats0
                 if mode.startswith("ce"):
-                    assert stats["ce_copies"] > 0, "no cold expert was staged: the ce path was not exercised"
+                    assert stats0["ce_copies"] > 0, "no cold expert was staged: the ce path was not exercised"
                     try:
                         st.capture()
                         raise AssertionError(f"{mode} captured without StageCaptureError")
@@ -232,13 +334,18 @@ def test_static6_modes_equal_kernel_mini4():
                 else:
                     assert st.stage_ov.side is not None
                     st.capture()
-                    ag = _static(model, st, ids, toks, n, graph=True)
-                    _assert_rows(ag[0], base[0], f"{mode}: graph vs kernel eager")
-                    _assert_rows(ag[0], bg[0], f"{mode}: graph vs kernel graph")
-                    rec[f"{mode}_graph_ms_per_step_mini"] = round(_replay_ms(st, model, ids, toks + toks, 2 * n), 4)
+                    for it in range(n_it):
+                        _restore(model, pool, st, ck)
+                        ag = _static(model, st, ids, toks, n, graph=True)
+                        _eq_all(ag, base, _snap(st, pool), base_snap, f"{tag}: graph vs kernel eager (#{it})")
+                        _assert_rows(ag[0], bg[0], f"{tag}: graph vs kernel graph (#{it})")
+                    rec[f"{tag}_graph_ms_per_step_mini"] = round(_replay_ms(st, model, ids, toks + toks, 2 * n), 4)
                 ov = st.overflow_counts()
                 assert ov["steps"] == 0 and ov["experts"] == 0, ov
-                rec[mode] = {"stats": dict(stats), "equal": True}
+                rec[tag] = {"stats_first_eager_run": stats0, "eager_runs_equal": n_eager,
+                            "graph_runs_equal": 0 if mode.startswith("ce") else n_it,
+                            "nprog": st.describe()["stage"]["nprog"],
+                            "block_bytes": st.describe()["stage"]["block_bytes"]}
                 st.detach()
                 COUNTS["gates"] += 1
     finally:
@@ -246,9 +353,9 @@ def test_static6_modes_equal_kernel_mini4():
             os.environ.pop(SO.STAGE_ENV, None)
         else:
             os.environ[SO.STAGE_ENV] = prev
-    rec["label"] = "[M] mini4 (tiny shapes): graph replay ms/step, a smoke number, not a performance claim"
-    RESULTS["mini4"] = rec
-    print("  mini4:", json.dumps(rec))
+        os.environ.pop(SO.NPROG_ENV, None)
+        os.environ.pop(SO.BLOCK_ENV, None)
+    print("  mini4:", json.dumps(rec, default=str))
 
 
 # ------------------------------------------------------------------------------------------------ the probe
