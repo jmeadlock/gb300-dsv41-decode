@@ -566,6 +566,7 @@ class DSparkLoop:
         """Prefill -> first draft (module docstring). Returns the prefill's fp32 logits [V] (device). keep_force: the
         scripted drafts set by `set_force` apply to the first draft too (tests); default off."""
         from runtime.draft_step import prefill_hidden, seed_draft_rings
+        from runtime.prefill_fast import last_prefill as _last_prefill
 
         st, ds, b = self.st, self.ds, self.b
         L = len(ids)
@@ -577,6 +578,7 @@ class DSparkLoop:
         b.set_eos(stop_on_eos)
         tokens = torch.tensor([list(ids)], dtype=torch.long, device=self.dev)
         out, logits, mh = prefill_hidden(self.model, tokens, self.hidden)  # the reference prefill (+ 256-ring sync)
+        self.last_prefill = _last_prefill()                                # M4-P2: $DSV41_PREFILL mode + counters
         first = out.reshape(-1)[:1]
         seed_draft_rings(self.model, first, mh)                            # forward_spec at start_pos 0
         b.reset(first, L, max_new)

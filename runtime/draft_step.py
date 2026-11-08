@@ -163,15 +163,21 @@ def freqs_rows(table_real: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
 
 # ------------------------------------------------------------------------------------------------ reference helpers
 @torch.inference_mode()
-def prefill_hidden(model, tokens: torch.Tensor, hidden_layers: Sequence[int]):
+def prefill_hidden(model, tokens: torch.Tensor, hidden_layers: Sequence[int], mode: Optional[str] = None):
     """The reference prefill `model(tokens, 0)` with `target_layer_ids` set for this call only (model.py:1211,
-    1267-1269) -> (ids, logits, main_hidden [1, L, n*dim]). Runs under refmodel.reference_device(tokens.device)."""
+    1267-1269) -> (ids, logits, main_hidden [1, L, n*dim]). Runs under refmodel.reference_device(tokens.device).
+    M4-P2: inside runtime/prefill_fast.py `prefill_scope` -- mode (arg, else $DSV41_PREFILL) "reference" (default:
+    the reference MoE loop) or "grouped" (the routed experts batched, bit-identical by construction); torch's
+    fill_uninitialized_memory scoped off ($DSV41_PREFILL_FILLS=on keeps the caller's). `prefill_fast.last_prefill()`
+    has the counters."""
+    from runtime.prefill_fast import prefill_scope
     from runtime.refmodel import reference_forward
 
     prev = getattr(model, "target_layer_ids", ())
     model.target_layer_ids = tuple(int(i) for i in hidden_layers)
     try:
-        return reference_forward(model, tokens, 0)
+        with prefill_scope(model, mode):
+            return reference_forward(model, tokens, 0)
     finally:
         model.target_layer_ids = prev
 

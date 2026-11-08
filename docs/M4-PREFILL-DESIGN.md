@@ -290,3 +290,40 @@ Host work becomes ~180 launches per layer for the whole forward. Modeled TTFT is
 3. Whether stage B is bit-equal on real activations, and what it gains.
 4. Row-invariance at 42 and 64 per family: whether a token-chunked prefill can ever be bit-identical.
 5. The census: distinct experts and cold experts per layer per prompt. These replace §2's independence numbers, and the model table is re-run from them.
+
+## 7.1 M4-P2 result (2026-11-08): what was built — Mac-verified, box pending
+
+Worker: M4-P2 (Opus), worktree `gb300-dsv41-decode-wtp2`, branch `m4-p2`. Handoff `docs/HANDOFF-M4-P2-FAST-PREFILL.md`. Code: `runtime/prefill_fast.py` (new), `runtime/draft_step.py` `prefill_hidden` (call site), `runtime/dspark_loop.py` `start` (records `last_prefill`), `bench/prefill_bench.py` (new), `tests/gpu/test_prefill_fast_gpu.py`, `tests/test_prefill_fast_cpu.py`. Switches: `$DSV41_PREFILL=reference|grouped` (default **reference** until the box gate), `$DSV41_PREFILL_FILLS=off|on` (default **off**, now for both modes: box 8/8 `off==on True`, −0.55 s), `$DSV41_PREFILL_STREAMS` (default 4).
+
+**No grouped entry exists in the reference.** `kernel.py` has one `fp4_gemm` (one expert, one launch) and no masked/grouped variant; DeepGEMM's masked grouped GEMM is row-invariant but is not the reference kernel text (A3). So this build is the handoff's "emulate the grouping" branch, not §7 stage 2's new TileLang kernel:
+
+- per MoE layer: the reference `Gate`; one stable sort + ONE `bincount().tolist()` (the reference's own sync, 896; the per-expert `torch.where` syncs are gone); each routed expert gets a segment of a layer-wide buffer starting on a multiple of 32 rows and padded to 32; ONE `index_select` gathers x into it; ONE `act_quant` (linear()'s arguments) for w1/w3;
+- per expert, ONLY the GEMM launches: the reference TileLang `fp4_gemm_kernel` object — the very object `kernel.fp4_gemm` builds, same arguments — called on views: A = the segment's c rows (M = c, the reference's M: same grid, same swizzle), B/scales = the expert's own pool views (hot HBM, cold UVA, unchanged), C = a view into the layer buffer. 3 launches per expert instead of 26;
+- the reference SwiGLU ops in the reference order on all rows at once; one `act_quant`; the w2 launches; the combine as k fp32 adds of `out[pos[:, j]]` with pos = each row's segment positions ascending (= ascending expert id), i.e. the reference's `0 + o_e1 + o_e2 + …`; shared expert and `type_as` unchanged.
+- the experts' launches can be spread over N CUDA streams (each writes only its own segment; the current stream waits before any read). Order cannot change a value.
+
+Why the 32-row segments matter beyond tidiness: a segment's views start on a 64-byte boundary (TVM's assumed buffer alignment; asserted per launch) — with DSV4.1's inter 2304 the w2 activation scale row is 72 B, so packed rows would give 8-byte-aligned scale views; an unguarded tail-tile store stays inside the expert's own padding (concurrent launches never touch a neighbour); act_quant's 32-row tiles never straddle experts. Pad rows copy token row 0 with weight 0 and are never combined.
+
+Everything else of the forward (attention, compressor, indexer, all KV caches, mHC, Engram, head) is the reference forward untouched: the scope installs the grouped function as the INSTANCE `forward` of each `model.layers[i].ffn` for one prefill and removes it on exit (the class-level static-MoE patch is not touched).
+
+**Launches per prefill** (census from the M4-P1 box receipt [D]; after = this build, counted):
+
+| prompt | L | expert calls | expert launches before (26/call) [D] | GEMM launches after (3/call) | + MoE glue after (40 × 42 ops) |
+|---|---|---|---|---|---|
+| story | 31 | 3,013 | 78,338 | 9,039 | ~1,680 |
+| prose | 42 | 3,672 | 95,472 | 11,016 | ~1,680 |
+| math | 54 | 3,652 | 94,952 | 10,956 | ~1,680 |
+
+MoE host syncs per prefill: ~3,700 (a bincount per layer + a `where` per expert) → 40 (the bincounts). The kineto count in `prefill_bench run --kineto` replaces the glue estimate.
+
+**Modeled TTFT [E]** (`python3 bench/prefill_bench.py model`; parameters printed with labels; the 20 µs host per direct TileLang launch is [A]): mean over the 8 prompts today 3,703 ms [D] → fills off 3,174 [D] → grouped 1 stream **~1,030** (GPU-bound: 3 × 3.5k latency-bound `fp4_gemm` × 79–88 µs [D] in series) → grouped 4–8 streams **~410** (host-bound: ~11k launches × 20 µs [A] + ~200 ms of unchanged non-MoE / gate / shared work). That is a 9× TTFT cut, not §0's ~0.1 s: the per-expert launch stays. The ~0.1 s needs §7 stage 2 (one grouped TileLang launch per projection per layer, the reference text with a tile → (expert, row base, count) indirection); this build is its scaffold (same routing, segments, gather, SwiGLU and combine) and its bit-identity oracle.
+
+**Mac verification** (CPU kernel emulations, both sides of every comparison): `tests/test_prefill_fast_cpu.py` 16 passed — per-layer MoE `torch.equal` (mini4 top-4 at L = 1, 23, 37, 77; mini3), the direct-kernel path through a fake `kernel` module whose kernel also scribbles NaN over every tile's unguarded tail rows, prefill ids/logits/main_hidden and every layer buffer equal under reference vs grouped (also past the 128 window, L = 130), self-replay, the counters against the PrefillProbe census, the DSpark loop's tokens / accept lengths / per-position logits sha after a grouped vs a reference prefill, scope install/uninstall, the bench `run` end to end. Mutation check: reversing the combine order makes the per-layer test fail (the order is observed). Full suite `.venv/bin/python -m pytest tests/ -q --ignore=tests/gpu`: 1399 passed, 1 skipped (`scratch/m4p2-cpu-tests.log`).
+
+## 8.1 M4-P2: open, decided by the box (`python3 bench/prefill_bench.py box`)
+
+1. `tests/gpu/test_prefill_fast_gpu.py` on the mini with the real kernels: per-layer MoE equal at 1 and 4 streams, prefill + every buffer equal, loop streams equal in static and graph mode.
+2. `prefill_bench.py run --streams 1,4,8 --kineto` on the real checkpoint, 8 prompts: first / logits / main_hidden / every layer buffer + draft rings equal to today's reference (fills on), replay, prefill and TTFT ms [M], kernels and `fp4_gemm` launches, GPU busy %, C2C bytes (cold weights are still read in-kernel over UVA, once per expert per M-tile, as today).
+3. `headline.py` with `DSV41_PREFILL=grouped --residency-ref docs/headline-20261108-main-ss.json`: the 256-token streams and accept lengths per prompt equal to today's receipt (`all_tokens_equal`, `all_accepts_equal`), and the headline's prefill_ms.
+4. Whether TileLang launches on the current stream (multi-stream speedup) and the real host µs per direct launch (the [A] above): both read off (2).
+5. Only if 1–3 pass: flip `DEFAULT_MODE` to "grouped". Then the next build is §7 stage 2 (the grouped TileLang kernel, ~0.1 s [E]); the cold pre-stage (handoff second stage) is not built — at the fixture lengths the cold calls are 4–9 % of the GEMM launches and run concurrently with hot ones, so it is measured from (2)'s cold/hot split before anyone builds it.
