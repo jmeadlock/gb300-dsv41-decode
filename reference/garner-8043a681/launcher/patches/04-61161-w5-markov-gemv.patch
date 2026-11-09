@@ -1,0 +1,10 @@
+--- a/fastpath/w5_markov_gemv.py
++++ b/fastpath/w5_markov_gemv.py
+@@ -56,6 +56,7 @@
+              lf.to(cache_ptr.dtype.element_ty), mask=row_mask & valid)
+     temp = tl.load(temp_ptr + req_state, mask=valid, other=0.0).to(tl.float32)
+     seed = tl.load(seeds_ptr + req_state, mask=valid, other=0)
++    seed = seed ^ (tl.cast(step, tl.int64) << 32)  # vLLM #61161 spec_step_seed(seed, col); col == step here
+     pos = tl.load(sample_pos_ptr + srow) - 1
+     # gumbel_noised_argmax(IS_DRAFTING=True, USE_FP64=False, APPLY_TEMPERATURE=True), production's arithmetic.
+     v = lf

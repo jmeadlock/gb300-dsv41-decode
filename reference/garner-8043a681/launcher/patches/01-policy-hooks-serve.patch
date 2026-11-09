@@ -1,0 +1,38 @@
+--- a/serve/serve.sh
++++ b/serve/serve.sh
+@@ -319,8 +319,13 @@
+               -e "DS41_FASTPATH=$fastpath"
+               -e "DS41_GPU_RESERVE_MIB=$DS41_GPU_RESERVE_MIB"
+               -e PEER3_PREBUILT=/fastpath/peer3/prebuilt -e VLLM_EXP_PEER3_SHM=/dev/shm/vllm_peer_tier3)
++  [ -n "${DS41_PEER3_SPINS:-}" ] && envs+=(-e "PEER3_SPINS=$DS41_PEER3_SPINS")
+   local envf; envf=$(mktemp); trap "rm -f '$envf'" RETURN
+   chmod 600 "$envf"; echo "VLLM_API_KEY=$(cat "$DS41_API_KEY_FILE")" > "$envf"
++  local keyargs=(--env-file "$envf"); [ "${DS41_NO_KEY:-0}" = 1 ] && keyargs=()
++  local attncfg=(); [ -n "${DS41_ATTN_CFG:-}" ] && attncfg=(--attention-config "$DS41_ATTN_CFG")
++  local genover=(); [ -n "${DS41_GEN_OVERRIDE:-}" ] && genover=(--override-generation-config "$DS41_GEN_OVERRIDE")
++  local effort=(--default-chat-template-kwargs "{\"reasoning_effort\":\"$DS41_EFFORT\"}"); [ "${DS41_EFFORT_DEFAULT:-1}" = 0 ] && effort=()
+   local spec=(--speculative-config '{"method":"dspark","num_speculative_tokens":5,"num_speculative_tokens_per_batch_size":[[1,4,5],[5,8,3],[9,32,3]],"draft_sample_method":"probabilistic","rejection_sample_method":"block"}')
+   local offload=()
+   if [ "$DS41_OFFLOAD_GB" != 0 ]; then offload=(--kv-offloading-size "$DS41_OFFLOAD_GB" --kv-offloading-backend native --kv-transfer-config "{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"store_threshold\":$DS41_OFFLOAD_THRESHOLD}}"); fi
+@@ -328,17 +333,17 @@
+   log "starting GB300 vLLM on $GB300_NAME ($GB300_UUID); util=$DS41_UTIL, reserve=${DS41_GPU_RESERVE_MIB} MiB, rowmap=$DS41_ROWMAP, maxlen=$DS41_MAXLEN"
+   docker run -d --name ds41 --restart no "${dev[@]}" --ipc host --network host \
+     --cap-add SYS_NICE --cap-add IPC_LOCK --ulimit memlock=-1 --ulimit stack=67108864 --security-opt label=disable \
+-    --env-file "$envf" "${mounts[@]}" "${envs[@]}" --entrypoint /usr/bin/numactl "$DS41_IMAGE" --membind=0 \
++    "${keyargs[@]}" "${mounts[@]}" "${envs[@]}" --entrypoint /usr/bin/numactl "$DS41_IMAGE" --membind=0 \
+     vllm serve --model /model --served-model-name "$DS41_SERVED" "${aliases[@]}" --trust-remote-code \
+     --tensor-parallel-size 1 --moe-backend deep_gemm_mega_moe --enable-expert-parallel \
+     --engram-config '{"cpu_offload": true}' --max-model-len "$DS41_MAXLEN" --max-num-seqs "$DS41_SEQS" \
+     --max-num-batched-tokens 8192 --gpu-memory-utilization "$DS41_UTIL" --kv-cache-dtype "$DS41_KV" \
+-    --attention-config '{"indexer_kv_dtype": "mxfp4", "indexer_sparse_logits": true}' \
++    "${attncfg[@]}" \
+     --tool-call-parser deepseek_v41 --reasoning-parser deepseek_v41 --enable-auto-tool-choice \
+     --long-prefill-token-threshold 6144 --enable-prefix-caching "${spec[@]}" \
+     --cudagraph-capture-sizes 1 2 4 6 8 12 16 18 20 24 28 32 36 40 48 56 64 72 80 96 128 144 160 192 224 256 \
+-    --override-generation-config '{"temperature": 1.0, "top_p": 0.95}' \
+-    --default-chat-template-kwargs "{\"reasoning_effort\":\"$DS41_EFFORT\"}" "${offload[@]}" \
++    "${genover[@]}" \
++    "${effort[@]}" "${offload[@]}" \
+     --host 0.0.0.0 --port "$DS41_PORT" >/dev/null
+   local t=0 summary
+   while :; do

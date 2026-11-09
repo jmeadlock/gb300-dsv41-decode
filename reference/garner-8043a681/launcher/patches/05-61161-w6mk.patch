@@ -1,0 +1,12 @@
+--- a/kernels/w6-moe/markov/w6mk.cu
++++ b/kernels/w6-moe/markov/w6mk.cu
+@@ -256,7 +256,8 @@
+       const int st = a.idx_mapping[i];
+       p_st[i] = st;
+       p_temp[i] = st >= 0 ? a.temp[st] : 0.0f;
+-      p_seed[i] = st >= 0 ? a.seeds[st] : 0;
++      // vLLM #61161 spec_step_seed(seed, col): col == s == i % S (q_cache[req, s])
++      p_seed[i] = st >= 0 ? (a.seeds[st] ^ (static_cast<long long>(i % a.S) << 32)) : 0;
+       p_pos[i] = a.sample_pos[i] - 1;
+     }
+     if (lane < a.R) tokens[lane] = a.input_ids[a.anchor_idx[lane]];

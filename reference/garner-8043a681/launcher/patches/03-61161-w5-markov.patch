@@ -1,0 +1,10 @@
+--- a/fastpath/w5_markov.py
++++ b/fastpath/w5_markov.py
+@@ -86,6 +86,7 @@
+     )
+     temp = tl.load(temp_ptr + req_state_idx, mask=is_valid_req, other=0.0).to(tl.float32)
+     seed = tl.load(seeds_ptr + req_state_idx, mask=is_valid_req, other=0)
++    seed = seed ^ (tl.cast(step, tl.int64) << 32)  # vLLM #61161 spec_step_seed(seed, col); col == step here
+     # sample_pos is the predicted token's position; the draw is keyed by the position before it.
+     pos = tl.load(sample_pos_ptr + row) - 1
+     value, idx = gumbel_noised_argmax(
