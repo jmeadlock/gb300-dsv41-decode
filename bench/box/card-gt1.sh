@@ -208,6 +208,8 @@ build() {
   mkdir -p "$GT" "$GT/home"
   rsync -a --delete --exclude __pycache__ "$PG61_WORK/tree/" "$GT/tree/" || return 1
   rsync -a --delete "$PG61_WORK/overlay-vllm/" "$GT/overlay-vllm/" || return 1
+  # Pg61's built tree is frozen read-only (BUILD-SHA256SUMS); the copy must be writable for the patches.
+  chmod -R u+rwX "$GT/tree" "$GT/overlay-vllm" || return 1
   local f
   for f in fastpath/fastpath_boundary.py fastpath/components.py; do
     cmp -s "$GT/tree/$f" "$SRC/$f" || { say "FAIL: $f in the Pg61 tree differs from the pin $PIN"; return 1; }
