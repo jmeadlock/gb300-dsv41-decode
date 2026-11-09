@@ -1,0 +1,76 @@
+diff --git a/fastpath/fastpath_boundary.py b/fastpath/fastpath_boundary.py
+index 6f5c529..f80ccf8 100644
+--- a/fastpath/fastpath_boundary.py
++++ b/fastpath/fastpath_boundary.py
+@@ -1148,14 +1148,21 @@ def _peer3_handle(device):
+     return h
+ 
+ 
+-def _moe_eligible(moe, hidden_states, input_ids, g, v3: bool) -> bool:
++def _gracetier(experts):
++    """fastpath_gracetier when this layer is a gracetier layer (all 384 experts resident in one MegaMoE, the cold groups
++    staged from Grace right after the router; no publish, no finish), else None."""
++    m = sys.modules.get("fastpath_gracetier")
++    return m if m is not None and m.is_gracetier(experts) else None
++
++
++def _moe_eligible(moe, hidden_states, input_ids, g, v3: bool, gracetier: bool = False) -> bool:
+     exp = moe.experts
+     st = getattr(exp, "_mp", None)
+     T = hidden_states.shape[0]
+     gate = moe.gate
+     bias_vl = getattr(gate, "bias_vl", None)
+-    min_t = ROUTER_MIN_T if v3 or not _peer3_installed(exp) else 5
+-    return ((v3 or (g is not None and g.get("PEER2") and g.get("FUSED_SEND2"))) and st is not None
++    min_t = ROUTER_MIN_T if v3 or gracetier or not _peer3_installed(exp) else 5
++    return ((v3 or gracetier or (g is not None and g.get("PEER2") and g.get("FUSED_SEND2"))) and st is not None
+             and min_t <= T <= ROUTER_MAX_T and moe.use_mega_moe and not moe.use_fi_mega_moe
+             and getattr(gate, "allow_ll_bf16_gemm", False) and T <= getattr(gate, "LL_BF16_MAX_TOKENS", 0)
+             and gate.tid2eid is None and gate.e_score_correction_bias is not None
+@@ -1308,14 +1315,15 @@ def _make_moe_forward(orig):
+             _join_for_moe(self)
+             return orig(self, hidden_states, input_ids, mega_gate_metadata)
+         g = _hook_globals(self.experts) if ROUTER_ON else None
+-        want_v3 = ROUTER_ON and PEER3_ON and _peer3_installed(self.experts)
++        gt = _gracetier(self.experts) if ROUTER_ON else None
++        want_v3 = ROUTER_ON and PEER3_ON and gt is None and _peer3_installed(self.experts)
+         p3 = _peer3_handle(hidden_states.device) if want_v3 else None
+         if want_v3 and (p3 is None or hidden_states.shape[0] > sys.modules["fastpath_peer3"].MAX_T):
+             if hidden_states.shape[0] <= ROUTER_MAX_T:
+                 _log_routing(self, "peer3 installed but no peer3 state yet" if p3 is None else "T above peer3 MAX_T")
+             _join_for_moe(self)  # peer3's own forward publishes this call (one path per width)
+             return orig(self, hidden_states, input_ids, mega_gate_metadata)
+-        if not _moe_eligible(self, hidden_states, input_ids, g, p3 is not None):
++        if not _moe_eligible(self, hidden_states, input_ids, g, p3 is not None, gt is not None):
+             if ROUTER_MIN_T <= hidden_states.shape[0] <= ROUTER_MAX_T:
+                 fwd = type(self.experts).forward
+                 _log_routing(self, "not eligible (peer3 installed: %s, experts forward from %s, input_ids %s)" % (
+@@ -1331,7 +1339,7 @@ def _make_moe_forward(orig):
+         exp = self.experts
+         T = hidden_states.shape[0]
+         layer = exp._mp.idx
+-        if p3 is None:
++        if p3 is None and gt is None:
+             peer = g["_peer_tier2"](hidden_states.device)
+             pf2 = g["_fused2"]()
+             pad = sys.modules["peer_tier2"].SMALL_ROWS
+@@ -1363,6 +1371,8 @@ def _make_moe_forward(orig):
+             prep=(symm.x, symm.x_sf, symm.shared_l1_acts_sf, sbm), peer=peer, peer_pad=pad,
+             p3=None if p3 is None else (p3.seg.dptr, p3.state), trigger_late=bool(_DEFERRED_MIX),
+             mega_ctl=sys.modules["fastpath_megamoe"].c11_skip(symm) if lay is not None else None)
++        if gt is not None:
++            gt.stage_symm(exp, symm, T)  # gracetier: the call's touched cold experts Grace -> their groups
+         cst = (_copy_state(p3, hidden_states.device)
+                if p3 is not None and FUSE_FINISH and layer in _FUSE_LAYERS else None)
+         if cst is not None:
+@@ -1377,7 +1387,9 @@ def _make_moe_forward(orig):
+                             shared_l2_weights=exp._transformed_shared_l2_weights,
+                             activation_clamp=float(self.swiglu_limit) if self.swiglu_limit is not None else None,
+                             fast_math=True)
+-        if p3 is None:
++        if gt is not None:
++            pass  # gracetier: MegaMoE computed all six routes in its own combine; nothing to finish
++        elif p3 is None:
+             pf2.finish2(peer, y, has, pos, rows)
+         elif fused:
+             _PENDING_FINISH.append(dict(y=y, has=has, layer=layer, p3=p3,

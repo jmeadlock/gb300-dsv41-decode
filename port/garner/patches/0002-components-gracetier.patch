@@ -1,0 +1,20 @@
+diff --git a/fastpath/components.py b/fastpath/components.py
+index b657ff2..49cabcf 100644
+--- a/fastpath/components.py
++++ b/fastpath/components.py
+@@ -27,6 +27,7 @@ import fastpath_engram_side
+ import fastpath_fastload
+ import fastpath_coldskip
+ import fastpath_peer3
++import fastpath_gracetier  # P1 card GT1: cold experts in Grace, no RTX
+ import fastpath_megamoe
+ import fastpath_quant_producer
+ import fastpath_a12_retire
+@@ -54,6 +55,7 @@ REGISTERED = (
+     fastpath_fastload,
+     fastpath_coldskip,
+     fastpath_peer3,
++    fastpath_gracetier,
+     fastpath_megamoe,
+     fastpath_quant_producer,
+     fastpath_a12_retire,

@@ -1,0 +1,40 @@
+diff --git a/serve/serve.sh b/serve/serve.sh
+index cc55a27..a0cc0c0 100644
+--- a/serve/serve.sh
++++ b/serve/serve.sh
+@@ -49,6 +49,8 @@ die()  {
+   exit 1
+ }
+ need() { command -v "$1" >/dev/null 2>&1 || die "missing $1"; }
++# gracetier (P1 card GT1): cold experts in Grace on the GB300 itself -- no RTX PRO 6000, no peer3 sidecar.
++gracetier_on() { case ",${DS41_FASTPATH_COMPONENTS:-}," in *,gracetier,*) return 0;; esac; return 1; }
+ running() { [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null || true)" = true ]; }  # allow-2>/dev/null: absent container is "not running"; allow-||-true: same
+ ready() {
+   # Health comes from the server, not from Docker health or the key file.  The key is optional for
+@@ -80,7 +82,7 @@ check_runtime_files() {
+   [ -d "$DS41_FASTPATH_DIR" ] || die "missing fastpath tree at $DS41_FASTPATH_DIR"
+   [ -d "$DS41_HOOK_DIR" ] || die "missing hook tree at $DS41_HOOK_DIR"
+   [ -d "$DS41_B12X_DIR" ] || die "missing b12x tree at $DS41_B12X_DIR"
+-  [ -d "$DS41_FASTPATH_DIR/peer3" ] || die "missing peer3 tree at $DS41_FASTPATH_DIR/peer3"
++  [ -d "$DS41_FASTPATH_DIR/peer3" ] || gracetier_on || die "missing peer3 tree at $DS41_FASTPATH_DIR/peer3"
+   [ -d "$DS41_OVERLAY_1017_DIR" ] || die "missing 1017 overlay at $DS41_OVERLAY_1017_DIR"
+   [ -f "$DS41_HOOK_DIR/$DS41_ROWMAP" ] || die "missing rowmap $DS41_HOOK_DIR/$DS41_ROWMAP"
+   [ -f "$DS41_HOOK_DIR/fi-tune/$DS41_FI_TUNE_FILE" ] || die "missing tune file $DS41_HOOK_DIR/fi-tune/$DS41_FI_TUNE_FILE"
+@@ -121,7 +123,7 @@ detect_gpus() {
+     RTX_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader --id="$RTX_UUID") || die "configured DS41_GPU_RTX=$RTX_UUID is not visible to nvidia-smi"
+   fi
+   [ -n "$GB300_UUID" ] || die "no NVIDIA GB300 found; this recipe needs a GB300 (nvidia-smi sees: $(nvidia-smi --query-gpu=name --format=csv,noheader | paste -sd, -))"
+-  [ -n "$RTX_UUID" ] || die "found only the GB300 / Fix: install the RTX PRO 6000 (96 GB); the model does not fit in the GB300 alone."
++  [ -n "$RTX_UUID" ] || gracetier_on || die "found only the GB300 / Fix: install the RTX PRO 6000 (96 GB); the model does not fit in the GB300 alone."
+ }
+ 
+ device_args() {
+@@ -380,7 +382,7 @@ cmd_start() {
+   STARTUP_LOGS_SAVED=0
+   STARTING=1
+   trap 'rc=$?; if [ "${STARTING:-0}" = 1 ]; then save_startup_logs; remove_container ds41; remove_container ds41-sidecar; fix_state_ownership; fi; exit $rc' EXIT
+-  start_sidecar
++  if gracetier_on; then log "gracetier: no RTX sidecar (cold experts in Grace)"; else start_sidecar; fi
+   start_vllm
+   STARTING=0
+   trap - EXIT
