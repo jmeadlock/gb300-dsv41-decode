@@ -1,0 +1,80 @@
+{
+ "summary": {
+  "reps": 3,
+  "step_ms_median": 10.452,
+  "ms_per_token_median": 3.817,
+  "tokens_per_step_median": 2.738,
+  "pg61_step_ms_median": 7.746,
+  "pg61_ms_per_token_median": 2.814,
+  "pg61_receipt": "w0/results/phase1/step-pg61.json",
+  "framings": "ms/step = decode wall / (spec drafts - 1) from /metrics; ms/token = ms/step / tokens per step"
+ },
+ "gracetier": [
+  {
+   "rep": 0,
+   "step_ms": 10.452,
+   "tokens_per_step": 2.738,
+   "ms_per_token": 3.817,
+   "steps": 187.0,
+   "ttft_s": 0.057,
+   "decode_wall_s": 1.944,
+   "decode_wall_ms_per_chunk": 10.34
+  },
+  {
+   "rep": 1,
+   "step_ms": 10.452,
+   "tokens_per_step": 2.738,
+   "ms_per_token": 3.817,
+   "steps": 187.0,
+   "ttft_s": 0.056,
+   "decode_wall_s": 1.944,
+   "decode_wall_ms_per_chunk": 10.34
+  },
+  {
+   "rep": 2,
+   "step_ms": 10.479,
+   "tokens_per_step": 2.709,
+   "ms_per_token": 3.868,
+   "steps": 189.0,
+   "ttft_s": 0.056,
+   "decode_wall_s": 1.97,
+   "decode_wall_ms_per_chunk": 10.368
+  }
+ ],
+ "pg61_phase1": [
+  {
+   "rep": 0,
+   "step_ms": 7.746,
+   "tokens_per_step": 2.753,
+   "ms_per_token": 2.814,
+   "steps": 186.0,
+   "ttft_s": 0.03,
+   "decode_wall_s": 1.433,
+   "decode_wall_ms_per_chunk": 7.663
+  },
+  {
+   "rep": 1,
+   "step_ms": 7.747,
+   "tokens_per_step": 2.626,
+   "ms_per_token": 2.95,
+   "steps": 195.0,
+   "ttft_s": 0.031,
+   "decode_wall_s": 1.503,
+   "decode_wall_ms_per_chunk": 7.668
+  },
+  {
+   "rep": 2,
+   "step_ms": 7.724,
+   "tokens_per_step": 2.926,
+   "ms_per_token": 2.64,
+   "steps": 175.0,
+   "ttft_s": 0.03,
+   "decode_wall_s": 1.344,
+   "decode_wall_ms_per_chunk": 7.636
+  }
+ ],
+ "errors": [
+  null,
+  null
+ ]
+}

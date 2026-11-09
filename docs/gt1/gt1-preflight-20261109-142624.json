@@ -1,0 +1,14 @@
+{
+ "stamp": "20261109-142624",
+ "window": "gt1-1109c",
+ "commit": "a787a2d card-gt1: restore runs with the card lock fd closed (the re-armed p3 watchdog inherited it and blocked the next run)",
+ "dirty": "",
+ "nvidia_smi": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, GPU-d07eb6e6-7053-42a7-6811-7bb833266182, 95682 MiB, 97887 MiB, 0 %",
+ "compute_apps": "1313868, 95554 MiB;1315001, 242862 MiB",
+ "MemAvailable_GiB": 201.2,
+ "pg61_models": "\"id\":\"dsv41-flash-uva\",\"id\":\"modelperm-9e1f1d8e9bc70117\",\"id\":\"deepseek-v4.1-flash\",\"id\":\"modelperm-bb9d87990aa36e63\"",
+ "restore_pg61_at_end": true,
+ "model_dir": "/models/DeepSeek-V4.1-Flash-1017-1bae0e1088993b9b82de08f59de5be5a34e42170",
+ "hot_map": "",
+ "refused": null
+}

@@ -1,0 +1,14 @@
+[ds41] generated API key at /home/milo/dsv41/gracetier/home/api-key (keep it private)
+API key (save it): <redacted>
+[ds41] gracetier: no RTX sidecar (cold experts in Grace)
+[ds41] starting GB300 vLLM on NVIDIA GB300 (GPU-1c1855c8-dd10-0247-583e-3c3880ddbf55); util=0.95, reserve=0 MiB, rowmap=rowmap-mix-v1-h255.json, maxlen=1048576
+(EngineCore pid=952) INFO 11-09 20:28:22 [model.py:766] Decoder SWA bounded replay: in eager prefill steps, layers 21-39 run on each request's last 128 tokens only.
+W6_MEGAMOE: JIT include root /tmp/ds41-megamoe-fork/shared-early-7575386ce19c02ec (pipeline variant shared-early)
+(EngineCore pid=952) INFO 11-09 20:30:32 [interface.py:692] Setting kv cache block size to 128 for FLASHMLA_MEGA_ATTN_DSV41/DEEPSEEK_SPARSE_SWA/DEEPSEEK_V41_INDEXER/CompressorBackend backend(s).
+(EngineCore pid=952) INFO 11-09 20:31:02 [kv_cache_utils.py:2464] GPU KV cache size: 8,413,784 tokens, Maximum concurrency for 1,048,576 tokens per request: 8.02x
+A12_INSTALL_MEMORY {"phase": "after_capture_warmup_gc", "reason": null, "retirement": {"alternate_graphs_retained": 0, "candidate_allocated_bytes": 17456693248, "checked_graph_managers": [{"full_count": 36, "manager": "ModelCudaGraphManager
+[ds41] ready: http://127.0.0.1:30006/v1  (model dsv41-flash-gracetier)
+[ds41] sample: curl -s http://127.0.0.1:30006/v1/models -H "Authorization: Bearer $(cat /home/milo/dsv41/gracetier/home/api-key)"
+2026-11-09 14:32:09 CST [pg61] verify OK: gumbel 6eac3e134833 rsu edc8f8f4c425 libw6mk b54168223847560b PEER3_SPINS=1000000000000
+2026-11-09 14:32:09 CST [pg61] UP on :30006 (gracetier: no RTX sidecar, no p3 watchdog)
+2026-11-09 14:32:09 CST [pg61] soak clock started: {"soak_start_utc": "2026-11-09T20:32:09Z", "soak_start_local": "2026-11-09 14:32:09 CST", "epoch": 1794256329}

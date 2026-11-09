@@ -1,0 +1,19 @@
+parity prose: 256 tokens, 1.445 s, finish=length
+parity code: 256 tokens, 0.841 s, finish=length
+parity math: 256 tokens, 0.682 s, finish=length
+parity json: 18 tokens, 0.118 s, finish=stop
+parity shell: 256 tokens, 0.886 s, finish=length
+parity tool: 21 tokens, 0.107 s, finish=stop
+parity long: 256 tokens, 1.216 s, finish=length
+parity story: 170 tokens, 0.991 s, finish=stop
+parity: 8 prompts -> /home/milo/dsv41/decode/scratch/gt1-parity-20261109-142624.jsonl
+tag        A2 first/flips_w/maxd        cand first/flips_w/maxd      verdict
+prose      None    0.000  0.0000        14      0.000  0.2349        FAIL
+code       121     0.000  0.1206        151     0.000  0.2072        FAIL
+math       None    0.000  0.0000        14      0.000  0.1479        FAIL
+json       None    0.000  0.0000        None    0.000  0.0889        FAIL
+shell      None    0.000  0.0000        118     0.000  0.1864        FAIL
+tool       None    0.000  0.0000        None    0.000  0.2266        FAIL
+long       None    0.000  0.0000        24      0.000  0.2807        FAIL
+story      None    0.000  0.0000        9       0.000  0.3765        FAIL
+identical 2/8; PARITY: FAIL

@@ -1,0 +1,134 @@
+{
+ "summary": {
+  "requests": 16,
+  "ok": 16,
+  "ttft_ms_mean": 70.6,
+  "ttft_ms_median": 70.2,
+  "ttft_ms_max": 84.8,
+  "prompt_tokens": [
+   49,
+   52,
+   56,
+   60,
+   64,
+   65,
+   67,
+   72
+  ],
+  "how": "chat stream, max_tokens 16, TTFT = first content chunk - request start (client side, includes HTTP)"
+ },
+ "rows": [
+  {
+   "rep": 0,
+   "tag": "prose",
+   "ttft_ms": 84.8,
+   "prompt_tokens": 60,
+   "chunks": 5
+  },
+  {
+   "rep": 0,
+   "tag": "code",
+   "ttft_ms": 68.0,
+   "prompt_tokens": 65,
+   "chunks": 4
+  },
+  {
+   "rep": 0,
+   "tag": "math",
+   "ttft_ms": 67.7,
+   "prompt_tokens": 72,
+   "chunks": 6
+  },
+  {
+   "rep": 0,
+   "tag": "json",
+   "ttft_ms": 70.1,
+   "prompt_tokens": 56,
+   "chunks": 4
+  },
+  {
+   "rep": 0,
+   "tag": "shell",
+   "ttft_ms": 75.6,
+   "prompt_tokens": 52,
+   "chunks": 5
+  },
+  {
+   "rep": 0,
+   "tag": "tool",
+   "ttft_ms": 73.6,
+   "prompt_tokens": 67,
+   "chunks": 4
+  },
+  {
+   "rep": 0,
+   "tag": "long",
+   "ttft_ms": 73.3,
+   "prompt_tokens": 64,
+   "chunks": 5
+  },
+  {
+   "rep": 0,
+   "tag": "story",
+   "ttft_ms": 65.5,
+   "prompt_tokens": 49,
+   "chunks": 11
+  },
+  {
+   "rep": 1,
+   "tag": "prose",
+   "ttft_ms": 70.9,
+   "prompt_tokens": 60,
+   "chunks": 5
+  },
+  {
+   "rep": 1,
+   "tag": "code",
+   "ttft_ms": 68.7,
+   "prompt_tokens": 65,
+   "chunks": 4
+  },
+  {
+   "rep": 1,
+   "tag": "math",
+   "ttft_ms": 67.1,
+   "prompt_tokens": 72,
+   "chunks": 7
+  },
+  {
+   "rep": 1,
+   "tag": "json",
+   "ttft_ms": 70.3,
+   "prompt_tokens": 56,
+   "chunks": 4
+  },
+  {
+   "rep": 1,
+   "tag": "shell",
+   "ttft_ms": 76.0,
+   "prompt_tokens": 52,
+   "chunks": 5
+  },
+  {
+   "rep": 1,
+   "tag": "tool",
+   "ttft_ms": 74.8,
+   "prompt_tokens": 67,
+   "chunks": 5
+  },
+  {
+   "rep": 1,
+   "tag": "long",
+   "ttft_ms": 64.1,
+   "prompt_tokens": 64,
+   "chunks": 6
+  },
+  {
+   "rep": 1,
+   "tag": "story",
+   "ttft_ms": 59.0,
+   "prompt_tokens": 49,
+   "chunks": 11
+  }
+ ]
+}

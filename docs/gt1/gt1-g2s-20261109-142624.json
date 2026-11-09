@@ -1,0 +1,30 @@
+{
+ "drive_rc": 0,
+ "prompts": 8,
+ "identical": 2,
+ "top1_flips": 0,
+ "top1_flips_weighted": 0.0,
+ "max_abs_dlogprob": 0.37648,
+ "first_divergence": {
+  "prose": 14,
+  "code": 151,
+  "math": 14,
+  "json": null,
+  "shell": 118,
+  "tool": null,
+  "long": 24,
+  "story": 9
+ },
+ "a2_first_divergence": {
+  "prose": null,
+  "code": 121,
+  "math": null,
+  "json": null,
+  "shell": null,
+  "tool": null,
+  "long": null,
+  "story": null
+ },
+ "a2_max_abs_dlogprob": 0.12061,
+ "note": "bench/parity.py (A3 instrument): flips are counted before the first divergence (docs/A3-DEFINITION.md); peer3 in the Pg61 control changes numerics, gracetier (b) does not -- an A3-class difference is expected"
+}

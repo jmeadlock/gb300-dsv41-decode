@@ -1,0 +1,1 @@
+C32 2026-11-09 14:32:24 CST: 32/32 ok, min tokens 128 (>= 128: True), 4096 tokens in 7.924 s = 516.9 tok/s aggregate, latency p50 6.962 s max 7.923 s, server alive after: True, client urllib (openai not importable: ModuleNotFoundError) -> PASS

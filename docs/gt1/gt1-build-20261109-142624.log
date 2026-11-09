@@ -1,0 +1,10 @@
+2026-11-09 14:27:09 CST [gt1] applied patches/0001-boundary-gracetier.patch (5 hunks, clean)
+2026-11-09 14:27:09 CST [gt1] applied patches/0002-components-gracetier.patch (2 hunks, clean)
+warning: serve/serve.sh has type 100755, expected 100644
+2026-11-09 14:27:09 CST [gt1] applied serve-gracetier.patch (4 hunks, clean)
+make_rowmap_allres: 40 layers, H=255 (per-layer [255]), source rowmap-mix-v1-h255.json sha256 10df39c60ef7d1fb, hot_map None, all entries >= 0, permutation per layer -> /home/milo/dsv41/gracetier/tree/fastpath/hook/rowmap-allres.json sha256 51da2571cc98aeac
+policy.env: DS41_PORT=30006 DS41_SERVED=dsv41-flash-gracetier DS41_ALIASES=deepseek-v4.1-flash DS41_GPU_MODE=cdi DS41_NO_KEY=1 DS41_MAXLEN=1048576 DS41_KV=fp8_ds_mla DS41_OFFLOAD_GB=48 DS41_EFFORT_DEFAULT=0 DS41_OVERLAY_58132_DIR=/home/milo/dsv41/gracetier/overlay-vllm DS41_PEER3_SPINS=1000000000000
+2026-11-09 14:27:09 CST [gt1] launch-gt1.sh: 19 changed lines vs launch-pg61.sh
+2026-11-09 14:27:11 CST [gt1] seeded /home/milo/dsv41/gracetier/home/state/jit from Pg61
+2026-11-09 14:27:11 CST [gt1] seeded /home/milo/dsv41/gracetier/home/state/flashinfer from Pg61
+2026-11-09 14:27:11 CST [gt1] built: 125 files hashed; component 96d70cf74cdd6114; rowmap-allres 51da2571cc98aeac
