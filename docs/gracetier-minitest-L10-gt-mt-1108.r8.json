@@ -1,0 +1,663 @@
+{
+ "schema": "gracetier-minitest/1",
+ "sub": "r8",
+ "argv": [
+  "r8",
+  "--json",
+  "scratch/gracetier-minitest-L10-gt-mt-1108.r8.json",
+  "--layer",
+  "10",
+  "--model-dir",
+  "/ref",
+  "--rowmap",
+  "/work/reference/garner-8043a681/fastpath/hook/rowmap-mix-v1-h255.json",
+  "--acts",
+  "scratch/m3n1-acts.pt",
+  "--garner",
+  "/garner/fastpath",
+  "--max-tokens",
+  "64",
+  "--iters",
+  "200",
+  "--seed",
+  "20261108",
+  "--ts",
+  "1,6,16,64",
+  "--cs",
+  "0,1,2,4,8,16",
+  "--programs",
+  "8,16,48,152",
+  "--fast-math",
+  "both",
+  "--gate-json",
+  "scratch/gracetier-minitest-L10-gt-mt-1108.vmm.json",
+  "--timing-json",
+  "scratch/gracetier-minitest-L10-gt-mt-1108.timing.json"
+ ],
+ "date": "2026-11-09 00:56:00 UTC",
+ "design": "docs/P1-GRACETIER-DESIGN.md section 5",
+ "phases": {
+  "M3": {
+   "acts": {
+    "tags": [
+     "code",
+     "json",
+     "long",
+     "math",
+     "prose",
+     "shell",
+     "story",
+     "tool"
+    ],
+    "rows": 325,
+    "windows": 8,
+    "meta": {
+     "layers": [
+      0,
+      10,
+      20,
+      39
+     ],
+     "steps": 48,
+     "config": {
+      "model_dir": "/ref",
+      "map": "docs/maps/hot-v26ar-seed-295.json",
+      "mode": "static",
+      "moe_impl": "dg-inplace",
+      "fp8_impl": "gemv",
+      "glue_impl": "fused",
+      "attn_impl": "flashmla",
+      "fp32_impl": "fixed",
+      "moe_rowmatch": "off",
+      "max_pos": 4095,
+      "max_new": 256,
+      "shared": "gemv",
+      "groups": "auto"
+     }
+    }
+   },
+   "cases_path": "/work/scratch/gracetier-m3-cases-L10.pt",
+   "cases_sha256": "4995b7b1ffeb944b9f02681e1ec2ebce4fbef551d0939c41f49334b9cae72099",
+   "cases": [
+    {
+     "name": "acts-T1",
+     "source": "acts",
+     "T": 1,
+     "c": 0
+    },
+    {
+     "name": "acts-T6",
+     "source": "acts",
+     "T": 6,
+     "c": 0
+    },
+    {
+     "name": "acts-T16",
+     "source": "acts",
+     "T": 16,
+     "c": 1
+    },
+    {
+     "name": "acts-T64",
+     "source": "acts",
+     "T": 64,
+     "c": 5
+    },
+    {
+     "name": "win0-code",
+     "source": "acts-window",
+     "T": 6,
+     "c": 0
+    },
+    {
+     "name": "win1-json",
+     "source": "acts-window",
+     "T": 6,
+     "c": 0
+    },
+    {
+     "name": "win2-long",
+     "source": "acts-window",
+     "T": 6,
+     "c": 1
+    },
+    {
+     "name": "win3-math",
+     "source": "acts-window",
+     "T": 6,
+     "c": 1
+    },
+    {
+     "name": "win4-prose",
+     "source": "acts-window",
+     "T": 6,
+     "c": 1
+    },
+    {
+     "name": "win5-shell",
+     "source": "acts-window",
+     "T": 6,
+     "c": 1
+    },
+    {
+     "name": "win6-story",
+     "source": "acts-window",
+     "T": 6,
+     "c": 6
+    },
+    {
+     "name": "win7-tool",
+     "source": "acts-window",
+     "T": 6,
+     "c": 3
+    },
+    {
+     "name": "syn-T1-c0",
+     "source": "synthetic",
+     "T": 1,
+     "c_req": 0,
+     "x_source": "acts",
+     "c": 0
+    },
+    {
+     "name": "syn-T1-c1",
+     "source": "synthetic",
+     "T": 1,
+     "c_req": 1,
+     "x_source": "acts",
+     "c": 1
+    },
+    {
+     "name": "syn-T1-c2",
+     "source": "synthetic",
+     "T": 1,
+     "c_req": 2,
+     "x_source": "acts",
+     "c": 2
+    },
+    {
+     "name": "syn-T1-c4",
+     "source": "synthetic",
+     "T": 1,
+     "c_req": 4,
+     "x_source": "acts",
+     "c": 4
+    },
+    {
+     "name": "syn-T1-c8",
+     "source": "synthetic",
+     "T": 1,
+     "c_req": 8,
+     "skipped": "infeasible: c 8 > T x k 6"
+    },
+    {
+     "name": "syn-T1-c16",
+     "source": "synthetic",
+     "T": 1,
+     "c_req": 16,
+     "skipped": "infeasible: c 16 > T x k 6"
+    },
+    {
+     "name": "syn-T6-c0",
+     "source": "synthetic",
+     "T": 6,
+     "c_req": 0,
+     "x_source": "acts",
+     "c": 0
+    },
+    {
+     "name": "syn-T6-c1",
+     "source": "synthetic",
+     "T": 6,
+     "c_req": 1,
+     "x_source": "acts",
+     "c": 1
+    },
+    {
+     "name": "syn-T6-c2",
+     "source": "synthetic",
+     "T": 6,
+     "c_req": 2,
+     "x_source": "acts",
+     "c": 2
+    },
+    {
+     "name": "syn-T6-c4",
+     "source": "synthetic",
+     "T": 6,
+     "c_req": 4,
+     "x_source": "acts",
+     "c": 4
+    },
+    {
+     "name": "syn-T6-c8",
+     "source": "synthetic",
+     "T": 6,
+     "c_req": 8,
+     "x_source": "acts",
+     "c": 8
+    },
+    {
+     "name": "syn-T6-c16",
+     "source": "synthetic",
+     "T": 6,
+     "c_req": 16,
+     "x_source": "acts",
+     "c": 16
+    },
+    {
+     "name": "syn-T16-c0",
+     "source": "synthetic",
+     "T": 16,
+     "c_req": 0,
+     "x_source": "acts",
+     "c": 0
+    },
+    {
+     "name": "syn-T16-c1",
+     "source": "synthetic",
+     "T": 16,
+     "c_req": 1,
+     "x_source": "acts",
+     "c": 1
+    },
+    {
+     "name": "syn-T16-c2",
+     "source": "synthetic",
+     "T": 16,
+     "c_req": 2,
+     "x_source": "acts",
+     "c": 2
+    },
+    {
+     "name": "syn-T16-c4",
+     "source": "synthetic",
+     "T": 16,
+     "c_req": 4,
+     "x_source": "acts",
+     "c": 4
+    },
+    {
+     "name": "syn-T16-c8",
+     "source": "synthetic",
+     "T": 16,
+     "c_req": 8,
+     "x_source": "acts",
+     "c": 8
+    },
+    {
+     "name": "syn-T16-c16",
+     "source": "synthetic",
+     "T": 16,
+     "c_req": 16,
+     "x_source": "acts",
+     "c": 16
+    },
+    {
+     "name": "syn-T64-c0",
+     "source": "synthetic",
+     "T": 64,
+     "c_req": 0,
+     "x_source": "acts",
+     "c": 0
+    },
+    {
+     "name": "syn-T64-c1",
+     "source": "synthetic",
+     "T": 64,
+     "c_req": 1,
+     "x_source": "acts",
+     "c": 1
+    },
+    {
+     "name": "syn-T64-c2",
+     "source": "synthetic",
+     "T": 64,
+     "c_req": 2,
+     "x_source": "acts",
+     "c": 2
+    },
+    {
+     "name": "syn-T64-c4",
+     "source": "synthetic",
+     "T": 64,
+     "c_req": 4,
+     "x_source": "acts",
+     "c": 4
+    },
+    {
+     "name": "syn-T64-c8",
+     "source": "synthetic",
+     "T": 64,
+     "c_req": 8,
+     "x_source": "acts",
+     "c": 8
+    },
+    {
+     "name": "syn-T64-c16",
+     "source": "synthetic",
+     "T": 64,
+     "c_req": 16,
+     "x_source": "acts",
+     "c": 16
+    }
+   ]
+  },
+  "M7": {
+   "programs": [
+    8,
+    16,
+    48,
+    152
+   ],
+   "mega_sms": 144,
+   "T": 6,
+   "timing_fallbacks": [],
+   "placement": "[A] one program = one CTA; the hardware scheduler places CTAs (no SM pinning)",
+   "fork_join_empty_us": 2.53,
+   "empty_launch_us": 4.09,
+   "mega_hot_alone_us_per_call_eager": 136.99,
+   "rows": [
+    {
+     "programs": 8,
+     "read_alone_us": 9898.97,
+     "read_alone_GBps": 19.07,
+     "stage_nprog": 1,
+     "stage_programs_touched": 8,
+     "stage_alone_us": 2072.1,
+     "stage_alone_GBps": 68.32,
+     "read_concurrent": {
+      "side_us": 4408.54,
+      "mega_us_per_call": 103.09,
+      "overlap_frac_of_side": 0.935,
+      "offsets_us": {
+       "s0": 18.72,
+       "s1": 4427.26,
+       "m0": 67.58,
+       "m1": 4191.3
+      },
+      "bytes": 82575360,
+      "GBps": 18.73,
+      "mega_slowdown": 0.753
+     },
+     "stage_concurrent": {
+      "side_us": 4233.73,
+      "mega_us_per_call": 152.35,
+      "overlap_frac_of_side": 0.983,
+      "offsets_us": {
+       "s0": 17.5,
+       "s1": 4251.23,
+       "m0": 89.09,
+       "m1": 6183.23
+      },
+      "bytes": 283115520,
+      "launches": 2,
+      "GBps": 66.87,
+      "mega_slowdown": 1.112
+     }
+    },
+    {
+     "programs": 16,
+     "read_alone_us": 4995.17,
+     "read_alone_GBps": 37.79,
+     "stage_nprog": 2,
+     "stage_programs_touched": 16,
+     "stage_alone_us": 1170.82,
+     "stage_alone_GBps": 120.9,
+     "read_concurrent": {
+      "side_us": 4418.08,
+      "mega_us_per_call": 207.78,
+      "overlap_frac_of_side": 0.988,
+      "offsets_us": {
+       "s0": 20.9,
+       "s1": 4438.98,
+       "m0": 72.99,
+       "m1": 8384.1
+      },
+      "bytes": 165150720,
+      "GBps": 37.38,
+      "mega_slowdown": 1.517
+     },
+     "stage_concurrent": {
+      "side_us": 4834.5,
+      "mega_us_per_call": 132.11,
+      "overlap_frac_of_side": 0.977,
+      "offsets_us": {
+       "s0": 19.55,
+       "s1": 4854.05,
+       "m0": 130.62,
+       "m1": 5414.98
+      },
+      "bytes": 566231040,
+      "launches": 4,
+      "GBps": 117.12,
+      "mega_slowdown": 0.964
+     }
+    },
+    {
+     "programs": 48,
+     "read_alone_us": 1772.75,
+     "read_alone_GBps": 106.47,
+     "stage_nprog": 6,
+     "stage_programs_touched": 48,
+     "stage_alone_us": 617.01,
+     "stage_alone_GBps": 229.43,
+     "read_concurrent": {
+      "side_us": 4331.87,
+      "mega_us_per_call": 206.38,
+      "overlap_frac_of_side": 0.988,
+      "offsets_us": {
+       "s0": 20.83,
+       "s1": 4352.7,
+       "m0": 73.25,
+       "m1": 8328.32
+      },
+      "bytes": 471859200,
+      "GBps": 108.93,
+      "mega_slowdown": 1.507
+     },
+     "stage_concurrent": {
+      "side_us": 4700.45,
+      "mega_us_per_call": 122.44,
+      "overlap_frac_of_side": 0.968,
+      "offsets_us": {
+       "s0": 18.91,
+       "s1": 4719.36,
+       "m0": 171.26,
+       "m1": 5069.02
+      },
+      "bytes": 990904320,
+      "launches": 7,
+      "GBps": 210.81,
+      "mega_slowdown": 0.894
+     }
+    },
+    {
+     "programs": 152,
+     "read_alone_us": 805.51,
+     "read_alone_GBps": 234.32,
+     "stage_nprog": 19,
+     "stage_programs_touched": 152,
+     "stage_alone_us": 394.47,
+     "stage_alone_GBps": 358.86,
+     "read_concurrent": {
+      "side_us": 3715.49,
+      "mega_us_per_call": 191.15,
+      "overlap_frac_of_side": 0.986,
+      "offsets_us": {
+       "s0": 18.66,
+       "s1": 3734.14,
+       "m0": 71.26,
+       "m1": 7717.22
+      },
+      "bytes": 1026293760,
+      "GBps": 276.22,
+      "mega_slowdown": 1.395
+     },
+     "stage_concurrent": {
+      "side_us": 4625.82,
+      "mega_us_per_call": 185.06,
+      "overlap_frac_of_side": 0.951,
+      "offsets_us": {
+       "s0": 15.84,
+       "s1": 4641.66,
+       "m0": 244.61,
+       "m1": 7647.1
+      },
+      "bytes": 1557135360,
+      "launches": 11,
+      "GBps": 336.62,
+      "mega_slowdown": 1.351
+     }
+    }
+   ],
+   "headline": {
+    "read_GBps_8_under_mega": 18.73,
+    "stage_GBps_8_under_mega": 66.87,
+    "mega_slowdown_read_8": 0.753
+   },
+   "p11": {
+    "status": "fail",
+    "per_c": {
+     "1": {
+      "a_model_us": 854.49,
+      "b_measured_us": 63.64,
+      "pass": false
+     },
+     "2": {
+      "a_model_us": 1799.22,
+      "b_measured_us": 103.2,
+      "pass": false
+     },
+     "4": {
+      "a_model_us": 3688.67,
+      "b_measured_us": 209.47,
+      "pass": false
+     }
+    },
+    "inputs": {
+     "fork_join_us": 2.53,
+     "cold_intercept_us": 28.873,
+     "rate_GBps": 18.73,
+     "w_hot_us": 121.64,
+     "weights_B": 17694720,
+     "factor": 0.7
+    },
+    "with_gt_stage_rate": {
+     "status": "fail",
+     "per_c": {
+      "1": {
+       "a_model_us": 174.38,
+       "b_measured_us": 63.64,
+       "pass": false
+      },
+      "2": {
+       "a_model_us": 438.99,
+       "b_measured_us": 103.2,
+       "pass": false
+      },
+      "4": {
+       "a_model_us": 968.22,
+       "b_measured_us": 209.47,
+       "pass": false
+      }
+     },
+     "inputs": {
+      "fork_join_us": 2.53,
+      "cold_intercept_us": 28.873,
+      "rate_GBps": 66.87,
+      "w_hot_us": 121.64,
+      "weights_B": 17694720,
+      "factor": 0.7
+     }
+    }
+   }
+  }
+ },
+ "errors": [],
+ "exit": 0,
+ "receipt": {
+  "schema": "dsv41-receipt/1",
+  "argv": [
+   "r8",
+   "--json",
+   "scratch/gracetier-minitest-L10-gt-mt-1108.r8.json",
+   "--layer",
+   "10",
+   "--model-dir",
+   "/ref",
+   "--rowmap",
+   "/work/reference/garner-8043a681/fastpath/hook/rowmap-mix-v1-h255.json",
+   "--acts",
+   "scratch/m3n1-acts.pt",
+   "--garner",
+   "/garner/fastpath",
+   "--max-tokens",
+   "64",
+   "--iters",
+   "200",
+   "--seed",
+   "20261108",
+   "--ts",
+   "1,6,16,64",
+   "--cs",
+   "0,1,2,4,8,16",
+   "--programs",
+   "8,16,48,152",
+   "--fast-math",
+   "both",
+   "--gate-json",
+   "scratch/gracetier-minitest-L10-gt-mt-1108.vmm.json",
+   "--timing-json",
+   "scratch/gracetier-minitest-L10-gt-mt-1108.timing.json"
+  ],
+  "host": "f7b833ec2cc9",
+  "python": "3.12.3 aarch64",
+  "git_commit": "3dc143f1500ca357ad5e3ca62f19ef43e6d79283",
+  "git_branch": "main",
+  "git_dirty": true,
+  "git_dirty_sha256": "6b7afe0a64c25fadd1ea3ee876aaf8cb0f0d89e7f6f7bb752ae45582b5b880ab",
+  "git_dirty_files": [
+   "docs/first-light-20261106.json"
+  ],
+  "git_untracked_count": 3,
+  "git_source": "env",
+  "env_switches": {
+   "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+   "DSV41_MODEL_DIR": "/ref"
+  },
+  "impls": {
+   "probe": "gracetier_minitest",
+   "sub": "r8"
+  },
+  "checkpoint_path": "/ref",
+  "checkpoint_config_path": "/ref/config.json",
+  "checkpoint_config_sha256": "8be45ce0476004a3f529fd896115a4a2e800a129ad2d3ec05b16050f52e21879",
+  "fixture_path": null,
+  "fixture_sha256": null,
+  "torch_version": "2.13.0+cu130",
+  "triton_version": "3.7.1",
+  "cuda_version": "13.0",
+  "driver_version": "595.99.02",
+  "gpu_name": "NVIDIA GB300",
+  "gpu_uuid": "GPU-1c1855c8-dd10-0247-583e-3c3880ddbf55",
+  "clocks_sm_mhz_start": 2070.0,
+  "clocks_mem_mhz_start": 3996.0,
+  "clocks_sm_mhz_end": 2070.0,
+  "clocks_mem_mhz_end": 3996.0,
+  "residency_condition": "off (static map /work/reference/garner-8043a681/fastpath/hook/rowmap-mix-v1-h255.json)",
+  "steady_state_condition": "n/a",
+  "steady_state": null,
+  "lease": "/home/milo/dsv41/box.lock|milo@sn4622130625:pid=3982468:since=2026-11-08T18:55:07-0600:gracetier_minitest.sh",
+  "start_wall": 1794185760.7221842,
+  "start_iso": "2026-11-09 00:56:00 UTC",
+  "end_wall": 1794185765.4532094,
+  "end_iso": "2026-11-09 00:56:05 UTC",
+  "wall_s": 4.731,
+  "receipt_errors": [
+   "git: FileNotFoundError: [Errno 2] No such file or directory: 'git'"
+  ]
+ },
+ "gate_from": "scratch/gracetier-minitest-L10-gt-mt-1108.vmm.json",
+ "verdict": "GRACETIER-MINITEST: M1 torch.equal=not measured; M4 torch.equal all T=not measured; stage us/expert T1/6/16/64=not measured/not measured/not measured/not measured; MegaMoE marginal us/expert=not measured/not measured/not measured/not measured; M6 uva=not measured; R8 GB/s @8 under MegaMoE=18.7; P1.1 bar=fail"
+}

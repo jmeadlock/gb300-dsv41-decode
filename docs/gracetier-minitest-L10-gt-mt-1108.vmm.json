@@ -1,0 +1,322 @@
+{
+ "schema": "gracetier-minitest/1",
+ "sub": "vmm",
+ "argv": [
+  "vmm",
+  "--json",
+  "scratch/gracetier-minitest-L10-gt-mt-1108.vmm.json",
+  "--layer",
+  "10",
+  "--model-dir",
+  "/ref",
+  "--rowmap",
+  "/work/reference/garner-8043a681/fastpath/hook/rowmap-mix-v1-h255.json",
+  "--acts",
+  "scratch/m3n1-acts.pt",
+  "--garner",
+  "/garner/fastpath",
+  "--max-tokens",
+  "64",
+  "--iters",
+  "200",
+  "--seed",
+  "20261108",
+  "--ts",
+  "1,6,16,64",
+  "--cs",
+  "0,1,2,4,8,16",
+  "--programs",
+  "8,16,48,152",
+  "--fast-math",
+  "both"
+ ],
+ "date": "2026-11-09 00:55:33 UTC",
+ "design": "docs/P1-GRACETIER-DESIGN.md section 5",
+ "phases": {
+  "M0": {
+   "date": "2026-11-09 00:55:33 UTC",
+   "MemAvailable_GiB": 443.85,
+   "nvidia_smi": "NVIDIA GB300, GPU-1c1855c8-dd10-0247-583e-3c3880ddbf55, 22 MiB, 256703 MiB, 0 %, 225 MHz",
+   "compute_apps": "",
+   "hbm_free_GiB": 249.12,
+   "hbm_total_GiB": 249.81,
+   "memory_used_MiB": 22.0,
+   "busy": false
+  },
+  "M1": {
+   "H": 255,
+   "G": 384,
+   "D": 5120,
+   "I": 2304,
+   "fast_math": false,
+   "swiglu_limit": 10.0,
+   "swiglu_limit_source": "fallback constant (config.json has no swiglu_limit)",
+   "granularity": 2097152,
+   "granularity_minimum": 2097152,
+   "alias_write_A_read_B": true,
+   "straddle_private": true,
+   "shared_untouched_by_straddle_writes": true,
+   "torch_view": {
+    "data_ptr_is_va": true,
+    "device": "cuda:0",
+    "contiguous": true,
+    "plan": {
+     "name": "m1",
+     "G": 8,
+     "H": 3,
+     "B": 1310720,
+     "gran": 2097152,
+     "va_bytes": 10485760,
+     "private_bytes": 4194304,
+     "shared_va_off": 4194304,
+     "shared_bytes": 6291456,
+     "straddle": true,
+     "straddle_off": 2097152,
+     "straddle_bytes": 262144,
+     "straddle_groups": [
+      1,
+      2,
+      3
+     ]
+    }
+   },
+   "megamoe_groups_routed": [
+    [
+     49,
+     254,
+     255,
+     351,
+     352,
+     383
+    ],
+    [
+     7,
+     41,
+     217,
+     280,
+     343,
+     358
+    ],
+    [
+     0,
+     55,
+     152,
+     191,
+     206,
+     342
+    ],
+    [
+     42,
+     134,
+     191,
+     217,
+     239,
+     353
+    ],
+    [
+     0,
+     103,
+     171,
+     217,
+     221,
+     289
+    ],
+    [
+     6,
+     94,
+     200,
+     204,
+     250,
+     334
+    ]
+   ],
+   "weights_equal_plain": true,
+   "megamoe_vmm_vs_plain": {
+    "equal": true,
+    "rows": 6,
+    "rows_exact": 6,
+    "frac_bytes_equal": 1.0,
+    "max_abs": 0.0,
+    "nonfinite": 0
+   },
+   "vmm": {
+    "G": 384,
+    "D": 5120,
+    "I": 2304,
+    "gran": 2097152,
+    "shared_B": {
+     "l1": 1520435200,
+     "l2": 759169024
+    },
+    "plans": {
+     "0": {
+      "l1": {
+       "name": "l1",
+       "G": 384,
+       "H": 255,
+       "B": 11796480,
+       "gran": 2097152,
+       "va_bytes": 4529848320,
+       "private_bytes": 3009413120,
+       "shared_va_off": 3009413120,
+       "shared_bytes": 1520435200,
+       "straddle": true,
+       "straddle_off": 3007315968,
+       "straddle_bytes": 1310720,
+       "straddle_groups": [
+        254,
+        255
+       ]
+      },
+      "l2": {
+       "name": "l2",
+       "G": 384,
+       "H": 255,
+       "B": 5898240,
+       "gran": 2097152,
+       "va_bytes": 2264924160,
+       "private_bytes": 1505755136,
+       "shared_va_off": 1505755136,
+       "shared_bytes": 759169024,
+       "straddle": true,
+       "straddle_off": 1503657984,
+       "straddle_bytes": 1703936,
+       "straddle_groups": [
+        254,
+        255
+       ]
+      }
+     }
+    },
+    "arena": {
+     "device": 0,
+     "gran": 2097152,
+     "allocs": [
+      [
+       "m1.shared",
+       6291456
+      ],
+      [
+       "m1.A.private",
+       4194304
+      ],
+      [
+       "m1.B.straddle",
+       2097152
+      ],
+      [
+       "shared.l1",
+       1520435200
+      ],
+      [
+       "shared.l2",
+       759169024
+      ],
+      [
+       "L0.l1.private",
+       3009413120
+      ],
+      [
+       "L0.l2.private",
+       1505755136
+      ]
+     ],
+     "alloc_bytes": 6807355392,
+     "reserved_bytes": 6815744000,
+     "maps": 8
+    }
+   },
+   "release_order": [
+    "release",
+    "release",
+    "release",
+    "release",
+    "release",
+    "release"
+   ],
+   "hbm_free_delta_after_release_MiB": -2.0,
+   "gate": true
+  }
+ },
+ "errors": [],
+ "exit": 0,
+ "receipt": {
+  "schema": "dsv41-receipt/1",
+  "argv": [
+   "vmm",
+   "--json",
+   "scratch/gracetier-minitest-L10-gt-mt-1108.vmm.json",
+   "--layer",
+   "10",
+   "--model-dir",
+   "/ref",
+   "--rowmap",
+   "/work/reference/garner-8043a681/fastpath/hook/rowmap-mix-v1-h255.json",
+   "--acts",
+   "scratch/m3n1-acts.pt",
+   "--garner",
+   "/garner/fastpath",
+   "--max-tokens",
+   "64",
+   "--iters",
+   "200",
+   "--seed",
+   "20261108",
+   "--ts",
+   "1,6,16,64",
+   "--cs",
+   "0,1,2,4,8,16",
+   "--programs",
+   "8,16,48,152",
+   "--fast-math",
+   "both"
+  ],
+  "host": "f7b833ec2cc9",
+  "python": "3.12.3 aarch64",
+  "git_commit": "3dc143f1500ca357ad5e3ca62f19ef43e6d79283",
+  "git_branch": "main",
+  "git_dirty": true,
+  "git_dirty_sha256": "6b7afe0a64c25fadd1ea3ee876aaf8cb0f0d89e7f6f7bb752ae45582b5b880ab",
+  "git_dirty_files": [
+   "docs/first-light-20261106.json"
+  ],
+  "git_untracked_count": 3,
+  "git_source": "env",
+  "env_switches": {
+   "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+   "DSV41_MODEL_DIR": "/ref"
+  },
+  "impls": {
+   "probe": "gracetier_minitest",
+   "sub": "vmm"
+  },
+  "checkpoint_path": "/ref",
+  "checkpoint_config_path": "/ref/config.json",
+  "checkpoint_config_sha256": "8be45ce0476004a3f529fd896115a4a2e800a129ad2d3ec05b16050f52e21879",
+  "fixture_path": null,
+  "fixture_sha256": null,
+  "torch_version": "2.13.0+cu130",
+  "triton_version": "3.7.1",
+  "cuda_version": "13.0",
+  "driver_version": "595.99.02",
+  "gpu_name": "NVIDIA GB300",
+  "gpu_uuid": "GPU-1c1855c8-dd10-0247-583e-3c3880ddbf55",
+  "clocks_sm_mhz_start": 225.0,
+  "clocks_mem_mhz_start": 3996.0,
+  "clocks_sm_mhz_end": 2070.0,
+  "clocks_mem_mhz_end": 3996.0,
+  "residency_condition": "off (static map /work/reference/garner-8043a681/fastpath/hook/rowmap-mix-v1-h255.json)",
+  "steady_state_condition": "n/a",
+  "steady_state": null,
+  "lease": "/home/milo/dsv41/box.lock|milo@sn4622130625:pid=3982468:since=2026-11-08T18:55:07-0600:gracetier_minitest.sh",
+  "start_wall": 1794185733.3664935,
+  "start_iso": "2026-11-09 00:55:33 UTC",
+  "end_wall": 1794185734.208162,
+  "end_iso": "2026-11-09 00:55:34 UTC",
+  "wall_s": 0.842,
+  "receipt_errors": [
+   "git: FileNotFoundError: [Errno 2] No such file or directory: 'git'"
+  ]
+ },
+ "verdict": "GRACETIER-MINITEST: M1 torch.equal=True; M4 torch.equal all T=not measured; stage us/expert T1/6/16/64=not measured/not measured/not measured/not measured; MegaMoE marginal us/expert=not measured/not measured/not measured/not measured; M6 uva=not measured; R8 GB/s @8 under MegaMoE=not measured; P1.1 bar=not measured"
+}
