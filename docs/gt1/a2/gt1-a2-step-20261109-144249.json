@@ -1,0 +1,32 @@
+{
+ "base": "http://127.0.0.1:30006",
+ "model": "dsv41-flash-gracetier",
+ "profile": true,
+ "reps": [
+  {
+   "rep": 0,
+   "wall_s": 2.488,
+   "ttft_s": 0.493,
+   "decode_wall_s": 1.994,
+   "chunks": 187,
+   "usage": {
+    "prompt_tokens": 66,
+    "total_tokens": 578,
+    "completion_tokens": 512,
+    "completion_tokens_details": {
+     "reasoning_tokens": 0
+    }
+   },
+   "stop_profile": [
+    -1,
+    "RemoteDisconnected('Remote end closed connection without response')"
+   ],
+   "arrival_gap_ms_p50": 10.499,
+   "arrival_gap_ms_mean": 10.719
+  }
+ ],
+ "start_profile": [
+  200,
+  ""
+ ]
+}

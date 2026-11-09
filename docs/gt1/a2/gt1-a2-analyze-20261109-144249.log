@@ -1,0 +1,56 @@
+kernels=148215  window_ms=2060.19  MegaMoE per step={43: 186}
+steps=184  wall_median_ms=10.494  busy=10.396 (99.3%)  kernels/step=786  idle_ms=0.297
+role            excl ms/step
+attention              1.086
+dense_gemm             1.832
+mhc                    0.023
+moe_hot                3.434
+other                  3.790
+route_send             0.242
+      0-    3 us:   141.1/step   0.262 ms/step
+      3-    6 us:   166.8/step   0.778 ms/step
+      6-   10 us:   131.0/step   0.987 ms/step
+     10-   20 us:   226.6/step   2.589 ms/step
+     20-   50 us:    49.5/step   1.387 ms/step
+     50-100000 us:    71.3/step   6.466 ms/step
+  ms/step  n/step  avg_us  kernel
+    3.441    43.0    80.0  sm100_fp8_fp4_mega_moe_impl
+    2.601    40.0    65.0  gt_stage_kernel
+    1.199   130.0     9.2  kernel_cutlass_kernel_flashinfergemmkernelscute_dsllow_latency_blockscaled_gemmLowLatencyBlockscaled
+    1.070    38.0    28.2  void sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::fwd_kernel<sm100::pref
+    0.991    80.0    12.4  mix_kernel
+    0.507    43.0    11.8  sm100_fp8_fp4_gemm_1d1d_impl
+    0.455    40.0    11.4  router_kernel
+    0.417     2.0   208.3  nvjet_sm103_tst_128x8_64x12_2x1_v_bz_TNT
+    0.380    80.0     4.7  seam_kernel
+    0.270    46.0     5.9  stage_kernel
+    0.165    10.0    16.5  kernel_cutlass_kernel_flashinfergemmkernelsdense_blockscaled_gemm_sm100Sm100BlockScaledPersistentDen
+    0.089     5.0    17.7  attn_ss_kernel
+    0.086    43.0     2.0  kernel_cutlass_kernel_flashinferquantizationkernelsmxfp8_quantizeMXFP8QuantizeSwizzledKernel_object_
+    0.082    12.0     6.8  Kernel2
+    0.067     1.0    66.7  markov_kernel
+    0.050     5.0    10.1  mega_mix_kernel
+    0.049     8.0     6.1  sm100_paged_mqa_logits
+    0.040    19.1     2.1  vectorized_elementwise_kernel
+    0.034     4.0     8.4  _mask_candidates_kernel
+    0.030     4.0     7.6  _candidate_flags_kernel
+    0.030     2.0    14.9  _engram_lookup_kernel
+    0.025    12.0     2.1  splitKreduce_kernel
+    0.021     5.0     4.3  mega_seam_kernel
+    0.019     3.0     6.3  nvjet_sm103_tss_64x8_64x16_4x1_v_bz_splitK_TNT
+    0.019     4.0     4.6  _fused_save_compress_norm_kernel
+    0.018     3.0     6.1  draft_router
+    0.018     1.0    17.6  kernel_cutlass_kernel_flashinfergemmkernelsdense_blockscaled_gemm_sm100_splitkSm100BlockScaledSplitK
+    0.017     5.0     3.3  kernel_cutlass_kernel_flashinferquantizationkernelsmxfp8_quantizeMXFP8QuantizeSwizzledKernel_object_
+    0.016     8.0     1.9  kernel_cutlass_device_kernel_tensorptri64gmemo1_tensorptrbf16gmemalign32o32128i64div16i64div161_tens
+    0.015     3.0     5.1  mhc_post_tilelang_kernel
+    0.014     4.0     3.5  _rope_quant_insert_mxfp8_kernel
+    0.014     2.0     6.9  mhc_pre_big_fuse_with_norm_tilelang_kernel
+    0.013     6.0     2.2  rms_norm_kernel
+    0.013     1.0    12.8  _match_chain_kernel
+    0.013     4.0     3.2  topk_global_cs8
+    0.010     1.9     5.4  elementwise_kernel
+    0.010     1.0    10.1  _compute_local_logits_stats_kernel
+    0.009     4.0     2.1  _indexer_k_norm_rope_quant_store_kernel
+    0.008     2.0     3.8  _fused_engram_post_wkv_kernel
+    0.007     4.0     1.8  _compute_global_topk_indices_and_lens_kernel

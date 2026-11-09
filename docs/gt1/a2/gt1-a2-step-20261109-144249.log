@@ -1,0 +1,2 @@
+step rep0: {"rep": 0, "wall_s": 2.488, "ttft_s": 0.493, "decode_wall_s": 1.994, "chunks": 187, "stop_profile": [-1, "RemoteDisconnected('Remote end closed connection without response')"], "arrival_gap_ms_p50": 10.499, "arrival_gap_ms_mean": 10.719}
+step: -> /home/milo/dsv41/decode/scratch/gt1-a2-step-20261109-144249.json
