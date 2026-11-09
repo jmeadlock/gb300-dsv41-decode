@@ -153,7 +153,7 @@ open(p, 'w').write(s)
 PY
       bash -n restore-pg61-after-gt1.sh || exit 9
       say "restore clone: $(diff restore-pg61-after-gt-mt-1108.sh restore-pg61-after-gt1.sh | grep -c '^[<>]') changed lines"
-      bash restore-pg61-after-gt1.sh
+      bash restore-pg61-after-gt1.sh 9>&-   # the p3 watchdog it re-arms must not inherit the card lock (fd 9)
     ) > "$S/gt1-restore-$STAMP.log" 2>&1
     rrc=$?
     say "restore rc=$rrc ($(tail -2 "$S/gt1-restore-$STAMP.log" | tr '\n' ' ' | cut -c1-200))"
