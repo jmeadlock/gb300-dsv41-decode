@@ -252,6 +252,13 @@ assert "coldskip" not in s and "peer3," not in s and ",gracetier," in s
 open(dst, "w").write(s)
 print("policy.env: " + " ".join(l for l in s.splitlines() if not l.startswith("DS41_FASTPATH_COMPONENTS")))
 PY_POLICY
+  if [ "${GT1_NSYS:-0}" = 1 ]; then   # A2 anatomy: W0's optional nsys wrap of the server (no-op unless DS41_NSYS_WRAP=1)
+    patch -p1 -d "$GT/tree" --no-backup-if-mismatch < "$HOME/dsv41/w0/patches/06-nsys-wrap-serve.patch" || return 1
+    [ "$(grep -c nsyspfx "$GT/tree/serve/serve.sh")" = 3 ] || { echo "nsys wrap: unexpected hunk result"; return 1; }
+    printf 'DS41_NSYS_WRAP=1\nDS41_NSYS_TAG=GTA2\n' >> "$GT/policy.env"
+    rm -rf "$GT/home/state/prof/GTA2"
+    echo "nsys wrap applied (tag GTA2, $(grep -o 'cuda-graph-trace=[^ "]*' "$GT/tree/serve/serve.sh" | head -1))"
+  fi
   # launch-gt1.sh = launch-pg61.sh with the served name, the component list, no sidecar restart policy, no p3 watchdog
   python3 - "$GR/launcher/launch-pg61.sh" "$GT/launch-gt1.sh" <<'PY_LAUNCHER' || return 1
 import sys
@@ -346,6 +353,35 @@ cd "$DEC" || exit 0
 export W0_BASE=$BASE W0_MODEL=$SERVED
 alive() { curl -sf -m 5 "$BASE/v1/models" | grep -q "$SERVED" && \
           [ "$(docker inspect -f '{{.State.Running}} {{.RestartCount}}' ds41 2>/dev/null)" = "true 0" ]; }
+
+# ---------------------------------------------------------------------------------------------- A2 (GT1_NSYS=1)
+if [ "${GT1_NSYS:-0}" = 1 ]; then
+  say "== A2 nsys anatomy: warm cell under the wrap, then one profiled 512-token greedy cell (the server exits on /stop_profile)"
+  PROF=$GT/home/state/prof/GTA2; NSYS=/usr/local/bin/nsys
+  docker inspect -f '{{json .Args}}' ds41 | grep -q '/nsys","profile"' || { say "FAIL: ds41 args carry no nsys wrap"; exit 0; }
+  timeout 600 python3 w0/w0_drive.py step "$S/gt1-a2-warm-$STAMP.json" > "$S/gt1-a2-warm-$STAMP.log" 2>&1
+  say "warm cell rc=$? $(grep 'step rep' "$S/gt1-a2-warm-$STAMP.log" | tail -1 | cut -c1-230)"
+  timeout 300 python3 w0/w0_drive.py step "$S/gt1-a2-step-$STAMP.json" --profile > "$S/gt1-a2-step-$STAMP.log" 2>&1
+  say "profiled cell rc=$? $(grep 'step rep' "$S/gt1-a2-step-$STAMP.log" | tail -1 | cut -c1-230)"
+  curl -s -m 20 -X POST "$BASE/stop_profile" -H 'Content-Type: application/json' -d '{}' >/dev/null 2>&1 || true
+  for _ in $(seq 1 60); do docker ps --format '{{.Names}}' | grep -qx ds41 || break; sleep 5; done
+  docker ps --format '{{.Names}}' | grep -qx ds41 && { say "WARN: ds41 still up 5 min after stop_profile; stopping"; docker stop -t 60 ds41 >/dev/null 2>&1 || true; }
+  docker logs ds41 2>&1 | grep -iE "nsys|profil|Generat|report" | tail -20 > "$S/gt1-a2-nsys-lines-$STAMP.log"
+  rep=$(ls -t "$PROF"/*.nsys-rep 2>/dev/null | head -1)
+  say "nsys report: ${rep:-MISSING} $( [ -n "$rep" ] && stat -c %s "$rep" ) bytes"
+  if [ -n "$rep" ]; then
+    timeout 1200 $NSYS export --type sqlite --force-overwrite=true -o "$S/gt1-a2-$STAMP.sqlite" "$rep" > "$S/gt1-a2-export-$STAMP.log" 2>&1
+    say "sqlite $(stat -c %s "$S/gt1-a2-$STAMP.sqlite" 2>/dev/null) bytes"
+    timeout 900 $NSYS stats --report cuda_gpu_kern_sum --format csv "$rep" > "$S/gt1-a2-kern-$STAMP.csv" 2> "$S/gt1-a2-stats-$STAMP.err"
+    say "kern csv lines=$(wc -l < "$S/gt1-a2-kern-$STAMP.csv")"
+    timeout 900 python3 w0/step_profile_analyze.py "$S/gt1-a2-$STAMP.sqlite" > "$S/gt1-a2-analyze-$STAMP.log" 2>&1
+    say "analyze rc=$? $(head -3 "$S/gt1-a2-analyze-$STAMP.log" | tr '\n' ' ' | cut -c1-220)"
+    G3=a2-profiled
+  else
+    G3=a2-no-report
+  fi
+  exit 0
+fi
 
 # ---------------------------------------------------------------------------------------------- G2
 say "== G2 greedy fixture parity"
