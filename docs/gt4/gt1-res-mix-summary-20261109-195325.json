@@ -1,0 +1,115 @@
+{
+ "stamp": "20261109-195325",
+ "cells": {
+  "m0a": {
+   "prompts": 20,
+   "prompts_measured": 20,
+   "errors": 0,
+   "steps": 1506.0,
+   "gen_tokens": 4596.0,
+   "step_ms": 13.247,
+   "tokens_per_step": 3.052,
+   "ms_per_token": 4.341,
+   "set": "A"
+  },
+  "m0b": {
+   "prompts": 20,
+   "prompts_measured": 20,
+   "errors": 0,
+   "steps": 1559.0,
+   "gen_tokens": 4606.0,
+   "step_ms": 13.002,
+   "tokens_per_step": 2.954,
+   "ms_per_token": 4.401,
+   "set": "B"
+  },
+  "m1a": {
+   "prompts": 20,
+   "prompts_measured": 20,
+   "errors": 0,
+   "steps": 1511.0,
+   "gen_tokens": 4596.0,
+   "step_ms": 13.229,
+   "tokens_per_step": 3.042,
+   "ms_per_token": 4.349,
+   "set": "A"
+  },
+  "m1b": {
+   "prompts": 20,
+   "prompts_measured": 20,
+   "errors": 0,
+   "steps": 1509.0,
+   "gen_tokens": 4596.0,
+   "step_ms": 11.424,
+   "tokens_per_step": 3.046,
+   "ms_per_token": 3.751,
+   "set": "A"
+  },
+  "m1c": {
+   "prompts": 20,
+   "prompts_measured": 20,
+   "errors": 0,
+   "steps": 1509.0,
+   "gen_tokens": 4596.0,
+   "step_ms": 11.496,
+   "tokens_per_step": 3.046,
+   "ms_per_token": 3.774,
+   "set": "A"
+  },
+  "m2": {
+   "prompts": 20,
+   "prompts_measured": 20,
+   "errors": 0,
+   "steps": 1559.0,
+   "gen_tokens": 4606.0,
+   "step_ms": 11.973,
+   "tokens_per_step": 2.954,
+   "ms_per_token": 4.053,
+   "set": "B"
+  },
+  "m3": {
+   "prompts": 20,
+   "prompts_measured": 20,
+   "errors": 0,
+   "steps": 1509.0,
+   "gen_tokens": 4596.0,
+   "step_ms": 12.03,
+   "tokens_per_step": 3.046,
+   "ms_per_token": 3.95,
+   "set": "A"
+  },
+  "m4": {
+   "prompts": 20,
+   "prompts_measured": 20,
+   "errors": 0,
+   "steps": 1559.0,
+   "gen_tokens": 4606.0,
+   "step_ms": 11.787,
+   "tokens_per_step": 2.954,
+   "ms_per_token": 3.989,
+   "set": "B"
+  },
+  "m5": {
+   "prompts": 20,
+   "prompts_measured": 20,
+   "errors": 0,
+   "steps": 1510.0,
+   "gen_tokens": 4596.0,
+   "step_ms": 13.166,
+   "tokens_per_step": 3.044,
+   "ms_per_token": 4.326,
+   "set": "A"
+  }
+ },
+ "ratios": {
+  "first_sight_M2_over_M0b": 0.9209,
+  "adapted_A_M1c_over_M0a": 0.8678,
+  "seen_interleaved_(M3+M4)_over_(M0a+M0b)": 0.9073,
+  "thrash_M3_over_M1c": 1.0465,
+  "restore_M5_over_M0a": 0.9939
+ },
+ "audit_mismatches": [
+  0,
+  0
+ ]
+}

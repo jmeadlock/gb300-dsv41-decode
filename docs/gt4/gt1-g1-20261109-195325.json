@@ -1,0 +1,65 @@
+{
+ "up_rc": 0,
+ "boot_log": "/home/milo/dsv41/decode/scratch/gt1-boot-20261109-195325.log",
+ "lines": 727,
+ "active_line": [
+  "DS41_FASTPATH ACTIVE gracetier"
+ ],
+ "budget_lines": [
+  "DS41_FASTPATH gracetier: HOST_RAM_BUDGET [pre-alloc: the cold pool must fit now; Engram / KV residency is checked after load_model] engram 189.13 GiB (resident) + cold_pool 85.26 GiB (pending) + kv_offload 48.0 GiB (resident) = 322.39 GiB; MemAvailable 256.7 GiB - pending 85.26 GiB = headroom 171.45 GiB vs floor 32.0 GiB -> fits {\"GiB\": {\"MemAvailable\": 256.7, \"cold_pool\": 85.26, \"engram\": 189.13, \"floor\": 32.0, \"headroom\": 171.45, \"host_total\": 322.39, \"kv_offload\": 48.0, \"pending\": 85.26}, \"MemAvailable_B\": 275634716672, \"fits\": true, \"floor_B\": 34359738368, \"headroom_B\": 184089051136, \"host_total_B\": 346158349328, \"pending\": [\"cold_pool\"], \"pending_B\": 91545665536, \"resident\": [\"engram\", \"kv_offload\"], \"terms_B\": {\"cold_pool\": 91545665536, \"engram\": 203073076240, \"kv_offload\": 51539607552}} kv_source='vllm_config.cache_config.kv_offloading_size' scan_s=0.70",
+  "DS41_FASTPATH gracetier: HOST_RAM_BUDGET [post-load: Engram + cold pool resident, KV overflow pending] engram 189.13 GiB (resident) + cold_pool 85.26 GiB (resident) + kv_offload 48.0 GiB (pending) = 322.39 GiB; MemAvailable 173.11 GiB - pending 48.0 GiB = headroom 125.11 GiB vs floor 32.0 GiB -> fits {\"GiB\": {\"MemAvailable\": 173.11, \"cold_pool\": 85.26, \"engram\": 189.13, \"floor\": 32.0, \"headroom\": 125.11, \"host_total\": 322.39, \"kv_offload\": 48.0, \"pending\": 48.0}, \"MemAvailable_B\": 185875890176, \"MemAvailable_at_load_start_B\": 275634716672, \"fits\": true, \"floor_B\": 34359738368, \"headroom_B\": 134336282624, \"host_total_B\": 346158349328, \"kv_source\": \"vllm_config.cache_config.kv_offloading_size\", \"pending\": [\"kv_offload\"], \"pending_B\": 51539607552, \"resident\": [\"engram\", \"cold_pool\"], \"terms_B\": {\"cold_pool\": 91545665536, \"engram\": 203073076240, \"kv_offload\": 51539607552}}"
+ ],
+ "post_load_fits": true,
+ "engaged": [
+  "DS41_FASTPATH gracetier: ENGAGED: 40 layers, H [255], G = 384, 30960 cold tensors in Grace (85.26 GiB, read 62.3 s, registered 0.22 s); VMM {\"alloc_bytes\": 182886334464, \"allocs\": [[\"shared.l1\", 1520435200], [\"shared.l2\", 759169024], [\"L0.l1.private\", 3009413120], [\"L0.l2.private\", 1505755136], [\"L1.l1.private\", 3009413120], [\"L1.l2.private\", 1505755136], [\"L2.l1.private\", 3009413120], [\"L2.l2.private\", 1505755136], [\"L3.l1.private\", 3009413120], [\"L3.l2.private\", 1505755136], [\"L4.l1.private\", 3009413120], [\"L4.l2.private\", 1505755136], [\"L5.l1.private\", 3009413120], [\"L5.l2.private\", 1505755136], [\"L6.l1.private\", 3009413120], [\"L6.l2.private\", 1505755136], [\"L7.l1.private\", 3009413120], [\"L7.l2.private\", 1505755136], [\"L8.l1.private\", 3009413120], [\"L8.l2.private\", 1505755136], [\"L9.l1.private\", 3009413120], [\"L9.l2.private\", 1505755136], [\"L10.l1.private\", 3009413120], [\"L10.l2.private\", 1505755136], [\"L11.l1.private\", 3009413120], [\"L11.l2.private\", 1505755136], [\"L12.l1.private\", 3009413120], [\"L12.l2.private\", 1505755136], [\"L13.l1.private\", 3009413120], [\"L13.l2.private\", 1505755136], [\"L14.l1.private\", 3009413120], [\"L14.l2.private\", 1505755136], [\"L15.l1.private\", 3009413120], [\"L15.l2.private\", 1505755136], [\"L16.l1.private\", 3009413120], [\"L16.l2.private\", 1505755136], [\"L17.l1.private\", 3009413120], [\"L17.l2.private\", 1505755136], [\"L18.l1.private\", 3009413120], [\"L18.l2.private\", 1505755136], [\"L19.l1.private\", 3009413120], [\"L19.l2.private\", 1505755136], [\"L20.l1.private\", 3009413120], [\"L20.l2.private\", 1505755136], [\"L21.l1.private\", 3009413120], [\"L21.l2.private\", 1505755136], [\"L22.l1.private\", 3009413120], [\"L22.l2.private\", 1505755136], [\"L23.l1.private\", 3009413120], [\"L23.l2.private\", 1505755136], [\"L24.l1.private\", 3009413120], [\"L24.l2.private\", 1505755136], [\"L25.l1.private\", 3009413120], [\"L25.l2.private\", 1505755136], [\"L26.l1.private\", 3009413120], [\"L26.l2.private\", 1505755136], [\"L27.l1.private\", 3009413120], [\"L27.l2.private\", 1505755"
+ ],
+ "parity_slot0": [
+  "DS41_FASTPATH gracetier: parity slot0 layer 0 (our transform of the loader's raw hot slot 0 vs vLLM's finalized group 0): {\"l1_sf\": true, \"l1_weight\": true, \"l2_sf\": true, \"l2_weight\": true, \"names\": [\"w13_weight\", \"w2_weight\", \"w13_weight_scale\", \"w2_weight_scale\"], \"ok\": true}"
+ ],
+ "symm": [
+  "DS41_FASTPATH gracetier: SymmBuffer G = 384: {\"bytes\": 1048832384, \"how\": \"vLLM's own (already G = 384)\", \"num_experts\": 384, \"num_max_tokens_per_rank\": 9600, \"num_shared_experts\": 1}"
+ ],
+ "vmm": [
+  "DS41_FASTPATH gracetier: VMM: granularity 2097152 B; shared scratch {'l1': 1.416, 'l2': 0.707} GiB; plan for all layers: weights 170.326 GiB (shared 2.123, straddle 0.112), SF all groups 15.82 GiB"
+ ],
+ "first_forward": [
+  "DS41_FASTPATH gracetier: first eager stock-forward call (layer 0, T 8192): G = 384 SymmBuffer topk_idx == our groups: True"
+ ],
+ "reader": [
+  "DS41_FASTPATH gracetier: cold pool reader started: 5160 experts, 85.26 GiB pool, model /model",
+  "DS41_FASTPATH gracetier: cold pool read: 30960 tensors, 91.30 GB weights in 62.3 s; registered 2 chunk(s) in 0.22 s (85.26 GiB, hugepages True)"
+ ],
+ "all_active": [
+  "a12_memory_guard",
+  "a12_retire",
+  "attn",
+  "boundary",
+  "engram_side",
+  "fastload",
+  "gracetier",
+  "megamoe",
+  "preattn",
+  "preattn_cand",
+  "preattn_compress",
+  "preattn_index",
+  "quant_producer",
+  "suffix",
+  "tail_ctxkv",
+  "tail_dflash_prep",
+  "tail_draft_embed",
+  "tail_embed",
+  "tail_markov_fused",
+  "tail_proj_side",
+  "tail_replay_skip",
+  "tail_swa_meta",
+  "topp_fast"
+ ],
+ "kv_cache": [
+  "(EngineCore pid=403) INFO 11-10 01:57:36 [kv_cache_utils.py:2464] GPU KV cache size: 8,403,455 tokens, Maximum concurrency for 1,048,576 tokens per request: 8.01x"
+ ],
+ "a12_memory": [
+  "A12_INSTALL_MEMORY {\"phase\": \"after_capture_warmup_gc\", \"reason\": null, \"retirement\": {\"alternate_graphs_retained\": 0, \"candidate_allocated_bytes\": 17456693248, \"checked_graph_managers\": [{\"full_count\": 36, \"manager\": \"ModelCudaGraphManager\"}, {\"full_count\": 51, \"manager\": \"DFlashCudaGraphManager\"}], \"diagnostic_banks_bytes\": 0, \"fallback\": false, \"install_form\": \"replace\", \"layers\": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42], \"managers\": [{\"descriptors\": 36, \"duplicate_graphs_retained\": 0, \"graph_keys\": [\"BatchExecutionDescriptor(cg_mode=<CUDAGraphMode.FULL: 2>, num_tokens=12, num_reqs=2, uniform_token_count=6, max_query_len=None, num_active_loras=0, num_ubatches=1)\", \"BatchExecutionDescriptor(cg_mode=<CUDAGraphMode.FULL: 2>, num_tokens=12, num_reqs=3, uniform_token_count=4, max_query_len=None, num_active_loras=0, num_ubatches=1)\", \"BatchExecutionDescriptor(cg_mode=<CUDAGraphMode.FULL: 2>, num_tokens=128, num_reqs=32, uniform_token_count=4, max_query_len=None, num_active_loras=0, num_ubatches=1)\", \"BatchExecutionDescriptor(cg_mode=<CUDAGraphMode.FULL: 2>, num_tokens=132, num_reqs=22, uniform_token_count=6, max_query_len=None, num_active_loras=0, num_ubatches=1)\", \"BatchExecutionDescriptor(cg_mode=<CUDAGraphMode.FULL: 2>, num_tokens=144, num_reqs=24, uniform_token_count=6, max_query_len=None, num_active_loras=0, num_ubatches=1)\", \"BatchExecutionDescriptor(cg_mode=<CUDAGraphMode.FULL: 2>, num_tokens=16, num_reqs=4, uniform_token_count=4, max_query_len=None, num_active_loras=0, num_ubatches=1)\", \"BatchExecutionDescriptor(cg_mode=<CUDAGraphMode.FULL: 2>, num_tokens=162, num_reqs=27, uniform_token_count=6, max_query_len=None, num_active_loras=0, num_ubatches=1)\", \"BatchExecutionDescriptor(cg_mode=<CUDAGraphMode.FULL: 2>, num_tokens=18, num_reqs=3, uniform_token_count=6, max_query_len=None, num_active_loras=0, num_ubatches=1)\", \"BatchExecutionDescriptor"
+ ],
+ "fatal": [],
+ "pass": true
+}

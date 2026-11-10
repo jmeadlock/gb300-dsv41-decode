@@ -1,0 +1,74 @@
+{
+ "ack": {
+  "at_boot": true,
+  "audit": {
+   "at_boot": true,
+   "checked": 8325,
+   "event": "audit",
+   "first": [],
+   "mismatches": 0,
+   "moved": 5765,
+   "ms": 965.1,
+   "random": 2560,
+   "seq": 1794276112959,
+   "swaps": 20498,
+   "t": 1794276114.271
+  },
+  "event": "ctrl",
+  "freeze": true,
+  "host_steps": 15488,
+  "hot_moved": 0,
+  "msg": [
+   "audit mismatches=0"
+  ],
+  "params": {
+   "drain_n": 64,
+   "frozen_at_boot": true,
+   "halflife": 500.0,
+   "hyst": 1.5,
+   "min_abs": 8.0,
+   "restore_resets_ewma": false,
+   "swaps_per_barrier": 4,
+   "swaps_per_drain": 2
+  },
+  "pending": 0,
+  "seq": 1794276112959,
+  "swaps": 20498,
+  "t": 1794276114.272,
+  "unknown": []
+ },
+ "settled": true,
+ "nudges": 1,
+ "wait_s": 1.52,
+ "state": {
+  "at_boot": true,
+  "cold": 5106,
+  "cold_share": 0.04686123348017621,
+  "drains": 242,
+  "event": "drain",
+  "freeze": true,
+  "host_steps": 15488,
+  "hot_moved": 0,
+  "pending": 0,
+  "queued": 0,
+  "sel": 108960,
+  "stale": 0,
+  "steps": 64,
+  "stream_changes": 0,
+  "swaps": 20498,
+  "swaps_since": 0,
+  "t": 1794276114.272,
+  "vetoed": 0
+ },
+ "errors": [],
+ "seq": 1794276112959,
+ "ctrl": {
+  "audit": {
+   "moved": true,
+   "random": 64
+  }
+ },
+ "wait": "ack",
+ "nudge": "step",
+ "date": "2026-11-09 20:01:54 CST"
+}

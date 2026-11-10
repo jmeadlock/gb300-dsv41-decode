@@ -1,0 +1,14 @@
+{
+ "stamp": "20261109-195325",
+ "window": "gt4-1109",
+ "commit": "c980ede card GT4: mixed-traffic step cells for gracetier residency (GT1_RES_CELLS=mix; bench/gt_mix_drive.py, sets A/B of 20 prompts, cells M0-M5, pre-registered reading)",
+ "dirty": "",
+ "nvidia_smi": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, GPU-d07eb6e6-7053-42a7-6811-7bb833266182, 95682 MiB, 97887 MiB, 0 %",
+ "compute_apps": "1669099, 95554 MiB;1670294, 242862 MiB",
+ "MemAvailable_GiB": 200.4,
+ "pg61_models": "\"id\":\"dsv41-flash-uva\",\"id\":\"modelperm-9a65c2ecdcb89214\",\"id\":\"deepseek-v4.1-flash\",\"id\":\"modelperm-94e369f9df746295\"",
+ "restore_pg61_at_end": true,
+ "model_dir": "/models/DeepSeek-V4.1-Flash-1017-1bae0e1088993b9b82de08f59de5be5a34e42170",
+ "hot_map": "",
+ "refused": null
+}

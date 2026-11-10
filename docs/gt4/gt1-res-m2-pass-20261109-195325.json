@@ -1,0 +1,220 @@
+{
+ "set": "B",
+ "tokens": 256,
+ "base": "http://127.0.0.1:30006",
+ "model": "dsv41-flash-gracetier",
+ "t_start": 1794276022.3699663,
+ "t_end": 1794276041.9347398,
+ "agg": {
+  "prompts": 20,
+  "prompts_measured": 20,
+  "errors": 0,
+  "steps": 1559.0,
+  "gen_tokens": 4606.0,
+  "step_ms": 11.973,
+  "tokens_per_step": 2.954,
+  "ms_per_token": 4.053
+ },
+ "rows": [
+  {
+   "kind": "code-py",
+   "ttft_s": 0.038,
+   "decode_wall_s": 0.9588,
+   "chunks": 79,
+   "steps": 78.0,
+   "gen_tokens": 256.0,
+   "completion_tokens": 256,
+   "step_ms": 12.452
+  },
+  {
+   "kind": "code-go",
+   "ttft_s": 0.043,
+   "decode_wall_s": 0.8364,
+   "chunks": 57,
+   "steps": 56.0,
+   "gen_tokens": 256.0,
+   "completion_tokens": 256,
+   "step_ms": 15.207
+  },
+  {
+   "kind": "sql",
+   "ttft_s": 0.048,
+   "decode_wall_s": 0.809,
+   "chunks": 64,
+   "steps": 63.0,
+   "gen_tokens": 256.0,
+   "completion_tokens": 256,
+   "step_ms": 13.048
+  },
+  {
+   "kind": "json",
+   "ttft_s": 0.043,
+   "decode_wall_s": 0.8242,
+   "chunks": 57,
+   "steps": 56.0,
+   "gen_tokens": 217.0,
+   "completion_tokens": 217,
+   "step_ms": 14.985
+  },
+  {
+   "kind": "shell",
+   "ttft_s": 0.102,
+   "decode_wall_s": 0.9322,
+   "chunks": 64,
+   "steps": 63.0,
+   "gen_tokens": 256.0,
+   "completion_tokens": 256,
+   "step_ms": 15.035
+  },
+  {
+   "kind": "math",
+   "ttft_s": 0.044,
+   "decode_wall_s": 0.7479,
+   "chunks": 63,
+   "steps": 62.0,
+   "gen_tokens": 256.0,
+   "completion_tokens": 256,
+   "step_ms": 12.261
+  },
+  {
+   "kind": "history",
+   "ttft_s": 0.04,
+   "decode_wall_s": 1.3913,
+   "chunks": 127,
+   "steps": 126.0,
+   "gen_tokens": 256.0,
+   "completion_tokens": 256,
+   "step_ms": 11.13
+  },
+  {
+   "kind": "cooking",
+   "ttft_s": 0.035,
+   "decode_wall_s": 1.0119,
+   "chunks": 95,
+   "steps": 94.0,
+   "gen_tokens": 256.0,
+   "completion_tokens": 256,
+   "step_ms": 10.881
+  },
+  {
+   "kind": "translate",
+   "ttft_s": 0.045,
+   "decode_wall_s": 1.1446,
+   "chunks": 86,
+   "steps": 85.0,
+   "gen_tokens": 214.0,
+   "completion_tokens": 214,
+   "step_ms": 13.626
+  },
+  {
+   "kind": "story",
+   "ttft_s": 0.038,
+   "decode_wall_s": 1.4377,
+   "chunks": 121,
+   "steps": 121.0,
+   "gen_tokens": 242.0,
+   "completion_tokens": 242,
+   "step_ms": 11.981
+  },
+  {
+   "kind": "code-c",
+   "ttft_s": 0.036,
+   "decode_wall_s": 0.7246,
+   "chunks": 55,
+   "steps": 54.0,
+   "gen_tokens": 256.0,
+   "completion_tokens": 256,
+   "step_ms": 13.672
+  },
+  {
+   "kind": "legal",
+   "ttft_s": 0.039,
+   "decode_wall_s": 1.0184,
+   "chunks": 100,
+   "steps": 99.0,
+   "gen_tokens": 256.0,
+   "completion_tokens": 256,
+   "step_ms": 10.392
+  },
+  {
+   "kind": "bio",
+   "ttft_s": 0.035,
+   "decode_wall_s": 0.9279,
+   "chunks": 85,
+   "steps": 84.0,
+   "gen_tokens": 256.0,
+   "completion_tokens": 256,
+   "step_ms": 11.18
+  },
+  {
+   "kind": "email",
+   "ttft_s": 0.037,
+   "decode_wall_s": 0.7817,
+   "chunks": 67,
+   "steps": 66.0,
+   "gen_tokens": 186.0,
+   "completion_tokens": 186,
+   "step_ms": 12.026
+  },
+  {
+   "kind": "table",
+   "ttft_s": 0.056,
+   "decode_wall_s": 1.2342,
+   "chunks": 107,
+   "steps": 106.0,
+   "gen_tokens": 256.0,
+   "completion_tokens": 256,
+   "step_ms": 11.754
+  },
+  {
+   "kind": "poem",
+   "ttft_s": 0.032,
+   "decode_wall_s": 0.7993,
+   "chunks": 84,
+   "steps": 83.0,
+   "gen_tokens": 150.0,
+   "completion_tokens": 150,
+   "step_ms": 9.748
+  },
+  {
+   "kind": "physics",
+   "ttft_s": 0.036,
+   "decode_wall_s": 0.8958,
+   "chunks": 92,
+   "steps": 91.0,
+   "gen_tokens": 256.0,
+   "completion_tokens": 256,
+   "step_ms": 9.953
+  },
+  {
+   "kind": "tool",
+   "ttft_s": 0.059,
+   "decode_wall_s": 0.1162,
+   "chunks": 8,
+   "steps": 7.0,
+   "gen_tokens": 37.0,
+   "completion_tokens": 37,
+   "step_ms": 19.367
+  },
+  {
+   "kind": "finance",
+   "ttft_s": 0.042,
+   "decode_wall_s": 1.0755,
+   "chunks": 98,
+   "steps": 97.0,
+   "gen_tokens": 232.0,
+   "completion_tokens": 232,
+   "step_ms": 11.203
+  },
+  {
+   "kind": "debug",
+   "ttft_s": 0.06,
+   "decode_wall_s": 0.7596,
+   "chunks": 69,
+   "steps": 68.0,
+   "gen_tokens": 256.0,
+   "completion_tokens": 256,
+   "step_ms": 11.337
+  }
+ ]
+}

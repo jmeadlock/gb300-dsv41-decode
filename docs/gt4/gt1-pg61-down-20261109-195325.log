@@ -1,0 +1,4 @@
+[ds41] returned /home/milo/dsv41/garner/home/state to 1001:1001
+[ds41] stopped
+[ds41] removed ds41 and ds41-sidecar
+2026-11-09 19:54:06 CST [pg61] down; peer shm removed (verified absent), containers stopped, watchdog stopped
