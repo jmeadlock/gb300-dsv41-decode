@@ -212,6 +212,47 @@ def cmd_conc(a) -> int:
     return 0 if agg["errors"] == 0 and alive else 1
 
 
+WORDS = ("time year people way day man thing woman life child world school state family student group country problem "
+         "hand part place case week company system program question work government number night point home water room "
+         "mother area money story fact month lot right study book eye job word business issue side kind head house "
+         "service friend father power hour game line end member law car city community name president team minute idea "
+         "kid body information back parent face others level office door health person art war history party result "
+         "change morning reason research girl guy moment air teacher force education").split()
+
+
+def cmd_ttft(a) -> int:
+    """Time to first token by prompt length: max_tokens 1, non-streamed wall time, `usage.prompt_tokens` as the length.
+    Each run's prompt starts with its own salt and is seeded pseudo-random common words, so no run can hit the prefix
+    cache of another."""
+    import random
+
+    W = w0()
+    out = []
+    for size in [int(x) for x in a.sizes.split(",")]:
+        rec = {"target_tokens": size, "runs": []}
+        for r in range(a.reps):
+            rng = random.Random(f"{size}-{r}-{a.salt}")
+            n = max(4, int(size / 1.05) - 24)
+            text = f"(ttft {a.salt} {size} {r}) " + " ".join(rng.choice(WORDS) for _ in range(n)) + "\nReply with the single word OK."
+            t0 = time.time()
+            try:
+                d = json.loads(W.post("/v1/chat/completions", W.chat_body(text, 1), timeout=1800))
+                rec["runs"].append({"s": round(time.time() - t0, 3), "prompt_tokens": d["usage"]["prompt_tokens"]})
+            except Exception as e:
+                rec["runs"].append({"error": repr(e)[:200]})
+        ok = sorted(x["s"] for x in rec["runs"] if "s" in x)
+        rec["median_s"] = ok[len(ok) // 2] if ok else None
+        rec["prompt_tokens"] = next((x["prompt_tokens"] for x in rec["runs"] if "prompt_tokens" in x), None)
+        if rec["median_s"] and rec["prompt_tokens"]:
+            rec["prefill_tok_s"] = round(rec["prompt_tokens"] / rec["median_s"])
+        out.append(rec)
+    with open(a.out, "w") as f:
+        json.dump({"base": W.BASE, "model": W.MODEL, "salt": a.salt, "sizes": out}, f, indent=1)
+    print("ttft: " + "; ".join(f"{x['prompt_tokens']} tok {x['median_s']} s" for x in out)
+          + f"; errors {sum(1 for x in out for y in x['runs'] if 'error' in y)}", flush=True)
+    return 0
+
+
 CELLS = ["m0a", "m0b", "m1a", "m1b", "m1c", "m2", "m3", "m4", "m6a", "m6b", "m5"]
 
 
@@ -266,8 +307,13 @@ def main(argv=None) -> int:
     c.add_argument("--tokens", type=int, default=256)
     c.add_argument("--tag", required=True, help="salt tag: use the same tag for the same cell in every arm")
     c.add_argument("--out", required=True)
+    t = sub.add_parser("ttft")
+    t.add_argument("--sizes", default="32,300,1000,8000,64000")
+    t.add_argument("--reps", type=int, default=3)
+    t.add_argument("--salt", default=str(int(time.time())))
+    t.add_argument("--out", required=True)
     a = ap.parse_args(argv)
-    return {"pass": cmd_pass, "summary": cmd_summary, "conc": cmd_conc}[a.cmd](a)
+    return {"pass": cmd_pass, "summary": cmd_summary, "conc": cmd_conc, "ttft": cmd_ttft}[a.cmd](a)
 
 
 if __name__ == "__main__":
