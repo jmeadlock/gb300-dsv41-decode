@@ -103,6 +103,8 @@ if [ "${GT1_RES:-0}" = 1 ]; then   # card GT3: the residency manager, its vendor
     [ -f "$f" ] || refuse "GT1_RES=1: missing $f"
   done
   [ "${GT1_NSYS:-0}" != 1 ] || refuse "GT1_RES=1 and GT1_NSYS=1 are separate cards (one mode per window)"
+  case "${GT1_RES_CELLS:-std}" in std) ;; mix) [ -f "$DEC/bench/gt_mix_drive.py" ] || refuse "GT1_RES_CELLS=mix: missing bench/gt_mix_drive.py" ;;
+    *) refuse "GT1_RES_CELLS must be std|mix" ;; esac
   GT1_RES_CONFIG=${GT1_RES_CONFIG:-'{"mode": "adaptive", "freeze": true}'}
   RESCFG="$GT1_RES_CONFIG" python3 -c 'import ast, json, os, sys
 c = json.loads(os.environ["RESCFG"]); assert isinstance(c, dict) and c.get("mode") == "adaptive", c
@@ -454,6 +456,37 @@ if [ "${GT1_RES:-0}" = 1 ]; then
     || { say "FAIL: the boot log has no residency manager line (gracetier-res.json not read?): R0..R5 skipped"; G3=res-not-armed; exit 0; }
   [ -f "$RESDIR/telemetry.jsonl" ] || { say "FAIL: no $RESDIR/telemetry.jsonl: R0..R5 skipped"; G3=res-no-telemetry; exit 0; }
   AUDIT='{"audit": {"moved": true, "random": 64}}'
+
+  if [ "${GT1_RES_CELLS:-std}" = mix ]; then   # card GT4: mixed-traffic step cells (bench/gt_mix_drive.py docstring)
+    say "== card GT4: mixed traffic, sets A / B of 20 prompts x 256 tokens, C1"
+    mpass() {   # $1 = cell, $2 = set
+      timeout 900 python3 bench/gt_mix_drive.py pass --set "$2" --tokens 256 --out "$(R "$1-pass").json" > "$(R "$1-pass").log" 2>&1
+      say "$1 rc=$? $(tail -1 "$(R "$1-pass").log" | cut -c1-260)"
+    }
+    say "== M0 frozen at the boot map: pass A, pass B (controls)"
+    mpass m0a A; mpass m0b B
+    say "== M1 unfreeze + baseline; pass A x 3"
+    if alive && ctl m1-ctrl '{"freeze": false, "baseline": true}' step ack; then
+      mpass m1a A; mpass m1b A; mpass m1c A
+      say "== M2 pass B (first sight); M3 pass A again; M4 pass B again"
+      mpass m2 B; mpass m3 A; mpass m4 B
+    else say "M1..M4 skipped"; fi
+    say "== M5 freeze, audit, restore_map, audit, pass A"
+    if alive; then
+      ctl m5-audit1 "$AUDIT" step ack
+      if ctl m5-restore '{"freeze": true, "restore_map": true}' step boot 900; then
+        ctl m5-audit2 "$AUDIT" step ack
+        mpass m5 A
+      else say "M5: the boot map did not come back within the timeout"; fi
+    else say "M5 skipped: server not alive"; fi
+    cp "$RESDIR/telemetry.jsonl" "$(R telemetry).jsonl" 2>/dev/null || say "WARN: no telemetry.jsonl to copy"
+    docker logs ds41 2>&1 | grep -E "gracetier: (residency|\[gracetier-res\]|stream check)" | cut -c1-600 > "$(R server-lines).log" || true
+    say "container $(docker inspect -f '{{.State.Status}} restarts={{.RestartCount}}' ds41 2>/dev/null); alive $(alive && echo yes || echo NO)"
+    PYTHONIOENCODING=utf-8 python3 bench/gt_mix_drive.py summary --scratch "$S" --stamp "$STAMP" --out "$(R mix-summary).json" \
+      2>&1 | tee "$(R mix-summary).log"
+    G3=res-mix
+    exit 0
+  fi
 
   say "== R0 frozen at the boot map: step cell (3 reps) + the fixture capture R3 compares with"
   stepcell r0-step
