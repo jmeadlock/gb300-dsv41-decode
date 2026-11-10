@@ -470,6 +470,10 @@ if [ "${GT1_RES:-0}" = 1 ]; then
       mpass m1a A; mpass m1b A; mpass m1c A
       say "== M2 pass B (first sight); M3 pass A again; M4 pass B again"
       mpass m2 B; mpass m3 A; mpass m4 B
+      if [ -n "${GT1_MIX_HYST:-}" ]; then   # optional churn arm: a higher swap hysteresis, then A and B again
+        say "== M6 hyst ${GT1_MIX_HYST}; pass A, pass B"
+        ctl m6-ctrl "{\"hyst\": ${GT1_MIX_HYST}}" step ack && { mpass m6a A; mpass m6b B; }
+      fi
     else say "M1..M4 skipped"; fi
     say "== M5 freeze, audit, restore_map, audit, pass A"
     if alive; then

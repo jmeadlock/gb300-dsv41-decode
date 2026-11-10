@@ -139,7 +139,7 @@ def cmd_pass(a) -> int:
     return 0 if g["errors"] == 0 and g["prompts_measured"] == g["prompts"] else 1
 
 
-CELLS = ["m0a", "m0b", "m1a", "m1b", "m1c", "m2", "m3", "m4", "m5"]
+CELLS = ["m0a", "m0b", "m1a", "m1b", "m1c", "m2", "m3", "m4", "m6a", "m6b", "m5"]
 
 
 def cmd_summary(a) -> int:
