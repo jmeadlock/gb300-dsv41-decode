@@ -103,8 +103,8 @@ if [ "${GT1_RES:-0}" = 1 ]; then   # card GT3: the residency manager, its vendor
     [ -f "$f" ] || refuse "GT1_RES=1: missing $f"
   done
   [ "${GT1_NSYS:-0}" != 1 ] || refuse "GT1_RES=1 and GT1_NSYS=1 are separate cards (one mode per window)"
-  case "${GT1_RES_CELLS:-std}" in std) ;; mix) [ -f "$DEC/bench/gt_mix_drive.py" ] || refuse "GT1_RES_CELLS=mix: missing bench/gt_mix_drive.py" ;;
-    *) refuse "GT1_RES_CELLS must be std|mix" ;; esac
+  case "${GT1_RES_CELLS:-std}" in std) ;; a5) [ -f "$DEC/bench/box/a5-cells.sh" ] || refuse "GT1_RES_CELLS=a5: missing bench/box/a5-cells.sh" ;; mix) [ -f "$DEC/bench/gt_mix_drive.py" ] || refuse "GT1_RES_CELLS=mix: missing bench/gt_mix_drive.py" ;;
+    *) refuse "GT1_RES_CELLS must be std|mix|a5" ;; esac
   GT1_RES_CONFIG=${GT1_RES_CONFIG:-'{"mode": "adaptive", "freeze": true}'}
   RESCFG="$GT1_RES_CONFIG" python3 -c 'import ast, json, os, sys
 c = json.loads(os.environ["RESCFG"]); assert isinstance(c, dict) and c.get("mode") == "adaptive", c
@@ -456,6 +456,17 @@ if [ "${GT1_RES:-0}" = 1 ]; then
     || { say "FAIL: the boot log has no residency manager line (gracetier-res.json not read?): R0..R5 skipped"; G3=res-not-armed; exit 0; }
   [ -f "$RESDIR/telemetry.jsonl" ] || { say "FAIL: no $RESDIR/telemetry.jsonl: R0..R5 skipped"; G3=res-no-telemetry; exit 0; }
   AUDIT='{"audit": {"moved": true, "random": 64}}'
+
+  if [ "${GT1_RES_CELLS:-std}" = a5 ]; then   # card A5, gracetier arm: the cells every arm runs (bench/box/a5-cells.sh)
+    say "== card A5 gracetier arm (config $(cat "$GT/tree/fastpath/gracetier-res.json"))"
+    A5_OUT="$S/a5-gracetier-$STAMP" A5_ARM=gracetier A5_WARM=1 A5_GAUNTLET=1 bash bench/box/a5-cells.sh
+    alive && ctl a5-audit "$AUDIT" step ack
+    cp "$RESDIR/telemetry.jsonl" "$(R telemetry).jsonl" 2>/dev/null || say "WARN: no telemetry.jsonl to copy"
+    docker logs ds41 2>&1 | grep -E "gracetier: (residency|\[gracetier-res\]|stream check)" | cut -c1-600 > "$(R server-lines).log" || true
+    say "container $(docker inspect -f '{{.State.Status}} restarts={{.RestartCount}}' ds41 2>/dev/null); alive $(alive && echo yes || echo NO)"
+    G3=res-a5
+    exit 0
+  fi
 
   if [ "${GT1_RES_CELLS:-std}" = mix ]; then   # card GT4: mixed-traffic step cells (bench/gt_mix_drive.py docstring)
     say "== card GT4: mixed traffic, sets A / B of 20 prompts x 256 tokens, C1"

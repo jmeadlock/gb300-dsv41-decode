@@ -99,7 +99,13 @@ def aggregate(rows):
     wall = sum(r["decode_wall_s"] for r in ok)
     gen = sum(r["gen_tokens"] for r in ok)
     all_steps = sum(r["steps"] for r in ok)
+    tk = [r for r in rows if r.get("completion_tokens") and r.get("decode_wall_s")]
+    ctok = sum(r["completion_tokens"] for r in tk)
+    cwall = sum(r["decode_wall_s"] for r in tk)
     return {"prompts": len(rows), "prompts_measured": len(ok), "errors": sum(1 for r in rows if r.get("error")),
+            "prompts_timed": len(tk), "completion_tokens": ctok,
+            # client-side decode rate: completion tokens over first-to-last content chunk, every server reports it
+            "decode_tok_s": round(ctok / cwall, 2) if cwall else None,
             "steps": all_steps, "gen_tokens": gen,
             "step_ms": round(1000 * wall / steps, 3) if steps else None,
             "tokens_per_step": round(gen / all_steps, 3) if all_steps else None,
@@ -117,12 +123,15 @@ def cmd_pass(a) -> int:
             t0 = time.time()
             t_first, t_last, n, usage, _ = W.one_stream(prompt, a.tokens)
             m1 = W.metrics()
-            steps = m1["num_drafts_total"] - m0["num_drafts_total"]
+            have = "num_drafts_total" in m0 and "num_drafts_total" in m1   # absent on a server without spec counters
+            steps = (m1["num_drafts_total"] - m0["num_drafts_total"]) if have else None
             rec.update({"ttft_s": round((t_first or t0) - t0, 3),
                         "decode_wall_s": round(t_last - t_first, 4) if t_first and t_last else None, "chunks": n,
-                        "steps": steps, "gen_tokens": m1["generation_tokens_total"] - m0["generation_tokens_total"],
+                        "steps": steps,
+                        "gen_tokens": (m1["generation_tokens_total"] - m0["generation_tokens_total"])
+                        if "generation_tokens_total" in m0 and "generation_tokens_total" in m1 else None,
                         "completion_tokens": (usage or {}).get("completion_tokens")})
-            if steps > 1 and rec["decode_wall_s"]:
+            if steps and steps > 1 and rec["decode_wall_s"]:
                 rec["step_ms"] = round(1000 * rec["decode_wall_s"] / (steps - 1), 3)
         except Exception as e:  # reported, never hidden
             rec["error"] = repr(e)[:200]
@@ -132,11 +141,75 @@ def cmd_pass(a) -> int:
     with open(a.out, "w") as f:
         json.dump(res, f, indent=1)
     g = res["agg"]
-    print(f"pass {a.set}: {g['prompts_measured']}/{g['prompts']} prompts, errors {g['errors']}; ms/step {g['step_ms']} "
+    print(f"pass {a.set}: {g['prompts_measured']}/{g['prompts']} prompts, errors {g['errors']}; decode tok/s "
+          f"{g['decode_tok_s']} ({g['prompts_timed']} timed); ms/step {g['step_ms']} "
           f"tok/step {g['tokens_per_step']} ms/token {g['ms_per_token']}; per-prompt ms/step min "
           f"{min((r['step_ms'] for r in rows if r.get('step_ms')), default=None)} max "
           f"{max((r['step_ms'] for r in rows if r.get('step_ms')), default=None)}", flush=True)
-    return 0 if g["errors"] == 0 and g["prompts_measured"] == g["prompts"] else 1
+    return 0 if g["errors"] == 0 and g["prompts_timed"] == g["prompts"] else 1
+
+
+def cmd_conc(a) -> int:
+    """N concurrent streams. Requests = the 40 prompts of A + B, cycled, each with a salt in front (same salts for
+    every arm, never repeated inside an arm, so no arm gets a prefix-cache hit another did not). Reported: aggregate
+    tok/s = completion tokens / wall of the whole cell; per-stream decode tok/s; TTFT."""
+    import threading
+
+    W = w0()
+    prompts = [p for _, p in SETS["A"] + SETS["B"]]
+    total = a.requests or max(40, 2 * a.n)
+    jobs = [(i, f"(request {a.tag}-{i}) " + prompts[i % len(prompts)]) for i in range(total)]
+    rows, lock, nxt = [], threading.Lock(), [0]
+
+    def worker():
+        while True:
+            with lock:
+                if nxt[0] >= len(jobs):
+                    return
+                i, prompt = jobs[nxt[0]]
+                nxt[0] += 1
+            rec = {"i": i}
+            t0 = time.time()
+            try:
+                t_first, t_last, n, usage, _ = W.one_stream(prompt, a.tokens)
+                ct = (usage or {}).get("completion_tokens")
+                rec.update({"t0": t0, "t_end": time.time(), "ttft_s": round((t_first or t0) - t0, 3),
+                            "decode_wall_s": round(t_last - t_first, 4) if t_first and t_last else None,
+                            "completion_tokens": ct})
+                if ct and rec["decode_wall_s"]:
+                    rec["decode_tok_s"] = round(ct / rec["decode_wall_s"], 2)
+            except Exception as e:
+                rec["error"] = repr(e)[:200]
+            with lock:
+                rows.append(rec)
+
+    t_start = time.time()
+    th = [threading.Thread(target=worker, daemon=True) for _ in range(a.n)]
+    for t in th:
+        t.start()
+    for t in th:
+        t.join()
+    wall = time.time() - t_start
+    ok = [r for r in rows if r.get("completion_tokens")]
+    ctok = sum(r["completion_tokens"] for r in ok)
+    ds = sorted(r["decode_tok_s"] for r in ok if r.get("decode_tok_s"))
+    tt = sorted(r["ttft_s"] for r in ok)
+    med = lambda v: v[len(v) // 2] if v else None  # noqa: E731
+    alive = True
+    try:
+        W.metrics()
+    except Exception:
+        alive = False
+    agg = {"n": a.n, "requests": total, "ok": len(ok), "errors": len(rows) - len(ok), "wall_s": round(wall, 2),
+           "completion_tokens": ctok, "agg_tok_s": round(ctok / wall, 1) if wall else None,
+           "stream_decode_tok_s_p50": med(ds), "stream_decode_tok_s_min": ds[0] if ds else None,
+           "ttft_s_p50": med(tt), "ttft_s_max": tt[-1] if tt else None, "server_alive_after": alive}
+    with open(a.out, "w") as f:
+        json.dump({"tag": a.tag, "tokens": a.tokens, "base": W.BASE, "model": W.MODEL, "agg": agg, "rows": rows}, f, indent=1)
+    print(f"conc C{a.n}: {agg['ok']}/{total} ok, errors {agg['errors']}; aggregate {agg['agg_tok_s']} tok/s over "
+          f"{agg['wall_s']} s; per-stream decode p50 {agg['stream_decode_tok_s_p50']} min {agg['stream_decode_tok_s_min']} "
+          f"tok/s; TTFT p50 {agg['ttft_s_p50']} max {agg['ttft_s_max']} s; alive {alive}", flush=True)
+    return 0 if agg["errors"] == 0 and alive else 1
 
 
 CELLS = ["m0a", "m0b", "m1a", "m1b", "m1c", "m2", "m3", "m4", "m6a", "m6b", "m5"]
@@ -187,8 +260,14 @@ def main(argv=None) -> int:
     s.add_argument("--scratch", required=True)
     s.add_argument("--stamp", required=True)
     s.add_argument("--out", required=True)
+    c = sub.add_parser("conc")
+    c.add_argument("--n", type=int, required=True)
+    c.add_argument("--requests", type=int, default=0, help="default max(40, 2 x n)")
+    c.add_argument("--tokens", type=int, default=256)
+    c.add_argument("--tag", required=True, help="salt tag: use the same tag for the same cell in every arm")
+    c.add_argument("--out", required=True)
     a = ap.parse_args(argv)
-    return cmd_pass(a) if a.cmd == "pass" else cmd_summary(a)
+    return {"pass": cmd_pass, "summary": cmd_summary, "conc": cmd_conc}[a.cmd](a)
 
 
 if __name__ == "__main__":
