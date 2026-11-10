@@ -1,0 +1,14 @@
+{
+ "stamp": "20261109-185832",
+ "window": "gt3-1109",
+ "commit": "e598f0a A3 Build (coder, Fable 5.2): adaptive residency on gracetier's fixed slots \u2014 GtResManager (true-exchange swap, v26ar policy unchanged), per-expert counter in gt_stage, execute_model barrier, card GT3 (GT1_RES=1, cells R0-R5), gt_res_drive; 35 new CPU tests; full suite 1512 pass / 2 pre-existing fails. Worker hit a rate limit after its final suite run; landed by Milo after re-running the gracetier tests (91 pass)",
+ "dirty": "",
+ "nvidia_smi": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, GPU-d07eb6e6-7053-42a7-6811-7bb833266182, 95682 MiB, 97887 MiB, 0 %",
+ "compute_apps": "1343486, 95554 MiB;1344657, 242862 MiB",
+ "MemAvailable_GiB": 196.8,
+ "pg61_models": "\"id\":\"dsv41-flash-uva\",\"id\":\"modelperm-85b16e008502556e\",\"id\":\"deepseek-v4.1-flash\",\"id\":\"modelperm-9a3178144045546d\"",
+ "restore_pg61_at_end": true,
+ "model_dir": "/models/DeepSeek-V4.1-Flash-1017-1bae0e1088993b9b82de08f59de5be5a34e42170",
+ "hot_map": "",
+ "refused": null
+}

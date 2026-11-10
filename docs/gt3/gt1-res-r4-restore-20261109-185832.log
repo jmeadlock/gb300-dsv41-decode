@@ -1,0 +1,1 @@
+ctrl {"freeze": true, "restore_map": true} seq 1794272770173: ack yes after 12.807 s / 25 nudges; ['freeze=1', 'restore_map queued=4624 exact=1 dropped_pending=0']; settled(boot) True; state {"pending": 0, "at_boot": true, "freeze": true, "hot_moved": 0, "swaps": 8066}

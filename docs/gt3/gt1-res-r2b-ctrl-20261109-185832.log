@@ -1,0 +1,1 @@
+ctrl {"freeze": false} seq 1794272729412: ack yes after 0.505 s / 1 nudges; ['freeze=0']; settled(ack) True; state {"pending": 80, "at_boot": false, "freeze": false, "hot_moved": 1600, "swaps": 2590}

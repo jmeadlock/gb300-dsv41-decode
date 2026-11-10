@@ -1,0 +1,4 @@
+step rep0: {"rep": 0, "wall_s": 2.043, "ttft_s": 0.055, "decode_wall_s": 1.987, "chunks": 189, "steps": 188.0, "gen_tokens": 512.0, "accepted": 328.0, "tokens_per_step": 2.723, "step_ms_from_metrics": 10.626, "preemptions": 0.0, "arrival_gap_ms_p50": 10.499, "arrival_gap_ms_mean": 10.571}
+step rep1: {"rep": 1, "wall_s": 1.997, "ttft_s": 0.055, "decode_wall_s": 1.941, "chunks": 187, "steps": 186.0, "gen_tokens": 512.0, "accepted": 326.0, "tokens_per_step": 2.753, "step_ms_from_metrics": 10.492, "preemptions": 0.0, "arrival_gap_ms_p50": 10.42, "arrival_gap_ms_mean": 10.438}
+step rep2: {"rep": 2, "wall_s": 2.008, "ttft_s": 0.055, "decode_wall_s": 1.953, "chunks": 188, "steps": 187.0, "gen_tokens": 512.0, "accepted": 325.0, "tokens_per_step": 2.738, "step_ms_from_metrics": 10.5, "preemptions": 0.0, "arrival_gap_ms_p50": 10.414, "arrival_gap_ms_mean": 10.442}
+step: -> /home/milo/dsv41/decode/scratch/gt1-res-r0-step-20261109-185832.json

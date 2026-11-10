@@ -1,0 +1,330 @@
+{
+ "stamp": "20261109-185832",
+ "R0": {
+  "reps": 3,
+  "step_ms": 10.5,
+  "step_ms_reps": [
+   10.626,
+   10.492,
+   10.5
+  ],
+  "tokens_per_step": 2.738,
+  "ms_per_token": 3.835,
+  "receipt": "/home/milo/dsv41/decode/scratch/gt1-res-r0-step-20261109-185832.json"
+ },
+ "R2a": {
+  "reps": 3,
+  "step_ms": 9.595,
+  "step_ms_reps": [
+   9.595,
+   9.605,
+   9.587
+  ],
+  "tokens_per_step": 2.753,
+  "ms_per_token": 3.485,
+  "receipt": "/home/milo/dsv41/decode/scratch/gt1-res-r2a-step-20261109-185832.json"
+ },
+ "R2b": {
+  "reps": 3,
+  "step_ms": 8.204,
+  "step_ms_reps": [
+   8.211,
+   8.2,
+   8.204
+  ],
+  "tokens_per_step": 2.753,
+  "ms_per_token": 2.983,
+  "receipt": "/home/milo/dsv41/decode/scratch/gt1-res-r2b-step5-20261109-185832.json"
+ },
+ "R2b_cells": [
+  {
+   "reps": 3,
+   "step_ms": 9.661,
+   "step_ms_reps": [
+    9.661,
+    12.658,
+    8.461
+   ],
+   "tokens_per_step": 2.681,
+   "ms_per_token": 3.528,
+   "receipt": "/home/milo/dsv41/decode/scratch/gt1-res-r2b-step1-20261109-185832.json"
+  },
+  {
+   "reps": 3,
+   "step_ms": 8.317,
+   "step_ms_reps": [
+    8.349,
+    8.317,
+    8.28
+   ],
+   "tokens_per_step": 2.738,
+   "ms_per_token": 3.038,
+   "receipt": "/home/milo/dsv41/decode/scratch/gt1-res-r2b-step2-20261109-185832.json"
+  },
+  {
+   "reps": 3,
+   "step_ms": 8.247,
+   "step_ms_reps": [
+    8.289,
+    8.247,
+    8.242
+   ],
+   "tokens_per_step": 2.738,
+   "ms_per_token": 3.012,
+   "receipt": "/home/milo/dsv41/decode/scratch/gt1-res-r2b-step3-20261109-185832.json"
+  },
+  {
+   "reps": 3,
+   "step_ms": 8.222,
+   "step_ms_reps": [
+    8.222,
+    8.215,
+    8.24
+   ],
+   "tokens_per_step": 2.738,
+   "ms_per_token": 3.0,
+   "receipt": "/home/milo/dsv41/decode/scratch/gt1-res-r2b-step4-20261109-185832.json"
+  },
+  {
+   "reps": 3,
+   "step_ms": 8.204,
+   "step_ms_reps": [
+    8.211,
+    8.2,
+    8.204
+   ],
+   "tokens_per_step": 2.753,
+   "ms_per_token": 2.983,
+   "receipt": "/home/milo/dsv41/decode/scratch/gt1-res-r2b-step5-20261109-185832.json"
+  }
+ ],
+ "R4": {
+  "reps": 3,
+  "step_ms": 10.414,
+  "step_ms_reps": [
+   10.43,
+   10.414,
+   10.411
+  ],
+  "tokens_per_step": 2.738,
+  "ms_per_token": 3.804,
+  "receipt": "/home/milo/dsv41/decode/scratch/gt1-res-r4-step-20261109-185832.json"
+ },
+ "R1": {
+  "a": 0.04319727891156463,
+  "b": 0.01638227472040413,
+  "t90_s": 6.412,
+  "note": null,
+  "swaps_per_drain": {
+   "drains": 151,
+   "total": 2583,
+   "max": 80,
+   "mean": 17.106,
+   "series": [
+    0,
+    0,
+    62,
+    78,
+    77,
+    80,
+    80,
+    80,
+    80,
+    80,
+    80,
+    79,
+    79,
+    80,
+    80,
+    80,
+    79,
+    77,
+    72,
+    62,
+    63,
+    60,
+    54,
+    37,
+    39,
+    40,
+    23,
+    25,
+    27,
+    24,
+    23,
+    9,
+    9,
+    17,
+    6,
+    10,
+    22,
+    7,
+    17,
+    6,
+    7,
+    14,
+    3,
+    7,
+    13,
+    10,
+    11,
+    6,
+    6,
+    8,
+    6,
+    9,
+    9,
+    9,
+    10,
+    5,
+    5,
+    6,
+    5,
+    7,
+    13,
+    9,
+    7,
+    10,
+    3,
+    2,
+    6,
+    6,
+    8,
+    6,
+    5,
+    7,
+    5,
+    4,
+    6,
+    5,
+    6,
+    6,
+    7,
+    7,
+    3,
+    3,
+    7,
+    3,
+    8,
+    6,
+    4,
+    6,
+    4,
+    3,
+    7,
+    3,
+    7,
+    7,
+    8,
+    9,
+    3,
+    5,
+    8,
+    2,
+    10,
+    7,
+    8,
+    8,
+    3,
+    5,
+    8,
+    2,
+    8,
+    8,
+    8,
+    9,
+    1,
+    4,
+    8,
+    1,
+    5,
+    8,
+    6,
+    8,
+    0,
+    4,
+    6,
+    2,
+    7,
+    8,
+    7,
+    8,
+    0,
+    3,
+    7,
+    2,
+    7,
+    8,
+    6,
+    9,
+    5,
+    5,
+    5,
+    3,
+    5,
+    9,
+    6,
+    8,
+    3,
+    3,
+    5,
+    4,
+    6,
+    8,
+    6
+   ]
+  },
+  "requests": 149,
+  "tok_s_median": 383.81
+ },
+ "R3": {
+  "self": {
+   "identical": 8,
+   "prompts": 8,
+   "differ": []
+  },
+  "vs_r0_map": {
+   "identical": 8,
+   "prompts": 8,
+   "differ": []
+  }
+ },
+ "audit": {
+  "before_restore": 0,
+  "after_restore": 0,
+  "mismatches": 0
+ },
+ "restore": {
+  "settled": true,
+  "ack": true
+ },
+ "C32": {
+  "pass": true,
+  "ok": 32,
+  "n": 32,
+  "server_alive_after": true
+ },
+ "ratios": {
+  "R2a_over_R0": 0.9138,
+  "R2b_over_R0": 0.7813,
+  "R4_over_R0": 0.9918
+ },
+ "adopt": {
+  "criteria": {
+   "R2b <= 0.90 x R0": true,
+   "T90 <= 20 s": true,
+   "audits 0": true,
+   "C32 alive": true,
+   "R4 within 2 % of R0": true
+  },
+  "bar": {
+   "r2b_over_r0_max": 0.9,
+   "t90_s_max": 20.0,
+   "audit_mismatches_max": 0,
+   "r4_within": 0.02
+  },
+  "adopt": true,
+  "not_measured": []
+ },
+ "verdict": "GT3: R0 10.500 | R2a 9.595 | R2b 8.204 | T90 6.4 | cold share 0.0432 \u2192 0.0164 | audit 0 mismatches | C32 pass"
+}

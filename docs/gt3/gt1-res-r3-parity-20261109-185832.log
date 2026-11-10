@@ -1,0 +1,10 @@
+tag        A2 first/flips_w/maxd        cand first/flips_w/maxd      verdict
+prose      None    0.000  0.0000        None    0.000  0.0000        ok
+code       None    0.000  0.0000        None    0.000  0.0000        ok
+math       None    0.000  0.0000        None    0.000  0.0000        ok
+json       None    0.000  0.0000        None    0.000  0.0000        ok
+shell      None    0.000  0.0000        None    0.000  0.0000        ok
+tool       None    0.000  0.0000        None    0.000  0.0000        ok
+long       None    0.000  0.0000        None    0.000  0.0000        ok
+story      None    0.000  0.0000        None    0.000  0.0000        ok
+identical 8/8; PARITY: PASS

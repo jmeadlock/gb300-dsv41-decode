@@ -1,0 +1,9 @@
+parity prose: 256 tokens, 1.095 s, finish=length
+parity code: 256 tokens, 0.796 s, finish=length
+parity math: 256 tokens, 0.656 s, finish=length
+parity json: 18 tokens, 0.103 s, finish=stop
+parity shell: 256 tokens, 0.838 s, finish=length
+parity tool: 21 tokens, 0.136 s, finish=stop
+parity long: 256 tokens, 1.069 s, finish=length
+parity story: 170 tokens, 0.858 s, finish=stop
+parity: 8 prompts -> /home/milo/dsv41/decode/scratch/gt1-res-r3-parity-b-20261109-185832.jsonl
