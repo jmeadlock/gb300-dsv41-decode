@@ -523,8 +523,8 @@ DS41_FASTPATH suffix: dynamic K v3 on: batch-1 normal steps verify 5 or 7 drafts
 INFO:     Started server process [1]
 INFO:     Waiting for application startup.
 INFO:     Application startup complete.
-INFO:     192.168.1.19:53884 - "GET /metrics HTTP/1.1" 200 OK
-INFO:     192.168.1.19:42980 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:53884 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:42980 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:33640 - "GET /health HTTP/1.1" 200 OK
 INFO:     127.0.0.1:33648 - "GET /v1/models HTTP/1.1" 200 OK
 INFO:     127.0.0.1:33650 - "GET /v1/models HTTP/1.1" 200 OK
@@ -542,7 +542,7 @@ INFO:     127.0.0.1:33676 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:33688 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:33694 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:33696 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:53890 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:53890 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:33708 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:33716 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:33730 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -566,7 +566,7 @@ INFO:     127.0.0.1:48436 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:48438 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:48452 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:48462 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:48804 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:48804 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:48472 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:48482 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:48496 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -579,11 +579,11 @@ INFO:     127.0.0.1:48550 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:48552 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:48556 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:48570 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:48810 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:48810 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:48584 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:48588 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:48600 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:41174 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:41174 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:59400 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:59414 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:59426 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -596,7 +596,7 @@ INFO:     127.0.0.1:59458 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:59462 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:59466 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:59478 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:45982 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:45982 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:59484 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:59488 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:59498 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -618,7 +618,7 @@ INFO:     127.0.0.1:59628 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:59632 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:59646 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:59652 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:45994 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:45994 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:40752 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:40760 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:40764 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -637,11 +637,11 @@ INFO:     127.0.0.1:40834 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:40850 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:40862 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:40872 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:45254 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:45254 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:40884 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:40890 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:40896 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:37876 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:37876 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:40912 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:40918 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:40928 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -651,7 +651,7 @@ INFO:     127.0.0.1:40954 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:40966 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:40978 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:40984 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:45268 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:45268 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:46168 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:46184 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:46188 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -670,7 +670,7 @@ INFO:     127.0.0.1:46260 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:46272 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:46274 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:46288 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:36952 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:36952 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:46292 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:46304 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:46320 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -690,11 +690,11 @@ INFO:     127.0.0.1:46440 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:46444 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:46448 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:46464 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:36968 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:36968 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:52214 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:52230 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:52240 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:34252 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:34252 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:52250 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:52254 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:52268 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -713,7 +713,7 @@ INFO:     127.0.0.1:52344 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:52356 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:52366 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:52378 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:53004 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:53004 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:52382 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:52384 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:52386 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -726,7 +726,7 @@ INFO:     127.0.0.1:52456 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:52468 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:52484 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:52486 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:53012 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:53012 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60322 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60326 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60330 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -743,11 +743,11 @@ INFO:     127.0.0.1:60390 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60392 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60396 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60412 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:36018 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:36018 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60418 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60420 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60432 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:33648 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:33648 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60448 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60454 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60456 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -766,7 +766,7 @@ INFO:     127.0.0.1:60580 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60584 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60594 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60600 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:36022 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:36022 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:47200 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:47208 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:47224 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -788,7 +788,7 @@ INFO:     127.0.0.1:47358 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:47366 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:47372 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:47376 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:35188 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:35188 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:47378 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:47386 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:47396 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -804,11 +804,11 @@ INFO:     127.0.0.1:47458 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:47472 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:47476 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:47492 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:35194 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:35194 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:47506 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:47522 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:47532 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:42310 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:42310 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:34174 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:34178 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:34192 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -827,7 +827,7 @@ INFO:     127.0.0.1:34262 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:34274 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:34280 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:34288 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:46124 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:46124 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:34294 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:34304 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:34314 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -849,7 +849,7 @@ INFO:     127.0.0.1:34440 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:34442 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:34446 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:34456 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:46126 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:46126 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:34464 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:34466 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:34472 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -871,11 +871,11 @@ INFO:     127.0.0.1:39558 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:39562 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:39566 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:39574 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:52738 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:52738 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:39580 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:39592 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:39596 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:39542 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:39542 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:39604 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:39616 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:39628 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -891,7 +891,7 @@ INFO:     127.0.0.1:39698 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:39708 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:39710 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:39712 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:52742 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:52742 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:34826 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:34830 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:34842 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -913,7 +913,7 @@ INFO:     127.0.0.1:34956 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:34958 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:34968 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:34980 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:57112 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:57112 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:34994 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:35000 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:35016 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -930,8 +930,8 @@ INFO:     127.0.0.1:35110 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:35114 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:35128 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:35132 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:57124 - "GET /metrics HTTP/1.1" 200 OK
-INFO:     192.168.1.19:60126 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:57124 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:60126 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:58366 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:58374 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:58384 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -950,7 +950,7 @@ INFO:     127.0.0.1:58484 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:58494 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:58506 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:58508 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:43174 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:43174 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:58520 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:58528 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:58536 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -969,7 +969,7 @@ INFO:     127.0.0.1:58662 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:58672 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:58678 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:58682 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:43178 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:43178 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:58698 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:58706 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:58716 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -994,11 +994,11 @@ INFO:     127.0.0.1:45528 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:45538 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:45542 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:45546 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:44368 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:44368 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:45554 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:45560 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:45564 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:59006 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:59006 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:45578 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:45590 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:45598 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -1011,7 +1011,7 @@ INFO:     127.0.0.1:45654 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:45662 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:45676 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:45690 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:44378 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:44378 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:59684 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:59694 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:59710 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -1033,7 +1033,7 @@ INFO:     127.0.0.1:59812 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:59826 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:59832 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:59838 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:32974 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:32974 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:59852 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:59858 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:59866 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -1052,11 +1052,11 @@ INFO:     127.0.0.1:59980 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:59990 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60004 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60012 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:32988 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:32988 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:51946 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:51960 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:51972 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:38900 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:38900 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:51974 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:51980 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:51992 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -1072,7 +1072,7 @@ INFO:     127.0.0.1:52070 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:52074 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:52076 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:52092 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:52144 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:52144 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:52108 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:52112 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:52118 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -1088,7 +1088,7 @@ INFO:     127.0.0.1:52188 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:52202 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:52218 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:52230 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:52154 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:52154 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:57316 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:57322 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:57332 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -1112,11 +1112,11 @@ INFO:     127.0.0.1:57444 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:57458 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:57472 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:57486 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:54582 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:54582 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:57494 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:57498 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:57512 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:47968 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:47968 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:57526 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:57536 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:57550 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -1132,7 +1132,7 @@ INFO:     127.0.0.1:57646 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:57650 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:57656 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:57666 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:54594 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:54594 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:57674 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:57690 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:57696 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -1151,7 +1151,7 @@ INFO:     127.0.0.1:39096 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:39106 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:39110 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:39124 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:36260 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:36260 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:39136 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:39152 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:39166 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -1167,14 +1167,14 @@ INFO:     127.0.0.1:39228 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:39232 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:39236 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:39250 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:36262 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:36262 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:39264 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:39268 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:39272 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:39274 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:39284 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:39298 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:43858 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:43858 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:56218 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:56224 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:56226 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -1193,7 +1193,7 @@ INFO:     127.0.0.1:56306 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:56308 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:56312 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:56326 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:55078 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:55078 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:56334 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:56350 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:56360 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -1212,7 +1212,7 @@ INFO:     127.0.0.1:56460 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:56476 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:56488 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:56504 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:55094 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:55094 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37018 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37022 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37038 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -1231,11 +1231,11 @@ INFO:     127.0.0.1:37120 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37134 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37148 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37152 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:49022 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:49022 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37160 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37162 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37170 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:35662 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:35662 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37182 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37194 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37204 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -1252,7 +1252,7 @@ INFO:     127.0.0.1:37276 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37284 - "GET /v1/models HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37290 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37296 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:49034 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:49034 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:49474 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:49490 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:49498 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -1263,7 +1263,7 @@ INFO:     127.0.0.1:49508 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:49510 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:49526 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:49540 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:35764 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:35764 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:49546 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:49550 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:49564 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -1275,10 +1275,10 @@ INFO:     127.0.0.1:49606 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:49610 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:49626 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:49638 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:35770 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:35770 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:49640 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37524 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:42270 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:42270 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37530 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37532 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37544 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -1289,7 +1289,7 @@ INFO:     127.0.0.1:37546 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37554 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37556 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37560 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:32874 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:32874 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37564 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37566 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37582 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -1299,7 +1299,7 @@ INFO:     127.0.0.1:37610 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37620 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37624 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37626 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:32884 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:32884 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37634 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:53074 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:53090 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -1312,16 +1312,16 @@ INFO:     127.0.0.1:53116 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:53118 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:53126 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:53130 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:46856 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:46856 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:53142 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:53150 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:54812 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:54812 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:53156 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:53166 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:53180 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:53194 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:53202 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:46866 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:46866 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:53208 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:53212 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:42308 - "GET /metrics HTTP/1.1" 200 OK
@@ -1345,7 +1345,7 @@ INFO:     127.0.0.1:42428 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:42434 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:42442 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:42448 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:37152 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:37152 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:42460 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:42472 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:42480 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -1358,11 +1358,11 @@ INFO:     127.0.0.1:42522 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:42524 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:42540 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:42550 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:37166 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:37166 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:42566 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:42572 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:42576 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:45068 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:45068 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36362 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36376 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36390 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -1375,7 +1375,7 @@ INFO:     127.0.0.1:36422 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36432 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36444 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36460 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:33472 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:33472 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36468 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36478 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36494 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -1393,4 +1393,4 @@ INFO:     127.0.0.1:36600 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36606 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36616 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36618 - "GET /v1/models HTTP/1.1" 200 OK
-INFO:     192.168.1.19:33482 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:33482 - "GET /metrics HTTP/1.1" 200 OK

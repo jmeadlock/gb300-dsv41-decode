@@ -520,10 +520,10 @@ INFO:     Waiting for application startup.
 INFO:     Application startup complete.
 INFO:     127.0.0.1:41792 - "GET /health HTTP/1.1" 200 OK
 INFO:     127.0.0.1:41798 - "GET /v1/models HTTP/1.1" 200 OK
-INFO:     192.168.1.19:54744 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:54744 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:41800 - "GET /v1/models HTTP/1.1" 200 OK
 INFO:     127.0.0.1:41804 - "GET /v1/models HTTP/1.1" 200 OK
-INFO:     192.168.1.19:37034 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:37034 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:41820 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:41834 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 (EngineCore pid=405) WARNING 11-10 04:16:42 [jit_monitor.py:140] Triton kernel JIT compilation during inference: _block_scores_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
@@ -548,7 +548,7 @@ INFO:     127.0.0.1:41914 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:41930 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:41940 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 (EngineCore pid=405) WARNING 11-10 04:16:45 [jit_monitor.py:140] Triton kernel JIT compilation during inference: _ring_slot_mapping_kernel. This causes a latency spike; consider extending warmup to cover this shape/config.
-INFO:     192.168.1.19:54746 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:54746 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60624 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60626 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60628 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -564,7 +564,7 @@ INFO:     127.0.0.1:60690 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60696 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60704 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60706 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:43450 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:43450 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60710 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60712 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60726 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -577,14 +577,14 @@ INFO:     127.0.0.1:60766 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60776 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60788 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60796 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:43458 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:43458 - "GET /metrics HTTP/1.1" 200 OK
 (APIServer pid=1) INFO 11-10 04:16:56 [loggers.py:320] Engine 000: Avg prompt throughput: 20.6 tokens/s, Avg generation throughput: 188.5 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.0%, Prefix cache hit rate: 0.0%, External prefix cache hit rate: 0.0%
 (APIServer pid=1) INFO 11-10 04:16:56 [metrics.py:120] SpecDecoding metrics: Mean acceptance length: 2.74, Accepted throughput: 120.19 tokens/s, Drafted throughput: 377.97 tokens/s, Accepted: 1202 tokens, Drafted: 3780 tokens, Per-position acceptance rate: 0.677, 0.442, 0.272, 0.175, 0.106, 0.043, 0.026, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, Avg Draft acceptance rate: 31.8%
 (APIServer pid=1) INFO 11-10 04:16:56 [metrics.py:103] KV Transfer metrics: vllm:kv_offload_cpu_cache_usage_perc=0.0, vllm:kv_offload_cpu_cache_write_usage_perc=0.0, vllm:kv_offload_cpu_cache_read_usage_perc=0.0, vllm:kv_offload_stores_skipped=0, vllm:kv_offload_lookup_sync_delay_seconds_count=7, vllm:kv_offload_lookup_sync_delay_seconds_sum=2.1408020984381437e-05
 INFO:     127.0.0.1:54300 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:54310 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:54314 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:36950 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:36950 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:54322 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:54324 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:54330 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -594,7 +594,7 @@ INFO:     127.0.0.1:54360 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:54366 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:54372 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:54384 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:41772 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:41772 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:54388 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:54404 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:54416 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -613,7 +613,7 @@ INFO:     127.0.0.1:54528 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:54534 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:54538 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:54546 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:41780 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:41780 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37824 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37832 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37836 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -632,11 +632,11 @@ INFO:     127.0.0.1:37922 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37936 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37946 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37960 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:38596 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:38596 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37970 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37980 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37990 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:54120 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:54120 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:37994 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:38004 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:38006 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -646,7 +646,7 @@ INFO:     127.0.0.1:38020 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:38036 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:38048 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:38056 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:38606 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:38606 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:38070 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:38080 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:38092 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -665,7 +665,7 @@ INFO:     127.0.0.1:50880 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:50884 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:50900 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:50912 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:50654 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:50654 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:50916 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:50918 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:50934 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -688,14 +688,14 @@ INFO:     127.0.0.1:51058 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:51072 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:51086 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:51096 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:50656 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:50656 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:47274 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:47278 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:47290 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 (APIServer pid=1) INFO 11-10 04:17:26 [loggers.py:320] Engine 000: Avg prompt throughput: 48.8 tokens/s, Avg generation throughput: 253.5 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.0%, Prefix cache hit rate: 0.0%, External prefix cache hit rate: 0.0%
 (APIServer pid=1) INFO 11-10 04:17:26 [metrics.py:120] SpecDecoding metrics: Mean acceptance length: 3.39, Accepted throughput: 179.60 tokens/s, Drafted throughput: 416.50 tokens/s, Accepted: 1796 tokens, Drafted: 4165 tokens, Per-position acceptance rate: 0.734, 0.531, 0.398, 0.288, 0.238, 0.116, 0.087, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, Avg Draft acceptance rate: 43.1%
 (APIServer pid=1) INFO 11-10 04:17:26 [metrics.py:103] KV Transfer metrics: vllm:kv_offload_cpu_cache_usage_perc=0.0, vllm:kv_offload_cpu_cache_write_usage_perc=0.0, vllm:kv_offload_cpu_cache_read_usage_perc=0.0, vllm:kv_offload_stores_skipped=0, vllm:kv_offload_lookup_sync_delay_seconds_count=12, vllm:kv_offload_lookup_sync_delay_seconds_sum=3.488105721771717e-05
-INFO:     192.168.1.19:53240 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:53240 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:47302 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:47318 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:47324 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -708,7 +708,7 @@ INFO:     127.0.0.1:47360 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:47370 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:47382 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:47392 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:51404 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:51404 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:47404 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:47412 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:47426 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -725,7 +725,7 @@ DS41_FASTPATH suffix: dynamic K: chose 5 x3014, 7 x1082 (explore 154 up, 0 down;
 INFO:     127.0.0.1:47520 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:47530 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:47540 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:51414 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:51414 - "GET /metrics HTTP/1.1" 200 OK
 (APIServer pid=1) INFO 11-10 04:17:36 [loggers.py:320] Engine 000: Avg prompt throughput: 28.3 tokens/s, Avg generation throughput: 240.1 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.0%, Prefix cache hit rate: 0.0%, External prefix cache hit rate: 0.0%
 (APIServer pid=1) INFO 11-10 04:17:36 [metrics.py:120] SpecDecoding metrics: Mean acceptance length: 2.82, Accepted throughput: 155.29 tokens/s, Drafted throughput: 465.27 tokens/s, Accepted: 1553 tokens, Drafted: 4653 tokens, Per-position acceptance rate: 0.687, 0.465, 0.292, 0.190, 0.116, 0.043, 0.027, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, Avg Draft acceptance rate: 33.4%
 (APIServer pid=1) INFO 11-10 04:17:36 [metrics.py:103] KV Transfer metrics: vllm:kv_offload_cpu_cache_usage_perc=0.0, vllm:kv_offload_cpu_cache_write_usage_perc=0.0, vllm:kv_offload_cpu_cache_read_usage_perc=0.0, vllm:kv_offload_stores_skipped=0, vllm:kv_offload_lookup_sync_delay_seconds_count=9, vllm:kv_offload_lookup_sync_delay_seconds_sum=2.5920046027749777e-05
@@ -744,12 +744,12 @@ INFO:     127.0.0.1:35618 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:35634 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:35650 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:35656 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:57810 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:57810 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:35668 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:35684 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:35688 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:35696 - "GET /metrics HTTP/1.1" 200 OK
-INFO:     192.168.1.19:33682 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:33682 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:35712 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:35716 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:35730 - "GET /metrics HTTP/1.1" 200 OK
@@ -764,7 +764,7 @@ INFO:     127.0.0.1:35780 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:35786 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:35788 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:35798 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:57814 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:57814 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:57646 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:57662 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:57668 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -783,7 +783,7 @@ INFO:     127.0.0.1:57744 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:57760 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:57766 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:57780 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:33778 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:33778 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:57788 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:57794 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:57802 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -799,14 +799,14 @@ INFO:     127.0.0.1:57892 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:57896 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:57900 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:57916 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:33790 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:33790 - "GET /metrics HTTP/1.1" 200 OK
 (APIServer pid=1) INFO 11-10 04:17:56 [loggers.py:320] Engine 000: Avg prompt throughput: 28.8 tokens/s, Avg generation throughput: 229.3 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.0%, Prefix cache hit rate: 0.0%, External prefix cache hit rate: 0.0%
 (APIServer pid=1) INFO 11-10 04:17:56 [metrics.py:120] SpecDecoding metrics: Mean acceptance length: 2.69, Accepted throughput: 144.09 tokens/s, Drafted throughput: 447.07 tokens/s, Accepted: 1441 tokens, Drafted: 4471 tokens, Per-position acceptance rate: 0.705, 0.423, 0.259, 0.169, 0.099, 0.022, 0.016, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, Avg Draft acceptance rate: 32.2%
 (APIServer pid=1) INFO 11-10 04:17:56 [metrics.py:103] KV Transfer metrics: vllm:kv_offload_cpu_cache_usage_perc=0.0, vllm:kv_offload_cpu_cache_write_usage_perc=0.0, vllm:kv_offload_cpu_cache_read_usage_perc=0.0, vllm:kv_offload_stores_skipped=0, vllm:kv_offload_lookup_sync_delay_seconds_count=9, vllm:kv_offload_lookup_sync_delay_seconds_sum=2.8064940124750137e-05
 INFO:     127.0.0.1:58818 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:58822 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:58830 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:55948 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:55948 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:58842 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:58852 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:58858 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -820,7 +820,7 @@ INFO:     127.0.0.1:58926 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:58932 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:58948 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:58958 - "GET /metrics HTTP/1.1" 200 OK
-INFO:     192.168.1.19:45172 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:45172 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:58968 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:58992 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:59004 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -834,7 +834,7 @@ DS41_FASTPATH engram_side: not forked: T=337 outside 1..32
 INFO:     127.0.0.1:59026 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:59038 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:59048 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:45174 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:45174 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:59050 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:59058 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:40102 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -852,9 +852,9 @@ INFO:     127.0.0.1:40192 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:40206 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:40210 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:40224 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:33474 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:33474 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:40228 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:57104 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:57104 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:40240 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:40254 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:40258 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -863,7 +863,7 @@ INFO:     127.0.0.1:40280 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:40284 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:40296 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:40312 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:33484 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:33484 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:40318 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:58336 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 (APIServer pid=1) INFO 11-10 04:18:16 [loggers.py:320] Engine 000: Avg prompt throughput: 89.6 tokens/s, Avg generation throughput: 567.0 tokens/s, Running: 8 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.2%, Prefix cache hit rate: 0.0%, External prefix cache hit rate: 0.0%
@@ -906,15 +906,15 @@ INFO:     127.0.0.1:58630 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:58634 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:58642 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:58646 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:33926 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:33926 - "GET /metrics HTTP/1.1" 200 OK
 DS41_FASTPATH engram_side: not forked: T=1053 outside 1..32
 INFO:     127.0.0.1:58662 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:58670 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:33938 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:33938 - "GET /metrics HTTP/1.1" 200 OK
 (APIServer pid=1) INFO 11-10 04:18:26 [loggers.py:320] Engine 000: Avg prompt throughput: 159.6 tokens/s, Avg generation throughput: 626.5 tokens/s, Running: 32 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.9%, Prefix cache hit rate: 0.0%, External prefix cache hit rate: 0.0%
 (APIServer pid=1) INFO 11-10 04:18:26 [metrics.py:120] SpecDecoding metrics: Mean acceptance length: 2.68, Accepted throughput: 391.29 tokens/s, Drafted throughput: 701.40 tokens/s, Accepted: 3914 tokens, Drafted: 7016 tokens, Per-position acceptance rate: 0.753, 0.534, 0.390, 0.003, 0.003, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, Avg Draft acceptance rate: 55.8%
 (APIServer pid=1) INFO 11-10 04:18:26 [metrics.py:103] KV Transfer metrics: vllm:kv_offload_cpu_cache_usage_perc=0.0, vllm:kv_offload_cpu_cache_write_usage_perc=0.0, vllm:kv_offload_cpu_cache_read_usage_perc=0.0, vllm:kv_offload_stores_skipped=0, vllm:kv_offload_lookup_sync_delay_seconds_count=38, vllm:kv_offload_lookup_sync_delay_seconds_sum=5.708803655579686e-05
-INFO:     192.168.1.19:47400 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:47400 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:35916 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:35926 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:35936 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -937,7 +937,7 @@ INFO:     127.0.0.1:36064 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36072 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36088 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36100 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:37264 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:37264 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36116 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36122 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36130 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -947,21 +947,21 @@ INFO:     127.0.0.1:36156 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36166 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36176 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36190 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:37280 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:37280 - "GET /metrics HTTP/1.1" 200 OK
 (APIServer pid=1) INFO 11-10 04:18:36 [loggers.py:320] Engine 000: Avg prompt throughput: 128.9 tokens/s, Avg generation throughput: 748.4 tokens/s, Running: 26 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.8%, Prefix cache hit rate: 0.0%, External prefix cache hit rate: 0.0%
 (APIServer pid=1) INFO 11-10 04:18:36 [metrics.py:120] SpecDecoding metrics: Mean acceptance length: 2.67, Accepted throughput: 469.08 tokens/s, Drafted throughput: 841.28 tokens/s, Accepted: 4692 tokens, Drafted: 8415 tokens, Per-position acceptance rate: 0.743, 0.538, 0.391, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, Avg Draft acceptance rate: 55.8%
 (APIServer pid=1) INFO 11-10 04:18:36 [metrics.py:103] KV Transfer metrics: vllm:kv_offload_cpu_cache_usage_perc=0.0, vllm:kv_offload_cpu_cache_write_usage_perc=0.0, vllm:kv_offload_cpu_cache_read_usage_perc=0.0, vllm:kv_offload_stores_skipped=0, vllm:kv_offload_lookup_sync_delay_seconds_count=30, vllm:kv_offload_lookup_sync_delay_seconds_sum=8.13439255580306e-05
 INFO:     127.0.0.1:36400 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36416 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36418 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:36268 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:36268 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36432 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36438 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36446 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36460 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36474 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36484 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:42038 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:42038 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36490 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36494 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36502 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -974,7 +974,7 @@ INFO:     127.0.0.1:36568 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36582 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36594 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36604 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:36284 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:36284 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36616 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36624 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36634 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -993,7 +993,7 @@ INFO:     127.0.0.1:60804 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60820 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60832 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60836 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:32854 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:32854 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60838 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60840 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60852 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -1009,7 +1009,7 @@ INFO:     127.0.0.1:60936 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60940 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60948 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60960 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-INFO:     192.168.1.19:32866 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:32866 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60964 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60978 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:60994 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -1019,7 +1019,7 @@ INFO:     127.0.0.1:32792 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 (APIServer pid=1) INFO 11-10 04:18:56 [loggers.py:320] Engine 000: Avg prompt throughput: 34.8 tokens/s, Avg generation throughput: 232.9 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.0%, Prefix cache hit rate: 0.0%, External prefix cache hit rate: 0.0%
 (APIServer pid=1) INFO 11-10 04:18:56 [metrics.py:120] SpecDecoding metrics: Mean acceptance length: 2.57, Accepted throughput: 142.59 tokens/s, Drafted throughput: 474.36 tokens/s, Accepted: 1426 tokens, Drafted: 4744 tokens, Per-position acceptance rate: 0.659, 0.410, 0.241, 0.142, 0.089, 0.021, 0.009, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, Avg Draft acceptance rate: 30.1%
 (APIServer pid=1) INFO 11-10 04:18:56 [metrics.py:103] KV Transfer metrics: vllm:kv_offload_cpu_cache_usage_perc=0.0, vllm:kv_offload_cpu_cache_write_usage_perc=0.0, vllm:kv_offload_cpu_cache_read_usage_perc=0.0, vllm:kv_offload_stores_skipped=0, vllm:kv_offload_lookup_sync_delay_seconds_count=11, vllm:kv_offload_lookup_sync_delay_seconds_sum=3.1648087315261364e-05
-INFO:     192.168.1.19:52722 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:52722 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36260 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36264 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36278 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -1028,4 +1028,4 @@ INFO:     127.0.0.1:36292 - "GET /v1/models HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36306 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36320 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     127.0.0.1:36332 - "GET /v1/models HTTP/1.1" 200 OK
-INFO:     192.168.1.19:51040 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:51040 - "GET /metrics HTTP/1.1" 200 OK

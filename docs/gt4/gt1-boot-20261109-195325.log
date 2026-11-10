@@ -522,4 +522,4 @@ INFO:     127.0.0.1:45142 - "GET /health HTTP/1.1" 200 OK
 INFO:     127.0.0.1:45152 - "GET /v1/models HTTP/1.1" 200 OK
 INFO:     127.0.0.1:45154 - "GET /v1/models HTTP/1.1" 200 OK
 INFO:     127.0.0.1:45168 - "GET /v1/models HTTP/1.1" 200 OK
-INFO:     192.168.1.19:56024 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:56024 - "GET /metrics HTTP/1.1" 200 OK

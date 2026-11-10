@@ -520,7 +520,7 @@ INFO:     Waiting for application startup.
 INFO:     Application startup complete.
 INFO:     127.0.0.1:41792 - "GET /health HTTP/1.1" 200 OK
 INFO:     127.0.0.1:41798 - "GET /v1/models HTTP/1.1" 200 OK
-INFO:     192.168.1.19:54744 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:54744 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:41800 - "GET /v1/models HTTP/1.1" 200 OK
 INFO:     127.0.0.1:41804 - "GET /v1/models HTTP/1.1" 200 OK
-INFO:     192.168.1.19:37034 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:37034 - "GET /metrics HTTP/1.1" 200 OK

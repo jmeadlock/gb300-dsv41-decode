@@ -523,8 +523,8 @@ DS41_FASTPATH suffix: dynamic K v3 on: batch-1 normal steps verify 5 or 7 drafts
 INFO:     Started server process [1]
 INFO:     Waiting for application startup.
 INFO:     Application startup complete.
-INFO:     192.168.1.19:53884 - "GET /metrics HTTP/1.1" 200 OK
-INFO:     192.168.1.19:42980 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:53884 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     <lan-host>:42980 - "GET /metrics HTTP/1.1" 200 OK
 INFO:     127.0.0.1:33640 - "GET /health HTTP/1.1" 200 OK
 INFO:     127.0.0.1:33648 - "GET /v1/models HTTP/1.1" 200 OK
 INFO:     127.0.0.1:33650 - "GET /v1/models HTTP/1.1" 200 OK
