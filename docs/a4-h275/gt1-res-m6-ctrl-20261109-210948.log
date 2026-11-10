@@ -1,0 +1,1 @@
+ctrl {"hyst": 3.0} seq 1794280660214: ack yes after 0.597 s / 1 nudges; ['hyst=3.0']; settled(ack) True; state {"pending": 38, "at_boot": false, "freeze": false, "hot_moved": 1673, "swaps": 9860}

@@ -1,0 +1,137 @@
+{
+ "stamp": "20261109-210948",
+ "cells": {
+  "m0a": {
+   "prompts": 20,
+   "prompts_measured": 20,
+   "errors": 0,
+   "steps": 1506.0,
+   "gen_tokens": 4596.0,
+   "step_ms": 12.262,
+   "tokens_per_step": 3.052,
+   "ms_per_token": 4.018,
+   "set": "A"
+  },
+  "m0b": {
+   "prompts": 20,
+   "prompts_measured": 20,
+   "errors": 0,
+   "steps": 1559.0,
+   "gen_tokens": 4606.0,
+   "step_ms": 12.107,
+   "tokens_per_step": 2.954,
+   "ms_per_token": 4.098,
+   "set": "B"
+  },
+  "m1a": {
+   "prompts": 20,
+   "prompts_measured": 20,
+   "errors": 0,
+   "steps": 1511.0,
+   "gen_tokens": 4596.0,
+   "step_ms": 12.171,
+   "tokens_per_step": 3.042,
+   "ms_per_token": 4.001,
+   "set": "A"
+  },
+  "m1b": {
+   "prompts": 20,
+   "prompts_measured": 20,
+   "errors": 0,
+   "steps": 1509.0,
+   "gen_tokens": 4596.0,
+   "step_ms": 10.46,
+   "tokens_per_step": 3.046,
+   "ms_per_token": 3.434,
+   "set": "A"
+  },
+  "m1c": {
+   "prompts": 20,
+   "prompts_measured": 20,
+   "errors": 0,
+   "steps": 1509.0,
+   "gen_tokens": 4596.0,
+   "step_ms": 10.461,
+   "tokens_per_step": 3.046,
+   "ms_per_token": 3.435,
+   "set": "A"
+  },
+  "m2": {
+   "prompts": 20,
+   "prompts_measured": 20,
+   "errors": 0,
+   "steps": 1559.0,
+   "gen_tokens": 4606.0,
+   "step_ms": 10.875,
+   "tokens_per_step": 2.954,
+   "ms_per_token": 3.681,
+   "set": "B"
+  },
+  "m3": {
+   "prompts": 20,
+   "prompts_measured": 20,
+   "errors": 0,
+   "steps": 1509.0,
+   "gen_tokens": 4596.0,
+   "step_ms": 10.917,
+   "tokens_per_step": 3.046,
+   "ms_per_token": 3.584,
+   "set": "A"
+  },
+  "m4": {
+   "prompts": 20,
+   "prompts_measured": 20,
+   "errors": 0,
+   "steps": 1559.0,
+   "gen_tokens": 4606.0,
+   "step_ms": 10.775,
+   "tokens_per_step": 2.954,
+   "ms_per_token": 3.647,
+   "set": "B"
+  },
+  "m6a": {
+   "prompts": 20,
+   "prompts_measured": 20,
+   "errors": 0,
+   "steps": 1511.0,
+   "gen_tokens": 4596.0,
+   "step_ms": 10.796,
+   "tokens_per_step": 3.042,
+   "ms_per_token": 3.549,
+   "set": "A"
+  },
+  "m6b": {
+   "prompts": 20,
+   "prompts_measured": 20,
+   "errors": 0,
+   "steps": 1559.0,
+   "gen_tokens": 4606.0,
+   "step_ms": 10.445,
+   "tokens_per_step": 2.954,
+   "ms_per_token": 3.535,
+   "set": "B"
+  },
+  "m5": {
+   "prompts": 20,
+   "prompts_measured": 20,
+   "errors": 0,
+   "steps": 1510.0,
+   "gen_tokens": 4596.0,
+   "step_ms": 12.209,
+   "tokens_per_step": 3.044,
+   "ms_per_token": 4.011,
+   "set": "A"
+  }
+ },
+ "ratios": {
+  "first_sight_M2_over_M0b": 0.8982,
+  "adapted_A_M1c_over_M0a": 0.8531,
+  "seen_interleaved_(M3+M4)_over_(M0a+M0b)": 0.8901,
+  "thrash_M3_over_M1c": 1.0436,
+  "restore_M5_over_M0a": 0.9957
+ },
+ "audit_mismatches": [
+  0,
+  0
+ ]
+}

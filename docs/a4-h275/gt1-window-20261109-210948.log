@@ -1,0 +1,62 @@
+2026-11-09 21:09:48 CST [gt1] == card GT1 preflight (window a4-h275-1109) log /home/milo/dsv41/decode/scratch/gt1-window-20261109-210948.log
+2026-11-09 21:09:48 CST [gt1] preflight OK: commit 18a3227 A4 prep: hot maps Garner-255 + 10/20 per layer (H 265/275; KV has only 19 GiB to give, so ~280 is the ceiling at 1M context); GT4 optional hysteresis arm M6 (GT1_MIX_HYST); dirty []; GPU NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, GPU-d07eb6e6-7053-42a7-6811-7bb833266182, 95682 MiB, 97887 MiB, 0 %; apps [1729400, 95554 MiB;1730572, 242864 MiB]; MemAvailable 200.8 GiB; :30006 serves ["id":"dsv41-flash-uva","id":"modelperm-93b2e62d607f9cd8","id":"deepseek-v4.1-flash","id":"modelperm-a3c19b002967ce02"]; restore Pg61 at end: 1 (GT1_RESTORE=auto)
+2026-11-09 21:09:48 CST [gt1] == Pg61 down
+2026-11-09 21:10:29 CST [gt1] Pg61 down rc=0 (2026-11-09 21:10:29 CST [pg61] down; peer shm removed (verified absent), containers stopped, watchdog stopped)
+2026-11-09 21:10:34 CST [gt1] GPU memory.used 120 MiB, compute apps 0
+2026-11-09 21:10:34 CST [gt1] == build /home/milo/dsv41/gracetier (copy of /home/milo/dsv41/garner/pg61-work/tree + gracetier)
+2026-11-09 21:10:34 CST [gt1] applied patches/0001-boundary-gracetier.patch (5 hunks, clean)
+2026-11-09 21:10:34 CST [gt1] applied patches/0002-components-gracetier.patch (2 hunks, clean)
+warning: serve/serve.sh has type 100755, expected 100644
+2026-11-09 21:10:34 CST [gt1] applied serve-gracetier.patch (4 hunks, clean)
+2026-11-09 21:10:34 CST [gt1] residency: gracetier-res.json = {"mode": "adaptive", "freeze": true}; gracetier_rt + gracetier_res residency_policy
+make_rowmap_allres: 40 layers, H=275 (per-layer [275]), source rowmap-mix-v1-h255.json sha256 10df39c60ef7d1fb, hot_map hot-garner255-plus-275.json, all entries >= 0, permutation per layer -> /home/milo/dsv41/gracetier/tree/fastpath/hook/rowmap-allres.json sha256 01c2663808d7f7bf
+policy.env: DS41_PORT=30006 DS41_SERVED=dsv41-flash-gracetier DS41_ALIASES=deepseek-v4.1-flash DS41_GPU_MODE=cdi DS41_NO_KEY=1 DS41_MAXLEN=1048576 DS41_KV=fp8_ds_mla DS41_OFFLOAD_GB=48 DS41_EFFORT_DEFAULT=0 DS41_OVERLAY_58132_DIR=/home/milo/dsv41/gracetier/overlay-vllm DS41_PEER3_SPINS=1000000000000
+2026-11-09 21:10:34 CST [gt1] launch-gt1.sh: 19 changed lines vs launch-pg61.sh
+2026-11-09 21:10:34 CST [gt1] built: 128 files hashed; component 543d89204e4e087b; rowmap-allres 01c2663808d7f7bf
+2026-11-09 21:10:34 CST [gt1] == boot gracetier on :30006 (dsv41-flash-gracetier)
+2026-11-09 21:15:13 CST [gt1] up rc=0 (2026-11-09 21:15:13 CST [pg61] UP on :30006 (gracetier: no RTX sidecar, no p3 watchdog) 2026-11-09 21:15:13 CST [pg61] soak clock started: {"soak_start_utc": "2026-11-10T03:15:13Z", "soak_start_local")
+G1: up rc 0; ACTIVE gracetier yes; post-load budget fits True; components ACTIVE 23; fatal lines 0 -> PASS
+    DS41_FASTPATH gracetier: HOST_RAM_BUDGET [pre-alloc: the cold pool must fit now; Engram / KV residency is checked after load_model] engram 189.13 GiB (resident) + cold_pool 72.98 GiB (pending) + kv_offload 48.0 GiB (resident) = 310.11 GiB; MemAvailable 256.32 GiB - pending 72.98 GiB = headroom 183.34 GiB vs floor 32.0 GiB -> fits {"GiB": {"MemAvailable": 256.32, "cold_pool": 72.98, "engram": 189.1
+    DS41_FASTPATH gracetier: HOST_RAM_BUDGET [post-load: Engram + cold pool resident, KV overflow pending] engram 189.13 GiB (resident) + cold_pool 72.98 GiB (resident) + kv_offload 48.0 GiB (pending) = 310.11 GiB; MemAvailable 186.66 GiB - pending 48.0 GiB = headroom 138.66 GiB vs floor 32.0 GiB -> fits {"GiB": {"MemAvailable": 186.66, "cold_pool": 72.98, "engram": 189.13, "floor": 32.0, "headroom": 
+    DS41_FASTPATH gracetier: ENGAGED: 40 layers, H [275], G = 384, 26160 cold tensors in Grace (72.98 GiB, read 56.3 s, registered 0.21 s); VMM {"alloc_bytes": 196626874368, "allocs": [["shared.l1", 1285554176], ["shared.l2", 641728512], ["L0.l1.private", 3244294144], ["L0.l2.private", 1623195648], ["L1.l1.private", 3244294144], ["L1.l2.private", 1623195648], ["L2.l1.private", 3244294144], ["L2.l2.pri
+    DS41_FASTPATH gracetier: parity slot0 layer 0 (our transform of the loader's raw hot slot 0 vs vLLM's finalized group 0): {"l1_sf": true, "l1_weight": true, "l2_sf": true, "l2_weight": true, "names": ["w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"], "ok": true}
+    (EngineCore pid=403) INFO 11-10 03:14:05 [kv_cache_utils.py:2464] GPU KV cache size: 2,763,997 tokens, Maximum concurrency for 1,048,576 tokens per request: 2.64x
+2026-11-09 21:15:14 CST [gt1] == card GT3: adaptive residency cells R0..R5 (control + telemetry /home/milo/dsv41/gracetier/home/state/prof/gracetier-res)
+DS41_FASTPATH gracetier: residency config /fastpath/gracetier-res.json: {"freeze": true, "mode": "adaptive"}
+DS41_FASTPATH gracetier: GPUModelRunner.execute_model wrapped: residency barrier before every call
+DS41_FASTPATH gracetier: [gracetier-res] adaptive residency on 40 layers (H [275], G 384): drain_n 64 swaps/drain 2 cap/barrier 4 hyst 1.5 min_abs 8.0 halflife 500.0; freeze=1; ctrl + telemetry /prof/gracetier-res; boot digests 1.98 s
+DS41_FASTPATH gracetier: residency: manager over 40 layers; the SF banks it swaps are module._transformed_l1/l2_weights[1] as they are after load (40/40 layers retired by a12_retire into its compressible allocation); counter int32 (40, 384), counted calls <= 1536 ids; freeze=1
+DS41_FASTPATH gracetier: residency: first barrier: weights and SF banks of 40 layers unchanged since load_model
+DS41_FASTPATH gracetier: stream check: 64 eager gt_stage calls inside execute_model ran on the barrier's stream
+2026-11-09 21:15:14 CST [gt1] == card GT4: mixed traffic, sets A / B of 20 prompts x 256 tokens, C1
+2026-11-09 21:15:14 CST [gt1] == M0 frozen at the boot map: pass A, pass B (controls)
+2026-11-09 21:15:34 CST [gt1] m0a rc=0 pass A: 20/20 prompts, errors 0; ms/step 12.262 tok/step 3.052 ms/token 4.018; per-prompt ms/step min 9.948 max 17.825
+2026-11-09 21:15:54 CST [gt1] m0b rc=0 pass B: 20/20 prompts, errors 0; ms/step 12.107 tok/step 2.954 ms/token 4.098; per-prompt ms/step min 10.113 max 16.017
+2026-11-09 21:15:54 CST [gt1] == M1 unfreeze + baseline; pass A x 3
+2026-11-09 21:15:55 CST [gt1] m1-ctrl rc=0 ctrl {"freeze": false, "baseline": true} seq 1794280554070: ack yes after 1.077 s / 1 nudges; ['freeze=0', 'baseline']; settled(ack) True; state {"pending": 0, "at_boot": true, "freeze": false, "hot_moved": 0, "swaps": 0}
+2026-11-09 21:16:14 CST [gt1] m1a rc=0 pass A: 20/20 prompts, errors 0; ms/step 12.171 tok/step 3.042 ms/token 4.001; per-prompt ms/step min 10.128 max 17.112
+2026-11-09 21:16:30 CST [gt1] m1b rc=0 pass A: 20/20 prompts, errors 0; ms/step 10.46 tok/step 3.046 ms/token 3.434; per-prompt ms/step min 9.38 max 15.9
+2026-11-09 21:16:47 CST [gt1] m1c rc=0 pass A: 20/20 prompts, errors 0; ms/step 10.461 tok/step 3.046 ms/token 3.435; per-prompt ms/step min 9.235 max 16.0
+2026-11-09 21:16:47 CST [gt1] == M2 pass B (first sight); M3 pass A again; M4 pass B again
+2026-11-09 21:17:05 CST [gt1] m2 rc=0 pass B: 20/20 prompts, errors 0; ms/step 10.875 tok/step 2.954 ms/token 3.681; per-prompt ms/step min 9.105 max 16.75
+2026-11-09 21:17:22 CST [gt1] m3 rc=0 pass A: 20/20 prompts, errors 0; ms/step 10.917 tok/step 3.046 ms/token 3.584; per-prompt ms/step min 9.546 max 18.0
+2026-11-09 21:17:40 CST [gt1] m4 rc=0 pass B: 20/20 prompts, errors 0; ms/step 10.775 tok/step 2.954 ms/token 3.647; per-prompt ms/step min 9.035 max 16.733
+2026-11-09 21:17:40 CST [gt1] == M6 hyst 3.0; pass A, pass B
+2026-11-09 21:17:40 CST [gt1] m6-ctrl rc=0 ctrl {"hyst": 3.0} seq 1794280660214: ack yes after 0.597 s / 1 nudges; ['hyst=3.0']; settled(ack) True; state {"pending": 38, "at_boot": false, "freeze": false, "hot_moved": 1673, "swaps": 9860}
+2026-11-09 21:17:57 CST [gt1] m6a rc=0 pass A: 20/20 prompts, errors 0; ms/step 10.796 tok/step 3.042 ms/token 3.549; per-prompt ms/step min 9.484 max 17.477
+2026-11-09 21:18:15 CST [gt1] m6b rc=0 pass B: 20/20 prompts, errors 0; ms/step 10.445 tok/step 2.954 ms/token 3.535; per-prompt ms/step min 8.784 max 15.917
+2026-11-09 21:18:15 CST [gt1] == M5 freeze, audit, restore_map, audit, pass A
+2026-11-09 21:18:17 CST [gt1] m5-audit1 rc=0 ctrl {"audit": {"moved": true, "random": 64}} seq 1794280695081: ack yes after 2.232 s / 2 nudges; ['audit mismatches=0']; settled(ack) True; state {"pending": 48, "at_boot": false, "freeze": false, "hot_moved": 1615, "swaps": 11465}; audit {"checked": 8101, "moved": 5541, "random": 2560, "mismatches": 0, "ms": 1130.3}
+2026-11-09 21:18:44 CST [gt1] m5-restore rc=0 ctrl {"freeze": true, "restore_map": true} seq 1794280697365: ack yes after 26.99 s / 50 nudges; ['freeze=1', 'restore_map queued=9629 exact=1 dropped_pending=0']; settled(boot) True; state {"pending": 0, "at_boot": true, "freeze": true, "hot_moved": 0, "swaps": 21142}
+2026-11-09 21:18:46 CST [gt1] m5-audit2 rc=0 ctrl {"audit": {"moved": true, "random": 64}} seq 1794280724415: ack yes after 1.662 s / 1 nudges; ['audit mismatches=0']; settled(ack) True; state {"pending": 0, "at_boot": true, "freeze": true, "hot_moved": 0, "swaps": 21142}; audit {"checked": 8142, "moved": 5582, "random": 2560, "mismatches": 0, "ms": 1133.0}
+2026-11-09 21:19:05 CST [gt1] m5 rc=0 pass A: 20/20 prompts, errors 0; ms/step 12.209 tok/step 3.044 ms/token 4.011; per-prompt ms/step min 9.953 max 17.725
+2026-11-09 21:19:05 CST [gt1] container running restarts=0; alive yes
+GT4: M0A(A) 12.262 | M0B(B) 12.107 | M1A(A) 12.171 | M1B(A) 10.460 | M1C(A) 10.461 | M2(B) 10.875 | M3(A) 10.917 | M4(B) 10.775 | M6A(A) 10.796 | M6B(B) 10.445 | M5(A) 12.209
+GT4 ratios: first_sight_M2_over_M0b 0.898; adapted_A_M1c_over_M0a 0.853; seen_interleaved_(M3+M4)_over_(M0a+M0b) 0.890; thrash_M3_over_M1c 1.044; restore_M5_over_M0a 0.996; audits [0, 0]
+GT4 tok/step: m0a 3.052 m0b 2.954 m1a 3.042 m1b 3.046 m1c 3.046 m2 2.954 m3 3.046 m4 2.954 m6a 3.042 m6b 2.954 m5 3.044
+2026-11-09 21:19:05 CST [gt1] == finish (G1=pass G2=skip G3=res-mix G4=skip G5=skip)
+2026-11-09 21:19:20 CST [gt1] gracetier down rc=0 (2026-11-09 21:19:20 CST [pg61] down; peer shm removed (verified absent), containers stopped, watchdog stopped)
+2026-11-09 21:19:20 CST [gt1] == restore Pg61
+2026-11-09 21:25:46 CST [gt1] restore rc=0 (2026-11-09 21:19:20 CST [gt1] restore clone: 6 changed lines )
+GT1 VERDICT 20261109-210948: G1 ACTIVE+budget=pass; G2 parity vs Pg61 A: identical None/None, flips None, weighted None, max|dlogp| None (skip); G3 ms/step None ms/token None (Pg61 None / None) (res-mix); G4 C32 None/None >= None tok, alive None (skip); G5 TTFT mean None ms (skip); restore rc 0
+2026-11-09 21:25:46 CST [gt1] == END

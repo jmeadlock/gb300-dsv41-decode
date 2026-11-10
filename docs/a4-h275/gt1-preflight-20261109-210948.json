@@ -1,0 +1,14 @@
+{
+ "stamp": "20261109-210948",
+ "window": "a4-h275-1109",
+ "commit": "18a3227 A4 prep: hot maps Garner-255 + 10/20 per layer (H 265/275; KV has only 19 GiB to give, so ~280 is the ceiling at 1M context); GT4 optional hysteresis arm M6 (GT1_MIX_HYST)",
+ "dirty": "",
+ "nvidia_smi": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, GPU-d07eb6e6-7053-42a7-6811-7bb833266182, 95682 MiB, 97887 MiB, 0 %",
+ "compute_apps": "1729400, 95554 MiB;1730572, 242864 MiB",
+ "MemAvailable_GiB": 200.8,
+ "pg61_models": "\"id\":\"dsv41-flash-uva\",\"id\":\"modelperm-93b2e62d607f9cd8\",\"id\":\"deepseek-v4.1-flash\",\"id\":\"modelperm-a3c19b002967ce02\"",
+ "restore_pg61_at_end": true,
+ "model_dir": "/models/DeepSeek-V4.1-Flash-1017-1bae0e1088993b9b82de08f59de5be5a34e42170",
+ "hot_map": "docs/maps/hot-garner255-plus-275.json",
+ "refused": null
+}
