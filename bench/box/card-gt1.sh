@@ -9,6 +9,10 @@
 # commit to test (this script does NOT git pull: bash reads a running script incrementally).
 # Optional env: GT1_HOT_MAP=<repo-relative hot map, e.g. docs/maps/hot-v26ar-seed-295.json> (default: the h255 split),
 #   GT1_SEED_CACHE=1 (copy Pg61's JIT kernel caches -- jit/ and flashinfer/ only, never vLLM's compile cache),
+#   GT1_NSYS=1 (A2 anatomy: nsys-wrapped server, one profiled cell after G1, then exit),
+#   GT1_RES=1 (card GT3, docs/HANDOFF-A3-RESIDENCY.md: adaptive residency. The build also copies runtime/gracetier_res.py
+#     + residency_policy.py into gracetier_rt/ and writes fastpath/gracetier-res.json = $GT1_RES_CONFIG, default
+#     {"mode": "adaptive", "freeze": true}; after G1 the cells R0..R5 below run instead of G2..G5, then exit),
 #   MODEL_DIR, GR, GT, DEC (box paths below).
 #
 # The tree: a copy of the Pg61 built tree ($GR/pg61-work/tree = Garner's clone at 8043a681 + our lane patches 01-05 +
@@ -26,6 +30,19 @@
 #   G3 w0/w0_drive.py step: 1 stream, 3 reps -> ms/step (spec counters) and ms/token; Pg61's phase-1 receipt beside it
 #   G4 bench/c32_smoke.py: 32 concurrent /v1/completions x >= 128 tokens; must not crash (all ok, server alive, no restart)
 #   G5 prefill / TTFT on the 8 fixture prompts (streamed, salted so the prefix cache cannot serve them), 2 reps
+# Card GT3 cells (GT1_RES=1; each to scratch/gt1-res-<cell>-$STAMP.*; control + telemetry in $GT/home/state/prof/gracetier-res,
+# the container's /prof/gracetier-res; bench/gt_res_drive.py writes ctrl.json and drives traffic until the server's
+# telemetry acknowledges it -- the manager reads the file at a counter drain, every 64 execute_model calls):
+#   R0  frozen at the boot map: w0_drive.py step (3 reps) = the same-boot static control; + a fixture capture (R3's reference)
+#   R1  unfreeze + baseline; C1 = the 8 fixture prompts x 256 tokens, looped 90 s -> cold share, swaps per drain, T90
+#   R2a freeze (map fitted to the fixture); step cell (the step prompt is not in the fixture) -> held-out ms/step
+#   R2b unfreeze; step cell x 5 -> adaptive ms/step = the last cell's 3 reps
+#   R3  freeze; fixture capture twice -> self-identical N/8; vs the R0-map capture N/8 (reported, not gated)
+#   R4  audit (every moved expert + 64 random per layer); restore_map; audit again; step cell -> mismatches (must be 0),
+#       ms/step back at R0 within 2 %
+#   R5  unfreeze; bench/c32_smoke.py; server alive
+#   Verdict: GT3: R0 <ms> | R2a <ms> | R2b <ms> | T90 <s> | cold share <a> -> <b> | audit <n> mismatches | C32 <pass>
+#   Adopt bar (pre-registered): R2b <= 0.90 x R0, T90 <= 20 s, audits 0, C32 alive, R4 within 2 % of R0.
 # Exit: 0 = ran (verdict line in the log + scratch/gt1-summary-$STAMP.json), 2 = preflight refused (nothing touched).
 set -u
 GR=${GR:-/home/milo/dsv41/garner}
@@ -79,6 +96,20 @@ done
 for m in __init__ gracetier_vmm gracetier_pool gracetier_stage dg_mega dg_moe host_tier ckpt; do
   [ -f "$DEC/runtime/$m.py" ] || refuse "missing runtime/$m.py"
 done
+RES_RT=""; RESDIR=$GT/home/state/prof/gracetier-res
+if [ "${GT1_RES:-0}" = 1 ]; then   # card GT3: the residency manager, its vendored policy, the driver, a valid config
+  RES_RT="gracetier_res residency_policy"
+  for f in "$DEC/runtime/gracetier_res.py" "$DEC/runtime/residency_policy.py" "$DEC/bench/gt_res_drive.py"; do
+    [ -f "$f" ] || refuse "GT1_RES=1: missing $f"
+  done
+  [ "${GT1_NSYS:-0}" != 1 ] || refuse "GT1_RES=1 and GT1_NSYS=1 are separate cards (one mode per window)"
+  GT1_RES_CONFIG=${GT1_RES_CONFIG:-'{"mode": "adaptive", "freeze": true}'}
+  RESCFG="$GT1_RES_CONFIG" python3 -c 'import ast, json, os, sys
+c = json.loads(os.environ["RESCFG"]); assert isinstance(c, dict) and c.get("mode") == "adaptive", c
+ast.parse(open(sys.argv[1]).read()); ast.parse(open(sys.argv[2]).read())' \
+    "$DEC/bench/gt_res_drive.py" "$DEC/runtime/gracetier_res.py" \
+    || refuse "GT1_RES=1: GT1_RES_CONFIG is not a JSON object with mode adaptive, or python syntax"
+fi
 for d in "$PG61_WORK/tree" "$PG61_WORK/overlay-vllm" "$SRC" "$MODEL_DIR"; do [ -d "$d" ] || refuse "missing dir $d"; done
 [ "$(git -C "$GR/src-git" rev-parse HEAD 2>/dev/null)" = "$PIN" ] || refuse "Garner's clone $GR/src-git is not at $PIN"
 python3 -c "import ast,sys; [ast.parse(open(f).read()) for f in sys.argv[1:]]" "$P/fastpath/fastpath_gracetier.py" \
@@ -129,9 +160,14 @@ gt_down() {
   ( cd "$GT" && WORK=$GT DS41_HOME=$GT/home bash "$GT/launch-gt1.sh" down ) > "$S/gt1-down-$STAMP.log" 2>&1
   local rc=$?; say "gracetier down rc=$rc ($(tail -1 "$S/gt1-down-$STAMP.log" | cut -c1-160))"
 }
+redact_key() {   # idempotent; the up log is the receipt that carries the launcher's "API key (save it): <hex>" line
+  [ -f "$S/gt1-up-$STAMP.log" ] && sed -E -i 's/(API key \(save it\): )[0-9a-f]+/\1<redacted>/' "$S/gt1-up-$STAMP.log"
+  return 0
+}
 finish() {
   [ "$FINISHED" = 1 ] && return; FINISHED=1
   say "== finish (G1=$G1 G2=$G2 G3=$G3 G4=$G4 G5=$G5)"
+  redact_key
   if docker ps -a --format '{{.Names}}' | grep -qx ds41 && [ "$GT_UP" = 1 ]; then
     docker logs ds41 > "$S/gt1-server-$STAMP.log" 2>&1 || true
   fi
@@ -228,9 +264,14 @@ build() {
   done
   cp "$P/fastpath/fastpath_gracetier.py" "$GT/tree/fastpath/" || return 1
   mkdir -p "$GT/tree/fastpath/gracetier_rt/runtime"
-  for f in __init__ gracetier_vmm gracetier_pool gracetier_stage dg_mega dg_moe host_tier ckpt; do
+  for f in __init__ gracetier_vmm gracetier_pool gracetier_stage dg_mega dg_moe host_tier ckpt $RES_RT; do
     cp "$DEC/runtime/$f.py" "$GT/tree/fastpath/gracetier_rt/runtime/" || return 1
   done
+  if [ "${GT1_RES:-0}" = 1 ]; then   # card GT3: the component reads this file (the container forwards no arbitrary env)
+    printf '%s\n' "$GT1_RES_CONFIG" > "$GT/tree/fastpath/gracetier-res.json" || return 1
+    say "residency: gracetier-res.json = $(cat "$GT/tree/fastpath/gracetier-res.json"); gracetier_rt + $RES_RT"
+  fi
+  [ "${GT1_RES:-0}" = 1 ] || rm -f "$GT/tree/fastpath/gracetier-res.json"   # the plain / nsys modes: residency off
   python3 "$P/make_rowmap_allres.py" --rowmap "$GT/tree/fastpath/hook/rowmap-mix-v1-h255.json" \
     --out "$GT/tree/fastpath/hook/rowmap-allres.json" ${GT1_HOT_MAP:+--hot-map "$DEC/$GT1_HOT_MAP"} || return 1
   # policy.env = Pg61's with coldskip,peer3 -> gracetier and the served name; overlay -> our copy
@@ -304,8 +345,13 @@ cat "$S/gt1-build-$STAMP.log"
 # ================================================================================================ boot
 say "== boot gracetier on :$PORT ($SERVED)"
 GT_UP=1
+if [ "${GT1_RES:-0}" = 1 ]; then   # card GT3: this user owns the control dir (the container writes telemetry into it)
+  mkdir -p "$RESDIR" && rm -f "$RESDIR"/ctrl.json "$RESDIR"/.ctrl.*.tmp "$RESDIR"/telemetry.jsonl "$RESDIR"/dump-* \
+    || { say "FAIL: cannot prepare $RESDIR"; exit 0; }
+fi
 ( cd "$GT" && WORK=$GT MODEL_DIR=$MODEL_DIR DS41_HOME=$GT/home bash "$GT/launch-gt1.sh" up ) > "$S/gt1-up-$STAMP.log" 2>&1
 urc=$?
+redact_key   # the launcher prints the generated API key: never into a receipt (a key reached the public repo once)
 say "up rc=$urc ($(tail -2 "$S/gt1-up-$STAMP.log" | tr '\n' ' ' | cut -c1-200))"
 if docker ps -a --format '{{.Names}}' | grep -qx ds41; then
   docker logs ds41 > "$S/gt1-boot-$STAMP.log" 2>&1
@@ -380,6 +426,89 @@ if [ "${GT1_NSYS:-0}" = 1 ]; then
   else
     G3=a2-no-report
   fi
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------------------------- GT3 (GT1_RES=1)
+if [ "${GT1_RES:-0}" = 1 ]; then
+  say "== card GT3: adaptive residency cells R0..R5 (control + telemetry $RESDIR)"
+  R() { echo "$S/gt1-res-$1-$STAMP"; }
+  drv() { local t=$1; shift; timeout "$t" python3 bench/gt_res_drive.py "$@"; }
+  stepcell() {   # $1 = cell name: w0_drive.py step (2 warm generations + 3 reps of 512 greedy tokens, 1 stream)
+    timeout 1800 python3 w0/w0_drive.py step "$(R "$1").json" > "$(R "$1").log" 2>&1
+    say "$1 rc=$? $(grep 'step rep' "$(R "$1").log" | tail -1 | cut -c1-220)"
+  }
+  capture() {    # $1 = cell name: the greedy fixture capture (8 prompts x 256 tokens, top-20 logprobs)
+    timeout 1800 python3 w0/w0_drive.py parity "$(R "$1").jsonl" > "$(R "$1").log" 2>&1
+    say "$1 rc=$? $(tail -1 "$(R "$1").log" | cut -c1-160)"
+  }
+  ctl() {        # $1 = cell name, $2 = control document, $3 = nudge traffic, $4 = wait (ack|idle|boot), $5 = timeout s
+    drv $(( ${5:-300} + 60 )) ctrl --dir "$RESDIR" --set "$2" --nudge "$3" --wait "$4" --timeout "${5:-300}" \
+      --out "$(R "$1").json" > "$(R "$1").log" 2>&1
+    local rc=$?; say "$1 rc=$rc $(tail -1 "$(R "$1").log" | cut -c1-400)"; return $rc
+  }
+  grep -E "gracetier: (residency|\[gracetier-res\]|stream check|GPUModelRunner\.execute_model wrapped)" \
+    "$S/gt1-boot-$STAMP.log" | cut -c1-600 > "$(R boot).log"
+  cat "$(R boot).log" | cut -c1-300
+  grep -q "gracetier: residency: manager over" "$(R boot).log" \
+    || { say "FAIL: the boot log has no residency manager line (gracetier-res.json not read?): R0..R5 skipped"; G3=res-not-armed; exit 0; }
+  [ -f "$RESDIR/telemetry.jsonl" ] || { say "FAIL: no $RESDIR/telemetry.jsonl: R0..R5 skipped"; G3=res-no-telemetry; exit 0; }
+  AUDIT='{"audit": {"moved": true, "random": 64}}'
+
+  say "== R0 frozen at the boot map: step cell (3 reps) + the fixture capture R3 compares with"
+  stepcell r0-step
+  capture r0-parity
+
+  say "== R1 unfreeze + baseline; C1 = the 8 fixture prompts x 256 tokens, looped 90 s"
+  if alive; then
+    drv 600 c1 --dir "$RESDIR" --seconds 90 --tokens 256 --out "$(R r1-c1).json" > "$(R r1-c1).log" 2>&1
+    say "R1 rc=$? $(tail -1 "$(R r1-c1).log" | cut -c1-400)"
+  else say "R1 skipped: server not alive"; fi
+
+  say "== R2a freeze (the map is now fitted to the fixture); step cell on the held-out step prompt"
+  if alive && ctl r2a-ctrl '{"freeze": true}' fixture idle; then stepcell r2a-step; else say "R2a skipped"; fi
+
+  say "== R2b unfreeze; step cell x 5 (reported: the fifth cell's 3 reps)"
+  if alive && ctl r2b-ctrl '{"freeze": false}' step ack; then
+    for i in 1 2 3 4 5; do stepcell "r2b-step$i"; done
+  else say "R2b skipped"; fi
+
+  say "== R3 freeze; fixture capture twice (self-identical N/8; vs the R0-map capture N/8, reported, not gated)"
+  if alive && ctl r3-ctrl '{"freeze": true}' step idle; then
+    capture r3-parity-a
+    capture r3-parity-b
+    drv 120 compare --a "$(R r3-parity-a).jsonl" --b "$(R r3-parity-b).jsonl" --ref "$(R r0-parity).jsonl" \
+      --out "$(R r3-compare).json" > "$(R r3-compare).log" 2>&1
+    say "R3 $(tail -1 "$(R r3-compare).log" | cut -c1-300)"
+    # the A3 instrument, for the record: column A2 = this map against itself, column cand = the R0-map capture
+    python3 bench/parity.py --ref "$(R r3-parity-a).jsonl" --ref2 "$(R r3-parity-b).jsonl" --cand "$(R r0-parity).jsonl" \
+      --json "$(R r3-parity).json" > "$(R r3-parity).log" 2>&1 || true
+  else say "R3 skipped"; fi
+
+  say "== R4 audit (every moved expert + 64 random per layer); restore_map; audit; step cell"
+  if alive; then
+    ctl r4-audit1 "$AUDIT" step ack
+    if ctl r4-restore '{"freeze": true, "restore_map": true}' step boot 900; then
+      ctl r4-audit2 "$AUDIT" step ack
+      stepcell r4-step
+    else say "R4: the boot map did not come back within the timeout: audit 2 and the step cell skipped"; fi
+  else say "R4 skipped: server not alive"; fi
+
+  say "== R5 unfreeze; C32 smoke (32 x >= 128 tokens); server alive"
+  if alive && ctl r5-ctrl '{"freeze": false}' fixture ack; then
+    timeout 1800 python3 bench/c32_smoke.py --base "$BASE" --model "$SERVED" --n 32 --tokens 128 \
+      --json "$(R r5-c32).json" > "$(R r5-c32).log" 2>&1
+    crc=$?
+    tail -1 "$(R r5-c32).log"
+    say "R5 c32 rc=$crc; container $(docker inspect -f '{{.State.Status}} restarts={{.RestartCount}}' ds41 2>/dev/null); alive $(alive && echo yes || echo NO)"
+  else say "R5 skipped"; fi
+
+  cp "$RESDIR/telemetry.jsonl" "$(R telemetry).jsonl" 2>/dev/null || say "WARN: no telemetry.jsonl to copy"
+  docker logs ds41 2>&1 | grep -E "gracetier: (residency|\[gracetier-res\]|stream check)" | cut -c1-600 > "$(R server-lines).log" || true
+  say "stream checks: $(grep -c 'stream check' "$(R server-lines).log") line(s) $(grep 'stream check' "$(R server-lines).log" | cut -c1-200 | tr '\n' ';')"
+  PYTHONIOENCODING=utf-8 python3 bench/gt_res_drive.py summary --scratch "$S" --stamp "$STAMP" --out "$(R summary).json" \
+    2>&1 | tee "$(R summary).log"
+  G3=res-ran
   exit 0
 fi
 

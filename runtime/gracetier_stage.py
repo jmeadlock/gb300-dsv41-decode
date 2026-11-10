@@ -19,6 +19,21 @@ source bytes and cnt[c] += hits; nothing else is written. The weight bytes are t
 MegaMoE's transform), so a staged group is byte-identical to an all-HBM 384-group build's group: that is the whole
 numerics argument of (b); M4 measures it.
 
+A3 (docs/HANDOFF-A3-RESIDENCY.md, card GT3) -- the per-expert residency counter, optional:
+
+    gt_stage(groups, H, src_tab, dtab, cnt, b1, b2, g2e=g2e, ecnt=ecnt_row, count_ids_max=N)
+
+  g2e      int32 [G]: group -> expert id of this layer (the inverse of the router's row_map; fixed address, the
+           residency manager rewrites two entries per swap between steps).
+  ecnt     int32 [E]: this layer's row of the [L, E] counter (fixed address). Program (0, 0) of the launch does
+           atomic_add(ecnt + g2e[group], 1) for every id >= 0 of the call while it scans them, hot or cold (integer
+           atomics: order-independent). The count is per EXPERT, so it stays attributed across swaps.
+  counting is on only when the call has P <= count_ids_max ids (decode-sized: 256 tokens x top-k). P is a host-side
+           constant of the launch, so each captured graph size bakes its own choice: a counted launch runs
+           gt_stage_count_kernel (gt_stage_kernel's body + the count), an uncounted one runs gt_stage_kernel itself.
+  Absent (the default): gt_stage_kernel with exactly the arguments of the first build -- nothing else changes.
+`stage_emulated` takes the same optional g2e / ecnt and stays the contract of both kernels.
+
 `gt_read` (M7, R8): a plain read kernel over the pool's L1 blocks with NPROG programs, xor-folding the words into
 out[NPROG, BW] so the loads are kept. `gt_touch`: an empty-ish launch (one store) for the fork/join cost.
 """
@@ -42,6 +57,7 @@ BLOCK_WORDS_DEFAULT = 1024      # 8 KiB per program per trip (static_kernels' st
 SCAN_BLOCK = 512                # ids scanned per trip (T <= 64 x k = 6 fits in one)
 WARPS_DEFAULT = 4
 ALIGN = 16
+COUNT_TOKENS_MAX = 256          # A3: the per-expert counter counts decode-sized calls only (v26ar's PIN_COUNT_TMAX)
 
 
 # ------------------------------------------------------------------------------------------------ pure planning
@@ -62,10 +78,36 @@ def words(nbytes: int) -> int:
 
 
 # ------------------------------------------------------------------------------------------------ contract
+def count_ids(tokens_max: int = COUNT_TOKENS_MAX, topk: int = 6) -> int:
+    """The largest id count P = T x top-k of a counted call (A3)."""
+    return int(tokens_max) * int(topk)
+
+
+def count_plan(groups: Sequence[int], g2e: Sequence[int]) -> Dict[int, int]:
+    """{expert id: picks} of one counted call: every id >= 0 counts once for the expert that owns its group."""
+    out: Dict[int, int] = {}
+    for g in groups:
+        g = int(g)
+        if g >= 0:
+            e = int(g2e[g])
+            out[e] = out.get(e, 0) + 1
+    return out
+
+
 def stage_emulated(groups: torch.Tensor, H: int, src_tab: torch.Tensor, dsts: Sequence[torch.Tensor],
-                   cnt: Optional[torch.Tensor], resolve: Callable[[int], torch.Tensor]) -> Dict[int, int]:
+                   cnt: Optional[torch.Tensor], resolve: Callable[[int], torch.Tensor],
+                   g2e: Optional[torch.Tensor] = None, ecnt: Optional[torch.Tensor] = None,
+                   count_ids_max: Optional[int] = None) -> Dict[int, int]:
     """The contract of gt_stage in torch. dsts = [L1 [G, ...], L2 [G, ...]] (any dtype; written as bytes);
-    src_tab int64 [C, 2]; resolve(address) -> uint8 tensor starting at that address. Returns the plan."""
+    src_tab int64 [C, 2]; resolve(address) -> uint8 tensor starting at that address. Returns the plan.
+    A3, optional (old behaviour when absent): with g2e int32 [G] and ecnt int32 [E], every id >= 0 of the call adds 1
+    to ecnt[g2e[id]] -- unless the call has more than count_ids_max ids (default count_ids(), as gt_stage), which
+    counts nothing."""
+    if (g2e is None) != (ecnt is None):
+        raise ValueError("stage_emulated: g2e and ecnt go together")
+    if ecnt is not None and groups.numel() <= (count_ids() if count_ids_max is None else int(count_ids_max)):
+        for e, n in sorted(count_plan(groups.reshape(-1).tolist(), g2e.reshape(-1).tolist()).items()):
+            ecnt[e] += n
     L1, L2 = dsts
     C = int(src_tab.shape[0])
     b1 = L1[0].numel() * L1.element_size()
@@ -138,6 +180,48 @@ if HAVE_TRITON:
                 tl.store(b_dst + b_off, tl.load(b_src + b_off, mask=b_m), mask=b_m)
 
     @triton.jit
+    def gt_stage_count_kernel(groups, P, H, src_tab, dtab, cnt, W1, W2, g2e, ecnt,
+                              PB: tl.constexpr, BW: tl.constexpr, NPROG: tl.constexpr, COUNT: tl.constexpr):
+        """A3: gt_stage_kernel plus the per-expert counter. Program (0, 0), while it scans the call's ids, adds 1 to
+        ecnt[g2e[id]] for every id >= 0 (hot and cold picks alike; one atomic per lane, so two lanes that name one
+        expert both count). Everything else is gt_stage_kernel's body, statement for statement."""
+        c = tl.program_id(0)
+        q = tl.program_id(1)
+        want = H + c
+        acc = tl.zeros([PB], dtype=tl.int32)
+        for it in range(0, (P + PB - 1) // PB):
+            offs = it * PB + tl.arange(0, PB)
+            gv = tl.load(groups + offs, mask=offs < P, other=-1)
+            acc += (gv == want).to(tl.int32)
+            if c == 0:
+                if q == 0:
+                    e_m = gv >= 0
+                    e_id = tl.load(g2e + gv, mask=e_m, other=0)
+                    # relaxed: the count feeds only the policy, and it is read between steps in stream order; the
+                    # default acq_rel fence cost v26ar 25-78 us/step against 2-6 relaxed (its measured overhead)
+                    tl.atomic_add(ecnt + e_id, e_m.to(tl.int32), mask=e_m, sem="relaxed")
+        hits = tl.sum(acc, axis=0)
+        if hits > 0:
+            if COUNT:
+                if q == 0:
+                    tl.atomic_add(cnt + c, hits)
+            grp = (hits * 0 + c + H).to(tl.int64)
+            a_src = tl.multiple_of(tl.load(src_tab + 2 * c).to(tl.pointer_type(tl.int64)), 16)
+            a_dst = tl.multiple_of(tl.load(dtab + 0).to(tl.pointer_type(tl.int64)), 16) + grp * W1
+            nb1 = (W1 + BW - 1) // BW
+            for ia in range(0, (nb1 + NPROG - 1) // NPROG):
+                a_off = (q + ia * NPROG) * BW + tl.arange(0, BW)
+                a_m = a_off < W1
+                tl.store(a_dst + a_off, tl.load(a_src + a_off, mask=a_m), mask=a_m)
+            b_src = tl.multiple_of(tl.load(src_tab + 2 * c + 1).to(tl.pointer_type(tl.int64)), 16)
+            b_dst = tl.multiple_of(tl.load(dtab + 1).to(tl.pointer_type(tl.int64)), 16) + grp * W2
+            nb2 = (W2 + BW - 1) // BW
+            for ib in range(0, (nb2 + NPROG - 1) // NPROG):
+                b_off = (q + ib * NPROG) * BW + tl.arange(0, BW)
+                b_m = b_off < W2
+                tl.store(b_dst + b_off, tl.load(b_src + b_off, mask=b_m), mask=b_m)
+
+    @triton.jit
     def gt_read_kernel(src_tab, n_src, W, out, BW: tl.constexpr, NPROG: tl.constexpr):
         """Program q xor-folds words of blocks b = q, q + NPROG, ... of the n_src L1 rows (W words each)."""
         q = tl.program_id(0)
@@ -169,9 +253,13 @@ def make_dtab(l1: torch.Tensor, l2: torch.Tensor, device=None) -> torch.Tensor:
 
 def gt_stage(groups: torch.Tensor, H: int, src_tab: torch.Tensor, dtab: torch.Tensor, cnt: Optional[torch.Tensor],
              b1: int, b2: int, *, nprog: Optional[int] = None, block_words: Optional[int] = None,
-             num_warps: Optional[int] = None) -> Tuple[int, int]:
+             num_warps: Optional[int] = None, g2e: Optional[torch.Tensor] = None,
+             ecnt: Optional[torch.Tensor] = None, count_ids_max: Optional[int] = None) -> Tuple[int, int]:
     """ONE launch of gt_stage_kernel over the C = src_tab.shape[0] cold slots. groups: contiguous int64 (any shape;
-    flattened). b1 / b2: bytes of one L1 / L2 group. Returns the grid."""
+    flattened). b1 / b2: bytes of one L1 / L2 group. Returns the grid.
+    A3, optional: g2e int32 [G] + ecnt int32 [E] (one layer's counter row) -> a call with at most count_ids_max ids
+    (default count_ids()) launches gt_stage_count_kernel instead, which also counts every pick per expert. A larger
+    call, or no g2e / ecnt, launches gt_stage_kernel with the first build's arguments."""
     if not HAVE_TRITON:
         raise RuntimeError("gt_stage needs triton (box) -- the Mac runs stage_emulated")
     if groups.dtype != torch.int64 or not groups.is_contiguous():
@@ -187,6 +275,19 @@ def gt_stage(groups: torch.Tensor, H: int, src_tab: torch.Tensor, dtab: torch.Te
     if bw < 2 or bw & (bw - 1):
         raise ValueError(f"block_words {bw} must be a power of two >= 2")
     count = cnt is not None
+    if (g2e is None) != (ecnt is None):
+        raise ValueError("gt_stage: g2e and ecnt go together")
+    if ecnt is not None:
+        for t, what in ((g2e, "g2e"), (ecnt, "ecnt")):
+            if t.dtype != torch.int32 or t.dim() != 1 or not t.is_contiguous():
+                raise ValueError(f"gt_stage: {what} must be contiguous int32 [n]")
+        if C < 1:
+            raise ValueError("gt_stage: the per-expert counter needs program (0, 0): C >= 1")
+        if groups.numel() <= (count_ids() if count_ids_max is None else int(count_ids_max)):
+            gt_stage_count_kernel[(C, npg)](groups, groups.numel(), int(H), src_tab, dtab, cnt if count else groups,
+                                            W1, W2, g2e, ecnt, SCAN_BLOCK, bw, npg, count,
+                                            num_warps=int(num_warps or WARPS_DEFAULT))
+            return C, npg
     gt_stage_kernel[(C, npg)](groups, groups.numel(), int(H), src_tab, dtab, cnt if count else groups, W1, W2,
                               SCAN_BLOCK, bw, npg, count, num_warps=int(num_warps or WARPS_DEFAULT))
     return C, npg

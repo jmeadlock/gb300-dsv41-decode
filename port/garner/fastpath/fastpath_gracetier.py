@@ -61,10 +61,46 @@ INFERRED, each checked at boot where possible (a failed check raises; nothing is
   * the MegaMoE fork (component `megamoe`) at G = 384 with zeroed fold / C11 control blocks behaves as stock MegaMoE
     (the drafter's buffers run it that way); the mini-test measured stock DeepGEMM, not the fork, at G = 384.
 
+A3 / card GT3 -- adaptive residency (docs/HANDOFF-A3-RESIDENCY.md; runtime/gracetier_res.py is the manager and says
+what a swap is). Armed by a config file, GRACETIER_RES_CONFIG (default gracetier-res.json next to this file =
+/fastpath/gracetier-res.json; the container forwards no arbitrary env, the card writes the file at build):
+{"mode": "adaptive" | "off", "freeze": bool, policy overrides}. Absent file or mode "off": none of the code below
+runs -- no extra tensor, the first build's gt_stage arguments, GPUModelRunner.execute_model untouched. With "adaptive":
+  finalize   per layer g2e int32 [384] (group -> expert) and this layer's row of ONE cnt int32 [L, 384]; gt_stage
+             then runs its counting kernel for calls of at most count_tokens_max x 6 ids.
+  load_model after vLLM's (every layer finalized, so also retired by a12_retire): one GtResManager over the tensors
+             the step reads NOW -- row_map, g2e, the VMM weight tensors, the pool's UVA alias, and the SF banks in
+             module._transformed_l{1,2}_weights[1].
+  barrier    GPUModelRunner.execute_model wrapped: manager.barrier() (counter drain, control file, <= 4 swaps), then
+             the original. Control + telemetry under /prof/gracetier-res/ (the one rw mount serve.sh makes).
+READ for this: a12_retire replaces each module's two SF banks with tensors over a compressible allocation and keeps
+the weights (`experts._transformed_l1_weights = (l1[0], owners[0].tensor)`, fastpath_a12_retire.py:100-101, asserted
+unchanged :109-110) inside its wrap of finalize_weights (:177-181), i.e. during vLLM's load; the boundary passes
+`exp._transformed_l1_weights` / `_l2_weights` to MegaMoE on every call (fastpath_boundary.py:1375), so the banks
+MegaMoE reads after retire are exactly those attributes' second elements -- the manager is built from them after
+load_model and never from the banks _finalize_layer made (they are released by then). The registration order makes
+a12_retire's finalize / load_model wraps the outer ones (gracetier is listed before it in components.py and in the
+launcher's component list; fastpath_hook.install applies patches in list order), so our post-load code runs inside
+a12_retire's load wrap, before its POST_LOAD check and after every layer's retirement; the reverse order would work
+too. No shipped component wraps execute_model (a12_retire wraps load_model / capture_model, tail_proj_side wraps
+sample_tokens and reads self.execute_model_state, w9_suffix wraps __init__), and the router takes row_map as a pointer
+per call (fastpath_boundary.py:1065, :1360; measured per call in mini-test M2).
+INFERRED for this, each with a check that raises:
+  * vLLM's stock MegaMoE forward (T > 16) reads the same `_transformed_l{1,2}_weights` attributes -- the manager
+    refuses unless they still hold the VMM weight tensors at load end, and the first barrier re-checks that weights
+    and SF banks are the tensors it bound (a later replacement would make swaps write dead memory);
+  * GPUModelRunner.execute_model exists, is an ordinary function, and one call = one engine step whose GPU work is
+    enqueued on the stream that is current when it is entered -- checked for what this file can see: every eager
+    gt_stage call and the first REPLAY_CHECKS CUDA graph replays made inside an execute_model call must be on the
+    stream the barrier ran on, else RuntimeError. A change of stream between two calls is made safe by a device
+    synchronize at that barrier (manager stat `stream_changes`), not assumed away;
+  * a barrier is never reached during a graph capture (it returns at once if it is: stat `barriers_in_capture`).
+
 Env (container): GRACETIER_ROWMAP (default: rowmap-allres.json next to MEGA_ROWMAP, i.e. /w/rowmap-allres.json),
 GRACETIER_RT_DIR (default: gracetier_rt/ next to this file: a copy of our runtime/ package's gracetier_*, dg_mega,
 dg_moe, host_tier, ckpt modules), GRACETIER_HOST_FLOOR_GIB (default 32: [A] a policy floor, not a measurement),
-GRACETIER_KV_OFFLOAD_GB (overrides the --kv-offloading-size lookup), GRACETIER_FINALIZE_S (600), GRACETIER_JOIN_S (1800).
+GRACETIER_KV_OFFLOAD_GB (overrides the --kv-offloading-size lookup), GRACETIER_FINALIZE_S (600), GRACETIER_JOIN_S (1800),
+GRACETIER_RES_CONFIG (the residency config file, above).
 This module imports neither torch nor vllm at import time (components.py is imported by sitecustomize in every
 interpreter); vllm is never imported here at all, torch and the runtime package only inside the hooks.
 """
@@ -104,6 +140,10 @@ HOST_FLOOR_GIB = float(os.environ.get("GRACETIER_HOST_FLOOR_GIB", "32"))
 FINALIZE_S = float(os.environ.get("GRACETIER_FINALIZE_S", "600"))   # = the hook's per-layer finalize watchdog
 JOIN_S = float(os.environ.get("GRACETIER_JOIN_S", "1800"))
 PREWARM_P = (TOPK, 8 * TOPK)   # gt_stage's id count P = T * 6: one value not divisible by 16, one divisible
+RES_CONFIG = os.environ.get("GRACETIER_RES_CONFIG") or os.path.join(_DIR, "gracetier-res.json")
+RES_MODES = ("adaptive", "off")
+REPLAY_CHECKS = 256            # CUDA graph replays inside execute_model whose stream is compared with the barrier's
+_UNSET = object()
 
 
 def _log(msg: str) -> None:
@@ -112,6 +152,19 @@ def _log(msg: str) -> None:
 
 
 # ================================================================================================ pure (Mac-tested)
+def res_doc(path=None):
+    """The residency config document when it says mode "adaptive", else None (file absent, or mode "off": the build
+    without residency). A file that is not a JSON object with a known mode raises -- a typo must not mean "off"."""
+    p = RES_CONFIG if path is None else path
+    if not os.path.isfile(p):
+        return None
+    with open(p) as f:
+        doc = json.load(f)
+    if not isinstance(doc, dict) or doc.get("mode") not in RES_MODES:
+        raise RuntimeError(f"gracetier: {p} must be a JSON object with \"mode\": one of {RES_MODES}")
+    return doc if doc["mode"] == "adaptive" else None
+
+
 def load_allres(path: str, n_experts: int = E) -> dict:
     """{layer: {"hot", "cold", "row"}} from make_rowmap_allres.py's JSON; raises unless every layer's hot / cold is a
     partition of 0..E-1 and row is the all-resident map of it (every entry >= 0, hot -> 0..H-1, cold -> H..E-1)."""
@@ -253,6 +306,7 @@ class GtState:
         self.row_allres = [int(r) for r in row_allres]  # gracetier form: every entry >= 0
         self.row_map = None                             # int32 [E] device (row_allres), built at finalize
         self.src_tab = self.dtab = self.cnt = None
+        self.g2e = self.ecnt = self.count_ids = None    # A3 residency (adaptive mode only): the per-expert counter
         self.b1 = self.b2 = 0
         self.vas = None
 
@@ -294,13 +348,41 @@ class _State:
         self.fwd_checked: Any = False
         self.parity: Any = {}
         self.lock: Any = threading.Lock()
+        # A3 residency (all unused when the config is absent or says "off")
+        self.res_doc: Any = _UNSET       # the config document (mode adaptive) or None
+        self.res_cfg: Any = None         # runtime/gracetier_res.ResConfig
+        self.res_cnt: Any = None         # int32 [L, 384] device: the per-expert counter (one row per layer)
+        self.res: Any = None             # the GtResManager, after load_model
+        self.modules: Any = {}           # layer -> its experts module (the tensors the step reads are read from it)
+        self.res_in_exec: Any = False    # inside an execute_model call
+        self.res_bound: Any = None       # {layer: (w1, sf1, w2, sf2 data_ptrs)} the manager was built on
+        self.res_rechecked: Any = False
+        self.res_replays: Any = 0
+        self.res_eager: Any = 0
 
 
 _S = _State()
 
 
+def _res_doc():
+    """The cached residency config document (adaptive), or None = residency off."""
+    if _S.res_doc is _UNSET:
+        _S.res_doc = res_doc()
+        if _S.res_doc is not None:
+            _log(f"residency config {RES_CONFIG}: {json.dumps(_S.res_doc, sort_keys=True)}")
+    return _S.res_doc
+
+
+def _res_cfg():
+    """The validated config (runtime/gracetier_res.ResConfig; unknown keys raise), or None when residency is off."""
+    if _S.res_cfg is None and _res_doc() is not None:
+        _S.res_cfg = _rt().GR.ResConfig.from_dict(_res_doc())
+    return _S.res_cfg
+
+
 def _rt():
-    """Our runtime package from RT_DIR (gracetier_*, dg_mega, dg_moe, host_tier, ckpt; no vllm)."""
+    """Our runtime package from RT_DIR (gracetier_*, dg_mega, dg_moe, host_tier, ckpt; no vllm). With residency on
+    also gracetier_res + residency_policy (the card copies them only for that mode)."""
     if _S.rt is None:
         if not os.path.isdir(os.path.join(RT_DIR, "runtime")):
             raise RuntimeError(f"gracetier: runtime package missing at {RT_DIR}/runtime (the card copies it)")
@@ -321,7 +403,14 @@ def _rt():
             raise RuntimeError(f"gracetier: `runtime` resolved to {here}, not {RT_DIR}/runtime")
         if not GS.HAVE_TRITON:
             raise RuntimeError("gracetier: triton is not importable; gt_stage cannot run")
-        _S.rt = types.SimpleNamespace(CK=CK, DM=DM, GP=GP, GS=GS, GV=GV, HT=HT)
+        GR = None
+        if _res_doc() is not None:
+            from runtime import gracetier_res as GR   # imports residency_policy (numpy) beside it
+
+            if not hasattr(GS, "gt_stage_count_kernel"):
+                raise RuntimeError("gracetier: residency is on but runtime/gracetier_stage.py has no counting kernel "
+                                   "(an old copy in gracetier_rt/)")
+        _S.rt = types.SimpleNamespace(CK=CK, DM=DM, GP=GP, GS=GS, GV=GV, HT=HT, GR=GR)
     return _S.rt
 
 
@@ -525,7 +614,8 @@ def _sf_bank(dev, hot_sf, cold_sf, n: int, q: int, H: int, C: int, what: str):
 
 
 def _prewarm(st, dev) -> None:
-    """Compile gt_stage's specializations eagerly (P divisible by 16 or not), touching nothing (ids all -1)."""
+    """Compile gt_stage's specializations eagerly (P divisible by 16 or not), touching nothing (ids all -1). With
+    residency on: the counting kernel too (decode-sized calls run it; larger ones keep the plain kernel)."""
     import torch
 
     key = (st.H, st.C)
@@ -535,8 +625,27 @@ def _prewarm(st, dev) -> None:
     for P in PREWARM_P:
         g = torch.full((P,), -1, dtype=torch.int64, device=dev)
         GS.gt_stage(g, st.H, st.src_tab, st.dtab, st.cnt, st.b1, st.b2)
+        if st.ecnt is not None:
+            GS.gt_stage(g, st.H, st.src_tab, st.dtab, st.cnt, st.b1, st.b2, g2e=st.g2e, ecnt=st.ecnt,
+                        count_ids_max=st.count_ids)
     torch.cuda.synchronize(dev)
     _S.prewarmed.add(key)
+
+
+def _res_finalize(st, dev) -> None:
+    """A3, adaptive mode only: this layer's g2e (group -> expert, the inverse of row_map) and its row of the one
+    [L, 384] counter, both at addresses fixed from here on. Residency off: returns at once, nothing is built."""
+    cfg = _res_cfg()
+    if cfg is None:
+        return
+    import torch
+
+    R = _rt()
+    if _S.res_cnt is None:
+        _S.res_cnt = torch.zeros(max(_S.allres) + 1, E, dtype=torch.int32, device=dev)
+    st.g2e = torch.tensor(R.GR.g2e_list(st.row_allres), dtype=torch.int32, device="cpu").to(dev)
+    st.ecnt = _S.res_cnt[st.idx]
+    st.count_ids = R.GS.count_ids(cfg.count_tokens_max, TOPK)
 
 
 def _finalize_layer(module, st, dev, snap, why_no_snap) -> None:
@@ -581,6 +690,9 @@ def _finalize_layer(module, st, dev, snap, why_no_snap) -> None:
     st.cnt = torch.zeros(C, dtype=torch.int32, device=dev)
     st.b1, st.b2 = R.GP.l1_bytes(D, I), R.GP.l2_bytes(D, I)
     st.vas = (va1, va2)
+    if _res_doc() is not None:      # A3 residency: the counter tables, and the module the manager reads at load end
+        _res_finalize(st, dev)
+        _S.modules[st.idx] = module
     # [inferred] what the boundary's get_block_m_for_mega_moe (B/:1344) and vLLM's stock forward read for G
     module.num_experts = E
     module.num_local_experts = E
@@ -598,10 +710,17 @@ def _finalize_layer(module, st, dev, snap, why_no_snap) -> None:
 # ================================================================================================ per call
 def stage(st, groups) -> None:
     """gt_stage on the current stream: the cold groups named in `groups` (contiguous int64, any shape; -1 = skip)
-    get their Grace bytes. One launch; capturable."""
+    get their Grace bytes. One launch; capturable. With residency on the same launch also counts the call's picks
+    per expert (decode-sized calls), and an eager call inside execute_model is checked to be on the barrier's stream."""
     if st.src_tab is None:
         raise RuntimeError(f"gracetier layer {st.idx}: forward before finalize")
-    _S.rt.GS.gt_stage(groups, st.H, st.src_tab, st.dtab, st.cnt, st.b1, st.b2)
+    if st.ecnt is None:
+        _S.rt.GS.gt_stage(groups, st.H, st.src_tab, st.dtab, st.cnt, st.b1, st.b2)
+        return
+    if _S.res_in_exec:
+        _res_check_eager()
+    _S.rt.GS.gt_stage(groups, st.H, st.src_tab, st.dtab, st.cnt, st.b1, st.b2, g2e=st.g2e, ecnt=st.ecnt,
+                      count_ids_max=st.count_ids)
 
 
 def stage_symm(experts, symm, T: int) -> None:
@@ -611,6 +730,158 @@ def stage_symm(experts, symm, T: int) -> None:
 
 def is_gracetier(experts) -> bool:
     return isinstance(getattr(experts, "_mp", None), GtState)
+
+
+# ================================================================================================ A3 residency
+def _res_check_eager() -> None:
+    """An eager (not captured) gt_stage call inside an execute_model call must be on the stream its barrier ran on
+    ([inferred] vLLM runs the step on the stream current at execute_model's entry; a mismatch raises)."""
+    m = _S.res
+    if m is None or not m.cuda:
+        return
+    import torch
+
+    if torch.cuda.is_current_stream_capturing():
+        return
+    m.check_stream("an eager gt_stage call inside execute_model")
+    _S.res_eager += 1
+    if _S.res_eager == 64:
+        _log("stream check: 64 eager gt_stage calls inside execute_model ran on the barrier's stream")
+
+
+def _res_check_chunks(idx: int, C: int) -> None:
+    """Every cold slot's L1 block and L2 block lies inside ONE registration chunk (a memcpy must: host_tier.py)."""
+    L, buf = _S.pool.layout, _S.pool.buf
+    for c in range(C):
+        for a, b in L.expert_ranges(idx, c):
+            lo, hi = buf.ptr + a, buf.ptr + b
+            if not any(p <= lo and hi <= p + n for p, n in buf.chunks):
+                raise RuntimeError(f"gracetier layer {idx}: cold slot {c} crosses a registration chunk of the Grace "
+                                   f"pool; a swap's H2D / D2H copy would fail. Refusing residency.")
+
+
+def _res_tensors(module) -> tuple:
+    (w1, sf1), (w2, sf2) = module._transformed_l1_weights, module._transformed_l2_weights
+    return w1, sf1, w2, sf2
+
+
+def _res_create() -> None:
+    """After vLLM's load_model (every layer finalized and, with a12_retire armed, retired): the residency manager over
+    the tensors the step reads NOW. Residency off: returns at once."""
+    cfg = _res_cfg()
+    if cfg is None:
+        return
+    R = _rt()
+    if set(_S.modules) != set(_S.allres) or _S.res_cnt is None:
+        raise RuntimeError(f"gracetier: residency saw layers {sorted(_S.modules)} finalize; expected all of "
+                           f"{sorted(_S.allres)}")
+    dev = _S.res_cnt.device
+    cuda = dev.type == "cuda"
+    views, bound, retired = {}, {}, 0
+    for idx in sorted(_S.allres):
+        module = _S.modules[idx]
+        st = module._mp
+        w1, sf1, w2, sf2 = _res_tensors(module)
+        cuts1 = cuts2 = ()
+        if st.vas is not None:
+            va1, va2 = st.vas
+            if w1.data_ptr() != va1.va or w2.data_ptr() != va2.va:
+                raise RuntimeError(f"gracetier layer {idx}: the module's MegaMoE weights are no longer the VMM tensors "
+                                   f"finalize installed; residency would swap memory the step does not read. Refusing.")
+            # no memcpy may cross the private / shared mapping boundary (not measured: gracetier_res.py docstring)
+            cuts1, cuts2 = (va1.plan.shared_va_off,), (va2.plan.shared_va_off,)
+        elif cuda:
+            raise RuntimeError(f"gracetier layer {idx}: no VMM geometry recorded at finalize")
+        if cuda:
+            _res_check_chunks(idx, st.C)
+            g1, g2 = _S.pool.cuda_l1(idx, dev), _S.pool.cuda_l2(idx, dev)
+        else:
+            g1, g2 = _S.pool.host_l1(idx), _S.pool.host_l2(idx)
+        views[idx] = R.GR.LayerView(idx, st.H, st.row_map, st.g2e, w1, w2, sf1, sf2, g1, g2, cuts1=cuts1, cuts2=cuts2)
+        bound[idx] = tuple(t.data_ptr() for t in (w1, sf1, w2, sf2))
+        retired += int(hasattr(module, "_a12_retire_owners"))
+    _S.res_bound = bound
+    _S.res = R.GR.GtResManager(views, {l: v["hot"] for l, v in _S.allres.items()},
+                               {l: v["cold"] for l, v in _S.allres.items()}, _S.res_cnt, cfg, log=_log)
+    if cuda:
+        _install_replay_check()
+    _log(f"residency: manager over {len(views)} layers; the SF banks it swaps are module._transformed_l1/l2_weights[1] "
+         f"as they are after load ({retired}/{len(views)} layers retired by a12_retire into its compressible "
+         f"allocation); counter int32 {tuple(_S.res_cnt.shape)}, counted calls <= "
+         f"{_S.modules[min(_S.modules)]._mp.count_ids} ids; freeze={int(_S.res.state.freeze)}")
+
+
+def _res_recheck() -> None:
+    """First barrier (after KV sizing, graph capture and warm-up): every layer's weights and SF banks are still the
+    tensors the manager was built on. A component that replaced one after load would make swaps write dead memory."""
+    for idx, want in _S.res_bound.items():
+        got = tuple(t.data_ptr() for t in _res_tensors(_S.modules[idx]))
+        if got != want:
+            raise RuntimeError(f"gracetier layer {idx}: MegaMoE weights / SF banks were replaced after load_model "
+                               f"({[hex(x) for x in want]} -> {[hex(x) for x in got]}); residency would swap tensors "
+                               f"the step no longer reads. Refusing.")
+    _S.res_rechecked = True
+    _log(f"residency: first barrier: weights and SF banks of {len(_S.res_bound)} layers unchanged since load_model")
+
+
+def _install_replay_check() -> None:
+    """[inferred] vLLM replays its CUDA graphs with torch.cuda.CUDAGraph.replay on the stream that is current inside
+    execute_model. The first REPLAY_CHECKS replays made inside an execute_model call are compared with that call's
+    barrier stream (RuntimeError on a mismatch); after that the wrap is one attribute test per replay."""
+    import torch
+
+    cls = getattr(torch.cuda, "CUDAGraph", None)
+    orig = getattr(cls, "replay", None)
+    if orig is None or getattr(orig, "_ds41_gracetier", False):
+        return
+
+    def replay(self, *args, **kwargs):
+        if _S.res_in_exec and _S.res_replays < REPLAY_CHECKS:
+            m = _S.res
+            if m is not None:
+                m.check_stream("a CUDA graph replay inside execute_model")
+                _S.res_replays += 1
+                if _S.res_replays == REPLAY_CHECKS:
+                    _log(f"stream check: {REPLAY_CHECKS} CUDA graph replays inside execute_model ran on the barrier's "
+                         f"stream")
+        return orig(self, *args, **kwargs)
+
+    replay._ds41_gracetier = True
+    cls.replay = replay
+
+
+def _wrap_execute_model(cls) -> None:
+    """The barrier: GPUModelRunner.execute_model runs manager.barrier() first, then the original. [inferred]
+    execute_model exists and is an ordinary function (checked here, at import of the runner module)."""
+    import functools
+    import inspect
+
+    orig = getattr(cls, "execute_model", None)
+    if orig is None or not callable(orig):
+        raise RuntimeError("gracetier: residency needs GPUModelRunner.execute_model (the barrier); it does not exist")
+    if getattr(orig, "_ds41_gracetier", False):
+        return
+    if inspect.iscoroutinefunction(orig):
+        raise RuntimeError("gracetier: GPUModelRunner.execute_model is a coroutine function; a wrap that runs the "
+                           "barrier before it would not sit between two steps. Refusing residency.")
+
+    @functools.wraps(orig)
+    def execute_model(self, *args, **kwargs):
+        m = _S.res
+        if m is None:
+            return orig(self, *args, **kwargs)
+        if not _S.res_rechecked:
+            _res_recheck()
+        m.barrier()
+        _S.res_in_exec = True
+        try:
+            return orig(self, *args, **kwargs)
+        finally:
+            _S.res_in_exec = False
+
+    execute_model._ds41_gracetier = True
+    cls.execute_model = execute_model
+    _log("GPUModelRunner.execute_model wrapped: residency barrier before every call")
 
 
 # ================================================================================================ the hook wraps
@@ -802,6 +1073,9 @@ def patch_runner(module) -> None:
         if not b["fits"]:
             raise RuntimeError(f"gracetier: host RAM budget does not fit (headroom {b['GiB']['headroom']} GiB < floor "
                                f"{b['GiB']['floor']} GiB); refusing to boot")
+        if _res_doc() is not None:      # A3: the residency manager (boot digests of every expert), before KV sizing
+            with bounded("gracetier residency manager (tables check + boot digests)", FINALIZE_S):
+                _res_create()
         _hook_activate(NAME)
         hs = sorted({len(v["hot"]) for v in _S.allres.values()})
         _log(f"ENGAGED: {len(_S.layers_done)} layers, H {hs}, G = {E}, {_S.tensors_read} cold tensors in Grace "
@@ -813,3 +1087,5 @@ def patch_runner(module) -> None:
 
     load_model._ds41_gracetier = True
     cls.load_model = load_model
+    if _res_doc() is not None:          # A3: the barrier. Residency off: execute_model is not touched.
+        _wrap_execute_model(cls)

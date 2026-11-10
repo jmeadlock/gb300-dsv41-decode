@@ -10,6 +10,12 @@ deep_gemm FAILS the MegaMoE tests (it is what is under test).
   * gt_read on the device == read_emulated.
   * MegaMoE G = 384 at real shapes: VMM-backed L1 / L2 vs the same bytes in plain allocations (the M1 gate), and
     after gt_stage of cold groups vs an all-HBM 384-group copy (the M4 gate on synthetic bytes): torch.equal.
+  * A3 residency (docs/HANDOFF-A3-RESIDENCY.md, runtime/gracetier_res.py), the checkpoint's layer 10 (needs the
+    checkpoint at $DSV41_MODEL_DIR, default /ref -- its absence FAILS on the box): an all-HBM G = 384 reference at the
+    boot map vs the pool after 32 random swaps (the scratch dirtied through a second layer's VA before every barrier
+    and every stage), MegaMoE output for random routings at T = 1 / 6 / 16 / 64: torch.equal, eager and through ONE
+    CUDA graph captured before the swaps; the device counter == the picks per expert; the audit; restore_map brings
+    the boot bytes back.
 
 Run on the box inside the library image (the runner does):
   ... --entrypoint python3 vllm/vllm-openai:v0.31.0 tests/gpu/test_gracetier_gpu.py
@@ -320,9 +326,190 @@ def test_megamoe_staged_cold_equals_all_hbm():
           "c = 1/2/4/8 (torch.equal)")
 
 
+# ------------------------------------------------------------------------------------------------ A3 residency
+RES_LAYER = 10
+RES_SWAPS = 32
+RES_TS = (1, 6, 16, 64)
+RES_ROUTINGS = 4               # random routings per T (the first names moved experts on purpose)
+
+
+def _res_mismatch(tag, cmp):
+    """A difference is reported as a class (rows exact / max |d|, the way mini-test M6 did), never hidden."""
+    return (f"A3 residency {tag}: MegaMoE output differs from the all-HBM reference: rows exact "
+            f"{cmp['rows_exact']}/{cmp['rows']}, elements equal {cmp['frac_bytes_equal']}, max|d| {cmp['max_abs']}, "
+            f"nonfinite {cmp['nonfinite']}")
+
+
+def test_residency_swaps_equal_all_hbm_layer10():
+    dg = _need_dg()
+    import numpy as np
+
+    import gracetier_minitest as GT
+    from runtime import gracetier_res as GR
+
+    model_dir = os.environ.get("DSV41_MODEL_DIR", "/ref")
+    if not os.path.isdir(model_dir):
+        raise RuntimeError(f"A3 residency gate needs the checkpoint (layer {RES_LAYER}) at {model_dir} "
+                           f"(DSV41_MODEL_DIR); the runner mounts it at /ref")
+    a = GT.build_parser().parse_args(["numerics", "--layer", str(RES_LAYER), "--model-dir", model_dir])
+    S = GT.LayerSetup(a, dg, want_ref=True, want_stock=False)
+    L, H, G, C, k, dev = S.L, S.H, S.G, S.C, S.k, S.dev
+    out = {}
+    try:
+        # the reference: all-HBM weights + SF banks in the BOOT group order; it never changes
+        ref_sf1, ref_sf2 = S.sf1.clone(), S.sf2.clone()
+        row_boot = S.row_long.clone()
+        # the pool side: the tables the server keeps at fixed addresses, and the manager over them
+        row_map = S.row_dev.clone()
+        g2e = torch.tensor(GR.g2e_list(S.row), dtype=torch.int32, device="cpu").to(dev)
+        cnt = torch.zeros(L + 1, G, dtype=torch.int32, device=dev)
+        va = S.vmm.va[L]
+        view = GR.LayerView(L, H, row_map, g2e, S.l1, S.l2, S.sf1, S.sf2, S.pool.cuda_l1(L, dev),
+                            S.pool.cuda_l2(L, dev), cuts1=(va["l1"].plan.shared_va_off,),
+                            cuts2=(va["l2"].plan.shared_va_off,))
+        cfg = GR.ResConfig(mode="adaptive", freeze=True, dir=None)
+        t0 = time.time()
+        mgr = GR.GtResManager({L: view}, {L: S.hot}, {L: S.cold}, cnt, cfg, log=lambda m: print("   ", m, flush=True))
+        out["manager_s"] = round(time.time() - t0, 2)
+        rng = random.Random(20261109)
+        nrng = np.random.default_rng(20261109)
+        ids_buf = torch.full((a.max_tokens, k), -1, dtype=torch.long, device=dev)
+        want_cnt = [0] * G
+
+        def step():
+            """One layer-call as the server makes it (fastpath_gracetier._forward): groups = row_map[ids] on the
+            device, gt_stage with the counter, MegaMoE. Reads only fixed-address tensors: capturable once."""
+            S.symm.topk_idx.copy_(torch.where(ids_buf >= 0, row_map[ids_buf.clamp(min=0)].to(ids_buf.dtype), ids_buf))
+            GS.gt_stage(S.symm.topk_idx.reshape(-1), H, S.src_tab, S.dtab, S.cnt, S.b1, S.b2, g2e=g2e, ecnt=cnt[L])
+            S.mega_vmm(True)
+
+        def load(ids, T):
+            """Inputs for T rows (weights, activations; the SymmBuffer's id rows are written by step())."""
+            g = torch.Generator(device="cpu").manual_seed(rng.randrange(1 << 30))
+            q, sc = GT.quant_rows(GT.synth_x(T, S.D, g).to(dev))
+            w = torch.tensor(GT.synth_weights(T, k, rng), dtype=torch.float32, device=dev)
+            topk = torch.tensor(ids, dtype=torch.long, device=dev)
+            GT.set_inputs(S.symm, topk, w, q, sc)                     # topk_idx is overwritten by the caller
+            return topk, w, q, sc
+
+        def reference(topk, w, q, sc, T):
+            GT.set_inputs(S.symm, row_boot[topk], w, q, sc)
+            GT.mega_call(dg, S.y, S.ref_l1, ref_sf1, S.ref_l2, ref_sf2, S.symm, S.lim, True)
+            torch.cuda.synchronize()
+            return S.y[:T].clone()
+
+        def run(ids, T, how, graph=None):
+            topk, w, q, sc = load(ids, T)
+            y_ref = reference(topk, w, q, sc, T)
+            GT.set_inputs(S.symm, topk, w, q, sc)
+            ids_buf.fill_(-1)
+            ids_buf[:T].copy_(topk)
+            S.dirty()                                                 # the scratch holds the WRONG experts
+            if graph is None:
+                step()
+            else:
+                graph.replay()
+            torch.cuda.synchronize()
+            for r in ids:
+                for e in r:
+                    want_cnt[e] += 1
+            cmp = GT.compare_bits(S.y[:T], y_ref)
+            assert cmp["equal"], _res_mismatch(f"T={T} {how}", cmp)
+            return cmp
+
+        def routings(T, moved):
+            outs = []
+            for i in range(RES_ROUTINGS):
+                ids = [rng.sample(range(G), k) for _ in range(T)]
+                if i == 0 and moved:                                  # name experts that changed tier
+                    for r, e in zip(ids, rng.sample(moved, min(len(moved), T))):
+                        if e not in r:
+                            r[0] = e
+                outs.append(ids)
+            return outs
+
+        # 0. the boot map: equal before any swap, eager; then capture the step ONCE (T_max rows, as the server's
+        #    graphs are captured before any swap happens)
+        for T in RES_TS:
+            for ids in routings(T, []):
+                run(ids, T, "boot map, eager")
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(graph):
+                step()
+            out["graph"] = "captured before the swaps"
+        except Exception as e:  # noqa: BLE001 - reported in the result line; the eager arms still gate
+            graph = None
+            out["graph"] = f"NOT captured ({type(e).__name__}: {str(e)[:160]}); eager only"
+        torch.cuda.synchronize()
+        cnt.zero_()
+        want_cnt[:] = [0] * G
+        for T in RES_TS:
+            run(routings(T, [])[0], T, "boot map, graph" if graph is not None else "boot map, eager", graph)
+
+        # 1. 32 random swaps through the queue and the barrier (the serving path), <= 4 per barrier
+        barriers = 0
+        while mgr.stats["swaps"] < RES_SWAPS:
+            mgr.queue_random(min(cfg.swaps_per_barrier, RES_SWAPS - mgr.stats["swaps"] - len(mgr.state.pending)), nrng)
+            S.dirty()
+            mgr.barrier()
+            barriers += 1
+            assert barriers < 64 * RES_SWAPS, "barriers apply no swaps"
+        torch.cuda.synchronize()
+        moved = sorted(e for e in range(G) if mgr.row[L][e] != S.row[e])
+        out.update(swaps=mgr.stats["swaps"], barriers=barriers, experts_displaced=len(moved),
+                   copies=mgr.stats["copies"], stale=mgr.state.stale)
+        assert mgr.stats["swaps"] == RES_SWAPS and moved, out
+        assert row_map.cpu().tolist() == mgr.row[L] and g2e.cpu().tolist() == GR.g2e_list(mgr.row[L])
+        assert sorted(mgr.row[L]) == list(range(G))
+        assert torch.equal(S.src_tab, S.pool.src_table(L, dev))        # the source table never changes
+
+        # 2. after the swaps: the same captured graph and eager calls, every T, vs the untouched reference
+        for T in RES_TS:
+            for i, ids in enumerate(routings(T, moved)):
+                use = graph if i % 2 == 0 else None
+                run(ids, T, "after 32 swaps, " + ("eager" if use is None else "graph"), use)
+        got = cnt[L].cpu().tolist()
+        assert got == want_cnt, ("the device counter is not the picks per expert",
+                                 [(e, got[e], want_cnt[e]) for e in range(G) if got[e] != want_cnt[e]][:8])
+        out["counted_picks"] = sum(got)
+        assert not bool(cnt[:L].any())
+
+        # 3. the audit (every moved expert + 64 random), then restore_map, the audit again, the boot bytes
+        a1 = mgr.audit(random_per_layer=64)
+        assert a1["mismatches"] == 0 and a1["moved"] >= len(moved), a1
+        rec = mgr.apply_ctrl({"freeze": True, "restore_map": True})
+        n = 0
+        while mgr.state.pending:
+            S.dirty()
+            mgr.barrier()
+            n += 1
+            assert n < 4096
+        torch.cuda.synchronize()
+        assert mgr.at_boot_map() and row_map.cpu().tolist() == S.row
+        assert torch.equal(S.l1[:H], S.ref_l1[:H]) and torch.equal(S.l2[:H], S.ref_l2[:H])
+        assert torch.equal(S.pool.host_l1(L), S.ref_l1[H:].cpu()) and torch.equal(S.pool.host_l2(L), S.ref_l2[H:].cpu())
+        assert torch.equal(S.sf1, ref_sf1) and torch.equal(S.sf2, ref_sf2)
+        a2 = mgr.audit(random_per_layer=64)
+        assert a2["mismatches"] == 0, a2
+        for T in RES_TS:
+            run(routings(T, moved)[0], T, "after restore_map", graph)
+        out.update(audit_checked=(a1["checked"], a2["checked"]), restore_queued=rec["restore_queued"],
+                   restore_barriers=n, audit_ms=(a1.get("ms"), a2.get("ms")), stream_changes=mgr.stats["stream_changes"])
+        del graph, view, mgr
+    finally:
+        torch.cuda.synchronize()
+        S.close()
+    print(f"  A3 residency, layer {RES_LAYER} (H = {H}): {RES_SWAPS} swaps -> MegaMoE G=384 == all-HBM reference at "
+          f"T = {RES_TS} (torch.equal; eager, and one CUDA graph: {out.get('graph')}); counter == picks; audit 0; "
+          f"restore_map -> boot bytes. {out}")
+
+
 TESTS = [test_vmm_alias_straddle_and_release, test_gt_stage_equals_contract_plain_and_vmm,
          test_gt_stage_is_graph_capturable_with_device_selection, test_gt_read_equals_contract,
-         test_megamoe_g384_vmm_equals_plain, test_megamoe_staged_cold_equals_all_hbm]
+         test_megamoe_g384_vmm_equals_plain, test_megamoe_staged_cold_equals_all_hbm,
+         test_residency_swaps_equal_all_hbm_layer10]
 
 if __name__ == "__main__":
     import traceback
