@@ -1,0 +1,14 @@
+{
+ "stamp": "20261109-224750",
+ "window": "a5q-1109",
+ "commit": "476176d A5: gauntlet output dir fix; TTFT-by-prompt-length cell; A5_SKIP_SPEED",
+ "dirty": "",
+ "nvidia_smi": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, GPU-d07eb6e6-7053-42a7-6811-7bb833266182, 95682 MiB, 97887 MiB, 0 %",
+ "compute_apps": "1892031, 95554 MiB;1893201, 247438 MiB",
+ "MemAvailable_GiB": 200.7,
+ "pg61_models": "\"id\":\"dsv41-flash-uva\",\"id\":\"modelperm-856090b5390f9371\",\"id\":\"deepseek-v4.1-flash\",\"id\":\"modelperm-b48429e49337189b\"",
+ "restore_pg61_at_end": true,
+ "model_dir": "/models/DeepSeek-V4.1-Flash-1017-1bae0e1088993b9b82de08f59de5be5a34e42170",
+ "hot_map": "",
+ "refused": null
+}

@@ -1,0 +1,18 @@
+2026-11-09 22:26:41 CST [a5-v28] == Pg61 down
+2026-11-09 22:27:22 CST [a5-v28] Pg61 down rc=0 (2026-11-09 22:27:22 CST [pg61] down; peer shm removed (verified absent), containers stopped, watchdog stopped)
+Mem:             494          31         480           0           0         462
+2026-11-09 22:28:14 CST [a5-v28] == docker start dsv41-vllm-1017-v28-prob-BOUND-REF
+2026-11-09 22:34:01 CST [a5-v28] bound after 345 s; 6 [kv_cache_utils.py:2321] GPU KV cache size: 2,481,694 tokens, Maximum concurrency for 1,048,576 tokens per request: 2.37x
+{"id":"chatcmpl-9b34d19a5eaa5959","object":"chat.completion","created":1794285241,"model":"dsv41-flash-uva","choices":[{"index":0,"message":{"role":"assistant","content":"OK","refusal":null,"annotatio
+
+2026-11-09 22:34:27 CST [a5 v28] warm-a rc=0 pass A: 20/20 prompts, errors 0; decode tok/s 196.61 (20 timed); ms/step 15.739 tok/step 3.053 ms/token 5.155; per-prompt ms/step min 12.805 max 25.975
+2026-11-09 22:34:49 CST [a5 v28] warm-b rc=0 pass B: 20/20 prompts, errors 0; decode tok/s 218.46 (20 timed); ms/step 13.83 tok/step 2.983 ms/token 4.637; per-prompt ms/step min 11.866 max 18.35
+2026-11-09 22:35:11 CST [a5 v28] c1-a rc=0 pass A: 20/20 prompts, errors 0; decode tok/s 226.4 (20 timed); ms/step 13.668 tok/step 3.053 ms/token 4.477; per-prompt ms/step min 12.642 max 18.419
+2026-11-09 22:35:32 CST [a5 v28] c1-b rc=0 pass B: 20/20 prompts, errors 0; decode tok/s 223.47 (20 timed); ms/step 13.52 tok/step 2.983 ms/token 4.533; per-prompt ms/step min 12.007 max 18.95
+2026-11-09 22:35:53 CST [a5 v28] c8 rc=0 conc C8: 40/40 ok, errors 0; aggregate 452.3 tok/s over 20.02 s; per-stream decode p50 75.2 min 43.18 tok/s; TTFT p50 0.162 max 2.717 s; alive True
+2026-11-09 22:36:14 CST [a5 v28] c32 rc=0 conc C32: 64/64 ok, errors 0; aggregate 683.2 tok/s over 21.49 s; per-stream decode p50 36.59 min 28.36 tok/s; TTFT p50 2.47 max 8.908 s; alive True
+2026-11-09 22:36:34 CST [a5 v28] c1-a2 rc=0 pass A: 20/20 prompts, errors 0; decode tok/s 247.03 (20 timed); ms/step 12.527 tok/step 3.053 ms/token 4.103; per-prompt ms/step min 11.776 max 21.525
+2026-11-09 22:36:34 CST [a5 v28] cells done
+2026-11-09 22:36:34 CST [a5-v28] server alive after cells: yes
+2026-11-09 22:36:49 CST [a5-v28] == restore Pg61
+2026-11-09 22:43:16 CST [a5-v28] restore rc=0; ds41 Up 4 minutes;ds41-sidecar Up 5 minutes;

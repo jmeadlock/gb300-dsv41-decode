@@ -1,0 +1,12 @@
+Traceback (most recent call last):
+  File "/home/milo/pin-hot-experts/round7/gauntlet/run_suite.py", line 87, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "/home/milo/pin-hot-experts/round7/gauntlet/run_suite.py", line 83, in main
+    return run_suite(p.parse_args())
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/milo/pin-hot-experts/round7/gauntlet/run_suite.py", line 17, in run_suite
+    out.mkdir(parents=True,exist_ok=False)
+  File "/usr/lib/python3.12/pathlib.py", line 1313, in mkdir
+    os.mkdir(self, mode)
+FileExistsError: [Errno 17] File exists: '/home/milo/dsv41/decode/scratch/a5-gracetier-20261109-221120-gauntlet'

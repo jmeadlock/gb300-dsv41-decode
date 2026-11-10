@@ -1,0 +1,1 @@
+conc C32: 64/64 ok, errors 0; aggregate 717.5 tok/s over 20.49 s; per-stream decode p50 29.0 min 16.14 tok/s; TTFT p50 1.431 max 1.65 s; alive True

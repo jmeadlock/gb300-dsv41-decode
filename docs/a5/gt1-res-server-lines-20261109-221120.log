@@ -1,0 +1,6 @@
+DS41_FASTPATH gracetier: residency config /fastpath/gracetier-res.json: {"freeze": false, "hyst": 3.0, "mode": "adaptive"}
+DS41_FASTPATH gracetier: [gracetier-res] adaptive residency on 40 layers (H [255], G 384): drain_n 64 swaps/drain 2 cap/barrier 4 hyst 3.0 min_abs 8.0 halflife 500.0; freeze=0; ctrl + telemetry /prof/gracetier-res; boot digests 1.63 s
+DS41_FASTPATH gracetier: residency: manager over 40 layers; the SF banks it swaps are module._transformed_l1/l2_weights[1] as they are after load (40/40 layers retired by a12_retire into its compressible allocation); counter int32 (40, 384), counted calls <= 1536 ids; freeze=0
+DS41_FASTPATH gracetier: residency: first barrier: weights and SF banks of 40 layers unchanged since load_model
+DS41_FASTPATH gracetier: stream check: 64 eager gt_stage calls inside execute_model ran on the barrier's stream
+DS41_FASTPATH gracetier: stream check: 256 CUDA graph replays inside execute_model ran on the barrier's stream

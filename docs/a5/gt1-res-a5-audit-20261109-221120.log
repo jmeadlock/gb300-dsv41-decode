@@ -1,0 +1,1 @@
+ctrl {"audit": {"moved": true, "random": 64}} seq 1794284338411: ack yes after 2.129 s / 2 nudges; ['audit mismatches=0']; settled(ack) True; state {"pending": 46, "at_boot": false, "freeze": false, "hot_moved": 1585, "swaps": 4819}; audit {"checked": 7264, "moved": 4704, "random": 2560, "mismatches": 0, "ms": 868.3}

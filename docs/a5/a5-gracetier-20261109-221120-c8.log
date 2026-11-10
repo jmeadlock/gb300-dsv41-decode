@@ -1,0 +1,1 @@
+conc C8: 40/40 ok, errors 0; aggregate 489.4 tok/s over 18.66 s; per-stream decode p50 74.76 min 45.9 tok/s; TTFT p50 0.146 max 1.363 s; alive True

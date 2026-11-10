@@ -1,0 +1,14 @@
+{
+ "stamp": "20261109-221120",
+ "window": "a5-20261109-2230",
+ "commit": "5cfc546 card A5: same-harness three-way (gracetier / v28-prob / Pg61) on the mixed sets at C1, C8, C32 \u2014 a5-cells.sh, a5-v28.sh, a5-driver.sh, card-gt1 a5 mode, gt_mix_drive conc + client decode tok/s",
+ "dirty": "",
+ "nvidia_smi": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, GPU-d07eb6e6-7053-42a7-6811-7bb833266182, 95682 MiB, 97887 MiB, 0 %",
+ "compute_apps": "1817193, 95554 MiB;1818344, 242884 MiB",
+ "MemAvailable_GiB": 198.4,
+ "pg61_models": "\"id\":\"dsv41-flash-uva\",\"id\":\"modelperm-9a6d97b08a0d7bdf\",\"id\":\"deepseek-v4.1-flash\",\"id\":\"modelperm-82850e9443e84cca\"",
+ "restore_pg61_at_end": true,
+ "model_dir": "/models/DeepSeek-V4.1-Flash-1017-1bae0e1088993b9b82de08f59de5be5a34e42170",
+ "hot_map": "",
+ "refused": null
+}
